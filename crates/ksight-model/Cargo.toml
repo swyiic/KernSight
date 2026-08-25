@@ -1,0 +1,16 @@
+[package]
+name = "ksight-model"
+description = "Normalized domain model shared by KernSight components"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true
+

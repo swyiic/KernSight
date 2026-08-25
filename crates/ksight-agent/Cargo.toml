@@ -1,0 +1,30 @@
+[package]
+name = "ksight-agent"
+description = "Android device agent and ksightd service boundary"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+name = "ksight_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ksightd"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+ksight-core.workspace = true
+ksight-abi.workspace = true
+ksight-model.workspace = true
+ksight-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

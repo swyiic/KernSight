@@ -1,0 +1,12 @@
+[package]
+name = "ksight-abi"
+description = "Fixed-layout eBPF-to-agent raw ABI for KernSight"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license = "GPL-2.0-only"
+
+[lints]
+workspace = true
+

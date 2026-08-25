@@ -1,0 +1,8 @@
+Copyright 2026 KernSight Contributors
+
+Userspace source code is intended to be licensed under the Apache License, Version 2.0.
+Kernel-facing and eBPF source code is intended to be licensed under GPL-2.0-only.
+
+Full license texts and per-path SPDX enforcement must be added before the first public release.
+This architecture baseline is not yet a public release artifact.
+

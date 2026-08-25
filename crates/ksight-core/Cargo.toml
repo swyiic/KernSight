@@ -1,0 +1,17 @@
+[package]
+name = "ksight-core"
+description = "Deterministic identity, ordering, policy, and correlation logic for KernSight"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+ksight-model.workspace = true
+ksight-protocol.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
+

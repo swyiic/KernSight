@@ -1,0 +1,44 @@
+raw_abi_version = 1
+
+[[sensor]]
+id = 1
+name = "process"
+default_mode = "observe"
+status = "planned"
+
+[[sensor]]
+id = 2
+name = "file"
+default_mode = "observe"
+status = "planned"
+
+[[sensor]]
+id = 3
+name = "memory"
+default_mode = "observe"
+status = "planned"
+
+[[sensor]]
+id = 4
+name = "network"
+default_mode = "observe"
+status = "planned"
+
+[[sensor]]
+id = 5
+name = "binder"
+default_mode = "observe"
+status = "planned"
+
+[[sensor]]
+id = 6
+name = "integrity"
+default_mode = "observe"
+status = "planned"
+
+[[sensor]]
+id = 7
+name = "syscall"
+default_mode = "inspect"
+status = "planned"
+

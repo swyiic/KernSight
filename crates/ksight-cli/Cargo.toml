@@ -1,0 +1,20 @@
+[package]
+name = "ksight-cli"
+description = "First-class command-line client for KernSight"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ksightctl"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+ksight-model.workspace = true
+ksight-protocol.workspace = true
+
+[lints]
+workspace = true
