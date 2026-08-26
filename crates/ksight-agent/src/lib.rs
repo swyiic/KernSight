@@ -22,5 +22,11 @@ pub mod spool;
 /// Authenticated local transport boundary.
 pub mod transport;
 
-pub use capabilities::{CapabilityProbe, HostCapabilityProbe, ProbeReport};
+/// Linux/Android eBPF sensor adapter.
+#[cfg(any(target_os = "android", target_os = "linux"))]
+pub mod ebpf;
+
+pub use capabilities::{
+    CapabilityProbe, CapabilityStatus, HostCapabilityProbe, ProbeReport, TracepointCapability,
+};
 pub use runtime::{AgentRuntime, RuntimeState};

@@ -4,7 +4,7 @@ raw_abi_version = 1
 id = 1
 name = "process"
 default_mode = "observe"
-status = "planned"
+status = "m1_experimental"
 
 [[sensor]]
 id = 2
@@ -41,4 +41,3 @@ id = 7
 name = "syscall"
 default_mode = "inspect"
 status = "planned"
-

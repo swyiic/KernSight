@@ -8,8 +8,8 @@ pub struct ProcessKey {
     pub boot_id: Uuid,
     /// Linux process ID.
     pub pid: u32,
-    /// Kernel process start time in clock ticks.
-    pub start_time_ticks: u64,
+    /// Kernel monotonic process start time in nanoseconds, or zero when not observed.
+    pub start_time_ns: u64,
 }
 
 /// Candidate Android package associated with a Linux identity.

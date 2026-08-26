@@ -12,6 +12,21 @@ pub struct RawRecord {
 }
 
 impl RawRecord {
+    /// Validate and copy one raw kernel record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an ABI decoding error when the record is truncated or incompatible.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ksight_abi::DecodeError> {
+        let header = ksight_abi::RawEventHeader::decode(bytes)?;
+        Ok(Self {
+            abi_version: header.abi_version,
+            sensor_id: header.sensor_id,
+            sequence: header.source_sequence,
+            bytes: bytes.to_vec(),
+        })
+    }
+
     /// Whether this record declares the ABI implemented by this agent build.
     pub fn has_supported_abi(&self) -> bool {
         self.abi_version == ksight_abi::RAW_ABI_VERSION

@@ -12,6 +12,7 @@ name = "ksightctl"
 path = "src/main.rs"
 
 [dependencies]
+anyhow.workspace = true
 clap.workspace = true
 ksight-model.workspace = true
 ksight-protocol.workspace = true

@@ -2,7 +2,7 @@
 #ifndef KSIGHT_ABI_H
 #define KSIGHT_ABI_H
 
-#include <linux/types.h>
+#include "ksight_types.h"
 
 #define KSIGHT_RAW_ABI_VERSION 1
 #define KSIGHT_TASK_COMM_LEN 16
@@ -37,28 +37,27 @@ enum ksight_raw_event_flags {
  * only kernel-local identity and monotonic time.
  */
 struct ksight_raw_event_header {
-    __u16 abi_version;
-    __u16 header_size;
-    __u16 sensor_id;
-    __u16 event_type;
-    __u32 total_size;
-    __u32 flags;
-    __u64 source_sequence;
-    __u64 monotonic_ns;
-    __u64 process_start_time;
-    __u32 cpu;
-    __u32 uid;
-    __u32 gid;
-    __u32 pid;
-    __u32 tid;
-    __u32 tgid;
-    __u32 ppid;
+    ksight_u16 abi_version;
+    ksight_u16 header_size;
+    ksight_u16 sensor_id;
+    ksight_u16 event_type;
+    ksight_u32 total_size;
+    ksight_u32 flags;
+    ksight_u64 source_sequence;
+    ksight_u64 monotonic_ns;
+    ksight_u64 process_start_time;
+    ksight_u32 cpu;
+    ksight_u32 uid;
+    ksight_u32 gid;
+    ksight_u32 pid;
+    ksight_u32 tid;
+    ksight_u32 tgid;
+    ksight_u32 ppid;
     char comm[KSIGHT_TASK_COMM_LEN];
-    __u32 reserved[3];
+    ksight_u32 reserved[3];
 };
 
 _Static_assert(sizeof(struct ksight_raw_event_header) == 96,
                "ksight raw event header ABI changed");
 
 #endif /* KSIGHT_ABI_H */
-
