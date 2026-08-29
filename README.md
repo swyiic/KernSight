@@ -54,7 +54,7 @@ make bpf BPF_CLANG=/absolute/path/to/clang
 - 已开启 USB 调试并被当前 PC 授权
 - 具备管理员控制权；当前部署流程需要 `su`
 - 内核支持 eBPF、BTF、tracefs、ring buffer 及所用 tracepoint
-- Pixel 6a 是已验证基线；其他 Android/内核版本必须重新执行能力探测
+- 测试环境：6.1.124-android14，其他 Android/内核版本必须重新执行能力探测
 
 KernSight 目前部署到 `/data/local/tmp/ksight`。AOSP init、独立 SELinux 域、AVB 签名
 及锁定自定义信任根仍属于后续系统集成工作。
