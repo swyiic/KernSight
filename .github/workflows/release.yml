@@ -9,6 +9,9 @@ on:
 permissions:
   contents: read
 
+env:
+  RUSTUP_TOOLCHAIN: 1.91.1
+
 jobs:
   verify:
     runs-on: ubuntu-latest
