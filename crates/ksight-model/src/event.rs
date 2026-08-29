@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -42,6 +44,8 @@ pub enum SensorKind {
     Integrity,
     /// Optional low-level syscall supplement.
     Syscall,
+    /// Scheduler wakeup relationships.
+    Sched,
 }
 
 /// Metadata shared by every normalized event.
@@ -82,6 +86,36 @@ pub struct Event {
 pub enum EventPayload {
     /// Process lifecycle transition.
     ProcessLifecycle(ProcessLifecycle),
+    /// Runtime process identity transition.
+    ProcessIdentityChange(ProcessIdentityChange),
+    /// File open attempt and kernel result.
+    FileOpen(FileOpen),
+    /// File-descriptor close or duplication result.
+    FileDescriptorChange(FileDescriptorChange),
+    /// Socket connect attempt and submitted peer endpoint.
+    SocketConnect(SocketConnect),
+    /// Inbound socket accepted from a listening descriptor.
+    SocketAccept(SocketAccept),
+    /// Completed socket send or receive operation with byte counts only.
+    SocketIo(SocketIo),
+    /// Memory mapping or protection transition.
+    MemoryRegionChange(MemoryRegionChange),
+    /// Binder IPC transaction metadata.
+    BinderTransaction(BinderTransaction),
+    /// Scheduler wakeup relationship.
+    SchedWakeup(SchedWakeup),
+    /// Session-start procfs FD snapshot for the scoped process.
+    SessionFdBaseline(SessionFdBaseline),
+    /// Session-start procfs VMA snapshot for the scoped process.
+    SessionVmaBaseline(SessionVmaBaseline),
+    /// Session-start device environment and collector independence facts.
+    SessionEnvironment(SessionEnvironment),
+    /// Normal capture termination and loss summary.
+    SessionCompletion(SessionCompletion),
+    /// Explicit Inspect adapter decision or hit. Never an Observe fact.
+    InspectObservation(InspectObservation),
+    /// Bounded TLS plaintext copied at an authorized `SSL_write` boundary.
+    InspectPlaintext(InspectPlaintext),
     /// Forward-compatible bounded bytes for an unknown event type.
     Opaque {
         /// Source type identifier.
@@ -89,6 +123,568 @@ pub enum EventPayload {
         /// Bounded raw payload.
         bytes: Vec<u8>,
     },
+}
+
+/// Completed `openat` or `openat2` attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileOpen {
+    /// Directory file descriptor supplied to the syscall.
+    pub directory_fd: i32,
+    /// New file descriptor when the operation succeeded.
+    pub file_descriptor: Option<i32>,
+    /// Raw non-negative descriptor or negative errno result.
+    pub result: i32,
+    /// Open flags supplied by userspace.
+    pub flags: u32,
+    /// Creation mode supplied by userspace.
+    pub mode: u32,
+    /// Bounded userspace path as submitted to the kernel.
+    pub path: String,
+    /// Best-effort absolute path resolved from `dirfd` and procfs.
+    pub resolved_path: Option<String>,
+    /// SHA-256 of a bounded regular file when the path looks like DEX/ELF.
+    #[serde(default)]
+    pub content_sha256: Option<String>,
+    /// Hashed byte length when `content_sha256` is present.
+    #[serde(default)]
+    pub content_bytes: Option<u64>,
+}
+
+/// Completed close or duplication operation on a file descriptor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileDescriptorChange {
+    /// Descriptor lifecycle operation.
+    pub operation: FileDescriptorOperation,
+    /// Source descriptor supplied by userspace.
+    pub file_descriptor: i32,
+    /// Requested destination or minimum descriptor, when supplied.
+    pub requested_file_descriptor: Option<i32>,
+    /// New descriptor when duplication succeeded.
+    pub resulting_file_descriptor: Option<i32>,
+    /// Zero, a new descriptor, or a negative errno result.
+    pub result: i32,
+    /// Raw syscall or fcntl command used to produce the event.
+    pub command: u32,
+    /// Operation-specific flags such as dup3 flags.
+    pub flags: u32,
+    /// Inclusive last descriptor for `close_range`; absent for single-fd operations.
+    #[serde(default)]
+    pub last_file_descriptor: Option<u32>,
+}
+
+/// File-descriptor lifecycle operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileDescriptorOperation {
+    /// Close one descriptor.
+    Close,
+    /// Create another reference to an existing descriptor.
+    Duplicate,
+    /// Close or mark a contiguous descriptor range.
+    CloseRange,
+    /// Pass descriptors over a Unix socket with `SCM_RIGHTS`.
+    RightsSend,
+    /// Receive descriptors over a Unix socket with `SCM_RIGHTS`.
+    RightsReceive,
+}
+
+/// Completed `connect` attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SocketConnect {
+    /// Socket file descriptor supplied to the syscall.
+    pub file_descriptor: i32,
+    /// Zero on success or a negative errno result.
+    pub result: i32,
+    /// Linux socket-address family number.
+    pub address_family: u16,
+    /// Socket-address length supplied by userspace.
+    pub submitted_address_length: u16,
+    /// Socket-address bytes successfully copied by the kernel sensor.
+    pub captured_address_length: u16,
+    /// Numeric IP address or bounded Unix-domain socket name, when decoded.
+    pub peer_address: Option<String>,
+    /// Network-byte-order peer port for IPv4 or IPv6.
+    pub peer_port: Option<u16>,
+    /// IPv6 scope identifier when present.
+    pub scope_id: Option<u32>,
+}
+
+/// Completed `accept` or `accept4` attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SocketAccept {
+    /// Listening socket descriptor supplied to the syscall.
+    pub listening_file_descriptor: i32,
+    /// New connected descriptor when the operation succeeded.
+    pub accepted_file_descriptor: Option<i32>,
+    /// New descriptor or a negative errno result.
+    pub result: i32,
+    /// Linux socket-address family number, when returned by the kernel.
+    pub address_family: u16,
+    /// Socket-address length returned to userspace.
+    pub returned_address_length: u16,
+    /// Socket-address bytes successfully copied by the kernel sensor.
+    pub captured_address_length: u16,
+    /// Numeric IP address or bounded Unix-domain peer name, when decoded.
+    pub peer_address: Option<String>,
+    /// Network-byte-order peer port for IPv4 or IPv6.
+    pub peer_port: Option<u16>,
+    /// IPv6 scope identifier when present.
+    pub scope_id: Option<u32>,
+}
+
+/// Completed socket I/O operation without buffer contents.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SocketIo {
+    /// Socket descriptor supplied to the syscall.
+    pub file_descriptor: i32,
+    /// Transfer direction.
+    pub operation: SocketIoOperation,
+    /// Bytes transferred, completed messages for `sendmmsg`/`recvmmsg`, or a negative errno.
+    pub result: i64,
+    /// Requested byte count when directly available from the syscall ABI.
+    pub requested_bytes: Option<u64>,
+    /// Raw syscall number for versioned interpretation.
+    pub syscall: u32,
+}
+
+/// Direction of one socket transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SocketIoOperation {
+    /// Bytes submitted to a socket.
+    Send,
+    /// Bytes returned from a socket.
+    Receive,
+}
+
+/// Completed memory mapping or protection syscall.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryRegionChange {
+    /// Operation that produced the event.
+    pub operation: MemoryOperation,
+    /// Requested base address.
+    pub address: u64,
+    /// Requested byte length.
+    pub length: u64,
+    /// Returned mapping address, zero, or negative errno.
+    pub result: i64,
+    /// Linux `PROT_*` bitset.
+    pub protection: u32,
+    /// Linux `MAP_*` bitset for mapping operations.
+    pub mapping_flags: Option<u32>,
+    /// Backing file descriptor for mapping operations, when present.
+    pub file_descriptor: Option<i32>,
+    /// Best-effort path resolved from the process file descriptor.
+    pub backing_path: Option<String>,
+    /// Backing file offset for mapping operations.
+    pub offset: Option<u64>,
+}
+
+/// Memory-region operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryOperation {
+    /// Create or replace a virtual-memory mapping.
+    Map,
+    /// Change access permissions on an existing region.
+    Protect,
+    /// Remove one virtual-memory address range.
+    Unmap,
+    /// Move or resize an existing mapping.
+    Remap,
+    /// Adjust the process program break.
+    Brk,
+}
+
+/// Binder driver transaction metadata without parcel contents.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BinderTransaction {
+    /// Driver lifecycle stage represented by this event.
+    #[serde(default)]
+    pub stage: BinderTransactionStage,
+    /// Kernel Binder debug transaction identifier.
+    pub transaction_id: i32,
+    /// Target Binder node identifier, when present.
+    pub target_node: Option<i32>,
+    /// Destination process ID, when resolved by the driver.
+    pub target_process_id: Option<u32>,
+    /// Destination thread ID, when resolved by the driver.
+    pub target_thread_id: Option<u32>,
+    /// Kind of Binder target, when the driver resolved one.
+    #[serde(default)]
+    pub target_kind: Option<BinderTargetKind>,
+    /// Whether this transaction is a reply.
+    pub reply: bool,
+    /// Client-to-server or server-to-client direction.
+    #[serde(default)]
+    pub direction: BinderTransactionDirection,
+    /// Reply direction: the paired request transaction identifier (reply only).
+    #[serde(default)]
+    pub reply_to_request_id: Option<i32>,
+    /// Kernel-side request-to-reply latency (reply only, when paired).
+    #[serde(default)]
+    pub reply_latency_ns: Option<u64>,
+    /// Interface-specific Binder transaction code.
+    pub code: u32,
+    /// Semantic classification of the raw transaction code.
+    #[serde(default)]
+    pub code_kind: Option<BinderCodeKind>,
+    /// Binder transaction flags.
+    pub flags: u32,
+    /// Decoded `TF_*` transaction flags.
+    #[serde(default)]
+    pub decoded_flags: Vec<BinderTransactionFlag>,
+    /// Parcel data bytes allocated by the Binder driver, when observed.
+    #[serde(default)]
+    pub data_size: Option<u64>,
+    /// Binder object-offset table bytes, when observed.
+    #[serde(default)]
+    pub offsets_size: Option<u64>,
+    /// Extra Binder buffer bytes, when observed.
+    #[serde(default)]
+    pub extra_buffers_size: Option<u64>,
+    /// File descriptor transferred at this Binder stage, when observed.
+    #[serde(default)]
+    pub file_descriptor: Option<i32>,
+    /// Offset of the Binder FD object inside the transaction buffer.
+    #[serde(default)]
+    pub object_offset: Option<u64>,
+    /// End-to-end lineage of a Binder-transferred FD, resolved when the
+    /// receiving side installs the descriptor (best-effort).
+    #[serde(default)]
+    pub transferred_fd_origin: Option<String>,
+}
+
+/// Kernel-observable Binder transaction lifecycle stage.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BinderTransactionStage {
+    /// Transaction was submitted to the Binder driver.
+    #[default]
+    Submitted,
+    /// Transaction was delivered to its destination thread.
+    Received,
+    /// Driver allocated the transaction payload buffers.
+    BufferAllocated,
+    /// Source process attached a file descriptor to the transaction.
+    FdSent,
+    /// Destination process installed a file descriptor from the transaction.
+    FdReceived,
+}
+
+/// Direction of a Binder transaction relative to the emitting process.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BinderTransactionDirection {
+    /// Client-to-server request.
+    #[default]
+    Request,
+    /// Server-to-client reply.
+    Reply,
+}
+
+/// Decoded Binder driver transaction flag (`TF_*`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BinderTransactionFlag {
+    /// Asynchronous one-way call with no reply.
+    OneWay,
+    /// Contents are the component's root object.
+    RootObject,
+    /// Contents are a 32-bit status code.
+    StatusCode,
+    /// Replies may carry file descriptors.
+    AcceptFds,
+    /// Clear the transaction buffer on completion.
+    ClearBuf,
+    /// Update the outdated pending async transaction.
+    UpdateTxn,
+}
+
+/// Semantic classification of a Binder transaction `code`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BinderCodeKind {
+    /// First user-callable transaction code (`FIRST_CALL_TRANSACTION`).
+    FirstCallTransaction,
+    /// Last user-callable transaction code (`LAST_CALL_TRANSACTION`).
+    LastCallTransaction,
+    /// `IBinder` `PING_TRANSACTION`.
+    PingTransaction,
+    /// `IBinder` `DUMP_TRANSACTION`.
+    DumpTransaction,
+    /// `IBinder` `INTERFACE_TRANSACTION`.
+    InterfaceTransaction,
+    /// `IBinder` `TWEET_TRANSACTION`.
+    TweetTransaction,
+    /// `IBinder` `LIKE_TRANSACTION`.
+    LikeTransaction,
+    /// Interface-specific method number.
+    Method,
+}
+
+/// Kind of Binder transaction target resolved by the driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BinderTargetKind {
+    /// Local Binder node targeted directly.
+    LocalNode,
+    /// Remote object reached through a handle/ref.
+    RemoteHandle,
+    /// Reply directed at the requesting thread.
+    Reply,
+}
+
+/// Scheduler wakeup relationship between the waker (header process) and a wakee.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchedWakeup {
+    /// Woken thread identifier.
+    pub wakee_tid: u32,
+    /// Woken task priority.
+    pub wakee_prio: i32,
+    /// Target CPU for the woken task.
+    pub target_cpu: i32,
+}
+
+/// One descriptor in a session-start FD baseline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BaselineFd {
+    /// Descriptor number.
+    pub fd: i32,
+    /// Best-effort descriptor kind derived from the procfs target.
+    pub kind: BaselineFdKind,
+    /// procfs `/proc/<pid>/fd/<n>` readlink target (bounded).
+    pub target: String,
+}
+
+/// Best-effort descriptor classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BaselineFdKind {
+    /// Regular file or directory.
+    File,
+    /// Socket identified by a `socket:[inode]` target.
+    Socket,
+    /// Pipe identified by a `pipe:[inode]` target.
+    Pipe,
+    /// Unresolved or other descriptor kind.
+    Other,
+}
+
+/// One virtual-memory area in a session-start VMA baseline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BaselineVma {
+    /// Inclusive start address.
+    pub start: u64,
+    /// Exclusive end address.
+    pub end: u64,
+    /// Linux `PROT_*` bitset decoded from the maps permission column.
+    pub protection: u32,
+    /// Backing file path when the mapping is file-backed.
+    pub path: Option<String>,
+}
+
+/// Session-start FD snapshot payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionFdBaseline {
+    /// Process that owns the descriptors.
+    pub process_id: u32,
+    /// Bounded descriptor list.
+    #[serde(default)]
+    pub fds: Vec<BaselineFd>,
+    /// Zero-based chunk when a process FD table is split across events.
+    #[serde(default)]
+    pub chunk_index: u32,
+    /// Total chunks for this process; zero means a legacy single event.
+    #[serde(default)]
+    pub chunk_count: u32,
+}
+
+/// Session-start VMA snapshot payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionVmaBaseline {
+    /// Process that owns the mappings.
+    pub process_id: u32,
+    /// Bounded virtual-memory area list.
+    #[serde(default)]
+    pub vmas: Vec<BaselineVma>,
+    /// Zero-based chunk when a process map table is split across events.
+    #[serde(default)]
+    pub chunk_index: u32,
+    /// Total chunks for this process; zero means a legacy single event.
+    #[serde(default)]
+    pub chunk_count: u32,
+}
+
+/// Whether an Android environment switch was established at session start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvironmentState {
+    /// The switch was observed enabled.
+    Enabled,
+    /// The switch was observed disabled.
+    Disabled,
+    /// The current security domain could not establish its state.
+    Unknown,
+}
+
+/// How the collector process was launched for this session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollectorMode {
+    /// Capture is attached to an interactive ADB command.
+    ForegroundAdb,
+    /// Capture runs as a detached device-side service.
+    DetachedDaemon,
+}
+
+/// Device state that may affect target behavior or collection independence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionEnvironment {
+    /// Collector launch mode.
+    pub collector_mode: CollectorMode,
+    /// Android developer-options state.
+    pub developer_options: EnvironmentState,
+    /// ADB debugging state.
+    pub usb_debugging: EnvironmentState,
+    /// Wireless-debugging state.
+    pub wireless_debugging: EnvironmentState,
+    /// Whether the agent has effective UID zero.
+    pub root_authorized: bool,
+    /// `SELinux` enforcing state when readable.
+    pub selinux_enforcing: Option<bool>,
+    /// Android verified-boot state property.
+    pub verified_boot_state: Option<String>,
+    /// Bootloader lock state when exposed by Android properties.
+    pub bootloader_locked: Option<bool>,
+    /// True when the observed environment may make an application change behavior.
+    pub target_behavior_may_be_altered: bool,
+    /// Bounded operator-facing reasons for the altered-behavior marker.
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    /// Collector monotonic clock at session start.
+    #[serde(default)]
+    pub monotonic_ns: Option<u64>,
+    /// Collector realtime clock at session start, for wall-clock correlation.
+    #[serde(default)]
+    pub wall_clock_ns: Option<u64>,
+}
+
+/// Why a normally completed capture loop stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureStopReason {
+    /// Requested duration elapsed.
+    DurationElapsed,
+    /// Requested live-event count was reached.
+    EventLimitReached,
+    /// SIGINT or SIGTERM requested graceful shutdown.
+    Signal,
+    /// A long-running service was asked to stop normally.
+    ServiceStop,
+    /// Durable storage reached a configured global or reserved limit.
+    StorageLimitReached,
+    /// The collector sealed this session and continued in a new session directory.
+    SessionRotated,
+    /// Kernel boot identity changed while the collector was running.
+    BootChanged,
+}
+
+/// Auditable Inspect adapter decision or a single authorized hit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InspectObservation {
+    /// Adapter identifier, for example `linker_so_load`.
+    pub adapter: String,
+    /// Whether a probe was actually attached.
+    pub attached: bool,
+    /// Whether a hit was observed.
+    pub hit: bool,
+    /// Target ELF path.
+    pub library: String,
+    /// Observed or required GNU build-id.
+    pub build_id: Option<String>,
+    /// File offset used for the uprobe, when attached.
+    pub offset: Option<u64>,
+    /// Best-effort argument string, such as a `dlopen` path.
+    pub path_hint: Option<String>,
+    /// Why attach was refused, revoked, or limited.
+    pub detail: String,
+    /// Operator-visible detectability statement.
+    pub detectability_notice: String,
+}
+
+/// Bounded plaintext copied from an authorized TLS write.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InspectPlaintext {
+    /// Adapter identifier, `tls_ssl_write`.
+    pub adapter: String,
+    /// `send` for `SSL_write`.
+    pub direction: String,
+    /// Target ELF path.
+    pub library: String,
+    /// Observed GNU build-id.
+    pub build_id: Option<String>,
+    /// File offset of the probe.
+    pub offset: Option<u64>,
+    /// Length argument supplied to `SSL_write`.
+    pub requested_bytes: u64,
+    /// Bytes actually copied into the event.
+    pub captured_bytes: u32,
+    /// True when `requested_bytes` exceeded the copy budget.
+    pub truncated: bool,
+    /// SHA-256 of the captured bytes, not of the unseen remainder.
+    pub sha256: String,
+    /// Lossy UTF-8 or hex preview of the captured bytes.
+    pub preview: String,
+    /// `utf8_lossy` or `hex`.
+    pub preview_encoding: String,
+    /// `text`, `tls_record`, or `binary`. TLS records are ciphertext, not HTTP.
+    #[serde(default)]
+    pub content_class: String,
+}
+
+/// End-of-session evidence used to distinguish complete execution from a broken capture.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCompletion {
+    /// Normal stop condition.
+    pub stop_reason: CaptureStopReason,
+    /// True only when the event loop and durable flush completed normally.
+    pub capture_complete: bool,
+    /// Raw records consumed before normalization.
+    pub raw_records: u64,
+    /// Live kernel events retained after filtering.
+    pub live_events: u64,
+    /// Records rejected by ABI or semantic validation.
+    pub invalid_records: u64,
+    /// Events excluded by capture scope.
+    pub filtered_scope: u64,
+    /// Thread events excluded by presentation policy.
+    pub filtered_threads: u64,
+    /// Collector self-events excluded from whole-device evidence.
+    #[serde(default)]
+    pub filtered_collector: u64,
+    /// Final per-sensor kernel ring-buffer drop counters.
+    #[serde(default)]
+    pub dropped_by_sensor: BTreeMap<SensorKind, u64>,
+}
+
+/// A change that makes an Android process identifiable after it was forked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessIdentityChange {
+    /// Identity transition type.
+    pub kind: ProcessIdentityChangeKind,
+    /// Previous kernel task name for rename events.
+    pub previous_comm: Option<String>,
+}
+
+/// Kind of runtime identity transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessIdentityChangeKind {
+    /// Effective user or group credentials changed.
+    Credentials,
+    /// Kernel task name changed.
+    Rename,
 }
 
 /// Process lifecycle transition.
@@ -102,6 +698,9 @@ pub struct ProcessLifecycle {
     pub filename: Option<String>,
     /// Exit code where meaningful.
     pub exit_code: Option<i32>,
+    /// Zygote lineage when the fork parent was a recognized Zygote process.
+    #[serde(default)]
+    pub zygote_source: Option<String>,
 }
 
 /// Kind of process lifecycle transition.

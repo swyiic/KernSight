@@ -14,6 +14,26 @@ pub const RAW_EVENT_HEADER_SIZE: usize = 96;
 pub const PROCESS_FILENAME_LEN: usize = 256;
 /// Fixed process lifecycle record size.
 pub const RAW_PROCESS_EVENT_SIZE: usize = RAW_EVENT_HEADER_SIZE + 8 + PROCESS_FILENAME_LEN;
+/// Maximum path bytes carried by the M2 file sensor.
+pub const FILE_PATH_LEN: usize = 256;
+/// Fixed file-open record size.
+pub const RAW_FILE_EVENT_SIZE: usize = RAW_EVENT_HEADER_SIZE + 24 + FILE_PATH_LEN;
+/// Fixed file-descriptor lifecycle record size.
+pub const RAW_FD_EVENT_SIZE: usize = RAW_EVENT_HEADER_SIZE + 24;
+/// Fixed memory-region record size.
+pub const RAW_MEMORY_EVENT_SIZE: usize = RAW_EVENT_HEADER_SIZE + 48;
+/// Maximum submitted socket-address bytes carried by the M2 network sensor.
+pub const SOCKET_ADDRESS_LEN: usize = 128;
+/// Fixed socket-connect record size.
+pub const RAW_NETWORK_EVENT_SIZE: usize = RAW_EVENT_HEADER_SIZE + 16 + SOCKET_ADDRESS_LEN;
+/// Fixed socket send/receive byte-count record size.
+pub const RAW_NETWORK_IO_EVENT_SIZE: usize = RAW_EVENT_HEADER_SIZE + 32;
+/// Fixed Binder transaction record size.
+pub const RAW_BINDER_EVENT_SIZE: usize = RAW_EVENT_HEADER_SIZE + 32;
+/// Fixed Binder file-descriptor transfer record size.
+pub const RAW_BINDER_FD_EVENT_SIZE: usize = RAW_EVENT_HEADER_SIZE + 16;
+/// Fixed scheduler wakeup record size.
+pub const RAW_SCHED_EVENT_SIZE: usize = RAW_EVENT_HEADER_SIZE + 16;
 
 /// Numeric raw sensor identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +53,8 @@ pub enum RawSensorId {
     Integrity = 6,
     /// Scoped syscall supplement.
     Syscall = 7,
+    /// Scheduler wakeup relationships.
+    Sched = 8,
 }
 
 /// Numeric raw event type.
@@ -45,6 +67,54 @@ pub enum RawEventType {
     ProcessExec = 0x0102,
     /// Process or thread exit.
     ProcessExit = 0x0103,
+    /// Process credentials changed successfully.
+    ProcessCredentials = 0x0104,
+    /// Process task name changed.
+    ProcessRename = 0x0105,
+    /// File open attempt completed.
+    FileOpen = 0x0201,
+    /// File descriptor close attempt completed.
+    FileDescriptorClose = 0x0202,
+    /// File descriptor duplication attempt completed.
+    FileDescriptorDuplicate = 0x0203,
+    /// `close_range` attempt completed.
+    FileDescriptorCloseRange = 0x0204,
+    /// Unix `SCM_RIGHTS` descriptors were submitted.
+    FileDescriptorRightsSend = 0x0205,
+    /// Unix `SCM_RIGHTS` descriptors were installed.
+    FileDescriptorRightsReceive = 0x0206,
+    /// Memory mapping attempt completed.
+    MemoryMap = 0x0301,
+    /// Memory protection change attempt completed.
+    MemoryProtect = 0x0302,
+    /// Memory unmap attempt completed.
+    MemoryUnmap = 0x0303,
+    /// Memory remap attempt completed.
+    MemoryRemap = 0x0304,
+    /// Program-break adjustment completed.
+    MemoryBrk = 0x0305,
+    /// Socket connect attempt completed.
+    NetworkConnect = 0x0401,
+    /// Inbound socket accept attempt completed.
+    NetworkAccept = 0x0402,
+    /// Socket send operation completed.
+    NetworkSend = 0x0403,
+    /// Socket receive operation completed.
+    NetworkReceive = 0x0404,
+    /// Binder transaction was submitted.
+    BinderTransaction = 0x0501,
+    /// Binder transaction reached its destination thread.
+    BinderTransactionReceived = 0x0502,
+    /// Binder transaction buffer sizes were allocated.
+    BinderBufferAllocated = 0x0503,
+    /// Source file descriptor was attached to a Binder transaction.
+    BinderFdSent = 0x0504,
+    /// Destination file descriptor was installed from a Binder transaction.
+    BinderFdReceived = 0x0505,
+    /// A task was woken by the current task.
+    SchedWakeup = 0x0801,
+    /// A scheduler context switch occurred.
+    SchedSwitch = 0x0802,
 }
 
 /// Raw event was truncated at its configured bound.

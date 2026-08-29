@@ -1,0 +1,42 @@
+{
+  "schema_version": 3,
+  "objects": {
+    "process": "/data/local/tmp/ksight/process_lifecycle.bpf.o",
+    "file": "/data/local/tmp/ksight/file_open.bpf.o",
+    "network": "/data/local/tmp/ksight/network_connect.bpf.o",
+    "memory": "/data/local/tmp/ksight/memory_regions.bpf.o",
+    "binder": "/data/local/tmp/ksight/binder_transaction.bpf.o"
+  },
+  "sensors": {
+    "files": true,
+    "network": true,
+    "network_io": false,
+    "memory": "executable",
+    "binder": true
+  },
+  "scope": {
+    "pid": null,
+    "uid": null,
+    "package": null
+  },
+  "storage": {
+    "spool_root": "/data/local/tmp/ksight/spool",
+    "max_spool_mib": 64,
+    "events_per_batch": 64,
+    "max_total_spool_mib": 512,
+    "max_session_age_secs": 3600,
+    "keep_completed_sessions": 4,
+    "completion_reserve_kib": 64,
+    "compress_batches": true
+  },
+  "sampling": {
+    "file": 4,
+    "network": 1,
+    "memory": 1,
+    "binder": 16
+  },
+  "lock_file": "/data/local/tmp/ksight/ksightd.lock",
+  "status_file": "/data/local/tmp/ksight/ksightd.status.json",
+  "log_file": "/data/local/tmp/ksight/ksightd.log",
+  "include_threads": false
+}

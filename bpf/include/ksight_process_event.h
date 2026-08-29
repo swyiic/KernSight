@@ -9,8 +9,8 @@
 struct ksight_process_event {
     struct ksight_raw_event_header header;
     ksight_s32 exit_code;
-    ksight_u32 filename_length;
-    char filename[KSIGHT_PROCESS_FILENAME_LEN];
+    ksight_u32 detail_length;
+    char detail[KSIGHT_PROCESS_FILENAME_LEN];
 };
 
 _Static_assert(sizeof(struct ksight_process_event) == 360,

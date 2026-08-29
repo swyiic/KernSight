@@ -1,11 +1,14 @@
 //! Version negotiation and wire-level messages shared by clients and the agent.
 
+mod framing;
 mod message;
 mod version;
 
+pub use framing::{FrameError, JsonFrameCodec, DEFAULT_MAX_FRAME_BYTES};
 pub use message::{
-    Ack, Capability, EventBatch, GapReport, Heartbeat, Hello, HelloAck, Message, SensorPolicy,
-    StartSession, UpdatePolicy,
+    Ack, AcknowledgeBatches, AgentStatus, Capability, DurableSessionState, DurableSessionSummary,
+    EventBatch, GapReport, GetStatus, Heartbeat, Hello, HelloAck, LastExit, ListSessions, Message,
+    ReplayBatches, ReplayComplete, SensorPolicy, SessionInventory, StartSession, UpdatePolicy,
 };
 pub use version::{ProtocolVersion, CURRENT_PROTOCOL};
 

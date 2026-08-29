@@ -1,0 +1,21 @@
+{
+  "schema_version": "kernsight.native-framework-rules/v1",
+  "rules": [
+    {"id":"shell.secneo","name":"SecNeo / 梆梆加固","category":"packer_shell","confidence":"high","exact_basenames":["libdexhelper.so","libdexjni.so","libdexvmp.so","libsecexe.so","libsecmain.so"],"path_markers":["secneo"],"description":"SecNeo/梆梆常见原生加载与 DEX 保护组件；命中表示框架候选，不单独证明具体版本。"},
+    {"id":"shell.360_jiagu","name":"360 加固","category":"packer_shell","confidence":"high","exact_basenames":["libjiagu.so","libjiagu_art.so","libjiagu_x86.so"],"path_markers":["/jiagu/"],"description":"360 加固常见运行时库或路径。"},
+    {"id":"shell.ijiami","name":"爱加密 / APKProtect","category":"packer_shell","confidence":"high","exact_basenames":["libexec.so","libexecmain.so","libapkprotect.so"],"path_markers":["ijiami","apkprotect"],"description":"爱加密/APKProtect 常见 assets 或运行时加载组件。"},
+    {"id":"shell.tencent_legu","name":"腾讯乐固","category":"packer_shell","confidence":"high","exact_basenames":["libshella.so","libshellx.so","libtup.so"],"path_markers":["tencentprotect","/legu/"],"description":"腾讯乐固常见原生壳组件。"},
+    {"id":"shell.alibaba","name":"阿里聚安全","category":"packer_shell","confidence":"high","exact_basenames":["libsgmain.so","libsgsecuritybody.so","libmobisec.so"],"path_markers":["alibaba/securityguard"],"description":"阿里聚安全/安全保镖常见原生组件。"},
+    {"id":"shell.baidu","name":"百度加固","category":"packer_shell","confidence":"high","exact_basenames":["libbaiduprotect.so"],"path_markers":["baiduprotect"],"description":"百度加固常见原生组件。"},
+    {"id":"shell.bangcle","name":"Bangcle","category":"packer_shell","confidence":"medium","exact_basenames":["libbangcle.so"],"path_markers":["bangcle"],"description":"Bangcle 命名线索；与 SecNeo 家族可能重叠。"},
+    {"id":"crypto.openssl","name":"OpenSSL / BoringSSL 兼容库","category":"crypto_framework","confidence":"medium","exact_basenames":["libssl.so","libcrypto.so","libboringssl.so"],"path_markers":[],"description":"通用 TLS/密码库文件名；Android 系统、应用自带库和兼容封装可能同名，需要结合来源路径与 build-id。"},
+    {"id":"crypto.conscrypt","name":"Conscrypt","category":"crypto_framework","confidence":"high","exact_basenames":["libconscrypt_jni.so","libjavacrypto.so"],"path_markers":["conscrypt"],"description":"Android/Java Conscrypt TLS 与密码实现。"},
+    {"id":"crypto.sqlcipher","name":"SQLCipher","category":"crypto_framework","confidence":"high","exact_basenames":["libsqlcipher.so"],"path_markers":["sqlcipher"],"description":"SQLite 数据库透明加密框架。"},
+    {"id":"crypto.libsodium","name":"libsodium","category":"crypto_framework","confidence":"high","exact_basenames":["libsodium.so"],"path_markers":["libsodium"],"description":"libsodium 现代密码学库。"},
+    {"id":"crypto.mbedtls","name":"Mbed TLS","category":"crypto_framework","confidence":"high","exact_basenames":["libmbedtls.so","libmbedcrypto.so","libmbedx509.so"],"path_markers":["mbedtls"],"description":"Mbed TLS 网络安全与密码组件。"},
+    {"id":"crypto.wolfssl","name":"wolfSSL","category":"crypto_framework","confidence":"high","exact_basenames":["libwolfssl.so"],"path_markers":["wolfssl"],"description":"wolfSSL TLS/密码库。"},
+    {"id":"crypto.botan","name":"Botan","category":"crypto_framework","confidence":"high","exact_basenames":["libbotan.so","libbotan-2.so","libbotan-3.so"],"path_markers":["botan"],"description":"Botan 密码学库。"},
+    {"id":"crypto.gmssl","name":"GmSSL / 国密组件","category":"crypto_framework","confidence":"medium","exact_basenames":["libgmssl.so","libsmcrypto.so"],"path_markers":["gmssl"],"description":"GmSSL 或显式国密原生组件命名线索。"},
+    {"id":"crypto.tencent_tassl","name":"Tencent TASSL","category":"crypto_framework","confidence":"high","exact_basenames":["libtassl.so"],"path_markers":["tassl"],"description":"腾讯 TASSL 国密 TLS 组件。"}
+  ]
+}

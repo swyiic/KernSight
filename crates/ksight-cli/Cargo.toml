@@ -15,7 +15,11 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 ksight-model.workspace = true
+ksight-core.workspace = true
 ksight-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
 
 [lints]
 workspace = true

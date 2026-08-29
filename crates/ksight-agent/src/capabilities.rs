@@ -20,6 +20,11 @@ impl CapabilityProbe for HostCapabilityProbe {
             "sched/sched_process_fork",
             "sched/sched_process_exec",
             "sched/sched_process_exit",
+            "task/task_rename",
+            "raw_syscalls/sys_enter",
+            "raw_syscalls/sys_exit",
+            "binder/binder_transaction",
+            "sched/sched_wakeup",
         ]
         .into_iter()
         .map(|name| TracepointCapability {
@@ -27,6 +32,15 @@ impl CapabilityProbe for HostCapabilityProbe {
                 .join(name)
                 .join("id")
                 .exists(),
+            format_compatible: (name == "sched/sched_wakeup").then(|| {
+                crate::tracepoint::format_compatible(
+                    "sched",
+                    "sched_wakeup",
+                    crate::tracepoint::SCHED_WAKEUP_FIELDS,
+                )
+                .unwrap_or(false)
+            }),
+            attachable: None,
             name: name.to_owned(),
         })
         .collect::<Vec<_>>();
@@ -49,6 +63,16 @@ impl CapabilityProbe for HostCapabilityProbe {
         if tracepoints.iter().any(|tracepoint| !tracepoint.available) {
             notes.push("one or more M1 scheduler tracepoints are unavailable".to_owned());
         }
+        if tracepoints
+            .iter()
+            .any(|tracepoint| tracepoint.format_compatible == Some(false))
+        {
+            notes.push("one or more hand-written tracepoint layouts are incompatible".to_owned());
+        }
+        notes.push(
+            "tracepoint discovery and format checks are read-only; attachment is validated when capture starts"
+                .to_owned(),
+        );
 
         ProbeReport {
             target_os: std::env::consts::OS.to_owned(),
@@ -85,7 +109,7 @@ pub struct ProbeReport {
     pub bpffs_mounted: CapabilityStatus,
     /// Whether tracefs is mounted at the conventional Android path.
     pub tracefs_mounted: CapabilityStatus,
-    /// Required M1 scheduler tracepoints.
+    /// Tracepoints used by implemented sensors.
     pub tracepoints: Vec<TracepointCapability>,
     /// Whether a real BPF loader is present in this build.
     pub bpf_loader_implemented: CapabilityStatus,
@@ -129,6 +153,12 @@ pub struct TracepointCapability {
     pub name: String,
     /// Whether its numeric tracepoint ID is visible.
     pub available: bool,
+    /// Whether a hand-written context layout matches tracefs, when one is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format_compatible: Option<bool>,
+    /// Actual BPF attachment result; read-only discovery leaves this unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachable: Option<bool>,
 }
 
 fn read_trimmed(path: &str) -> Option<String> {

@@ -23,6 +23,8 @@ pub struct DataQuality {
     pub truncated: bool,
     /// Number of known lost records immediately before this record.
     pub lost_before: u64,
+    /// One emitted eligible event out of this many; one means unsampled.
+    pub sample_one_in: u32,
     /// Human-readable capture source, such as a tracepoint name.
     pub source: String,
 }

@@ -9,5 +9,5 @@ pub struct ProtocolVersion {
     pub minor: u16,
 }
 
-/// Initial `KernSight` protocol version.
-pub const CURRENT_PROTOCOL: ProtocolVersion = ProtocolVersion { major: 1, minor: 0 };
+/// Current backward-compatible `KernSight` protocol feature level.
+pub const CURRENT_PROTOCOL: ProtocolVersion = ProtocolVersion { major: 1, minor: 5 };

@@ -47,4 +47,11 @@ pub trait Collector {
 
     /// Total records known to have been lost.
     fn dropped_records(&self) -> u64;
+
+    /// Seed kernel-side socket tracking with pre-session descriptors.
+    ///
+    /// The default implementation is a no-op; sensors that keep a `socket_fds`
+    /// map override this to enable read/write socket identification for
+    /// descriptors that predate the session.
+    fn seed_socket_fds(&mut self, _entries: &[(u32, i32)]) {}
 }

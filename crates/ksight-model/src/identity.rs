@@ -38,6 +38,8 @@ pub struct ProcessIdentity {
     pub gid: u32,
     /// Kernel task name.
     pub comm: String,
+    /// First null-terminated command-line component when procfs is readable.
+    pub command_line: Option<String>,
     /// `SELinux` context when available.
     pub selinux_context: Option<String>,
     /// Zero or more candidates; shared and isolated UIDs may be ambiguous.

@@ -6,6 +6,8 @@
 *.skel.rs
 /out/
 /captures/
+/packages/
+/forensics/
 
 # Architecture and design notes stay local; GitHub contains no Markdown files.
 *.md

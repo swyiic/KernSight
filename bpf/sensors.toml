@@ -10,25 +10,25 @@ status = "m1_experimental"
 id = 2
 name = "file"
 default_mode = "observe"
-status = "planned"
+status = "m2_experimental"
 
 [[sensor]]
 id = 3
 name = "memory"
 default_mode = "observe"
-status = "planned"
+status = "m2_experimental"
 
 [[sensor]]
 id = 4
 name = "network"
 default_mode = "observe"
-status = "planned"
+status = "m2_experimental"
 
 [[sensor]]
 id = 5
 name = "binder"
 default_mode = "observe"
-status = "planned"
+status = "m2_experimental"
 
 [[sensor]]
 id = 6
@@ -41,3 +41,9 @@ id = 7
 name = "syscall"
 default_mode = "inspect"
 status = "planned"
+
+[[sensor]]
+id = 8
+name = "sched"
+default_mode = "inspect"
+status = "m3_experimental"

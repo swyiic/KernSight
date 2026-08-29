@@ -11,6 +11,9 @@
 
 #define KSIGHT_BPF_MAP_TYPE_HASH 1
 #define KSIGHT_BPF_MAP_TYPE_ARRAY 2
+#define KSIGHT_BPF_MAP_TYPE_PERF_EVENT_ARRAY 4
+#define KSIGHT_BPF_MAP_TYPE_PERCPU_ARRAY 6
+#define KSIGHT_BPF_MAP_TYPE_LRU_HASH 9
 #define KSIGHT_BPF_MAP_TYPE_RINGBUF 27
 
 static void *(*const ksight_bpf_map_lookup_elem)(const void *map,
@@ -30,6 +33,15 @@ static long (*const ksight_bpf_get_current_comm)(void *buffer,
 static long (*const ksight_bpf_probe_read_kernel_str)(void *destination,
                                                       ksight_u32 size,
                                                       const void *source) = (void *)115;
+static long (*const ksight_bpf_probe_read_user)(void *destination,
+                                                ksight_u32 size,
+                                                const void *source) = (void *)112;
+static long (*const ksight_bpf_probe_read_kernel)(void *destination,
+                                                  ksight_u32 size,
+                                                  const void *source) = (void *)113;
+static long (*const ksight_bpf_probe_read_user_str)(void *destination,
+                                                    ksight_u32 size,
+                                                    const void *source) = (void *)114;
 static void *(*const ksight_bpf_ringbuf_reserve)(void *ringbuf,
                                                  ksight_u64 size,
                                                  ksight_u64 flags) = (void *)131;
