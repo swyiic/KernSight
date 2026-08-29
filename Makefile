@@ -1,7 +1,7 @@
 .PHONY: check test fmt lint architecture bpf device device-target deploy probe
 
 BPF_CLANG ?= $(firstword $(wildcard /opt/homebrew/opt/llvm/bin/clang) $(shell command -v clang))
-BPF_CFLAGS ?= -O2 -g -target bpfel -Wall -Werror
+BPF_CFLAGS ?= -O2 -g -target bpfel -mcpu=v3 -Wall -Werror
 BPF_OBJECTS := build/bpf/process_lifecycle.bpf.o build/bpf/file_open.bpf.o build/bpf/network_connect.bpf.o build/bpf/memory_regions.bpf.o build/bpf/binder_transaction.bpf.o build/bpf/sched_wakeup.bpf.o build/bpf/uprobe_regs.bpf.o
 BPF_HEADERS := $(wildcard bpf/include/*.h)
 DEVICE_TARGET := aarch64-unknown-linux-musl
