@@ -1,11 +1,15 @@
 # KernSight
 
-KernSight 是一个面向自有或明确授权 Android 设备的内核可观测项目。它使用 eBPF 采集
-进程、文件、内存映射、网络、Binder 和调度事实，由设备端 `ksightd` 归一化并持久化，
+KernSight 是一个面向自有或明确授权 Android 设备的内核可观测项目。
+基于 eBPF 采集进程、文件、内存映射、网络、Binder 和调度事实，由设备端 `ksightd` 归一化并持久化，
 再通过 `ksightctl` 或 MobileE 完成控制、回放、聚合和可视化。
 
 当前版本为 **0.2.1**，主要开发基线是 Pixel 6a、Android 14、ARM64。项目仍处于实验
 阶段，不应被视为通用的生产级 Android 监控组件。
+持续开发ing....
+
+## 测试应用
+- 测试应用，网上国网，大陆四大行，同花顺，平安证劵，政务相关，花旗银行，汇丰US均可获取可观测dex/so
 
 ## 组件
 
