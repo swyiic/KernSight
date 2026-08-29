@@ -1616,7 +1616,7 @@ fn collapse_loopback_scans(peers: &mut Vec<NetworkPeerActivity>) -> Vec<Loopback
             },
         )
         .collect::<Vec<_>>();
-    scans.sort_by(|left, right| right.attempts.cmp(&left.attempts));
+    scans.sort_by_key(|scan| std::cmp::Reverse(scan.attempts));
     scans
 }
 

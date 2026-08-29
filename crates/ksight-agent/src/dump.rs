@@ -499,8 +499,9 @@ fn default_dump_warnings() -> Vec<String> {
 fn unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 fn attach_artifact_hashes(dest: &Path, artifacts: &mut [ksight_core::DumpArtifact]) {
@@ -1072,11 +1073,7 @@ fn catalog_blob_records(dest: &Path, out: &mut Vec<ksight_core::DumpArtifact>) {
                 continue;
             };
             let rel = format!("apk-dex/split/{name}");
-            let bytes = dest
-                .join(&rel)
-                .metadata()
-                .map(|meta| meta.len())
-                .unwrap_or(0);
+            let bytes = dest.join(&rel).metadata().map_or(0, |meta| meta.len());
             out.push(ksight_core::DumpArtifact {
                 kind: "dex".to_owned(),
                 source: "heap-blob".to_owned(),
@@ -1111,7 +1108,7 @@ fn catalog_blob_filenames(dest: &Path, out: &mut Vec<ksight_core::DumpArtifact>)
         if out.iter().any(|existing| existing.relative_path == rel) {
             continue;
         }
-        let bytes = path.metadata().map(|meta| meta.len()).unwrap_or(0);
+        let bytes = path.metadata().map_or(0, |meta| meta.len());
         let vma_end = blob_ok_end(dest, pid, start);
         out.push(ksight_core::DumpArtifact {
             kind: "dex".to_owned(),
@@ -1163,7 +1160,7 @@ fn catalog_memory_dex(dest: &Path, out: &mut Vec<ksight_core::DumpArtifact>) {
         if out.iter().any(|existing| existing.relative_path == rel) {
             continue;
         }
-        let bytes = path.metadata().map(|meta| meta.len()).unwrap_or(0);
+        let bytes = path.metadata().map_or(0, |meta| meta.len());
         if bytes < 1024 {
             continue;
         }
@@ -1254,7 +1251,7 @@ fn catalog_named_dex(
         }) {
             continue;
         }
-        let bytes = path.metadata().map(|meta| meta.len()).unwrap_or(0);
+        let bytes = path.metadata().map_or(0, |meta| meta.len());
         out.push(ksight_core::DumpArtifact {
             kind: "dex".to_owned(),
             source: source.to_owned(),
@@ -1300,7 +1297,7 @@ fn catalog_so_tree(
             continue;
         };
         let rel = rel.to_string_lossy().replace('\\', "/");
-        let bytes = path.metadata().map(|meta| meta.len()).unwrap_or(0);
+        let bytes = path.metadata().map_or(0, |meta| meta.len());
         out.push(ksight_core::DumpArtifact {
             kind: "elf".to_owned(),
             source: source.to_owned(),
@@ -1337,7 +1334,7 @@ fn catalog_runtime_so(dest: &Path, out: &mut Vec<ksight_core::DumpArtifact>) {
             .split_once('-')
             .and_then(|(prefix, _)| prefix.parse::<u32>().ok());
         let rel = format!("runtime/runtime-so/{name}");
-        let bytes = path.metadata().map(|meta| meta.len()).unwrap_or(0);
+        let bytes = path.metadata().map_or(0, |meta| meta.len());
         out.push(ksight_core::DumpArtifact {
             kind: "elf".to_owned(),
             source: "runtime-so".to_owned(),
