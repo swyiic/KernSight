@@ -104,15 +104,24 @@ fn open_kprobe_on_cpu(
     }
     let owned = unsafe { OwnedFd::from_raw_fd(i32::try_from(fd).context("perf fd")?) };
     // PERF_EVENT_IOC_SET_BPF = _IOW('$', 8, __u32); ENABLE = _IO('$', 0)
-    // Linux libc exposes ioctl's request as `c_ulong`; keeping these as that
-    // type also avoids host-dependent inference when CI checks Linux targets.
+    // libc models ioctl's request differently for glibc (`c_ulong`) and musl
+    // (`c_int`). Calling the Linux syscall directly keeps cross builds typed
+    // consistently while preserving the exact request bits.
     const PERF_EVENT_IOC_SET_BPF: libc::c_ulong = 0x4004_2408;
     const PERF_EVENT_IOC_ENABLE: libc::c_ulong = 0x2400;
-    let set = unsafe { libc::ioctl(owned.as_raw_fd(), PERF_EVENT_IOC_SET_BPF, prog_fd) };
+    let set = unsafe {
+        libc::syscall(
+            libc::SYS_ioctl,
+            owned.as_raw_fd(),
+            PERF_EVENT_IOC_SET_BPF,
+            prog_fd,
+        )
+    };
     if set < 0 {
         return Err(std::io::Error::last_os_error()).context("PERF_EVENT_IOC_SET_BPF");
     }
-    let enable = unsafe { libc::ioctl(owned.as_raw_fd(), PERF_EVENT_IOC_ENABLE, 0) };
+    let enable =
+        unsafe { libc::syscall(libc::SYS_ioctl, owned.as_raw_fd(), PERF_EVENT_IOC_ENABLE, 0) };
     if enable < 0 {
         return Err(std::io::Error::last_os_error()).context("PERF_EVENT_IOC_ENABLE");
     }
