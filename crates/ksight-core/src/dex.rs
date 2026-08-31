@@ -467,6 +467,87 @@ pub fn extract_apk_packed_native(apk: &Path, dest: &Path) -> std::io::Result<Vec
     Ok(extracted)
 }
 
+/// Copy `lib/<abi>/*.so` from an APK, including Play Feature/split APKs.
+///
+/// App Bundles often ship native code only in `split_config.arm64_v8a.apk`, so the
+/// install `lib/` tree is empty. This does not replace assets packer SO extraction.
+///
+/// # Errors
+///
+/// Returns filesystem or zip errors. Existing files are left unchanged.
+pub fn extract_apk_native_libs(apk: &Path, dest: &Path) -> std::io::Result<Vec<ApkPackedFile>> {
+    let file = std::fs::File::open(apk)?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let mut extracted = Vec::new();
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        if !entry.is_file() {
+            continue;
+        }
+        let entry_name = entry.name().replace('\\', "/");
+        let lower = entry_name.to_ascii_lowercase();
+        if !lower.starts_with("lib/")
+            || !Path::new(&lower)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("so"))
+        {
+            continue;
+        }
+        let uncompressed = entry.size();
+        if uncompressed == 0 || uncompressed > 128 * 1024 * 1024 {
+            continue;
+        }
+        let Some(relative) = apk_lib_install_relative(&entry_name) else {
+            continue;
+        };
+        let target = dest.join(&relative);
+        if target.exists() {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes)?;
+        drop(entry);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&target, &bytes)?;
+        extracted.push(ApkPackedFile {
+            zip_name: entry_name,
+            output_name: relative,
+            bytes: u64::try_from(bytes.len()).unwrap_or(0),
+        });
+    }
+    Ok(extracted)
+}
+
+/// Map zip `lib/<abi>/...` onto the installer ISA directory (`arm64-v8a` → `arm64`).
+fn apk_lib_install_relative(entry_name: &str) -> Option<String> {
+    let normalized = entry_name.replace('\\', "/");
+    let rest = normalized.strip_prefix("lib/")?;
+    let (abi, tail) = rest.split_once('/')?;
+    if tail.is_empty() {
+        return None;
+    }
+    let isa = match abi {
+        "arm64-v8a" => "arm64",
+        "armeabi-v7a" | "armeabi" => "arm",
+        other => other,
+    };
+    let relative = format!("{isa}/{tail}");
+    if Path::new(&relative).components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::RootDir
+        )
+    }) {
+        return None;
+    }
+    Some(relative)
+}
+
 fn keep_packed_zip_entry(zip_name: &str) -> bool {
     let lower = zip_name.to_ascii_lowercase().replace('\\', "/");
     if lower.starts_with("lib/") {
@@ -487,6 +568,17 @@ fn keep_packed_zip_entry(zip_name: &str) -> bool {
         "dexjni",
         "secneo",
         "apkwrapper",
+        "apkprotect",
+        "jiagu",
+        "legu",
+        "qihoo",
+        "qvm",
+        "naga",
+        "bangcle",
+        "baiduprotect",
+        "shella",
+        "sgmain",
+        "loaddex",
     ]
     .iter()
     .any(|needle| file_name.contains(needle) || lower.contains(needle));
@@ -858,6 +950,9 @@ fn publish_runtime_dex(runtime: &Path, readable: &Path) -> std::io::Result<usize
             if !is_dex_magic(&bytes) {
                 continue;
             }
+            if bytes.len() < 1024 {
+                continue;
+            }
             let out_name = format!("{prefix}-{name}");
             let slices = split_concatenated_dex(&bytes);
             if slices.len() > 1 {
@@ -1085,6 +1180,12 @@ mod tests {
             .join("assets/assets_ijm_lib_arm64-v8a_libexecmain.so")
             .is_file());
         assert!(!dir.join("assets/lib_arm64-v8a_libfoo.so").exists());
+        let libs = extract_apk_native_libs(&apk, &dir.join("lib")).expect("extract lib");
+        assert_eq!(libs.len(), 1);
+        assert!(dir.join("lib/arm64/libfoo.so").is_file());
+        assert!(!dir.join("lib/arm64-v8a/libfoo.so").exists());
+        let again = extract_apk_native_libs(&apk, &dir.join("lib")).expect("skip existing");
+        assert!(again.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

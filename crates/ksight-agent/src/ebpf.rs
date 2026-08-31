@@ -1,11 +1,14 @@
 //! Linux and Android eBPF loading and ring-buffer collection.
 
-use std::path::Path;
+use std::{
+    os::fd::{AsFd as _, AsRawFd as _},
+    path::Path,
+};
 
 use anyhow::{Context, Result};
 use aya::{
     maps::{Array, HashMap, MapData, RingBuf},
-    programs::TracePoint,
+    programs::{KProbe, TracePoint},
     Ebpf,
 };
 
@@ -44,6 +47,8 @@ pub struct EbpfSensor {
     dropped: Array<MapData, u64>,
     /// Known socket descriptors keyed by `(tgid << 32) | fd` (network sensor only).
     socket_fds: Option<HashMap<MapData, u64, u8>>,
+    /// Per-CPU kprobe perf events; must outlive the program.
+    _probe_session: Option<ksight_hwbp::KprobeSession>,
 }
 
 impl std::fmt::Debug for EbpfSensor {
@@ -161,12 +166,36 @@ pub fn load_network_sensor(object: &Path, filter: CaptureFilter) -> Result<EbpfS
             category: "raw_syscalls",
             name: "sys_exit",
         },
+        TracepointSpec {
+            program: "ksight_dns_enter",
+            category: "raw_syscalls",
+            name: "sys_enter",
+        },
+        TracepointSpec {
+            program: "ksight_dns_exit",
+            category: "raw_syscalls",
+            name: "sys_exit",
+        },
+        TracepointSpec {
+            program: "ksight_handshake_enter",
+            category: "raw_syscalls",
+            name: "sys_enter",
+        },
+        TracepointSpec {
+            program: "ksight_handshake_exit",
+            category: "raw_syscalls",
+            name: "sys_exit",
+        },
     ];
     let with_io = [
         lifecycle[0],
         lifecycle[1],
         lifecycle[2],
         lifecycle[3],
+        lifecycle[4],
+        lifecycle[5],
+        lifecycle[6],
+        lifecycle[7],
         TracepointSpec {
             program: "ksight_network_io_enter",
             category: "raw_syscalls",
@@ -233,7 +262,7 @@ pub fn load_sched_sensor(object: &Path, filter: CaptureFilter) -> Result<EbpfSen
 ///
 /// Returns an error when the object, maps, verifier, or an attachment is unavailable.
 pub fn load_binder_sensor(object: &Path, filter: CaptureFilter) -> Result<EbpfSensor> {
-    load_sensor(
+    let mut sensor = load_sensor(
         object,
         filter,
         "binder",
@@ -266,7 +295,37 @@ pub fn load_binder_sensor(object: &Path, filter: CaptureFilter) -> Result<EbpfSe
             },
         ],
         false,
-    )
+    )?;
+    if let Err(error) = attach_binder_parcel_kprobe(&mut sensor) {
+        eprintln!(
+            "binder parcel kprobe unavailable (32-bit clients will have no interface token): {error:#}"
+        );
+    }
+    Ok(sensor)
+}
+
+fn attach_binder_parcel_kprobe(sensor: &mut EbpfSensor) -> Result<()> {
+    let program: &mut KProbe = sensor
+        .bpf
+        .program_mut("ksight_binder_parcel_enter")
+        .context("BPF program ksight_binder_parcel_enter is missing")?
+        .try_into()
+        .context("BPF program ksight_binder_parcel_enter is not a kprobe")?;
+    program
+        .load()
+        .context("load BPF program ksight_binder_parcel_enter")?;
+    let prog_fd = program
+        .fd()
+        .context("binder parcel kprobe fd")?
+        .as_fd()
+        .as_raw_fd();
+    let session = ksight_hwbp::attach_kprobe_all_cpus(prog_fd, "binder_transaction")?;
+    eprintln!(
+        "binder parcel kprobe attached on {} CPUs (32-bit and 64-bit clients)",
+        session.cpu_count()
+    );
+    sensor._probe_session = Some(session);
+    Ok(())
 }
 
 fn load_raw_syscall_sensor(
@@ -351,6 +410,7 @@ fn load_sensor(
         events,
         dropped,
         socket_fds,
+        _probe_session: None,
     })
 }
 

@@ -52,7 +52,7 @@ struct ksight_pending_request {
 
 struct {
     __uint(type, KSIGHT_BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 1 << 20);
+    __uint(max_entries, 1 << 22);
 } binder_events SEC(".maps");
 
 struct {
@@ -68,6 +68,33 @@ struct {
     __type(key, ksight_u64);
     __type(value, struct ksight_pending_request);
 } pending_requests SEC(".maps");
+
+/* Native 64-bit UAPI binder_transaction_data. 32-bit clients are converted
+ * by the driver before binder_transaction(), so one kprobe covers both ABIs. */
+#define KSIGHT_BINDER_TR_CODE 16
+#define KSIGHT_BINDER_TR_DATA_SIZE 32
+#define KSIGHT_BINDER_TR_BUFFER 48
+
+struct ksight_pt_regs {
+    ksight_u64 regs[31];
+    ksight_u64 sp;
+    ksight_u64 pc;
+    ksight_u64 pstate;
+};
+
+struct ksight_parcel_stash {
+    ksight_u32 code;
+    ksight_u32 copied;
+    ksight_u32 truncated;
+    ksight_u8 data[KSIGHT_BINDER_PARCEL_BYTES];
+};
+
+struct {
+    __uint(type, KSIGHT_BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 8192);
+    __type(key, ksight_u32);
+    __type(value, struct ksight_parcel_stash);
+} parcel_stash SEC(".maps");
 
 static __always_inline void
 ksight_fill_binder_header(struct ksight_raw_event_header *header,
@@ -93,6 +120,116 @@ ksight_fill_binder_header(struct ksight_raw_event_header *header,
     ksight_bpf_get_current_comm(header->comm, sizeof(header->comm));
 }
 
+static __always_inline void
+ksight_copy_parcel_prefix(struct ksight_parcel_stash *stash, const void *buffer,
+                          ksight_u64 data_size)
+{
+    stash->truncated = data_size > KSIGHT_BINDER_PARCEL_BYTES ? 1U : 0U;
+    if (ksight_bpf_probe_read_user(stash->data, 128, buffer) == 0 ||
+        ksight_bpf_probe_read_kernel(stash->data, 128, buffer) == 0) {
+        stash->copied = data_size > 128 ? 128 : (ksight_u32)data_size;
+        return;
+    }
+    if (ksight_bpf_probe_read_user(stash->data, 64, buffer) == 0 ||
+        ksight_bpf_probe_read_kernel(stash->data, 64, buffer) == 0) {
+        stash->copied = data_size > 64 ? 64 : (ksight_u32)data_size;
+        if (data_size > 64)
+            stash->truncated = 1;
+        return;
+    }
+    if (ksight_bpf_probe_read_user(stash->data, 32, buffer) == 0 ||
+        ksight_bpf_probe_read_kernel(stash->data, 32, buffer) == 0) {
+        stash->copied = data_size > 32 ? 32 : (ksight_u32)data_size;
+        if (data_size > 32)
+            stash->truncated = 1;
+        return;
+    }
+    stash->copied = 0;
+}
+
+static __always_inline void
+ksight_emit_parcel(const struct ksight_parcel_stash *stash, ksight_s32 transaction_id,
+                   ksight_u64 pid_tgid, ksight_u64 uid_gid)
+{
+    struct ksight_binder_parcel_event *event;
+
+    if (!stash || stash->copied == 0)
+        return;
+    event = ksight_bpf_ringbuf_reserve(&binder_events, sizeof(*event), 0);
+    if (!event) {
+        ksight_record_drop();
+        return;
+    }
+    __builtin_memset(event, 0, sizeof(*event));
+    ksight_fill_binder_header(&event->header, KSIGHT_EVENT_BINDER_PARCEL,
+                              sizeof(*event), pid_tgid, uid_gid);
+    event->transaction_id = transaction_id;
+    event->code = stash->code;
+    event->copied = stash->copied;
+    event->truncated = stash->truncated;
+    __builtin_memcpy(event->data, stash->data, KSIGHT_BINDER_PARCEL_BYTES);
+    ksight_bpf_ringbuf_submit(event, 0);
+}
+
+static __always_inline void
+ksight_emit_stashed_parcel(ksight_s32 transaction_id, ksight_u32 tid,
+                           ksight_u64 pid_tgid, ksight_u64 uid_gid)
+{
+    struct ksight_parcel_stash *stash;
+
+    stash = ksight_bpf_map_lookup_elem(&parcel_stash, &tid);
+    if (!stash)
+        return;
+    ksight_emit_parcel(stash, transaction_id, pid_tgid, uid_gid);
+    ksight_bpf_map_delete_elem(&parcel_stash, &tid);
+}
+
+SEC("kprobe/binder_transaction")
+int ksight_binder_parcel_enter(struct ksight_pt_regs *ctx)
+{
+    ksight_u64 pid_tgid;
+    ksight_u64 uid_gid;
+    ksight_u32 tid;
+    ksight_u64 tr;
+    ksight_u64 reply;
+    ksight_u64 data_size = 0;
+    ksight_u64 buffer = 0;
+    ksight_u32 code = 0;
+    struct ksight_parcel_stash stash;
+
+    pid_tgid = ksight_bpf_get_current_pid_tgid();
+    uid_gid = ksight_bpf_get_current_uid_gid();
+    if (!ksight_identity_allowed(pid_tgid, uid_gid))
+        return 0;
+
+    tr = ctx->regs[2];
+    reply = ctx->regs[3];
+    if (tr == 0 || (reply & 0xffffffffULL) != 0)
+        return 0;
+    if (ksight_bpf_probe_read_kernel(&code, sizeof(code),
+                                     (const void *)(tr + KSIGHT_BINDER_TR_CODE)) != 0)
+        return 0;
+    if (ksight_bpf_probe_read_kernel(&data_size, sizeof(data_size),
+                                     (const void *)(tr + KSIGHT_BINDER_TR_DATA_SIZE)) != 0)
+        return 0;
+    if (ksight_bpf_probe_read_kernel(&buffer, sizeof(buffer),
+                                     (const void *)(tr + KSIGHT_BINDER_TR_BUFFER)) != 0)
+        return 0;
+    if (buffer == 0 || data_size < 8)
+        return 0;
+
+    __builtin_memset(&stash, 0, sizeof(stash));
+    stash.code = code;
+    ksight_copy_parcel_prefix(&stash, (const void *)buffer, data_size);
+    if (stash.copied == 0)
+        return 0;
+    tid = (ksight_u32)pid_tgid;
+    ksight_emit_parcel(&stash, 0, pid_tgid, uid_gid);
+    if (ksight_bpf_map_update_elem(&parcel_stash, &tid, &stash, 0) != 0)
+        ksight_record_drop();
+    return 0;
+}
+
 SEC("tracepoint/binder/binder_transaction")
 int ksight_binder_transaction(struct ksight_binder_transaction_trace *context)
 {
@@ -107,6 +244,10 @@ int ksight_binder_transaction(struct ksight_binder_transaction_trace *context)
     transaction_key = context->debug_id;
     if (!ksight_should_capture(pid_tgid, uid_gid))
         return 0;
+
+    if (context->reply == 0)
+        ksight_emit_stashed_parcel(context->debug_id, (ksight_u32)pid_tgid,
+                                   pid_tgid, uid_gid);
 
     event = ksight_bpf_ringbuf_reserve(&binder_events, sizeof(*event), 0);
     if (!event) {

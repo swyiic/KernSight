@@ -22,8 +22,15 @@ const MAX_PENDING_BINDER_FDS: usize = 16_384;
 pub struct FdLineageTracker {
     /// `(tgid, fd)` → 来源描述。
     fd_origins: HashMap<(u32, i32), String>,
-    /// `(transaction_id, object_offset)` → 来源描述（发送侧暂存，等待接收侧配对）。
-    pending_binder_fds: HashMap<(i32, u64), String>,
+    /// `(transaction_id, object_offset)` → 发送侧来源（等待接收侧配对）。
+    pending_binder_fds: HashMap<(i32, u64), PendingBinderFd>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingBinderFd {
+    origin: String,
+    source_pid: u32,
+    source_fd: i32,
 }
 
 impl FdLineageTracker {
@@ -93,35 +100,46 @@ impl FdLineageTracker {
                 }
             }
             EventPayload::BinderTransaction(transaction) => {
-                let (Some(fd), Some(offset)) =
-                    (transaction.file_descriptor, transaction.object_offset)
-                else {
-                    return;
-                };
-                match transaction.stage {
-                    BinderTransactionStage::FdSent => {
-                        let origin = self
-                            .fd_origins
-                            .get(&(pid, fd))
-                            .cloned()
-                            .or_else(|| read_fd_target(pid, fd));
-                        if let Some(origin) = origin {
-                            if self.pending_binder_fds.len() < MAX_PENDING_BINDER_FDS {
-                                self.pending_binder_fds
-                                    .insert((transaction.transaction_id, offset), origin);
-                            }
-                        }
+                self.correlate_binder(pid, transaction);
+            }
+            _ => {}
+        }
+    }
+
+    fn correlate_binder(&mut self, pid: u32, transaction: &mut ksight_model::BinderTransaction) {
+        let (Some(fd), Some(offset)) = (transaction.file_descriptor, transaction.object_offset)
+        else {
+            return;
+        };
+        match transaction.stage {
+            BinderTransactionStage::FdSent => {
+                let origin = self
+                    .fd_origins
+                    .get(&(pid, fd))
+                    .cloned()
+                    .or_else(|| read_fd_target(pid, fd));
+                if let Some(origin) = origin {
+                    if self.pending_binder_fds.len() < MAX_PENDING_BINDER_FDS {
+                        self.pending_binder_fds.insert(
+                            (transaction.transaction_id, offset),
+                            PendingBinderFd {
+                                origin,
+                                source_pid: pid,
+                                source_fd: fd,
+                            },
+                        );
                     }
-                    BinderTransactionStage::FdReceived => {
-                        if let Some(origin) = self
-                            .pending_binder_fds
-                            .remove(&(transaction.transaction_id, offset))
-                        {
-                            transaction.transferred_fd_origin = Some(origin.clone());
-                            self.insert_origin(pid, fd, origin);
-                        }
-                    }
-                    _ => {}
+                }
+            }
+            BinderTransactionStage::FdReceived => {
+                if let Some(pending) = self
+                    .pending_binder_fds
+                    .remove(&(transaction.transaction_id, offset))
+                {
+                    transaction.transferred_fd_origin = Some(pending.origin.clone());
+                    transaction.transferred_fd_source_pid = Some(pending.source_pid);
+                    transaction.transferred_fd_source_fd = Some(pending.source_fd);
+                    self.insert_origin(pid, fd, pending.origin);
                 }
             }
             _ => {}
@@ -316,6 +334,8 @@ mod tests {
             transaction.transferred_fd_origin.as_deref(),
             Some("/data/app/base.apk")
         );
+        assert_eq!(transaction.transferred_fd_source_pid, Some(100));
+        assert_eq!(transaction.transferred_fd_source_fd, Some(7));
     }
 
     #[test]
@@ -465,6 +485,12 @@ mod tests {
                 file_descriptor: Some(fd),
                 object_offset: Some(object_offset),
                 transferred_fd_origin: None,
+                transferred_fd_source_pid: None,
+                transferred_fd_source_fd: None,
+                interface_token: None,
+                binder_method: None,
+                binder_method_source: None,
+                parcel_prefix_hex: None,
             }),
         }
     }

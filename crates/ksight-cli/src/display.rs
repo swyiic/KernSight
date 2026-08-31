@@ -95,8 +95,20 @@ pub(crate) fn print_session_report(report: &SessionReport, top: usize) {
             .map(|(code, count)| format!("{code:#x}×{count}"))
             .collect::<Vec<_>>()
             .join(", ");
+        let interfaces = relation
+            .interfaces
+            .iter()
+            .take(4)
+            .map(|(name, count)| format!("{name}×{count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let interface_note = if interfaces.is_empty() {
+            String::new()
+        } else {
+            format!(" | ifaces=[{interfaces}]")
+        };
         println!(
-            "  {}({}) -> {}({}) | requests={} replies={} | codes=[{}]",
+            "  {}({}) -> {}({}) | requests={} replies={} | codes=[{}]{interface_note}",
             relation.source,
             relation.source_process_id,
             relation.target,
@@ -136,7 +148,7 @@ pub(crate) fn print_session_report(report: &SessionReport, top: usize) {
     }
     for peer in report.network_peers.iter().take(top) {
         println!(
-            "  {}({}) <-> {}:{} | outbound={}/{}/in-progress={} inbound-accepted={} bytes-out/in={}/{} mmsg-out/in={}/{}",
+            "  {}({}) <-> {}:{} | outbound={}/{}/in-progress={} inbound-accepted={} bytes-out/in={}/{} mmsg-out/in={}/{} sni={} alpn={} http={}",
             peer.source,
             peer.source_process_id,
             peer.peer,
@@ -149,7 +161,42 @@ pub(crate) fn print_session_report(report: &SessionReport, top: usize) {
             peer.sent_bytes,
             peer.received_bytes,
             peer.sent_messages,
-            peer.received_messages
+            peer.received_messages,
+            peer.sni.as_deref().unwrap_or("-"),
+            peer.alpn.as_deref().unwrap_or("-"),
+            peer.http_host.as_deref().or(peer.http_method.as_deref()).unwrap_or("-")
+        );
+    }
+
+    println!("\nInspect hits (top {top})");
+    if report.inspect_hits.is_empty() {
+        println!("  none captured");
+    }
+    for hit in report.inspect_hits.iter().take(top) {
+        let method = match (
+            hit.binder_interface.as_deref(),
+            hit.binder_method.as_deref(),
+        ) {
+            (Some(interface), Some(name)) => format!(" {interface}::{name}"),
+            (Some(interface), None) => format!(" {interface}"),
+            _ => String::new(),
+        };
+        let joined = hit.binder_transaction_id.map_or_else(String::new, |id| {
+            format!(
+                " txn={id}{}",
+                hit.reply_latency_ns
+                    .map_or_else(String::new, |ns| format!(" reply-ns={ns}"))
+            )
+        });
+        println!(
+            "  {}({}) {} hits={} attached={}{method}{joined} {}",
+            hit.adapter,
+            hit.process_id,
+            hit.binder_code
+                .map_or_else(|| "-".to_owned(), |code| format!("{code:#x}")),
+            hit.hits,
+            hit.attached,
+            hit.last_detail.replace('\n', " ")
         );
     }
 
@@ -172,6 +219,35 @@ pub(crate) fn print_session_report(report: &SessionReport, top: usize) {
             row.requested_bytes,
             row.captured_bytes,
             row.preview.as_deref().unwrap_or("-").replace('\n', "\\n")
+        );
+    }
+
+    println!("\nHTTP calls from TLS plaintext (Inspect, top {top})");
+    if report.http_calls.is_empty() {
+        println!("  none parsed (need HTTP/1 or JSON preview; HTTP/2 frames are not decoded)");
+    }
+    for row in report.http_calls.iter().take(top) {
+        let host = row.host.as_deref().unwrap_or("-");
+        let tracker = if row.third_party { " tracker" } else { "" };
+        let keys = row
+            .body_keys
+            .iter()
+            .chain(row.query_keys.iter())
+            .take(8)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(",");
+        let redacted = row.redacted_body_keys.join(",");
+        println!(
+            "  {}({}) {} {} {host}{}{tracker} ×{} status={} keys=[{keys}] redacted=[{redacted}]",
+            row.source,
+            row.process_id,
+            row.direction,
+            row.method,
+            row.path,
+            row.count,
+            row.status
+                .map_or_else(|| "-".to_owned(), |value| value.to_string()),
         );
     }
 
@@ -335,6 +411,7 @@ fn print_environment_integrity(report: &SessionReport) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn print_lifecycle_summaries(report: &SessionReport) {
     println!(
         "  graph: entities={} edges={}",
@@ -352,6 +429,38 @@ fn print_lifecycle_summaries(report: &SessionReport) {
         report.fd_lifecycle.closes_without_observed_origin,
         report.fd_lifecycle.lineage_complete
     );
+    if !report.binder_fd_transfers.is_empty() {
+        println!(
+            "  binder fd transfers: {}",
+            report.binder_fd_transfers.len()
+        );
+    }
+    if report.dns_datagrams > 0 || !report.dns_names.is_empty() {
+        let named = report
+            .network_peers
+            .iter()
+            .filter(|peer| peer.resolved_name.is_some())
+            .count();
+        println!(
+            "  dns: datagrams={} names={} peers-with-qname={}",
+            report.dns_datagrams,
+            report.dns_names.len(),
+            named
+        );
+    }
+    if report.handshake_events > 0 || !report.handshake_names.is_empty() {
+        let named = report
+            .network_peers
+            .iter()
+            .filter(|peer| peer.sni.is_some() || peer.http_host.is_some())
+            .count();
+        println!(
+            "  handshake: events={} names={} peers-with-sni-or-host={}",
+            report.handshake_events,
+            report.handshake_names.len(),
+            named
+        );
+    }
     println!(
         "  memory lifecycle: map={} protect={} unmap={} remap={} brk={} matched/unmatched={}/{} active={} mapped-bytes={} unmapped-bytes={}",
         report.memory_lifecycle.successful_maps,
@@ -399,16 +508,20 @@ fn print_lifecycle_summaries(report: &SessionReport) {
         report.socket_lifecycle.active_at_end
     );
     println!(
-        "  Binder lifecycle: submitted={} delivered={} buffers={} fd-send/recv={}/{} delivery-miss={} avg-delivery-ns={}",
+        "  Binder lifecycle: submitted={} delivered={} two-way={} one-way={} replies={} paired={} avg-delivery-ns={} avg-reply-ns={}",
         report.binder_lifecycle.submitted,
         report.binder_lifecycle.delivered,
-        report.binder_lifecycle.buffers_observed,
-        report.binder_lifecycle.file_descriptors_sent,
-        report.binder_lifecycle.file_descriptors_received,
-        report.binder_lifecycle.delivery_without_submission,
+        report.binder_lifecycle.two_way_submitted,
+        report.binder_lifecycle.one_way_submitted,
+        report.binder_lifecycle.reply_submitted,
+        report.binder_lifecycle.paired_replies,
         report
             .binder_lifecycle
             .average_delivery_ns
+            .map_or_else(|| "-".to_owned(), |value| value.to_string()),
+        report
+            .binder_lifecycle
+            .average_reply_ns
             .map_or_else(|| "-".to_owned(), |value| value.to_string())
     );
 }

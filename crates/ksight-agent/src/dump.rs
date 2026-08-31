@@ -13,10 +13,15 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use crate::dexdump::{dump_live_process, pids_for_package, poll_followed_keys};
+use crate::dexdump::{
+    dump_live_process, keep_heap_blob_map_path, pids_for_package, poll_followed_keys,
+};
 
 const MAX_APK_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_TREE_FILE_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_PRIVATE_FILE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_PRIVATE_FILES: usize = 512;
+const APP_PRIVATE_DIRS: [&str; 4] = ["shared_prefs", "databases", "files", "no_backup"];
 /// Versioned package-dump document consumed by `MobileE`.
 pub const PACKAGE_DUMP_SCHEMA: &str = "mobilee.kernsight-package-dump/v2";
 const PRIVATE_PACKAGE_ROOT: &str = "/data/local/tmp/ksight/packages";
@@ -35,6 +40,96 @@ pub struct DumpEvidenceFile {
     pub sha256: String,
     /// Candidates are never promoted to confirmed secrets by the collector.
     pub confirmed: bool,
+}
+
+/// One paused `/proc/<pid>/mem` copy recorded by dump-package.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemorySnapshot {
+    /// Target process.
+    pub pid: u32,
+    /// True when `SIGSTOP` was applied for the copy.
+    #[serde(default)]
+    pub paused: bool,
+    /// True when the copy ran without a pause (pages may tear).
+    #[serde(default)]
+    pub torn: bool,
+    /// Wall milliseconds of the copy window.
+    #[serde(default)]
+    pub elapsed_ms: u64,
+    /// Adjacent same-path maps joined before a DEX/blob copy.
+    #[serde(default)]
+    pub stitched_spans: u32,
+    /// In-memory DEX/CDEX images copied in this snapshot.
+    #[serde(default)]
+    pub memory_images: u32,
+    /// Heap-blob DEX images copied in this snapshot.
+    #[serde(default)]
+    pub blob_dex: u32,
+}
+
+/// One mapped TLS/crypto library and whether Inspect will try `SSL_write`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TlsStackObservation {
+    /// `conscrypt_system`, `cronet`, `app_libssl`, `flutter`, ...
+    pub kind: String,
+    /// Mapped or dumped ELF path.
+    pub path: String,
+    /// True when `--inspect-tls` will look for exported `SSL_write` on this ELF.
+    pub inspect_tries_ssl_write: bool,
+}
+
+/// One file-backed DEX/APK/JAR/SO row from `/proc/<pid>/maps` order.
+///
+/// This is mapped order, not `ClassLoader` load order.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MappedCodeEntry {
+    /// Process that owned the mapping.
+    pub pid: u32,
+    /// 1-based order among code mappings of that process.
+    pub order: u32,
+    /// Inclusive mapping start.
+    pub start: u64,
+    /// Exclusive mapping end.
+    pub end: u64,
+    /// `/proc/<pid>/maps` pathname.
+    pub path: String,
+}
+
+/// One DEX/APK/JAR observation with a path-derived `ClassLoader` role.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CodeLoaderEntry {
+    /// Process that owned the mapping or fd.
+    pub pid: u32,
+    /// 1-based order within `origin`.
+    pub order: u32,
+    /// `boot`, `install`, `secondary`, `in_memory`, or `unknown`.
+    pub role: String,
+    /// `maps`, `fd`, or `art_open`.
+    pub origin: String,
+    /// Path, memfd label, or ART Open path hint.
+    pub path: String,
+    /// Inclusive mapping start, when origin is `maps`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<u64>,
+    /// Exclusive mapping end, when origin is `maps`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end: Option<u64>,
+    /// maps inode, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inode: Option<u64>,
+    /// `/proc/<pid>/fd` number, when origin is `fd`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fd: Option<i32>,
+    /// Size argument from ART `Open(uint8_t*, size_t)`, when origin is `art_open`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opened_bytes: Option<u64>,
+    /// Dump artifact path joined to this ART Open (correlated).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub joined_relative_path: Option<String>,
+    /// SHA-256 of the joined dump artifact, when hashed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub joined_sha256: Option<String>,
 }
 
 /// Result of bounded package-root retention.
@@ -198,6 +293,9 @@ pub struct PackageDumpReport {
     /// Native/DEX files taken from APK `assets/` (ijiami `libexec`, etc.).
     #[serde(default)]
     pub asset_files: usize,
+    /// Bounded CE app-private files (`shared_prefs` / `databases` / `files` / `no_backup`).
+    #[serde(default)]
+    pub private_files: usize,
     /// UUID for this dump; graph nodes are keyed under it.
     #[serde(default)]
     pub dump_id: String,
@@ -228,6 +326,38 @@ pub struct PackageDumpReport {
     /// Honest interpretation and compatibility warnings for clients.
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// Paused live-memory copies taken during this dump.
+    #[serde(default)]
+    pub snapshots: Vec<MemorySnapshot>,
+    /// `/proc/<pid>/maps` order of apk/dex/jar/so; not `ClassLoader` order.
+    #[serde(default)]
+    pub mapped_code: Vec<MappedCodeEntry>,
+    /// Path/fd/ART-Open derived `ClassLoader` role, not a Java `ClassLoader` instance.
+    #[serde(default)]
+    pub code_loaders: Vec<CodeLoaderEntry>,
+    /// Mapped TLS/crypto stacks. `--inspect-tls` only tries exported `SSL_write`.
+    #[serde(default)]
+    pub tls_stacks: Vec<TlsStackObservation>,
+    /// Adjacent same-path VMAs joined across all live copies.
+    #[serde(default)]
+    pub stitched_spans: usize,
+    /// USB/root environment at dump start. Not proof the app ignored these switches.
+    #[serde(default)]
+    pub observation_env: crate::dump_guard::DumpObservationEnv,
+}
+
+/// Operator flags for [`dump_package_with`].
+#[derive(Debug, Clone, Copy, Default)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct DumpOptions {
+    /// Force-stop and launch before live harvest.
+    pub launch: bool,
+    /// Skip APK/lib/oat install trees; the dest folder is evidence to pull.
+    pub runtime_only: bool,
+    /// Write dump-ready and yield so a hide-debug wrapper can clear `adb_enabled` before launch.
+    pub hide_debug: bool,
+    /// If Magisk is present, add the package to `DenyList` for this dump window.
+    pub denylist: bool,
 }
 
 /// Copy APK/native artifacts and, when the process is live, decrypted images.
@@ -242,8 +372,38 @@ pub fn dump_package(
     launch: bool,
     runtime_only: bool,
 ) -> Result<PackageDumpReport> {
+    dump_package_with(
+        package,
+        dest,
+        &DumpOptions {
+            launch,
+            runtime_only,
+            ..DumpOptions::default()
+        },
+    )
+}
+
+/// Copy APK/native artifacts with USB-hide / `DenyList` opt-in.
+///
+/// # Errors
+///
+/// Returns if the package name is invalid, the APK cannot be found, or writes fail.
+#[allow(clippy::too_many_lines)]
+pub fn dump_package_with(
+    package: &str,
+    dest: &Path,
+    options: &DumpOptions,
+) -> Result<PackageDumpReport> {
+    let launch = options.launch;
+    let runtime_only = options.runtime_only;
     validate_package(package)?;
+    let window =
+        crate::dump_guard::DumpWindow::enter(package, options.hide_debug, options.denylist);
+    let observation_env = window.observation_env();
     std::fs::create_dir_all(dest).with_context(|| format!("create {}", dest.display()))?;
+    if runtime_only {
+        prune_install_trees(dest);
+    }
     let apk_paths = apk_paths(package);
     if apk_paths.is_empty() {
         bail!("package {package} is not installed (pm path returned no APK)");
@@ -275,6 +435,7 @@ pub fn dump_package(
         recovered_sm4_key: None,
         runtime_blob_dex: 0,
         asset_files: 0,
+        private_files: 0,
         dump_id: uuid::Uuid::new_v4().to_string(),
         artifacts: Vec::new(),
         dex_sets: Vec::new(),
@@ -285,6 +446,12 @@ pub fn dump_package(
         sensitive_files: Vec::new(),
         total_bytes: 0,
         warnings: default_dump_warnings(),
+        snapshots: Vec::new(),
+        mapped_code: Vec::new(),
+        code_loaders: Vec::new(),
+        tls_stacks: Vec::new(),
+        stitched_spans: 0,
+        observation_env,
     };
 
     if !runtime_only {
@@ -320,6 +487,12 @@ pub fn dump_package(
                 MAX_TREE_FILE_BYTES,
             )?);
         }
+        // After the install tree so split-APK `lib/<abi>` fills gaps instead of
+        // duplicating `arm64-v8a/` next to the extracted `arm64/` ISA dir.
+        for apk in &apk_paths {
+            let from_apk = ksight_core::extract_apk_native_libs(apk, &dest.join("lib"))?;
+            report.native_libs = report.native_libs.saturating_add(from_apk.len());
+        }
         report.native_libs = report
             .native_libs
             .saturating_add(copy_data_code_cache(package, &dest.join("data-cache"))?);
@@ -327,6 +500,7 @@ pub fn dump_package(
 
     let runtime = dest.join("runtime");
     let _ = std::fs::remove_dir_all(runtime.join("packer-keys"));
+    let mut art_watch = None;
     let (pids, live_key) = if launch {
         force_stop_package(package);
         std::thread::sleep(Duration::from_millis(250));
@@ -336,14 +510,36 @@ pub fn dump_package(
         let handle = std::thread::spawn(move || {
             poll_fresh_package_keys(&package_name, &runtime_path, &stale)
         });
+        let watch_package = package.to_owned();
+        let watch_runtime = runtime.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        art_watch = Some(std::thread::spawn(move || {
+            crate::inspect_runtime::record_art_dex_opens_with_ready(
+                &watch_package,
+                &watch_runtime,
+                Path::new("/data/local/tmp/ksight/uprobe_regs.bpf.o"),
+                Duration::from_secs(45),
+                Some(ready_tx),
+            )
+        }));
+        let _ = ready_rx.recv_timeout(Duration::from_secs(20));
+        window.mark_ready_and_yield();
+        report.observation_env = window.observation_env();
         start_package(package);
         report.launched = true;
         handle
             .join()
             .map_err(|_| anyhow::anyhow!("SM4 poll thread panicked"))?
     } else {
+        window.mark_ready_and_yield();
+        report.observation_env = window.observation_env();
         poll_package_keys(package, &runtime)
     };
+    let mut pids = rank_package_pids(package, pids);
+    if launch {
+        std::thread::sleep(Duration::from_millis(800));
+        pids = merge_live_package_pids(package, pids);
+    }
     report.pids.clone_from(&pids);
     report.key_slots = report.key_slots.saturating_add(live_key.slots);
     report.runtime_blob_dex = report.runtime_blob_dex.saturating_add(live_key.blob_dex);
@@ -360,6 +556,8 @@ pub fn dump_package(
     }
     if !pids.is_empty() {
         std::thread::sleep(Duration::from_millis(500));
+        pids = merge_live_package_pids(package, pids);
+        report.pids.clone_from(&pids);
         let mid = Instant::now() + Duration::from_secs(8);
         for pid in pids.iter().copied().take(8) {
             if Instant::now() >= mid {
@@ -378,13 +576,27 @@ pub fn dump_package(
             accumulate_live(&mut report, live);
         }
     }
+    if let Some(watch) = art_watch {
+        let _ = watch.join();
+    }
+    report.private_files = copy_app_private(package, &dest.join("data-private")).unwrap_or(0);
     let (decrypted, recovered_key) = unpack_secneo(dest);
     report.secneo_decrypted = decrypted;
     if report.recovered_sm4_key.is_none() {
         report.recovered_sm4_key = recovered_key.map(hex_key);
     }
     report.readable_dex = ksight_core::publish_readable_dex(dest).unwrap_or(0);
+    if runtime_only {
+        prune_install_trees(dest);
+    }
     finalize_catalog(&mut report, dest)?;
+    write_evidence_index(dest, &report);
+    if !report.observation_env.denylist_detail.is_empty() {
+        report
+            .warnings
+            .push(report.observation_env.denylist_detail.clone());
+    }
+    drop(window);
     Ok(report)
 }
 
@@ -430,6 +642,7 @@ pub fn recatalog_package(dest: &Path) -> Result<PackageDumpReport> {
             recovered_sm4_key: None,
             runtime_blob_dex: 0,
             asset_files: 0,
+            private_files: 0,
             dump_id: uuid::Uuid::new_v4().to_string(),
             artifacts: Vec::new(),
             dex_sets: Vec::new(),
@@ -440,6 +653,12 @@ pub fn recatalog_package(dest: &Path) -> Result<PackageDumpReport> {
             sensitive_files: Vec::new(),
             total_bytes: 0,
             warnings: default_dump_warnings(),
+            snapshots: Vec::new(),
+            mapped_code: Vec::new(),
+            code_loaders: Vec::new(),
+            tls_stacks: Vec::new(),
+            stitched_spans: 0,
+            observation_env: crate::dump_guard::DumpObservationEnv::default(),
         }
     };
     PACKAGE_DUMP_SCHEMA.clone_into(&mut report.schema_version);
@@ -453,12 +672,33 @@ pub fn recatalog_package(dest: &Path) -> Result<PackageDumpReport> {
 }
 
 fn finalize_catalog(report: &mut PackageDumpReport, dest: &Path) -> Result<()> {
+    recount_static_trees(report, dest);
     report.artifacts = catalog_dump(dest);
     attach_artifact_hashes(dest, &mut report.artifacts);
     (report.dex_sets, report.dex_index) = build_dex_sets(dest, &report.artifacts);
     report.native_rule_version = ksight_core::native_framework_rule_version();
     report.native_framework_matches = ksight_core::classify_native_frameworks(&report.artifacts);
     report.sensitive_files = catalog_sensitive_files(dest);
+    report.snapshots = catalog_snapshots(dest);
+    report.mapped_code = catalog_mapped_code(dest);
+    report.code_loaders = catalog_code_loaders(dest);
+    report.tls_stacks = catalog_tls_stacks(&report.mapped_code, &report.artifacts);
+    if report
+        .tls_stacks
+        .iter()
+        .any(|row| !row.inspect_tries_ssl_write)
+    {
+        report.warnings.push(
+            "a mapped TLS stack is not a Conscrypt/libssl/libcronet SSL_write target; --inspect-tls will not copy that plaintext"
+                .to_owned(),
+        );
+    }
+    join_art_opens(&mut report.code_loaders, &report.artifacts);
+    if report.stitched_spans == 0 {
+        report.stitched_spans = report.snapshots.iter().fold(0_usize, |total, row| {
+            total.saturating_add(usize::try_from(row.stitched_spans).unwrap_or(0))
+        });
+    }
     report.total_bytes = tree_bytes(dest);
     PACKAGE_DUMP_SCHEMA.clone_into(&mut report.schema_version);
     env!("CARGO_PKG_VERSION").clone_into(&mut report.agent_version);
@@ -476,6 +716,11 @@ fn finalize_catalog(report: &mut PackageDumpReport, dest: &Path) -> Result<()> {
     heal_blob_sidecars(dest, &report.artifacts);
     let maps = maps_as_observed(dest, &report.artifacts);
     graph.correlate_dump_vmas(dump_uuid, &report.artifacts, &maps);
+    graph.attach_art_open_joins(
+        dump_uuid,
+        &report.package,
+        &art_open_joins(&report.code_loaders, &report.artifacts),
+    );
     report.graph = graph;
     write_dump_howto(dest, &report.package);
     std::fs::write(
@@ -491,8 +736,24 @@ fn default_dump_warnings() -> Vec<String> {
             .to_owned(),
         "package dump uses root procfs memory access and is L2 forensic evidence, not eBPF Observe"
             .to_owned(),
+        "live dump SIGSTOPs selected PIDs while copying /proc/pid/mem; torn=true means the copy raced"
+            .to_owned(),
+        "stitched VMAs are adjacent same-path maps, not proof of a single mmap"
+            .to_owned(),
+        "mapped_code is /proc/pid/maps order of apk/dex/jar/so, not ClassLoader load order"
+            .to_owned(),
+        "code_loaders.role is inferred from maps/fd/ART DexFile Open paths (boot/install/secondary/in_memory), not a Java ClassLoader instance"
+            .to_owned(),
+        "art_open joined_relative_path/sha256 is correlated (path or size), not proof that a ClassLoader object produced the bytes"
+            .to_owned(),
+        "packer-keys remain gated on a mapped packer/VMP SO; plaintext windows also scan large anonymous heaps"
+            .to_owned(),
         "sensitive candidate files are intentionally retained and published for operator review"
             .to_owned(),
+        "hide-debug only clears adb_enabled/developer options; it does not hide root or an unlocked bootloader".to_owned(),
+        "denylist is Magisk DenyList add/remove for this dump window when Magisk is present; it is not a root-hide claim".to_owned(),
+        "data-private is a bounded copy of CE shared_prefs/databases/files/no_backup after live harvest; not a full /data/data image".to_owned(),
+        "tls_stacks is mapped/dumped ELF classification; --inspect-tls attaches exported SSL_write on libssl.so and libcronet.so only. Cronet/Flutter/mbedTLS without that export stay uncovered".to_owned(),
     ]
 }
 
@@ -626,10 +887,11 @@ fn dex_source_priority(artifact: &ksight_core::DumpArtifact) -> u8 {
 }
 
 fn catalog_sensitive_files(dest: &Path) -> Vec<DumpEvidenceFile> {
-    let mut files = Vec::new();
+    let mut files = Vec::<DumpEvidenceFile>::new();
     for (relative, class) in [
         ("runtime/plaintext", "plaintext_candidate"),
         ("runtime/packer-keys", "key_candidate"),
+        ("data-private", "private_store"),
     ] {
         visit_files(&dest.join(relative), &mut |path| {
             let Ok(relative_path) = path.strip_prefix(dest) else {
@@ -641,6 +903,14 @@ fn catalog_sensitive_files(dest: &Path) -> Vec<DumpEvidenceFile> {
             let Some(sha256) = sha256_file(path) else {
                 return;
             };
+            if files
+                .iter()
+                .filter(|file| file.content_class == class)
+                .count()
+                >= 32
+            {
+                return;
+            }
             files.push(DumpEvidenceFile {
                 relative_path: relative_path.to_string_lossy().replace('\\', "/"),
                 content_class: class.to_owned(),
@@ -652,6 +922,44 @@ fn catalog_sensitive_files(dest: &Path) -> Vec<DumpEvidenceFile> {
     }
     files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     files
+}
+
+fn recount_static_trees(report: &mut PackageDumpReport, dest: &Path) {
+    report.apk_files = count_regular_files(&dest.join("apk"));
+    report.native_libs = count_ext_files(&dest.join("lib"), "so");
+    report.oat_files = count_regular_files(&dest.join("oat"));
+    report.asset_files = count_regular_files(&dest.join("apk-assets"));
+    report.apk_dex = count_shallow_ext(&dest.join("apk-dex"), "dex");
+    report.readable_dex = count_ext_files(&dest.join("readable-dex"), "dex");
+    report.private_files = count_regular_files(&dest.join("data-private"));
+}
+
+fn count_regular_files(root: &Path) -> usize {
+    let mut count = 0_usize;
+    visit_files(root, &mut |_| {
+        count = count.saturating_add(1);
+    });
+    count
+}
+
+fn count_ext_files(root: &Path, ext: &str) -> usize {
+    let mut count = 0_usize;
+    visit_files(root, &mut |path| {
+        if has_ext(path, ext) {
+            count = count.saturating_add(1);
+        }
+    });
+    count
+}
+
+fn count_shallow_ext(dir: &Path, ext: &str) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|entry| entry.path().is_file() && has_ext(&entry.path(), ext))
+        .count()
 }
 
 fn tree_bytes(root: &Path) -> u64 {
@@ -704,20 +1012,323 @@ fn write_dump_howto(dest: &Path, package: &str) {
          - apk-dex/split/          （含 APK 内 DEX 和冷启动从堆切开的 blob-*.dex）\n\
          \n\
          SO:\n\
-         - lib/                    安装目录里的 .so（apk 的 lib/）\n\
+         - lib/                    安装目录 .so，以及 APK/split zip 的 lib/<abi>（arm64-v8a→arm64，已有文件不重复）\n\
          - apk-assets/             APK assets 里的壳 SO（爱加密 libexec/libexecmain 等）\n\
-         - runtime/runtime-so/     冷启动时进程已加载的 .so 副本\n\
+         - runtime/runtime-so/     冷启动时进程已加载的 .so 磁盘副本（可写映射里的明文 DEX 在 heap-blob）\n\
          \n\
          其它:\n\
          - apk/                    原始 APK\n\
          - apk-dex/                APK 里的 classes*.dex（可能只是壳 stub）\n\
+         - data-private/ce|de/     冷启动后 credential/device-encrypted shared_prefs/databases/files/no_backup（有界，不是完整 /data/data）\n\
          - dump-report.json        计数、artifacts 清单、进程图（correlated；dump VMA overlaps_mmap 对齐 maps，不是 mmap 证明）\n\
          \n\
-         主机拉取:\n\
-         ksightctl device --serial <SERIAL> pull-package --package {package} --launch\n\
+         主机拉取（整个包名目录就是这一次搜集，不含安装 APK/lib）:\n\
+         ksightctl device --serial <SERIAL> pull-package --package {package} --launch --evidence-only\n\
+         USB 调试检测: 加 --hide-debug --launch（只关 adb_enabled，不隐 root）\n\
+         Root 检测且机上有 Magisk: 加 --denylist（DenyList 窗口，不是隐 root）\n\
          或: adb pull /data/local/tmp/ksight/packages/{package}\n"
     );
     let _ = std::fs::write(dest.join("HOWTO.txt"), text);
+}
+
+fn prune_install_trees(dest: &Path) {
+    for name in ["apk", "lib", "oat", "apk-assets"] {
+        let _ = std::fs::remove_dir_all(dest.join(name));
+    }
+}
+
+fn write_evidence_index(dest: &Path, report: &PackageDumpReport) {
+    let joined = report
+        .code_loaders
+        .iter()
+        .filter(|loader| loader.origin == "art_open" && loader.joined_sha256.is_some())
+        .count();
+    let mut lines = vec![
+        format!("package: {}", report.package),
+        format!("dump_id: {}", report.dump_id),
+        format!("launched: {}", report.launched),
+        format!("pids: {:?}", report.pids),
+        format!("readable_dex: {}", report.readable_dex),
+        format!("runtime_blob_dex: {}", report.runtime_blob_dex),
+        format!("private_files: {}", report.private_files),
+        format!("art_open_joined: {joined}"),
+        format!("usb_debugging: {}", report.observation_env.usb_debugging),
+        String::new(),
+        "This folder is one package's collected evidence (no install APK/lib).".to_owned(),
+        format!(
+            "pull: adb pull /data/local/tmp/ksight/packages/{}",
+            report.package
+        ),
+        String::new(),
+        "contents:".to_owned(),
+    ];
+    for name in [
+        "dump-report.json",
+        "EVIDENCE.txt",
+        "HOWTO.txt",
+        "data-private",
+        "runtime",
+        "readable-dex",
+        "apk-dex",
+    ] {
+        if dest.join(name).exists() {
+            lines.push(format!("  {name}"));
+        }
+    }
+    let _ = std::fs::write(dest.join("EVIDENCE.txt"), lines.join("\n") + "\n");
+}
+
+fn catalog_snapshots(dest: &Path) -> Vec<MemorySnapshot> {
+    let Ok(entries) = std::fs::read_dir(dest.join("runtime")) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with("snapshot-")
+            || !Path::new(name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+        {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        if let Ok(row) = serde_json::from_str::<MemorySnapshot>(&text) {
+            out.push(row);
+        }
+    }
+    out.sort_by_key(|row| row.pid);
+    out
+}
+
+fn join_art_opens(loaders: &mut [CodeLoaderEntry], artifacts: &[ksight_core::DumpArtifact]) {
+    for loader in loaders
+        .iter_mut()
+        .filter(|loader| loader.origin == "art_open")
+    {
+        let Some(artifact) = match_art_open_artifact(loader, artifacts) else {
+            continue;
+        };
+        loader.joined_relative_path = Some(artifact.relative_path.clone());
+        loader.joined_sha256.clone_from(&artifact.sha256);
+    }
+}
+
+fn art_open_joins(
+    loaders: &[CodeLoaderEntry],
+    artifacts: &[ksight_core::DumpArtifact],
+) -> Vec<(u32, String, String)> {
+    let mut joins = Vec::new();
+    for loader in loaders.iter().filter(|loader| loader.origin == "art_open") {
+        for artifact in artifacts
+            .iter()
+            .filter(|artifact| art_open_matches(loader, artifact))
+        {
+            joins.push((
+                loader.pid,
+                loader.path.clone(),
+                artifact_graph_key(artifact),
+            ));
+        }
+    }
+    joins
+}
+
+fn artifact_graph_key(artifact: &ksight_core::DumpArtifact) -> String {
+    artifact.sha256.as_ref().map_or_else(
+        || format!("artifact:{}", artifact.relative_path),
+        |sha256| format!("artifact:sha256:{sha256}"),
+    )
+}
+
+fn match_art_open_artifact<'a>(
+    loader: &CodeLoaderEntry,
+    artifacts: &'a [ksight_core::DumpArtifact],
+) -> Option<&'a ksight_core::DumpArtifact> {
+    artifacts
+        .iter()
+        .filter(|artifact| art_open_matches(loader, artifact))
+        .max_by_key(|artifact| artifact.bytes)
+}
+
+fn art_open_matches(loader: &CodeLoaderEntry, artifact: &ksight_core::DumpArtifact) -> bool {
+    if artifact.kind != "dex" {
+        return false;
+    }
+    if let Some((base, size)) = parse_memory_open(&loader.path) {
+        if let (Some(start), Some(end)) = (artifact.vma_start, artifact.vma_end) {
+            if base >= start && base < end {
+                return true;
+            }
+        }
+        let opened = loader.opened_bytes.unwrap_or(size);
+        return artifact.bytes.abs_diff(opened) <= 4096;
+    }
+    let open = loader.path.trim();
+    if open.is_empty() {
+        return false;
+    }
+    if artifact.map_path.as_deref() == Some(open) {
+        return true;
+    }
+    if artifact
+        .map_path
+        .as_deref()
+        .is_some_and(|path| path.ends_with(open) || open.ends_with(path))
+    {
+        return true;
+    }
+    let open_name = std::path::Path::new(open)
+        .file_name()
+        .and_then(|name| name.to_str());
+    let artifact_name = std::path::Path::new(&artifact.relative_path)
+        .file_name()
+        .and_then(|name| name.to_str());
+    if open_name.is_some() && open_name == artifact_name {
+        return true;
+    }
+    let open_ext = std::path::Path::new(open).extension();
+    if open_ext
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("apk") || ext.eq_ignore_ascii_case("jar"))
+        && artifact.source == "apk-dex"
+    {
+        let lower = open.to_ascii_lowercase();
+        return lower.contains("/data/app")
+            || lower.contains("/priv-app/")
+            || lower.contains("split_config")
+            || open_name == Some("base.apk");
+    }
+    false
+}
+
+fn parse_memory_open(path: &str) -> Option<(u64, u64)> {
+    let rest = path.strip_prefix("memory:")?;
+    let (base, size) = rest.split_once('+')?;
+    let base = u64::from_str_radix(base.trim_start_matches("0x"), 16).ok()?;
+    let size = size.parse().ok()?;
+    Some((base, size))
+}
+
+fn catalog_code_loaders(dest: &Path) -> Vec<CodeLoaderEntry> {
+    #[derive(Deserialize, Default)]
+    struct LoaderFile {
+        #[serde(default)]
+        entries: Vec<CodeLoaderEntry>,
+    }
+    let runtime = dest.join("runtime");
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&runtime) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let loader = name.starts_with("code-loader-") || name.starts_with("open-code-");
+            if !loader
+                || !Path::new(name)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+            {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            if let Ok(file) = serde_json::from_str::<LoaderFile>(&text) {
+                out.extend(file.entries);
+            }
+        }
+    }
+    if let Ok(text) = std::fs::read_to_string(runtime.join("dex-open-order.json")) {
+        if let Ok(file) = serde_json::from_str::<LoaderFile>(&text) {
+            out.extend(file.entries);
+        }
+    }
+    out.sort_by(|left, right| {
+        left.origin
+            .cmp(&right.origin)
+            .then_with(|| left.pid.cmp(&right.pid))
+            .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| left.order.cmp(&right.order))
+    });
+    out.dedup_by(|left, right| {
+        left.origin == right.origin && left.pid == right.pid && left.path == right.path
+    });
+    out
+}
+
+fn catalog_tls_stacks(
+    mapped: &[MappedCodeEntry],
+    artifacts: &[ksight_core::DumpArtifact],
+) -> Vec<TlsStackObservation> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    let paths = mapped.iter().map(|row| row.path.as_str()).chain(
+        artifacts
+            .iter()
+            .filter(|artifact| artifact.kind == "elf")
+            .map(|artifact| artifact.relative_path.as_str()),
+    );
+    for path in paths {
+        let Some(kind) = ksight_core::classify_tls_library_path(path) else {
+            continue;
+        };
+        if !seen.insert((kind.as_str(), path)) {
+            continue;
+        }
+        out.push(TlsStackObservation {
+            kind: kind.as_str().to_owned(),
+            path: path.to_owned(),
+            inspect_tries_ssl_write: kind.inspect_tries_ssl_write(),
+        });
+    }
+    out.sort_by(|left, right| {
+        left.kind
+            .cmp(&right.kind)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    out
+}
+
+fn catalog_mapped_code(dest: &Path) -> Vec<MappedCodeEntry> {
+    #[derive(Deserialize)]
+    struct MappedCodeFile {
+        entries: Vec<MappedCodeEntry>,
+    }
+    let Ok(entries) = std::fs::read_dir(dest.join("runtime")) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with("mapped-code-")
+            || !Path::new(name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+        {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        if let Ok(file) = serde_json::from_str::<MappedCodeFile>(&text) {
+            out.extend(file.entries);
+        }
+    }
+    out.sort_by(|left, right| {
+        left.pid
+            .cmp(&right.pid)
+            .then_with(|| left.order.cmp(&right.order))
+    });
+    out
 }
 
 fn catalog_dump(dest: &Path) -> Vec<ksight_core::DumpArtifact> {
@@ -741,19 +1352,20 @@ fn catalog_dump(dest: &Path) -> Vec<ksight_core::DumpArtifact> {
     );
     catalog_so_tree(dest, &dest.join("lib"), "install-lib", None, &mut artifacts);
     catalog_runtime_so(dest, &mut artifacts);
+    catalog_private_files(dest, &mut artifacts);
     enrich_artifacts_from_maps(dest, &mut artifacts);
     artifacts.retain(keep_catalog_artifact);
     rank_dump_artifacts(&mut artifacts);
-    artifacts.truncate(256);
+    artifacts.truncate(512);
     artifacts
 }
 
 fn keep_catalog_artifact(artifact: &ksight_core::DumpArtifact) -> bool {
     if artifact.source == "heap-blob" {
-        return !artifact
-            .map_path
-            .as_deref()
-            .is_some_and(|path| path.starts_with('/'));
+        return match artifact.map_path.as_deref() {
+            Some(path) if path.starts_with('/') => keep_heap_blob_map_path(path),
+            _ => true,
+        };
     }
     if artifact.source == "memory-dex" {
         return artifact.bytes >= 1024 && artifact.magic == "dex";
@@ -775,7 +1387,7 @@ fn artifact_keep_score(artifact: &ksight_core::DumpArtifact) -> (u8, u64) {
         "memory-dex" => 5,
         "runtime-so" => 4,
         "apk-assets" => 3,
-        "apk-dex" => 2,
+        "apk-dex" | "app-private" => 2,
         "install-lib" => 1,
         _ => 0,
     };
@@ -848,11 +1460,12 @@ fn maps_as_observed(
                 end: range.end,
                 backing_path: nonempty_path(&range.path),
                 source: ksight_core::MappingSource::ProcMaps,
+                mapping_generation: 0,
             });
         }
     }
     ksight_core::rank_observed_mappings(&mut mappings);
-    mappings.truncate(256);
+    mappings.truncate(512);
     mappings
 }
 
@@ -1314,6 +1927,34 @@ fn catalog_so_tree(
     }
 }
 
+fn catalog_private_files(dest: &Path, out: &mut Vec<ksight_core::DumpArtifact>) {
+    let root = dest.join("data-private");
+    let mut added = 0_usize;
+    visit_files(&root, &mut |path| {
+        if added >= 256 {
+            return;
+        }
+        let Ok(rel) = path.strip_prefix(dest) else {
+            return;
+        };
+        let bytes = path.metadata().map_or(0, |meta| meta.len());
+        out.push(ksight_core::DumpArtifact {
+            kind: "file".to_owned(),
+            source: "app-private".to_owned(),
+            relative_path: rel.to_string_lossy().replace('\\', "/"),
+            bytes,
+            magic: peek_magic(path),
+            pid: None,
+            vma_start: None,
+            vma_end: None,
+            map_path: None,
+            dex_offset: None,
+            sha256: None,
+        });
+        added = added.saturating_add(1);
+    });
+}
+
 fn catalog_runtime_so(dest: &Path, out: &mut Vec<ksight_core::DumpArtifact>) {
     let dir = dest.join("runtime").join("runtime-so");
     let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -1389,6 +2030,7 @@ fn accumulate_live(report: &mut PackageDumpReport, live: crate::dexdump::LiveDum
         .saturating_add(live.plaintext_windows);
     report.key_slots = report.key_slots.saturating_add(live.key_slots);
     report.runtime_blob_dex = report.runtime_blob_dex.saturating_add(live.blob_dex);
+    report.stitched_spans = report.stitched_spans.saturating_add(live.stitched_spans);
 }
 
 fn unpack_secneo(dest: &Path) -> (usize, Option<[u8; 16]>) {
@@ -1747,6 +2389,107 @@ fn copy_matching_files(src: &Path, dest: &Path, depth: u32) -> Result<usize> {
     Ok(copied)
 }
 
+fn copy_app_private(package: &str, dest: &Path) -> Result<usize> {
+    let mut copied = 0_usize;
+    let mut seen = BTreeSet::new();
+    for (label, root) in [
+        ("ce", format!("/data/user/0/{package}")),
+        ("de", format!("/data/user_de/0/{package}")),
+        ("ce", format!("/data/data/{package}")),
+    ] {
+        for dir in APP_PRIVATE_DIRS {
+            copied = copied.saturating_add(copy_private_tree(
+                &PathBuf::from(&root).join(dir),
+                &dest.join(label).join(dir),
+                dest,
+                &mut seen,
+                0,
+            )?);
+            if copied >= MAX_PRIVATE_FILES {
+                return Ok(copied);
+            }
+        }
+    }
+    Ok(copied)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn copy_app_private_from(roots: &[PathBuf], dest: &Path) -> Result<usize> {
+    let mut copied = 0_usize;
+    let mut seen = BTreeSet::new();
+    for root in roots {
+        for dir in APP_PRIVATE_DIRS {
+            copied = copied.saturating_add(copy_private_tree(
+                &root.join(dir),
+                &dest.join(dir),
+                dest,
+                &mut seen,
+                0,
+            )?);
+            if copied >= MAX_PRIVATE_FILES {
+                return Ok(copied);
+            }
+        }
+    }
+    Ok(copied)
+}
+
+fn copy_private_tree(
+    src: &Path,
+    dest: &Path,
+    dest_root: &Path,
+    seen: &mut BTreeSet<String>,
+    depth: u32,
+) -> Result<usize> {
+    if depth > 6 || !src.is_dir() {
+        return Ok(0);
+    }
+    let mut copied = 0_usize;
+    let Ok(entries) = std::fs::read_dir(src) else {
+        return Ok(0);
+    };
+    for entry in entries.flatten() {
+        if seen.len() >= MAX_PRIVATE_FILES {
+            break;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            copied = copied.saturating_add(copy_private_tree(
+                &path,
+                &dest.join(entry.file_name()),
+                dest_root,
+                seen,
+                depth.saturating_add(1),
+            )?);
+            continue;
+        }
+        if !path.is_file() {
+            continue;
+        }
+        if skip_private_file(&path) {
+            continue;
+        }
+        let target = dest.join(entry.file_name());
+        let Ok(rel) = target.strip_prefix(dest_root) else {
+            continue;
+        };
+        let key = rel.to_string_lossy().replace('\\', "/");
+        if !seen.insert(key) {
+            continue;
+        }
+        if copy_capped_path(&path, &target, MAX_PRIVATE_FILE_BYTES).is_ok() && target.is_file() {
+            copied = copied.saturating_add(1);
+        }
+    }
+    Ok(copied)
+}
+
+fn skip_private_file(path: &Path) -> bool {
+    ["jpg", "jpeg", "png", "webp", "mp4", "webm", "gif"]
+        .iter()
+        .any(|ext| has_ext(path, ext))
+}
+
 fn copy_capped_path(src: &Path, dest: &Path, cap: u64) -> Result<()> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1845,7 +2588,7 @@ fn poll_pids(pids: Vec<u32>, runtime: &Path) -> (Vec<u32>, LiveKeyPoll) {
     };
     let poll_until = Instant::now() + Duration::from_millis(2500);
     let mut seq = 0_u32;
-    while Instant::now() < poll_until {
+    while Instant::now() < poll_until && seq < 12 {
         let snap = poll_followed_keys(pid, runtime, seq);
         live.slots = live.slots.saturating_add(snap.dumped);
         live.blob_dex = live.blob_dex.saturating_add(snap.blob_dex);
@@ -1854,6 +2597,7 @@ fn poll_pids(pids: Vec<u32>, runtime: &Path) -> (Vec<u32>, LiveKeyPoll) {
             eprintln!("live SM4 key at poll seq {seq}");
         }
         seq = seq.saturating_add(1);
+        std::thread::sleep(Duration::from_millis(80));
     }
     (pids, live)
 }
@@ -1865,15 +2609,47 @@ fn wait_for_pids(package: &str, timeout: Duration) -> Vec<u32> {
 fn wait_for_fresh_pids(package: &str, stale: &[u32], timeout: Duration) -> Vec<u32> {
     let started = Instant::now();
     loop {
-        let pids: Vec<u32> = pids_for_package(package)
+        let mut pids: Vec<u32> = pids_for_package(package)
             .into_iter()
             .filter(|pid| !stale.contains(pid))
             .collect();
-        if !pids.is_empty() || started.elapsed() >= timeout {
+        pids = rank_package_pids(package, pids);
+        let has_main = pids.iter().any(|pid| package_cmdline(*pid) == package);
+        if has_main || started.elapsed() >= timeout {
+            return pids;
+        }
+        if !pids.is_empty() && started.elapsed() >= Duration::from_secs(3) {
             return pids;
         }
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+fn rank_package_pids(package: &str, mut pids: Vec<u32>) -> Vec<u32> {
+    pids.sort_by_key(|pid| crate::dump_guard::cmdline_dump_rank(package, &package_cmdline(*pid)));
+    pids
+}
+
+fn merge_live_package_pids(package: &str, mut pids: Vec<u32>) -> Vec<u32> {
+    for pid in pids_for_package(package) {
+        if !pids.contains(&pid) {
+            pids.push(pid);
+        }
+    }
+    rank_package_pids(package, pids)
+}
+
+fn package_cmdline(pid: u32) -> String {
+    std::fs::read(format!("/proc/{pid}/cmdline"))
+        .ok()
+        .map_or_else(String::new, |bytes| {
+            bytes
+                .split(|byte| *byte == 0)
+                .next()
+                .map(String::from_utf8_lossy)
+                .unwrap_or_default()
+                .into_owned()
+        })
 }
 
 #[cfg(test)]
@@ -1939,6 +2715,8 @@ mod tests {
         assert_eq!(report.asset_files, 0);
         assert!(report.artifacts.is_empty());
         assert!(report.schema_version.is_empty());
+        assert!(!report.observation_env.hide_debug_requested);
+        assert!(!report.observation_env.denylist_applied);
     }
 
     #[test]
@@ -1963,6 +2741,53 @@ mod tests {
         );
         assert_eq!(paths.len(), 2);
         assert!(paths[0].ends_with("base.apk"));
+    }
+
+    #[test]
+    fn prune_install_trees_keeps_evidence_dirs() {
+        let dir = std::env::temp_dir().join(format!("ksight-prune-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("apk")).expect("apk");
+        std::fs::create_dir_all(dir.join("lib")).expect("lib");
+        std::fs::create_dir_all(dir.join("runtime")).expect("runtime");
+        std::fs::create_dir_all(dir.join("data-private")).expect("private");
+        std::fs::write(dir.join("apk/base.apk"), b"apk").expect("apk file");
+        std::fs::write(dir.join("runtime/maps.txt"), b"maps").expect("maps");
+        prune_install_trees(&dir);
+        assert!(!dir.join("apk").exists());
+        assert!(!dir.join("lib").exists());
+        assert!(dir.join("runtime/maps.txt").is_file());
+        assert!(dir.join("data-private").is_dir());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn copies_bounded_app_private_prefs_and_skips_media() {
+        let root = std::env::temp_dir().join(format!("ksight-private-{}", uuid::Uuid::new_v4()));
+        let dest =
+            std::env::temp_dir().join(format!("ksight-private-out-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("shared_prefs")).expect("prefs");
+        std::fs::create_dir_all(root.join("databases")).expect("db");
+        std::fs::create_dir_all(root.join("files")).expect("files");
+        std::fs::write(
+            root.join("shared_prefs/token.xml"),
+            b"<map><string name=\"t\">x</string></map>",
+        )
+        .expect("xml");
+        std::fs::write(root.join("databases/app.db"), b"SQLite format 3\0").expect("db");
+        std::fs::write(root.join("files/photo.jpg"), b"not-a-jpeg").expect("jpg");
+        let copied = copy_app_private_from(std::slice::from_ref(&root), &dest).expect("copy");
+        assert_eq!(copied, 2);
+        assert!(dest.join("shared_prefs/token.xml").is_file());
+        assert!(dest.join("databases/app.db").is_file());
+        assert!(!dest.join("files/photo.jpg").exists());
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(dest);
+    }
+
+    #[test]
+    fn ranks_main_pid_before_service_processes() {
+        assert_eq!(crate::dump_guard::cmdline_dump_rank("pkg", "pkg"), 0);
+        assert_eq!(crate::dump_guard::cmdline_dump_rank("pkg", "pkg:push"), 1);
     }
 
     #[test]
@@ -2195,5 +3020,119 @@ mod tests {
         assert!(artifacts.iter().all(|row| row.source != "heap-blob"));
         assert!(artifacts.iter().all(|row| row.source != "memory-dex"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn catalog_keeps_writable_app_so_blobs() {
+        let dir = std::env::temp_dir().join(format!("ksight-so-blob-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let split = dir.join("apk-dex").join("split");
+        let blob = dir.join("runtime").join("blob-dex");
+        std::fs::create_dir_all(&split).expect("split");
+        std::fs::create_dir_all(&blob).expect("blob");
+        let mut dex = vec![0_u8; 2048];
+        dex[..8].copy_from_slice(b"dex\n035\0");
+        std::fs::write(split.join("blob-8-aaa_part00_0.dex"), &dex).expect("so blob");
+        std::fs::write(split.join("blob-8-bbb_part00_0.dex"), &dex).expect("vdex blob");
+        std::fs::write(
+            blob.join("8-aaa.json"),
+            r#"{"pid":8,"vma_start":1000,"vma_end":2000,"map_path":"/data/app/x/lib/arm64/libpayload.so","files":["blob-8-aaa_part00_0.dex"]}"#,
+        )
+        .expect("so json");
+        std::fs::write(
+            blob.join("8-bbb.json"),
+            r#"{"pid":8,"vma_start":3000,"vma_end":4000,"map_path":"/data/app/x/oat/arm64/base.vdex","files":["blob-8-bbb_part00_0.dex"]}"#,
+        )
+        .expect("vdex json");
+        std::fs::write(split.join("blob-8-ccc_part00_0.dex"), &dex).expect("memfd blob");
+        std::fs::write(
+            blob.join("8-ccc.json"),
+            r#"{"pid":8,"vma_start":5000,"vma_end":6000,"map_path":"/memfd:classes","files":["blob-8-ccc_part00_0.dex"]}"#,
+        )
+        .expect("memfd json");
+        let artifacts = catalog_dump(&dir);
+        let kept: Vec<_> = artifacts
+            .iter()
+            .filter(|row| row.source == "heap-blob")
+            .collect();
+        assert_eq!(kept.len(), 2);
+        assert!(kept
+            .iter()
+            .any(|row| { row.map_path.as_deref() == Some("/data/app/x/lib/arm64/libpayload.so") }));
+        assert!(kept
+            .iter()
+            .any(|row| row.map_path.as_deref() == Some("/memfd:classes")));
+        assert!(kept.iter().all(|row| {
+            row.map_path.as_deref().is_none_or(|path| {
+                std::path::Path::new(path)
+                    .extension()
+                    .is_none_or(|ext| !ext.eq_ignore_ascii_case("vdex"))
+            })
+        }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn art_file_open_joins_apk_dex_from_data_app() {
+        let mut loaders = vec![CodeLoaderEntry {
+            pid: 9,
+            order: 1,
+            role: "install".to_owned(),
+            origin: "art_open".to_owned(),
+            path: "/data/app/~~x==/pkg-y==/base.apk".to_owned(),
+            ..CodeLoaderEntry::default()
+        }];
+        let artifacts = vec![ksight_core::DumpArtifact {
+            kind: "dex".to_owned(),
+            source: "apk-dex".to_owned(),
+            relative_path: "apk-dex/classes.dex".to_owned(),
+            bytes: 128,
+            magic: "dex".to_owned(),
+            pid: None,
+            vma_start: None,
+            vma_end: None,
+            map_path: None,
+            dex_offset: None,
+            sha256: Some("abc".to_owned()),
+        }];
+        join_art_opens(&mut loaders, &artifacts);
+        assert_eq!(
+            loaders[0].joined_relative_path.as_deref(),
+            Some("apk-dex/classes.dex")
+        );
+        assert_eq!(loaders[0].joined_sha256.as_deref(), Some("abc"));
+        let joins = art_open_joins(&loaders, &artifacts);
+        assert_eq!(joins[0].2, "artifact:sha256:abc");
+    }
+
+    #[test]
+    fn art_memory_open_joins_containing_vma() {
+        let mut loaders = vec![CodeLoaderEntry {
+            pid: 4,
+            order: 1,
+            role: "in_memory".to_owned(),
+            origin: "art_open".to_owned(),
+            path: "memory:0x1200+64".to_owned(),
+            opened_bytes: Some(64),
+            ..CodeLoaderEntry::default()
+        }];
+        let artifacts = vec![ksight_core::DumpArtifact {
+            kind: "dex".to_owned(),
+            source: "heap-blob".to_owned(),
+            relative_path: "apk-dex/split/blob.dex".to_owned(),
+            bytes: 64,
+            magic: "dex".to_owned(),
+            pid: Some(4),
+            vma_start: Some(0x1000),
+            vma_end: Some(0x2000),
+            map_path: Some("[anon:scudo:secondary]".to_owned()),
+            dex_offset: Some(0),
+            sha256: Some("heap".to_owned()),
+        }];
+        join_art_opens(&mut loaders, &artifacts);
+        assert_eq!(
+            loaders[0].joined_relative_path.as_deref(),
+            Some("apk-dex/split/blob.dex")
+        );
     }
 }

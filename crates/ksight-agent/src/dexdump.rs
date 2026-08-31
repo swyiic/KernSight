@@ -4,7 +4,7 @@ use std::{
     fs::File,
     io::{Read as _, Seek as _, SeekFrom, Write as _},
     path::Path,
-    time::Instant,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 const MAX_REGION: u64 = 64 * 1024 * 1024;
@@ -32,6 +32,12 @@ pub struct LiveDump {
     pub key_slots: usize,
     /// DEX images harvested from payload-sized anonymous heaps.
     pub blob_dex: usize,
+    /// Adjacent same-path maps joined before a DEX copy.
+    pub stitched_spans: usize,
+    /// True when the target was `SIGSTOP`'d for the copy.
+    pub paused: bool,
+    /// Wall time of the paused copy window.
+    pub snapshot_ms: u64,
 }
 
 /// Scan mappings, open FDs, and loaded packer/gadget libraries.
@@ -41,19 +47,40 @@ pub fn dump_live_process(pid: u32, dest_dir: &Path, deadline: Instant) -> LiveDu
     let _ = std::fs::create_dir_all(dest_dir);
     let _ = std::fs::create_dir_all(dest_dir.join("repaired"));
     let maps_path = format!("/proc/{pid}/maps");
-    if let Ok(maps) = std::fs::read_to_string(&maps_path) {
-        let _ = std::fs::write(dest_dir.join(format!("maps-{pid}.txt")), maps.as_bytes());
+    let maps_text = std::fs::read_to_string(&maps_path).unwrap_or_default();
+    if !maps_text.is_empty() {
+        let _ = std::fs::write(
+            dest_dir.join(format!("maps-{pid}.txt")),
+            maps_text.as_bytes(),
+        );
     }
-    let mut dump = LiveDump::default();
-    let memory = dump_process_dex(pid, dest_dir, deadline);
+    let maps = parse_maps(&maps_text);
+    write_mapped_code(pid, dest_dir, &maps);
+    let pause = StoppedProcess::enter(pid);
+    let started = Instant::now();
+    let mut dump = LiveDump {
+        paused: pause.active,
+        ..LiveDump::default()
+    };
+    let memory = dump_process_dex_from_maps(pid, dest_dir, deadline, &maps);
     dump.memory_images = memory.dex;
     dump.vdex_images = memory.vdex;
+    dump.stitched_spans = dump.stitched_spans.saturating_add(memory.stitched);
     dump.fd_images = dump_process_fds(pid, dest_dir, deadline);
+    write_open_code(pid, dest_dir);
     dump.native_libs = dump_loaded_sos(pid, dest_dir, deadline);
-    dump.packer_regions = dump_packer_regions(pid, dest_dir, deadline);
-    dump.key_slots = dump_followed_keys(pid, dest_dir, deadline);
+    let packer = maps_have_packer_so(&maps);
+    if packer {
+        dump.packer_regions = dump_packer_regions(pid, dest_dir, deadline);
+        dump.key_slots = dump_followed_keys(pid, dest_dir, deadline);
+    }
     dump.plaintext_windows = dump_plaintext_windows(pid, dest_dir, deadline);
-    dump.blob_dex = dump_payload_blobs(pid, dest_dir, 0);
+    let harvest = harvest_payload_blobs(pid, dest_dir, &maps, 0);
+    dump.blob_dex = harvest.dex;
+    dump.stitched_spans = dump.stitched_spans.saturating_add(harvest.stitched);
+    dump.snapshot_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    drop(pause);
+    write_snapshot_sidecar(pid, dest_dir, &dump);
     dump
 }
 
@@ -82,9 +109,16 @@ pub fn poll_followed_keys(pid: u32, dest_dir: &Path, seq: u32) -> KeyPoll {
 /// Writes raw `mem-<pid>-<start>.dex` (or `.vdex`) plus a repaired copy under `repaired/`.
 #[must_use]
 pub fn dump_process_dex(pid: u32, dest_dir: &Path, deadline: Instant) -> MemoryDump {
-    let Ok(maps) = std::fs::read_to_string(format!("/proc/{pid}/maps")) else {
-        return MemoryDump::default();
-    };
+    let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap_or_default();
+    dump_process_dex_from_maps(pid, dest_dir, deadline, &parse_maps(&maps))
+}
+
+fn dump_process_dex_from_maps(
+    pid: u32,
+    dest_dir: &Path,
+    deadline: Instant,
+    maps: &[MapRow],
+) -> MemoryDump {
     let Ok(mut mem) = File::open(format!("/proc/{pid}/mem")) else {
         return MemoryDump::default();
     };
@@ -92,44 +126,49 @@ pub fn dump_process_dex(pid: u32, dest_dir: &Path, deadline: Instant) -> MemoryD
     let repaired_dir = dest_dir.join("repaired");
     let _ = std::fs::create_dir_all(&repaired_dir);
     let mut dumped = MemoryDump::default();
-    for line in maps.lines() {
+    for (index, row) in maps.iter().enumerate() {
         if Instant::now() >= deadline {
             break;
         }
-        let Some((start, end, perms, path)) = parse_map_line(line) else {
-            continue;
-        };
-        if !perms.contains('r') {
+        if !row.perms.contains('r') {
             continue;
         }
-        let len = end.saturating_sub(start);
-        if len < u64::try_from(MIN_DEX).unwrap_or(0x70) || len > MAX_REGION {
+        let len = row.end.saturating_sub(row.start);
+        if len < u64::try_from(MIN_DEX).unwrap_or(0x70) {
             continue;
         }
-        if !mapping_worth_reading(path, len, perms) {
+        if !mapping_worth_reading(&row.path, len, &row.perms) {
             continue;
         }
-        let search = search_window(path, perms, len);
-        let Some((magic_at, magic)) = find_container_magic(&mut mem, start, search) else {
+        let search = search_window(&row.path, &row.perms, len);
+        let Some((magic_at, magic)) = find_container_magic(&mut mem, row.start, search) else {
             continue;
         };
         let kind = container_kind(&magic);
+        let span_end = extend_span(maps, index, false, MAX_REGION);
+        if span_end > row.end {
+            dumped.stitched = dumped.stitched.saturating_add(1);
+        }
+        let available = span_end.saturating_sub(magic_at);
         let want = match kind {
             ContainerKind::Dex | ContainerKind::Cdex => {
-                let declared = peek_declared_size(&mut mem, magic_at).unwrap_or(len);
+                let declared = peek_declared_size(&mut mem, magic_at).unwrap_or(available);
                 if declared > MAX_DECLARED {
                     continue;
                 }
                 declared
                     .max(u64::try_from(MIN_DEX).unwrap_or(0x70))
-                    .min(len.saturating_sub(magic_at.saturating_sub(start)))
+                    .min(available)
                     .min(MAX_REGION)
             }
-            ContainerKind::Vdex => len.min(MAX_REGION).min(96 * 1024 * 1024),
+            ContainerKind::Vdex => available.min(MAX_REGION).min(96 * 1024 * 1024),
         };
         let Some(bytes) = read_region(&mut mem, magic_at, want) else {
             continue;
         };
+        if matches!(kind, ContainerKind::Dex | ContainerKind::Cdex) && bytes.len() < 1024 {
+            continue;
+        }
         let ext = match kind {
             ContainerKind::Vdex => "vdex",
             ContainerKind::Cdex => "cdex",
@@ -138,7 +177,10 @@ pub fn dump_process_dex(pid: u32, dest_dir: &Path, deadline: Instant) -> MemoryD
         let name = format!("mem-{pid}-{magic_at:x}.{ext}");
         let raw = dest_dir.join(&name);
         if raw.exists() {
-            continue;
+            let existing = raw.metadata().map(|meta| meta.len()).unwrap_or(0);
+            if existing >= u64::try_from(bytes.len()).unwrap_or(0) {
+                continue;
+            }
         }
         if File::create(&raw)
             .and_then(|mut file| file.write_all(&bytes))
@@ -168,6 +210,8 @@ pub struct MemoryDump {
     pub dex: usize,
     /// VDEX images.
     pub vdex: usize,
+    /// Copies that read past the original VMA into an adjacent same-path map.
+    pub stitched: usize,
 }
 
 /// PIDs whose cmdline starts with `package` or `package:`.
@@ -197,7 +241,7 @@ pub fn pids_for_package(package: &str) -> Vec<u32> {
     pids
 }
 
-const PLAINTEXT_NEEDLES: [&[u8]; 8] = [
+const PLAINTEXT_NEEDLES: [&[u8]; 7] = [
     b"HTTP/1.",
     b"POST /",
     b"GET /",
@@ -205,7 +249,6 @@ const PLAINTEXT_NEEDLES: [&[u8]; 8] = [
     b"\"password\"",
     b"\"token\"",
     b"Authorization:",
-    b"https://",
 ];
 const PLAINTEXT_WINDOW: usize = 2048;
 const PLAINTEXT_CAP: usize = 32;
@@ -236,11 +279,15 @@ fn dump_plaintext_windows(pid: u32, dest_dir: &Path, deadline: Instant) -> usize
         {
             continue;
         }
-        if !(path.is_empty() || path.starts_with('[') || path.starts_with("anon:")) {
+        let lower = path.to_ascii_lowercase();
+        let packer_heap = lower.contains("scudo:secondary")
+            || path.is_empty()
+            || (path.starts_with('[') && !lower.contains("dalvik") && !lower.contains("stack"));
+        if !packer_heap {
             continue;
         }
         let len = end.saturating_sub(start).min(8 * 1024 * 1024);
-        if len < 4096 {
+        if len < 64 * 1024 {
             continue;
         }
         let Some(bytes) = read_region(&mut mem, start, len) else {
@@ -359,7 +406,6 @@ fn dump_packer_regions(pid: u32, dest_dir: &Path, deadline: Instant) -> usize {
 const KEY_SLOT_BYTES: u64 = 128;
 const KEY_HEAP_CAP: u64 = 512 * 1024;
 const MAX_KEY_SLOTS: usize = 32;
-const DEXHELPER_GOT_OFFSET: u64 = 0xf3c10;
 
 fn dump_followed_keys(pid: u32, dest_dir: &Path, deadline: Instant) -> usize {
     let Ok(maps_text) = std::fs::read_to_string(format!("/proc/{pid}/maps")) else {
@@ -381,27 +427,11 @@ fn dump_followed_keys(pid: u32, dest_dir: &Path, deadline: Instant) -> usize {
     let mut seen_maps = Vec::<u64>::new();
     let mut candidates = Vec::<u64>::new();
 
-    for (start, end, perms, path) in &maps {
-        if packer_got_candidate(path, perms) {
-            if let Some(offset) = map_file_offset(&maps_text, *start) {
-                if offset == 0 {
-                    candidates.push(start.saturating_add(DEXHELPER_GOT_OFFSET));
-                }
-            }
-        }
-        if path.contains("anon:.bss")
-            || (crate::file::is_interesting_native(path)
-                && perms.contains('w')
-                && !perms.contains('x'))
-        {
-            let len = end.saturating_sub(*start);
-            if len == 0 || len > PACKER_REGION_CAP {
-                continue;
-            }
-            if let Some(bytes) = read_region(&mut mem, *start, len) {
-                collect_pointers(&bytes, &maps, &mut candidates);
-            }
-        }
+    if maps
+        .iter()
+        .any(|(_, _, _, path)| crate::file::is_interesting_native(path))
+    {
+        collect_packer_pointers(&mut mem, &maps, &mut candidates);
     }
 
     candidates.sort_unstable();
@@ -448,34 +478,28 @@ fn snapshot_dexhelper_keys(pid: u32, dest_dir: &Path, seq: u32) -> KeyPoll {
     let Ok(mut mem) = File::open(format!("/proc/{pid}/mem")) else {
         return KeyPoll::default();
     };
-    let maps: Vec<(u64, u64, String, String)> = maps_text
-        .lines()
-        .filter_map(|line| {
-            let (start, end, perms, path) = parse_map_line(line)?;
-            Some((start, end, perms.to_owned(), path.to_owned()))
-        })
-        .collect();
+    let maps = parse_maps(&maps_text);
+    let key_maps = maps
+        .iter()
+        .map(|row| (row.start, row.end, row.perms.clone(), row.path.clone()))
+        .collect::<Vec<_>>();
     let key_dir = dest_dir.join("packer-keys");
     let _ = std::fs::create_dir_all(&key_dir);
     let probes = load_cipher_probes(dest_dir);
     let mut poll = KeyPoll {
-        blob_dex: harvest_payload_blobs(pid, dest_dir, &maps, &mut mem, seq),
+        blob_dex: harvest_payload_blobs(pid, dest_dir, &maps, seq).dex,
         ..KeyPoll::default()
     };
     let mut got_addrs = Vec::<u64>::new();
-    for (start, _end, perms, path) in &maps {
-        if !packer_got_candidate(path, perms) {
-            continue;
-        }
-        let Some(offset) = map_file_offset(&maps_text, *start) else {
-            continue;
-        };
-        if offset == 0 {
-            got_addrs.push(start.saturating_add(DEXHELPER_GOT_OFFSET));
-        }
+    if key_maps
+        .iter()
+        .any(|(_, _, _, path)| crate::file::is_interesting_native(path))
+    {
+        collect_packer_pointers(&mut mem, &key_maps, &mut got_addrs);
     }
     got_addrs.sort_unstable();
     got_addrs.dedup();
+    got_addrs.truncate(MAX_KEY_SLOTS);
     if seq == 0 && !probes.is_empty() {
         if let Some(first) = probes.first() {
             let _ = std::fs::write(key_dir.join("cipher-probe.bin"), first);
@@ -483,22 +507,17 @@ fn snapshot_dexhelper_keys(pid: u32, dest_dir: &Path, seq: u32) -> KeyPoll {
     }
     let mut got_live = false;
     for got in &got_addrs {
-        let Some(word) = read_region(&mut mem, *got, 16) else {
-            continue;
-        };
-        let path = key_dir.join(format!("got-{pid}-{seq:04}-{got:x}.bin"));
-        if std::fs::write(&path, &word).is_ok() {
+        let word = got.to_le_bytes();
+        let path = key_dir.join(format!("ptr-{pid}-{seq:04}-{got:x}.bin"));
+        if std::fs::write(&path, word).is_ok() {
             poll.dumped = poll.dumped.saturating_add(1);
         }
-        if word.len() >= 8 {
-            let ptr = u64::from_le_bytes(word[0..8].try_into().unwrap_or([0; 8]));
-            got_live = got_live || looks_like_heap_ptr(ptr);
-        }
+        got_live = got_live || looks_like_heap_ptr(*got);
         poll.dumped = poll.dumped.saturating_add(dump_ptr_chain(
-            &mut mem, &maps, &key_dir, pid, seq, &word, 0,
+            &mut mem, &key_maps, &key_dir, pid, seq, &word, 0,
         ));
         if got_live {
-            if let Some((at, bytes)) = read_heap_around_ptr(&mut mem, &maps, &word) {
+            if let Some((at, bytes)) = read_heap_around_ptr(&mut mem, &key_maps, &word) {
                 if poll.recovered_key.is_none() && !probes.is_empty() {
                     if let Some(probe) = probes.first() {
                         if probe.len() >= 16 {
@@ -517,7 +536,7 @@ fn snapshot_dexhelper_keys(pid: u32, dest_dir: &Path, seq: u32) -> KeyPoll {
     }
     if poll.recovered_key.is_none() && !probes.is_empty() && !got_addrs.is_empty() {
         poll.recovered_key =
-            live_scan_key_maps(&mut mem, &maps, &probes, &got_addrs, &key_dir, pid, seq);
+            live_scan_key_maps(&mut mem, &key_maps, &probes, &got_addrs, &key_dir, pid, seq);
         poll.dumped = poll.dumped.saturating_add(1);
     }
     if let Some(key) = poll.recovered_key {
@@ -528,53 +547,29 @@ fn snapshot_dexhelper_keys(pid: u32, dest_dir: &Path, seq: u32) -> KeyPoll {
 
 const PAYLOAD_BLOB_MIN: u64 = 4 * 1024 * 1024;
 const PAYLOAD_BLOB_MAX: u64 = 160 * 1024 * 1024;
+const APP_FILE_BLOB_MIN: u64 = 512 * 1024;
+const BLOB_PEEK_MAX: u64 = 16 * 1024 * 1024;
+const BLOB_CANDIDATE_CAP: usize = 16;
 
-fn dump_payload_blobs(pid: u32, dest_dir: &Path, seq: u32) -> usize {
-    let Ok(maps_text) = std::fs::read_to_string(format!("/proc/{pid}/maps")) else {
-        return 0;
-    };
+fn harvest_payload_blobs(pid: u32, dest_dir: &Path, maps: &[MapRow], seq: u32) -> HarvestStats {
     let Ok(mut mem) = File::open(format!("/proc/{pid}/mem")) else {
-        return 0;
+        return HarvestStats::default();
     };
-    let maps: Vec<(u64, u64, String, String)> = maps_text
-        .lines()
-        .filter_map(|line| {
-            let (start, end, perms, path) = parse_map_line(line)?;
-            Some((start, end, perms.to_owned(), path.to_owned()))
-        })
-        .collect();
-    harvest_payload_blobs(pid, dest_dir, &maps, &mut mem, seq)
-}
-
-fn harvest_payload_blobs(
-    pid: u32,
-    dest_dir: &Path,
-    maps: &[(u64, u64, String, String)],
-    mem: &mut File,
-    seq: u32,
-) -> usize {
     let hints = apk_blob_sizes(dest_dir);
-    let mut candidates = Vec::<(u64, u64, u64, String)>::new();
-    for (start, end, perms, path) in maps {
-        let len = end.saturating_sub(*start);
-        if !is_payload_blob_map(path, perms, len, &hints) {
-            continue;
+    let spans = harvest_spans(maps, &hints);
+    let mut stats = HarvestStats::default();
+    for (class, dist, start, len, map_path, stitched) in spans.into_iter().take(BLOB_CANDIDATE_CAP)
+    {
+        let _ = (class, dist);
+        let written = harvest_one_blob(
+            &mut mem, dest_dir, pid, start, len, seq, &map_path, stitched,
+        );
+        stats.dex = stats.dex.saturating_add(written);
+        if written > 0 && stitched > 1 {
+            stats.stitched = stats.stitched.saturating_add(1);
         }
-        let dist = hints
-            .iter()
-            .map(|hint| len.abs_diff(*hint))
-            .min()
-            .unwrap_or(len);
-        candidates.push((dist, *start, len, path.clone()));
     }
-    candidates.sort_unstable();
-    let mut harvested = 0_usize;
-    for (_, start, len, map_path) in candidates.into_iter().take(12) {
-        harvested = harvested.saturating_add(harvest_one_blob(
-            mem, dest_dir, pid, start, len, seq, &map_path,
-        ));
-    }
-    harvested
+    stats
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -586,6 +581,7 @@ fn harvest_one_blob(
     len: u64,
     seq: u32,
     map_path: &str,
+    vma_count: u32,
 ) -> usize {
     let parent = dest_dir.parent().unwrap_or(dest_dir);
     let marker = dest_dir
@@ -594,7 +590,7 @@ fn harvest_one_blob(
     if marker.exists() {
         return 0;
     }
-    let peek_len = len.min(1024 * 1024);
+    let peek_len = len.min(BLOB_PEEK_MAX);
     let Some(peek) = read_region(mem, start, peek_len) else {
         return 0;
     };
@@ -633,6 +629,7 @@ fn harvest_one_blob(
             "bytes": bytes.len(),
             "slices": written,
             "files": files,
+            "vma_count": vma_count.max(1),
         });
         let json_path = dest_dir
             .join("blob-dex")
@@ -689,11 +686,21 @@ fn apk_blob_sizes(runtime_dir: &Path) -> Vec<u64> {
     sizes
 }
 
+fn is_harvestable_blob_map(path: &str, perms: &str, len: u64, hints: &[u64]) -> bool {
+    if skip_blob_noise(path) {
+        return false;
+    }
+    if is_payload_blob_map(path, perms, len, hints) {
+        return true;
+    }
+    is_writable_app_file_blob(path, perms, len)
+}
+
 fn is_payload_blob_map(path: &str, perms: &str, len: u64, hints: &[u64]) -> bool {
     if !perms.contains('r') || !perms.contains('w') {
         return false;
     }
-    if path.starts_with('/') {
+    if maps_path_for_match(path).starts_with('/') {
         return false;
     }
     if skip_art_heap(path) {
@@ -702,44 +709,162 @@ fn is_payload_blob_map(path: &str, perms: &str, len: u64, hints: &[u64]) -> bool
     blob_len_matches(len, hints)
 }
 
-fn skip_art_heap(path: &str) -> bool {
+/// Writable app-private file overlay (`MAP_PRIVATE` `.so`/`.jar`/`memfd`, not vdex).
+fn is_writable_app_file_blob(path: &str, perms: &str, len: u64) -> bool {
+    perms.contains('r')
+        && perms.contains('w')
+        && is_app_private_path(path)
+        && !is_installer_code_file(path)
+        && !skip_art_heap(path)
+        && (APP_FILE_BLOB_MIN..=PAYLOAD_BLOB_MAX).contains(&len)
+}
+
+fn maps_path_for_match(path: &str) -> &str {
+    path.strip_suffix(" (deleted)")
+        .or_else(|| path.strip_suffix("(deleted)"))
+        .unwrap_or(path)
+        .trim()
+}
+
+fn is_os_image_path(path: &str) -> bool {
+    let lower = maps_path_for_match(path).to_ascii_lowercase();
+    lower.starts_with("/system/")
+        || lower.starts_with("/apex/")
+        || lower.starts_with("/vendor/")
+        || lower.starts_with("/dev/")
+        || lower.contains("/dalvik-cache/")
+}
+
+fn is_installer_code_file(path: &str) -> bool {
+    Path::new(maps_path_for_match(path))
+        .extension()
+        .is_some_and(|ext| {
+            ext.eq_ignore_ascii_case("vdex")
+                || ext.eq_ignore_ascii_case("oat")
+                || ext.eq_ignore_ascii_case("art")
+                || ext.eq_ignore_ascii_case("apk")
+                || ext.eq_ignore_ascii_case("odex")
+        })
+}
+
+fn is_app_private_path(path: &str) -> bool {
+    let path = maps_path_for_match(path);
+    if path.is_empty() || is_os_image_path(path) {
+        return false;
+    }
     let lower = path.to_ascii_lowercase();
+    lower.starts_with("/data/app/")
+        || lower.starts_with("/data/app-")
+        || lower.starts_with("/data/data/")
+        || lower.starts_with("/data/user/")
+        || lower.starts_with("/data/user_de/")
+        || lower.starts_with("/mnt/expand/")
+        || lower.starts_with("/mnt/user/")
+        || lower.starts_with("/memfd:")
+}
+
+fn path_is_native_so(path: &str) -> bool {
+    Path::new(maps_path_for_match(path))
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("so"))
+}
+
+/// Keep a heap-blob whose `map_path` is anonymous or an app-private overlay.
+#[must_use]
+pub(crate) fn keep_heap_blob_map_path(path: &str) -> bool {
+    let path = maps_path_for_match(path);
+    if !path.starts_with('/') {
+        return true;
+    }
+    is_app_private_path(path) && !is_installer_code_file(path)
+}
+
+fn skip_blob_noise(path: &str) -> bool {
+    let lower = maps_path_for_match(path).to_ascii_lowercase();
+    lower.contains("[stack")
+        || lower.contains("stack_and_tls")
+        || lower.contains("bitmap")
+        || lower.contains("card table")
+        || lower.contains("compaction buffers")
+}
+
+pub(crate) fn blob_map_class(path: &str) -> u8 {
+    let lower = maps_path_for_match(path).to_ascii_lowercase();
+    if lower.contains("scudo:secondary") {
+        0
+    } else if (path_is_native_so(path) && is_app_private_path(path))
+        || (lower.starts_with("/memfd:") && !lower.contains("jit"))
+    {
+        1
+    } else if path.is_empty()
+        || path == "[anon]"
+        || lower.contains("anon:.bss")
+        || (path.starts_with("[anon]") && !lower.contains("dalvik"))
+    {
+        2
+    } else if is_app_private_path(path) {
+        3
+    } else if lower.contains("scudo") {
+        4
+    } else {
+        5
+    }
+}
+
+fn skip_art_heap(path: &str) -> bool {
+    let lower = maps_path_for_match(path).to_ascii_lowercase();
     lower.starts_with("/system/")
         || lower.starts_with("/apex/")
         || lower.starts_with("/vendor/")
         || lower.contains("dalvik")
         || lower.contains("jit-cache")
+        || lower.starts_with("/memfd:jit")
         || lower.contains("stack_and_tls")
         || lower.contains("primary_reserve")
 }
 
-fn blob_len_matches(len: u64, hints: &[u64]) -> bool {
-    if !(PAYLOAD_BLOB_MIN..=PAYLOAD_BLOB_MAX).contains(&len) {
-        return false;
-    }
-    if hints.is_empty() {
-        return true;
-    }
-    hints.iter().any(|hint| {
-        if *hint < PAYLOAD_BLOB_MIN {
-            return false;
-        }
-        let lo = (*hint / 2).max(PAYLOAD_BLOB_MIN);
-        let hi = hint.saturating_mul(2).clamp(lo, PAYLOAD_BLOB_MAX);
-        (lo..=hi).contains(&len)
-    })
+fn blob_len_matches(len: u64, _hints: &[u64]) -> bool {
+    (PAYLOAD_BLOB_MIN..=PAYLOAD_BLOB_MAX).contains(&len)
+}
+
+fn is_instrumentation_so(path: &str) -> bool {
+    let lower = maps_path_for_match(path).to_ascii_lowercase();
+    lower.contains("frida")
+        || lower.contains("gadget")
+        || lower.contains("xposed")
+        || lower.contains("substrate")
 }
 
 fn packer_got_candidate(path: &str, perms: &str) -> bool {
-    if !perms.contains('x') {
+    perms.contains('x') && crate::file::is_interesting_native(path) && !is_instrumentation_so(path)
+}
+
+fn maps_have_packer_so(maps: &[MapRow]) -> bool {
+    maps.iter()
+        .any(|row| crate::file::is_interesting_native(&row.path))
+}
+
+fn should_scan_for_keys(
+    path: &str,
+    perms: &str,
+    start: u64,
+    maps: &[(u64, u64, String, String)],
+) -> bool {
+    if is_instrumentation_so(path) {
         return false;
     }
-    let lower = path.to_ascii_lowercase();
-    crate::file::is_interesting_native(path)
-        && (lower.contains("dexhelper")
-            || lower.contains("dexjni")
-            || lower.contains("secneo")
-            || lower.contains("apkwrapper"))
+    if packer_got_candidate(path, perms)
+        || (crate::file::is_interesting_native(path) && perms.contains('r'))
+    {
+        return true;
+    }
+    if !path.contains("anon:.bss") || !perms.contains('w') {
+        return false;
+    }
+    maps.iter().any(|(map_start, map_end, _, map_path)| {
+        crate::file::is_interesting_native(map_path)
+            && (start.abs_diff(*map_end) < 0x4_0000 || start.abs_diff(*map_start) < 0x4_0000)
+    })
 }
 
 fn load_cipher_probes(runtime_dir: &Path) -> Vec<Vec<u8>> {
@@ -829,15 +954,11 @@ fn scan_got_if_live(
     pid: u32,
     seq: u32,
 ) -> Option<[u8; 16]> {
-    let got = *got_addrs.first()?;
-    let word = read_region(mem, got, 16)?;
-    if word.len() < 8 {
-        return None;
-    }
-    let ptr = u64::from_le_bytes(word[0..8].try_into().unwrap_or([0; 8]));
+    let ptr = *got_addrs.first()?;
     if !looks_like_heap_ptr(ptr) {
         return None;
     }
+    let word = ptr.to_le_bytes();
     let (at, bytes) = read_heap_around_ptr(mem, maps, &word)?;
     let key = scan_ptr_window(&bytes, at, &word, cipher)?;
     let hit = key_dir.join(format!("poll-hit-{pid}-{seq:04}-{ptr:x}.bin"));
@@ -973,23 +1094,35 @@ fn dump_ptr_chain(
 }
 
 fn looks_like_heap_ptr(value: u64) -> bool {
-    (0x6_0000_0000..=0x00ff_ffff_ffff).contains(&value)
+    if value < 0x1000 {
+        return false;
+    }
+    if value <= 0xbfff_ffff {
+        return true;
+    }
+    (0x1_0000_0000..=0x0000_7fff_ffff_ffff).contains(&value)
 }
 
-fn map_file_offset(maps: &str, start: u64) -> Option<u64> {
-    for line in maps.lines() {
-        let mut fields = line.split_whitespace();
-        let range = fields.next()?;
-        let (a, _) = range.split_once('-')?;
-        let mapped = u64::from_str_radix(a, 16).ok()?;
-        if mapped != start {
+fn collect_packer_pointers(
+    mem: &mut File,
+    maps: &[(u64, u64, String, String)],
+    out: &mut Vec<u64>,
+) {
+    for (start, end, perms, path) in maps {
+        if !perms.contains('r') {
             continue;
         }
-        let _perms = fields.next()?;
-        let offset = fields.next()?;
-        return u64::from_str_radix(offset, 16).ok();
+        if !should_scan_for_keys(path, perms, *start, maps) {
+            continue;
+        }
+        let len = end.saturating_sub(*start);
+        if len == 0 || len > PACKER_REGION_CAP {
+            continue;
+        }
+        if let Some(bytes) = read_region(mem, *start, len) {
+            collect_pointers(&bytes, maps, out);
+        }
     }
-    None
 }
 
 fn collect_pointers(bytes: &[u8], maps: &[(u64, u64, String, String)], out: &mut Vec<u64>) {
@@ -997,7 +1130,7 @@ fn collect_pointers(bytes: &[u8], maps: &[(u64, u64, String, String)], out: &mut
     while offset.saturating_add(8) <= bytes.len() {
         let ptr = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap_or([0; 8]));
         offset = offset.saturating_add(8);
-        if !(0x6_0000_0000..=0x00ff_ffff_ffff).contains(&ptr) {
+        if !looks_like_heap_ptr(ptr) {
             continue;
         }
         let mapped = maps.iter().any(|(start, end, perms, path)| {
@@ -1174,17 +1307,27 @@ fn dump_loaded_sos(pid: u32, dest_dir: &Path, deadline: Instant) -> usize {
     let _ = std::fs::create_dir_all(&so_dir);
     let mut seen = Vec::<String>::new();
     let mut dumped = 0_usize;
+    let mut extracted_apk = Vec::<String>::new();
     for line in maps.lines() {
         if Instant::now() >= deadline {
             break;
         }
-        let Some((start, end, _perms, path)) = parse_map_line(line) else {
+        let Some((start, end, perms, path)) = parse_map_line(line) else {
             continue;
         };
-        if path.is_empty()
-            || !Path::new(path)
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("so"))
+        if path.is_empty() {
+            continue;
+        }
+        if apk_embedded_native(path, perms) {
+            if !extracted_apk.iter().any(|existing| existing == path) {
+                extracted_apk.push(path.to_owned());
+                dumped = dumped.saturating_add(extract_mapped_apk_native(path, &so_dir, pid));
+            }
+            continue;
+        }
+        if !Path::new(path)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("so"))
         {
             continue;
         }
@@ -1220,6 +1363,47 @@ fn dump_loaded_sos(pid: u32, dest_dir: &Path, deadline: Instant) -> usize {
         }
     }
     dumped
+}
+
+fn apk_embedded_native(path: &str, perms: &str) -> bool {
+    if !perms.contains('x') || !path.starts_with("/data/app/") {
+        return false;
+    }
+    let lower = path.to_ascii_lowercase();
+    if lower.contains("webview") || lower.contains("trichrome") {
+        return false;
+    }
+    Path::new(path)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("apk"))
+}
+
+fn extract_mapped_apk_native(apk: &str, so_dir: &Path, pid: u32) -> usize {
+    let lower = apk.to_ascii_lowercase();
+    if !lower.contains("split_config.arm64") && !lower.contains("base.apk") {
+        return 0;
+    }
+    let Ok(extracted) = ksight_core::extract_apk_native_libs(Path::new(apk), so_dir) else {
+        return 0;
+    };
+    let mut renamed = 0_usize;
+    for file in extracted {
+        let src = so_dir.join(&file.output_name);
+        let name = Path::new(&file.output_name)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("lib.so");
+        let dest = so_dir.join(format!("{pid}-{name}"));
+        if dest.exists() {
+            let _ = std::fs::remove_file(&src);
+            continue;
+        }
+        if std::fs::rename(&src, &dest).is_ok() || std::fs::copy(&src, &dest).is_ok() {
+            renamed = renamed.saturating_add(1);
+        }
+        let _ = std::fs::remove_file(&src);
+    }
+    renamed
 }
 
 fn copy_capped(input: &mut File, dest: &Path, max_bytes: u64) -> std::io::Result<u64> {
@@ -1367,7 +1551,7 @@ fn peek_declared_size(mem: &mut File, magic_at: u64) -> Option<u64> {
     Some(u64::from(u32::from_le_bytes(size)))
 }
 
-fn read_region(mem: &mut File, start: u64, want: u64) -> Option<Vec<u8>> {
+pub(crate) fn read_region(mem: &mut File, start: u64, want: u64) -> Option<Vec<u8>> {
     let len = usize::try_from(want).ok()?;
     if len < 4 {
         return None;
@@ -1385,6 +1569,374 @@ enum ContainerKind {
     Dex,
     Cdex,
     Vdex,
+}
+
+#[derive(Debug, Clone, Default)]
+struct HarvestStats {
+    dex: usize,
+    stitched: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct MapRow {
+    pub(crate) start: u64,
+    pub(crate) end: u64,
+    pub(crate) perms: String,
+    pub(crate) path: String,
+    pub(crate) inode: u64,
+}
+
+pub(crate) fn parse_maps(text: &str) -> Vec<MapRow> {
+    text.lines()
+        .filter_map(|line| {
+            let (start, end, perms, path) = parse_map_line(line)?;
+            Some(MapRow {
+                start,
+                end,
+                perms: perms.to_owned(),
+                path: path.to_owned(),
+                inode: parse_map_inode(line).unwrap_or(0),
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn extend_span(maps: &[MapRow], index: usize, need_write: bool, max_len: u64) -> u64 {
+    let origin = maps[index].start;
+    let key = maps_path_for_match(&maps[index].path);
+    let mut end = maps[index].end;
+    for next in maps.iter().skip(index.saturating_add(1)) {
+        if next.start != end {
+            break;
+        }
+        if !next.perms.contains('r') {
+            break;
+        }
+        if need_write && !next.perms.contains('w') {
+            break;
+        }
+        if maps_path_for_match(&next.path) != key {
+            break;
+        }
+        if skip_blob_noise(&next.path) || skip_art_heap(&next.path) {
+            break;
+        }
+        if next.end.saturating_sub(origin) > max_len {
+            break;
+        }
+        end = next.end;
+    }
+    end
+}
+
+pub(crate) fn can_join_harvest(row: &MapRow) -> bool {
+    if skip_blob_noise(&row.path) || skip_art_heap(&row.path) {
+        return false;
+    }
+    if !row.perms.contains('r') || !row.perms.contains('w') {
+        return false;
+    }
+    let path = maps_path_for_match(&row.path);
+    if path.starts_with('/') {
+        return is_app_private_path(path) && !is_installer_code_file(path);
+    }
+    true
+}
+
+fn harvest_spans(maps: &[MapRow], hints: &[u64]) -> Vec<(u8, u64, u64, u64, String, u32)> {
+    let mut spans = Vec::new();
+    let mut index = 0_usize;
+    while index < maps.len() {
+        if !can_join_harvest(&maps[index]) {
+            index = index.saturating_add(1);
+            continue;
+        }
+        let start = maps[index].start;
+        let span_end = extend_span(maps, index, true, PAYLOAD_BLOB_MAX);
+        let len = span_end.saturating_sub(start);
+        let mut count = 0_u32;
+        let mut next = index;
+        while next < maps.len() && maps[next].start < span_end && maps[next].end <= span_end {
+            count = count.saturating_add(1);
+            next = next.saturating_add(1);
+        }
+        if is_harvestable_blob_map(&maps[index].path, &maps[index].perms, len, hints) {
+            let dist = if is_app_private_path(&maps[index].path) {
+                0
+            } else {
+                hints
+                    .iter()
+                    .map(|hint| len.abs_diff(*hint))
+                    .min()
+                    .unwrap_or(len)
+            };
+            spans.push((
+                blob_map_class(&maps[index].path),
+                dist,
+                start,
+                len,
+                maps[index].path.clone(),
+                count.max(1),
+            ));
+        }
+        index = next.max(index.saturating_add(1));
+    }
+    spans.sort_unstable();
+    spans
+}
+
+pub(crate) struct StoppedProcess {
+    pid: i32,
+    pub(crate) active: bool,
+}
+
+impl StoppedProcess {
+    pub(crate) fn inert() -> Self {
+        Self {
+            pid: -1,
+            active: false,
+        }
+    }
+
+    pub(crate) fn enter(pid: u32) -> Self {
+        let raw = i32::try_from(pid).unwrap_or(-1);
+        if raw <= 1 || pid == std::process::id() {
+            return Self::inert();
+        }
+        #[cfg(any(target_os = "android", target_os = "linux"))]
+        {
+            let active = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(raw),
+                nix::sys::signal::Signal::SIGSTOP,
+            )
+            .is_ok();
+            Self { pid: raw, active }
+        }
+        #[cfg(not(any(target_os = "android", target_os = "linux")))]
+        Self {
+            pid: raw,
+            active: false,
+        }
+    }
+}
+
+impl Drop for StoppedProcess {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        #[cfg(any(target_os = "android", target_os = "linux"))]
+        {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(self.pid),
+                nix::sys::signal::Signal::SIGCONT,
+            );
+        }
+        #[cfg(not(any(target_os = "android", target_os = "linux")))]
+        {
+            let _ = self.pid;
+        }
+    }
+}
+
+fn write_mapped_code(pid: u32, dest_dir: &Path, maps: &[MapRow]) {
+    let mut rows = Vec::new();
+    let mut loaders = Vec::<serde_json::Value>::new();
+    let mut order = 0_u32;
+    let mut loader_order = 0_u32;
+    for row in maps {
+        if is_mapped_code_path(&row.path) {
+            order = order.saturating_add(1);
+            rows.push(serde_json::json!({
+                "pid": pid,
+                "order": order,
+                "start": row.start,
+                "end": row.end,
+                "perms": row.perms,
+                "path": row.path,
+            }));
+        }
+        if let Some(role) = code_loader_role(&row.path) {
+            let path = maps_path_for_match(&row.path);
+            if loaders
+                .iter()
+                .any(|row| row.get("path").and_then(serde_json::Value::as_str) == Some(path))
+            {
+                continue;
+            }
+            loader_order = loader_order.saturating_add(1);
+            loaders.push(serde_json::json!({
+                "pid": pid,
+                "order": loader_order,
+                "role": role,
+                "origin": "maps",
+                "path": maps_path_for_match(&row.path),
+                "start": row.start,
+                "end": row.end,
+                "inode": (row.inode != 0).then_some(row.inode),
+            }));
+        }
+    }
+    let payload = serde_json::json!({
+        "pid": pid,
+        "note": "maps order of apk/dex/jar/so, not ClassLoader load order",
+        "entries": rows,
+    });
+    let _ = std::fs::write(
+        dest_dir.join(format!("mapped-code-{pid}.json")),
+        payload.to_string(),
+    );
+    let loader_payload = serde_json::json!({
+        "pid": pid,
+        "note": "path-derived ClassLoader role from maps; not a Java ClassLoader instance",
+        "entries": loaders,
+    });
+    let _ = std::fs::write(
+        dest_dir.join(format!("code-loader-{pid}.json")),
+        loader_payload.to_string(),
+    );
+}
+
+fn write_open_code(pid: u32, dest_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return;
+    };
+    let mut loaders = Vec::new();
+    let mut order = 0_u32;
+    for entry in entries.flatten() {
+        let Some(fd) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        let Ok(target) = std::fs::read_link(format!("/proc/{pid}/fd/{fd}")) else {
+            continue;
+        };
+        let path = target.to_string_lossy();
+        let Some(role) = code_loader_role(&path) else {
+            continue;
+        };
+        order = order.saturating_add(1);
+        loaders.push(serde_json::json!({
+            "pid": pid,
+            "order": order,
+            "role": role,
+            "origin": "fd",
+            "path": maps_path_for_match(&path),
+            "fd": fd,
+        }));
+    }
+    let payload = serde_json::json!({
+        "pid": pid,
+        "note": "open apk/dex/jar fds; not a Java ClassLoader instance",
+        "entries": loaders,
+    });
+    let _ = std::fs::write(
+        dest_dir.join(format!("open-code-{pid}.json")),
+        payload.to_string(),
+    );
+}
+
+pub(crate) fn code_loader_role(path: &str) -> Option<&'static str> {
+    let path = maps_path_for_match(path);
+    let lower = path.to_ascii_lowercase();
+    if lower.contains("/overlay/") || lower.contains("/auto_generated_rro_") {
+        return None;
+    }
+    let named = Path::new(path).extension().is_some_and(|ext| {
+        ext.eq_ignore_ascii_case("dex")
+            || ext.eq_ignore_ascii_case("apk")
+            || ext.eq_ignore_ascii_case("jar")
+            || ext.eq_ignore_ascii_case("zip")
+            || ext.eq_ignore_ascii_case("vdex")
+    });
+    let memfd = lower.starts_with("/memfd:");
+    let anon_dex = (lower.contains("[anon") || path.is_empty())
+        && (lower.contains("dex") || lower.contains("classes"));
+    if !(named || memfd || anon_dex) {
+        return None;
+    }
+    if lower.contains("/framework/")
+        || lower.contains("/javalib/")
+        || lower.starts_with("/apex/")
+        || lower.starts_with("/system/framework")
+    {
+        return Some("boot");
+    }
+    if lower.contains("/code_cache/")
+        || lower.contains("secondary-dex")
+        || lower.contains("/app_dex/")
+        || (lower.contains("/oat/") && lower.contains("/data/"))
+    {
+        return Some("secondary");
+    }
+    if memfd || anon_dex || !path.starts_with('/') {
+        return Some("in_memory");
+    }
+    if lower.starts_with("/data/app")
+        || is_app_private_path(path)
+        || lower.contains("/priv-app/")
+        || ((lower.starts_with("/system/")
+            || lower.starts_with("/system_ext/")
+            || lower.starts_with("/product/"))
+            && lower.contains("/app/"))
+    {
+        return Some("install");
+    }
+    Some("unknown")
+}
+
+fn is_mapped_code_path(path: &str) -> bool {
+    let path = maps_path_for_match(path);
+    if path.is_empty() || is_os_image_path(path) {
+        return false;
+    }
+    let lower = path.to_ascii_lowercase();
+    if lower.starts_with("/product/overlay/")
+        || lower.starts_with("/system_ext/framework/")
+        || lower.contains("/auto_generated_rro_")
+    {
+        return false;
+    }
+    Path::new(path).extension().is_some_and(|ext| {
+        ext.eq_ignore_ascii_case("dex")
+            || ext.eq_ignore_ascii_case("apk")
+            || ext.eq_ignore_ascii_case("jar")
+            || ext.eq_ignore_ascii_case("zip")
+            || ext.eq_ignore_ascii_case("so")
+    })
+}
+
+fn write_snapshot_sidecar(pid: u32, dest_dir: &Path, dump: &LiveDump) {
+    let payload = serde_json::json!({
+        "pid": pid,
+        "paused": dump.paused,
+        "torn": !dump.paused,
+        "elapsed_ms": dump.snapshot_ms,
+        "stitched_spans": dump.stitched_spans,
+        "memory_images": dump.memory_images,
+        "blob_dex": dump.blob_dex,
+        "visibility": "L2 forensic SIGSTOP + /proc/pid/mem copy",
+    });
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    let _ = std::fs::write(
+        dest_dir.join(format!("snapshot-{pid}-{stamp}.json")),
+        payload.to_string(),
+    );
+}
+
+fn parse_map_inode(line: &str) -> Option<u64> {
+    let mut fields = line.split_whitespace();
+    fields.next()?;
+    fields.next()?;
+    fields.next()?;
+    fields.next()?;
+    fields.next()?.parse().ok()
 }
 
 fn parse_map_line(line: &str) -> Option<(u64, u64, &str, &str)> {
@@ -1451,6 +2003,30 @@ mod tests {
     }
 
     #[test]
+    fn apk_embedded_native_is_executable_data_app_apk() {
+        assert!(apk_embedded_native(
+            "/data/app/~~x==/com.citibank.mobile.hk-y==/split_config.arm64_v8a.apk",
+            "r-xp"
+        ));
+        assert!(apk_embedded_native(
+            "/data/app/~~x==/com.citibank.mobile.hk-y==/split_config.arm64_v8a.apk",
+            "rwxp"
+        ));
+        assert!(!apk_embedded_native(
+            "/data/app/~~x==/com.citibank.mobile.hk-y==/split_config.arm64_v8a.apk",
+            "r--s"
+        ));
+        assert!(!apk_embedded_native(
+            "/data/app/~~x==/com.google.android.webview-y==/base.apk",
+            "r-xp"
+        ));
+        assert!(!apk_embedded_native(
+            "/system/framework/framework-res.apk",
+            "r-xp"
+        ));
+    }
+
+    #[test]
     fn copies_packer_rwx_and_finds_embedded_dex() {
         assert!(packer_region_worth_copying(
             "/data/app/x/libDexHelper.so",
@@ -1483,6 +2059,7 @@ mod tests {
         assert!(!blob_len_matches(512 * 1024 * 1024, &[jiangsu]));
         assert!(!blob_len_matches(256 * 1024, &[jiangsu]));
         assert!(blob_len_matches(12 * 1024 * 1024, &[]));
+        assert!(blob_len_matches(12 * 1024 * 1024, &[jiangsu]));
         assert!(!blob_len_matches(1024 * 1024, &[]));
         assert!(skip_art_heap("[anon:dalvik-main space]"));
         assert!(!skip_art_heap("[anon:scudo:secondary]"));
@@ -1490,6 +2067,12 @@ mod tests {
             "[anon:scudo:secondary]",
             "rw-p",
             121 * 1024 * 1024,
+            &[jiangsu]
+        ));
+        assert!(is_payload_blob_map(
+            "[anon:scudo:secondary]",
+            "rw-p",
+            12 * 1024 * 1024,
             &[jiangsu]
         ));
         assert!(!is_payload_blob_map(
@@ -1500,9 +2083,175 @@ mod tests {
         ));
         assert!(packer_got_candidate("/data/app/x/libDexHelper.so", "r-xp"));
         assert!(packer_got_candidate("/data/app/x/libdexjni.so", "rwxp"));
+        assert!(packer_got_candidate("/data/app/x/libjiagu.so", "r-xp"));
         assert!(!packer_got_candidate(
             "/data/app/x/libfrida-gadget.so",
             "r-xp"
+        ));
+        let overlay = "/data/app/x/lib/arm64/libpayload.so";
+        assert!(is_writable_app_file_blob(overlay, "rw-p", 64 * 1024 * 1024));
+        assert!(is_harvestable_blob_map(
+            overlay,
+            "rw-p",
+            64 * 1024 * 1024,
+            &[]
+        ));
+        assert!(is_writable_app_file_blob(
+            "/data/user_de/0/pkg/code_cache/oat.so (deleted)",
+            "rw-p",
+            3 * 1024 * 1024
+        ));
+        assert!(is_writable_app_file_blob(
+            "/mnt/expand/0000/user/0/pkg/lib/arm64/libx.so",
+            "rw-p",
+            8 * 1024 * 1024
+        ));
+        assert!(is_writable_app_file_blob(
+            "/memfd:classes",
+            "rw-p",
+            6 * 1024 * 1024
+        ));
+        assert!(!is_payload_blob_map(overlay, "rw-p", 64 * 1024 * 1024, &[]));
+        assert!(!is_writable_app_file_blob(
+            "/system/lib64/libc.so",
+            "rw-p",
+            64 * 1024 * 1024
+        ));
+        assert!(!is_writable_app_file_blob(
+            overlay,
+            "r-xp",
+            64 * 1024 * 1024
+        ));
+        assert!(!is_writable_app_file_blob(
+            "/data/app/x/oat/arm64/base.vdex",
+            "rw-p",
+            64 * 1024 * 1024
+        ));
+        assert!(!is_harvestable_blob_map(
+            "[stack]",
+            "rw-p",
+            8 * 1024 * 1024,
+            &[]
+        ));
+        assert!(!keep_heap_blob_map_path("/data/app/x/oat/arm64/base.vdex"));
+        assert!(keep_heap_blob_map_path(overlay));
+        assert!(keep_heap_blob_map_path("[anon:scudo:secondary]"));
+        assert_eq!(blob_map_class("[anon:scudo:secondary]"), 0);
+        assert_eq!(blob_map_class(overlay), 1);
+        assert!(looks_like_heap_ptr(0x006e_5b25_3000));
+        assert!(looks_like_heap_ptr(0x7f00_0000));
+        assert!(!looks_like_heap_ptr(0xff));
+    }
+
+    #[test]
+    fn adjacent_same_path_maps_form_one_span() {
+        let maps = vec![
+            MapRow {
+                start: 0x1000,
+                end: 0x2000,
+                perms: "rw-p".to_owned(),
+                path: "[anon:scudo:secondary]".to_owned(),
+                ..MapRow::default()
+            },
+            MapRow {
+                start: 0x2000,
+                end: 0x1000 + 5 * 1024 * 1024,
+                perms: "rw-p".to_owned(),
+                path: "[anon:scudo:secondary]".to_owned(),
+                ..MapRow::default()
+            },
+        ];
+        assert_eq!(
+            extend_span(&maps, 0, true, PAYLOAD_BLOB_MAX),
+            0x1000 + 5 * 1024 * 1024
+        );
+        let spans = harvest_spans(&maps, &[]);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].3, 5 * 1024 * 1024);
+        assert_eq!(spans[0].5, 2);
+    }
+
+    #[test]
+    fn gap_or_different_path_is_not_stitched() {
+        let maps = vec![
+            MapRow {
+                start: 0x1000,
+                end: 0x2000,
+                perms: "rw-p".to_owned(),
+                path: String::new(),
+                ..MapRow::default()
+            },
+            MapRow {
+                start: 0x3000,
+                end: 0x4000,
+                perms: "rw-p".to_owned(),
+                path: String::new(),
+                ..MapRow::default()
+            },
+            MapRow {
+                start: 0x4000,
+                end: 0x5000,
+                perms: "rw-p".to_owned(),
+                path: "[anon:libc_malloc]".to_owned(),
+                ..MapRow::default()
+            },
+        ];
+        assert_eq!(extend_span(&maps, 0, true, PAYLOAD_BLOB_MAX), 0x2000);
+        assert_eq!(extend_span(&maps, 1, true, PAYLOAD_BLOB_MAX), 0x4000);
+    }
+
+    #[test]
+    fn code_loader_role_from_path_not_java_instance() {
+        assert_eq!(
+            code_loader_role("/data/app/~~x==/pkg-y==/base.apk"),
+            Some("install")
+        );
+        assert_eq!(
+            code_loader_role("/system_ext/priv-app/SettingsGoogle/SettingsGoogle.apk"),
+            Some("install")
+        );
+        assert_eq!(
+            code_loader_role("/data/user/0/pkg/code_cache/secondary-dex/base.apk"),
+            Some("secondary")
+        );
+        assert_eq!(
+            code_loader_role("/apex/com.android.art/javalib/core-oj.jar"),
+            Some("boot")
+        );
+        assert_eq!(code_loader_role("/memfd:classes.dex"), Some("in_memory"));
+        assert_eq!(code_loader_role("/product/overlay/Foo.apk"), None);
+        assert_eq!(code_loader_role("/data/app/x/lib/arm64/libfoo.so"), None);
+    }
+
+    #[test]
+    fn key_scan_skips_bss_without_nearby_packer() {
+        let maps = [(
+            0x1000_u64,
+            0x2000_u64,
+            "rw-p".to_owned(),
+            "[anon:.bss]".to_owned(),
+        )];
+        assert!(!should_scan_for_keys("[anon:.bss]", "rw-p", 0x1000, &maps));
+        let packer = [
+            (
+                0x1000_u64,
+                0x2000_u64,
+                "r-xp".to_owned(),
+                "/data/app/x/libDexHelper.so".to_owned(),
+            ),
+            (
+                0x2000_u64,
+                0x3000_u64,
+                "rw-p".to_owned(),
+                "[anon:.bss]".to_owned(),
+            ),
+        ];
+        assert!(should_scan_for_keys("[anon:.bss]", "rw-p", 0x2000, &packer));
+        assert!(should_scan_for_keys(
+            "/data/app/x/libDexHelper.so",
+            "r-xp",
+            0x1000,
+            &packer
         ));
     }
 }

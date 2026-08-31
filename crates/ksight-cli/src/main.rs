@@ -13,8 +13,8 @@ use crate::{
     device::{
         cleanup_package, daemon_start, daemon_status, daemon_stop, deploy_agent,
         protocol_acknowledge, protocol_graph, protocol_replay, protocol_report, protocol_sessions,
-        pull_forensics, pull_package, read_last_session, recatalog_package, run_device,
-        run_device_tee, run_hide_debug_capture, validate_package, DEVICE_AGENT,
+        pull_forensics, pull_package, pull_snapshot, read_last_session, recatalog_package,
+        run_device, run_device_tee, run_hide_debug_capture, validate_package, DEVICE_AGENT,
         DEVICE_BINDER_OBJECT, DEVICE_FILE_OBJECT, DEVICE_MEMORY_OBJECT, DEVICE_NETWORK_OBJECT,
         DEVICE_PROCESS_OBJECT, DEVICE_SCHED_OBJECT, DEVICE_SPOOL_ROOT, DEVICE_UPROBE_OBJECT,
     },
@@ -143,9 +143,18 @@ enum DeviceCommand {
         /// Cold-start the app on device and harvest live DEX/SO (needed for packed APKs).
         #[arg(long)]
         launch: bool,
-        /// Skip APK/lib copy and only dump live process images.
-        #[arg(long)]
+        /// Skip install APK/lib/oat. The pulled folder is this package's collected evidence.
+        #[arg(long, alias = "evidence-only")]
         runtime_only: bool,
+        /// Hide USB debugging and developer options after ART attach, then launch. Apps that check `adb_enabled` need this. Does not hide root.
+        #[arg(long)]
+        hide_debug: bool,
+        /// If Magisk is present, add the package to `DenyList` for the dump window. Does not hide root or an unlocked bootloader.
+        #[arg(long)]
+        denylist: bool,
+        /// Hide-debug watchdog seconds. Default 120 with `--launch`, otherwise 60.
+        #[arg(long)]
+        hide_debug_secs: Option<u64>,
     },
     /// Rebuild dump-report.json artifacts and correlated VMA/maps edges without a live dump.
     RecatalogPackage {
@@ -158,6 +167,30 @@ enum DeviceCommand {
         /// Exact Android package name.
         #[arg(long)]
         package: String,
+    },
+    /// Bounded live `/proc/<pid>/mem` copy. L2 forensic; pauses the target.
+    Snapshot {
+        /// Exact Android package name. Resolves a live PID when `--pid` is omitted.
+        #[arg(long)]
+        package: Option<String>,
+        /// Target process ID.
+        #[arg(long)]
+        pid: Option<u32>,
+        /// Host directory that receives `dest/<name>/`.
+        #[arg(long, default_value = "snapshots")]
+        dest: std::path::PathBuf,
+        /// Inclusive hex or decimal virtual address. Requires `--end`.
+        #[arg(long)]
+        start: Option<String>,
+        /// Exclusive hex or decimal virtual address. Requires `--start`.
+        #[arg(long)]
+        end: Option<String>,
+        /// Maximum copied MiB.
+        #[arg(long, default_value_t = 32)]
+        max_mib: u64,
+        /// Copy without `SIGSTOP`.
+        #[arg(long)]
+        no_pause: bool,
     },
 }
 
@@ -240,7 +273,7 @@ struct CaptureOptions {
     /// Enable the linker SO-load Inspect adapter. Default off; pair with `--package` or `--pid`.
     #[arg(long)]
     inspect_linker: bool,
-    /// Enable bounded `SSL_write` plaintext for one app. Pair with `--package` during a short test.
+    /// Enable bounded `SSL_write` plaintext for one app. May be combined with `--inspect-adapter binder_userspace`.
     #[arg(long)]
     inspect_tls: bool,
     /// Inspect every app mapping the adapter ELF. Noisy; prefer `--package`.
@@ -252,7 +285,7 @@ struct CaptureOptions {
     /// Maximum Inspect hits; 0 uses the adapter default.
     #[arg(long, default_value_t = 0)]
     inspect_max_hits: u32,
-    /// Named Inspect adapter. `art_dex_memory` uses only the exported in-memory DEX Open. Implies inspect is enabled.
+    /// Named Inspect adapter. Combine with `--inspect-tls` for Binder plus TLS in one session.
     #[arg(long)]
     inspect_adapter: Option<String>,
     /// Optional GNU build-id that must match before Inspect attach.
@@ -301,6 +334,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_device_command(serial: Option<&str>, command: DeviceCommand) -> Result<()> {
     match command {
         DeviceCommand::Probe => run_device(serial, &format!("{DEVICE_AGENT} probe --json"))?,
@@ -311,9 +345,39 @@ fn run_device_command(serial: Option<&str>, command: DeviceCommand) -> Result<()
             dest,
             launch,
             runtime_only,
-        } => pull_package(serial, &package, &dest, launch, runtime_only)?,
+            hide_debug,
+            denylist,
+            hide_debug_secs,
+        } => pull_package(
+            serial,
+            &package,
+            &dest,
+            launch,
+            runtime_only,
+            hide_debug,
+            denylist,
+            hide_debug_secs,
+        )?,
         DeviceCommand::RecatalogPackage { package } => recatalog_package(serial, &package)?,
         DeviceCommand::CleanupPackage { package } => cleanup_package(serial, &package)?,
+        DeviceCommand::Snapshot {
+            package,
+            pid,
+            dest,
+            start,
+            end,
+            max_mib,
+            no_pause,
+        } => pull_snapshot(
+            serial,
+            package.as_deref(),
+            pid,
+            &dest,
+            start.as_deref(),
+            end.as_deref(),
+            max_mib,
+            no_pause,
+        )?,
         DeviceCommand::Daemon { command } => match command {
             DaemonCommand::Start => daemon_start(serial)?,
             DaemonCommand::Status => daemon_status(serial)?,
@@ -428,16 +492,14 @@ fn run_capture(serial: Option<&str>, options: &CaptureOptions) -> Result<()> {
     } else {
         String::new()
     };
-    if options.inspect_linker && options.inspect_tls {
-        bail!("--inspect-linker cannot be combined with --inspect-tls");
-    }
     if options.inspect_linker
-        && options
-            .inspect_adapter
-            .as_deref()
-            .is_some_and(|name| name != "linker_so_load")
+        && (options.inspect_tls
+            || options
+                .inspect_adapter
+                .as_deref()
+                .is_some_and(|name| name != "linker_so_load"))
     {
-        bail!("--inspect-linker cannot be combined with a non-linker --inspect-adapter");
+        bail!("--inspect-linker cannot be combined with --inspect-tls or a non-linker --inspect-adapter");
     }
     if options.inspect_all_apps
         && !(options.inspect_linker || options.inspect_tls || options.inspect_adapter.is_some())

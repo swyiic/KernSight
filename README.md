@@ -4,7 +4,7 @@ KernSight 是一个面向自有或明确授权 Android 设备的内核可观测�
 基于 eBPF 采集进程、文件、内存映射、网络、Binder 和调度事实，由设备端 `ksightd` 归一化并持久化，
 再通过 `ksightctl` 或 MobileE 完成控制、回放、聚合和可视化。
 
-当前版本为 **0.2.1**，主要开发基线是 Pixel 6a、Android 14、ARM64。项目仍处于实验
+当前版本为 **0.2.2**，主要开发基线是 Pixel 6a、Android 14、ARM64。项目仍处于实验
 阶段，不应被视为通用的生产级 Android 监控组件。
 持续开发ing....
 
@@ -109,6 +109,43 @@ make device
 ```
 
 设备端二进制为 `target/aarch64-unknown-linux-musl/release/ksightd`。
+它是单文件设备发行版：7 个 eBPF 对象、默认服务配置、hide-debug 辅助脚本以及原生框架
+规则均编译在 `ksightd` 内。第一次执行采集、Dump 或服务命令时，程序会自动在
+`/data/local/tmp/ksight` 安装并校验内部运行资源；用户不需要逐个复制这些文件。
+
+### 只使用一个设备端二进制
+
+从 GitHub Release 下载 `ksightd-android-arm64`，或使用上面的 `make device` 自行编译。
+电脑到手机只需执行一次 push：
+
+```bash
+adb push ksightd-android-arm64 /data/local/tmp/ksightd
+adb shell su -c 'chmod 0755 /data/local/tmp/ksightd'
+```
+
+随后可以直接探测和采集，不依赖 PC 端 `ksightctl`：
+
+```bash
+adb shell su -c '/data/local/tmp/ksightd probe --json'
+adb shell su -c '/data/local/tmp/ksightd capture --all \
+  --duration-seconds 30 \
+  --spool-dir /data/local/tmp/ksight/spool \
+  --json'
+```
+
+按包采集：
+
+```bash
+adb shell su -c '/data/local/tmp/ksightd capture \
+  --package com.example.app \
+  --files --network --memory --binder \
+  --duration-seconds 45 \
+  --spool-dir /data/local/tmp/ksight/spool \
+  --json'
+```
+
+这里的“单文件”是指安装和分发只需要 `ksightd`。eBPF 加载器仍需要把内嵌对象释放到
+设备私有运行目录，这是程序自动且带内容校验完成的，不需要用户手工管理。
 
 ### 一步编译并部署
 
@@ -204,6 +241,12 @@ cargo run -q -p ksight-cli -- device --serial "$SERIAL" replay <session-uuid> --
 ```bash
 cargo run -q -p ksight-cli -- device --serial "$SERIAL" pull-package \
   --package com.example.app
+# apps that check USB debugging:
+cargo run -q -p ksight-cli -- device --serial "$SERIAL" pull-package \
+  --package com.example.app --launch --hide-debug
+# apps that check root, Magisk present:
+cargo run -q -p ksight-cli -- device --serial "$SERIAL" pull-package \
+  --package com.example.app --launch --denylist
 ```
 
 该流程编目 APK DEX、内存 DEX、Native SO、明文片段和 key candidate，并生成

@@ -7,7 +7,10 @@ use ksight_model::{ArtifactKind, ArtifactProvenance, ArtifactRef, SensorKind};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{DumpArtifact, MappingSource, ObservedMapping, ProcessActivity};
+use crate::{
+    BinderFdTransfer, BinderReplyPair, DumpArtifact, InspectHitActivity, MappingSource,
+    ObservedMapping, ProcessActivity, ProcessInstanceRef,
+};
 
 /// Half-open interval overlap. Degenerate ranges never overlap.
 #[must_use]
@@ -77,6 +80,12 @@ pub enum GraphEntityKind {
     CodeArtifact,
     /// Forensic dump-package catalog bound into a session graph.
     EvidenceDump,
+    /// Selected-process Inspect adapter hit (never an Observe fact).
+    InspectHit,
+    /// DNS QNAME observed on UDP/53.
+    DnsName,
+    /// TLS SNI or HTTP Host observed on a first write.
+    HostName,
 }
 
 /// One node in a session analysis graph.
@@ -94,6 +103,9 @@ pub struct GraphEntity {
     pub sensors: Vec<SensorKind>,
     /// Optional content-addressed artifact.
     pub artifact: Option<ArtifactRef>,
+    /// Stable process instance (`boot_id:pid:start_time_ns`) when this node is a process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_instance_id: Option<String>,
 }
 
 /// Directed relationship between two entities.
@@ -177,11 +189,37 @@ impl SessionGraph {
 
     /// Insert a pid-qualified process node and a correlated package `contains` edge.
     pub fn ensure_process(&mut self, session_id: Uuid, label: &str, pid: u32) -> String {
-        if pid == 0 {
+        self.ensure_process_instance(session_id, label, pid, None)
+    }
+
+    /// Insert a process instance node keyed by `boot_id:pid:start_time_ns` when known.
+    pub fn ensure_process_instance(
+        &mut self,
+        session_id: Uuid,
+        label: &str,
+        pid: u32,
+        instance: Option<&ProcessInstanceRef>,
+    ) -> String {
+        if pid == 0 && instance.is_none() {
             return format!("process:{label}");
         }
         let package_key = format!("process:{label}");
-        let key = format!("process:{label}:{pid}");
+        let (key, instance_id, node_label) = if let Some(instance) = instance {
+            (
+                format!("procinst:{}", instance.process_instance_id),
+                Some(instance.process_instance_id.clone()),
+                format!(
+                    "{label} pid={} start={}",
+                    instance.pid, instance.start_time_ns
+                ),
+            )
+        } else {
+            (
+                format!("process:{label}:{pid}"),
+                None,
+                format!("{label} pid={pid}"),
+            )
+        };
         if self.entities.iter().any(|entity| entity.key == key) {
             return key;
         }
@@ -189,9 +227,10 @@ impl SessionGraph {
             kind: GraphEntityKind::ProcessInstance,
             session_id,
             key: key.clone(),
-            label: format!("{label} pid={pid}"),
+            label: node_label,
             sensors: Vec::new(),
             artifact: None,
+            process_instance_id: instance_id,
         });
         if self.entities.iter().any(|entity| entity.key == package_key) {
             self.edges.push(GraphEdge {
@@ -206,6 +245,7 @@ impl SessionGraph {
     }
 
     /// Materialize confirmed Binder/socket/sched edges and file identities from a report.
+    #[allow(clippy::too_many_lines)]
     pub fn from_l0(
         session_id: Option<Uuid>,
         processes: &[crate::ProcessActivity],
@@ -216,6 +256,9 @@ impl SessionGraph {
     ) -> Self {
         let session_id = session_id.unwrap_or(Uuid::nil());
         let mut graph = Self::l0_placeholder();
+        graph.limitations.push(
+            "process graph keys prefer procinst:{boot_id:pid:start_time_ns}; pid-only keys remain when start_time was not observed".to_owned(),
+        );
         for process in processes.iter().take(64) {
             graph.entities.push(GraphEntity {
                 kind: GraphEntityKind::ProcessInstance,
@@ -224,15 +267,31 @@ impl SessionGraph {
                 label: process.label.clone(),
                 sensors: process.sensor_counts.keys().copied().collect(),
                 artifact: None,
+                process_instance_id: None,
             });
+            for instance in process.instances.iter().take(16) {
+                let _ = graph.ensure_process_instance(
+                    session_id,
+                    &process.label,
+                    instance.pid,
+                    Some(instance),
+                );
+            }
         }
         for relation in binder.iter().take(128) {
-            let from =
-                graph.ensure_process(session_id, &relation.source, relation.source_process_id);
-            let to = graph.ensure_process(
+            let from = graph.ensure_process_instance(
+                session_id,
+                &relation.source,
+                relation.source_process_id,
+                instance_for_pid(processes, relation.source_process_id),
+            );
+            let to = graph.ensure_process_instance(
                 session_id,
                 &relation.target,
                 relation.target_process_id.unwrap_or(0),
+                relation
+                    .target_process_id
+                    .and_then(|pid| instance_for_pid(processes, pid)),
             );
             graph.edges.push(GraphEdge {
                 from,
@@ -255,6 +314,7 @@ impl SessionGraph {
                 label: artifact.path.clone(),
                 sensors: vec![SensorKind::File, SensorKind::Memory],
                 artifact: None,
+                process_instance_id: None,
             });
         }
         for peer in peers.iter().take(64) {
@@ -266,18 +326,77 @@ impl SessionGraph {
                 label: peer.peer.clone(),
                 sensors: vec![SensorKind::Network],
                 artifact: None,
+                process_instance_id: None,
             });
-            let from = graph.ensure_process(session_id, &peer.source, peer.source_process_id);
+            let from = graph.ensure_process_instance(
+                session_id,
+                &peer.source,
+                peer.source_process_id,
+                instance_for_pid(processes, peer.source_process_id),
+            );
             graph.edges.push(GraphEdge {
-                from,
-                to: key,
+                from: from.clone(),
+                to: key.clone(),
                 relation: "connects".to_owned(),
                 strength: EdgeStrength::Confirmed,
                 sensor: Some(SensorKind::Network),
             });
+            if let Some(name) = peer.resolved_name.as_deref() {
+                let dns_key = format!("dns:{name}");
+                if !graph.entities.iter().any(|entity| entity.key == dns_key) {
+                    graph.entities.push(GraphEntity {
+                        kind: GraphEntityKind::DnsName,
+                        session_id,
+                        key: dns_key.clone(),
+                        label: name.to_owned(),
+                        sensors: vec![SensorKind::Network],
+                        artifact: None,
+                        process_instance_id: None,
+                    });
+                }
+                graph.edges.push(GraphEdge {
+                    from: dns_key,
+                    to: key.clone(),
+                    relation: "answers".to_owned(),
+                    strength: EdgeStrength::Correlated,
+                    sensor: Some(SensorKind::Network),
+                });
+            }
+            for (name, relation) in [
+                (peer.sni.as_deref(), "sni"),
+                (peer.http_host.as_deref(), "http_host"),
+            ] {
+                let Some(name) = name else {
+                    continue;
+                };
+                let host_key = format!("host:{name}");
+                if !graph.entities.iter().any(|entity| entity.key == host_key) {
+                    graph.entities.push(GraphEntity {
+                        kind: GraphEntityKind::HostName,
+                        session_id,
+                        key: host_key.clone(),
+                        label: name.to_owned(),
+                        sensors: vec![SensorKind::Network],
+                        artifact: None,
+                        process_instance_id: None,
+                    });
+                }
+                graph.edges.push(GraphEdge {
+                    from: host_key,
+                    to: key.clone(),
+                    relation: relation.to_owned(),
+                    strength: EdgeStrength::Correlated,
+                    sensor: Some(SensorKind::Network),
+                });
+            }
         }
         for wakeup in sched.iter().take(128) {
-            let from = graph.ensure_process(session_id, &wakeup.waker, wakeup.waker_process_id);
+            let from = graph.ensure_process_instance(
+                session_id,
+                &wakeup.waker,
+                wakeup.waker_process_id,
+                instance_for_pid(processes, wakeup.waker_process_id),
+            );
             let to = format!("thread:{}", wakeup.wakee_tid);
             graph.entities.push(GraphEntity {
                 kind: GraphEntityKind::Thread,
@@ -286,6 +405,7 @@ impl SessionGraph {
                 label: format!("tid {}", wakeup.wakee_tid),
                 sensors: vec![SensorKind::Sched],
                 artifact: None,
+                process_instance_id: None,
             });
             graph.edges.push(GraphEdge {
                 from,
@@ -322,6 +442,7 @@ impl SessionGraph {
             label: format!("{package} dump"),
             sensors: Vec::new(),
             artifact: None,
+            process_instance_id: None,
         });
         for pid in pids.iter().copied().take(16) {
             let _ = graph.ensure_process(session_id, package, pid);
@@ -348,6 +469,7 @@ impl SessionGraph {
                     ),
                     sensors: Vec::new(),
                     artifact: dump_artifact_ref(artifact),
+                    process_instance_id: None,
                 });
             }
             let from = artifact.pid.map_or_else(
@@ -389,6 +511,7 @@ impl SessionGraph {
                             .unwrap_or_else(|| format!("{start:#x}-{end:#x}")),
                         sensors: Vec::new(),
                         artifact: None,
+                        process_instance_id: None,
                     });
                 }
                 if !graph.edges.iter().any(|edge| {
@@ -428,6 +551,7 @@ impl SessionGraph {
                 .unwrap_or_else(|| format!("{:#x}-{:#x}", mapping.start, mapping.end)),
             sensors,
             artifact: None,
+            process_instance_id: None,
         });
         key
     }
@@ -447,7 +571,12 @@ impl SessionGraph {
         for mapping in ranked.iter().take(64) {
             let to = self.ensure_mapping(session_id, mapping);
             let label = label_for_pid(processes, mapping.process_id);
-            let from = self.ensure_process(session_id, &label, mapping.process_id);
+            let from = self.ensure_process_instance(
+                session_id,
+                &label,
+                mapping.process_id,
+                instance_for_pid(processes, mapping.process_id),
+            );
             if self
                 .edges
                 .iter()
@@ -516,6 +645,7 @@ impl SessionGraph {
                         .unwrap_or_else(|| format!("{vma_start:#x}-{vma_end:#x}")),
                     sensors: Vec::new(),
                     artifact: None,
+                    process_instance_id: None,
                 });
             }
             let Some(mapping) = best_overlapping_mapping(mappings, pid, vma_start, vma_end) else {
@@ -630,6 +760,332 @@ impl SessionGraph {
     }
 }
 
+fn instance_for_pid(processes: &[ProcessActivity], pid: u32) -> Option<&ProcessInstanceRef> {
+    processes
+        .iter()
+        .flat_map(|process| process.instances.iter())
+        .find(|instance| instance.pid == pid)
+}
+
+/// Bind Inspect adapter hits as correlated evidence. They are never Observe facts.
+impl SessionGraph {
+    /// Record bounded Inspect hits as `inspect_hit` edges from process instances.
+    pub fn attach_inspect_hits(
+        &mut self,
+        session_id: Uuid,
+        hits: &[InspectHitActivity],
+        processes: &[ProcessActivity],
+    ) {
+        self.push_limitation(
+            "inspect_hit edges are selected-process adapter observations; they are not L0 kernel facts. Parcel C++ fields and JNI offsets are not decoded. Exported Parcel writers are paired by TID. transact joins L0 binder:req by tid+code as correlated joined_transact",
+        );
+        for hit in hits.iter().take(64) {
+            if hit.hits == 0 && !hit.attached {
+                continue;
+            }
+            let to = format!("inspect:{}:{}", hit.adapter, hit.process_id);
+            if !self.entities.iter().any(|entity| entity.key == to) {
+                self.entities.push(GraphEntity {
+                    kind: GraphEntityKind::InspectHit,
+                    session_id,
+                    key: to.clone(),
+                    label: match (
+                        hit.binder_interface.as_deref(),
+                        hit.binder_method.as_deref(),
+                    ) {
+                        (Some(interface), Some(method)) => format!(
+                            "{} pid={} hits={} {interface}::{method}",
+                            hit.adapter, hit.process_id, hit.hits
+                        ),
+                        (Some(interface), None) => format!(
+                            "{} pid={} hits={} {interface}",
+                            hit.adapter, hit.process_id, hit.hits
+                        ),
+                        _ => format!("{} pid={} hits={}", hit.adapter, hit.process_id, hit.hits),
+                    },
+                    sensors: Vec::new(),
+                    artifact: None,
+                    process_instance_id: hit.process_instance_id.clone(),
+                });
+            }
+            let label = label_for_pid(processes, hit.process_id);
+            let from = self.ensure_process_instance(
+                session_id,
+                &label,
+                hit.process_id,
+                instance_for_pid(processes, hit.process_id),
+            );
+            if !self
+                .edges
+                .iter()
+                .any(|edge| edge.from == from && edge.to == to && edge.relation == "inspect_hit")
+            {
+                self.edges.push(GraphEdge {
+                    from,
+                    to: to.clone(),
+                    relation: "inspect_hit".to_owned(),
+                    strength: EdgeStrength::Correlated,
+                    sensor: None,
+                });
+            }
+            if let Some(txn_id) = hit.binder_transaction_id {
+                let req_key = format!("binder:req:{txn_id}");
+                if !self.entities.iter().any(|entity| entity.key == req_key) {
+                    self.entities.push(GraphEntity {
+                        kind: GraphEntityKind::BinderTransaction,
+                        session_id,
+                        key: req_key.clone(),
+                        label: format!(
+                            "binder request {txn_id} code={}",
+                            hit.binder_code.unwrap_or(0)
+                        ),
+                        sensors: vec![SensorKind::Binder],
+                        artifact: None,
+                        process_instance_id: None,
+                    });
+                }
+                if !self.edges.iter().any(|edge| {
+                    edge.from == to && edge.to == req_key && edge.relation == "joined_transact"
+                }) {
+                    self.edges.push(GraphEdge {
+                        from: to,
+                        to: req_key,
+                        relation: "joined_transact".to_owned(),
+                        strength: EdgeStrength::Correlated,
+                        sensor: None,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Pair two-way Binder RPCs as confirmed `binder_reply` / `replies_to` edges.
+    ///
+    /// The kernel `debug_id` link is a single-sensor fact, not time proximity.
+    pub fn attach_binder_replies(
+        &mut self,
+        session_id: Uuid,
+        pairs: &[BinderReplyPair],
+        processes: &[ProcessActivity],
+    ) {
+        for pair in pairs.iter().take(64) {
+            let client_label = label_for_pid(processes, pair.client_process_id);
+            let server_label = label_for_pid(processes, pair.server_process_id);
+            let client = self.ensure_process_instance(
+                session_id,
+                &client_label,
+                pair.client_process_id,
+                instance_for_pid(processes, pair.client_process_id),
+            );
+            let server = self.ensure_process_instance(
+                session_id,
+                &server_label,
+                pair.server_process_id,
+                instance_for_pid(processes, pair.server_process_id),
+            );
+            let req_key = format!("binder:req:{}", pair.request_transaction_id);
+            let reply_key = format!("binder:reply:{}", pair.reply_transaction_id);
+            if !self.entities.iter().any(|entity| entity.key == req_key) {
+                self.entities.push(GraphEntity {
+                    kind: GraphEntityKind::BinderTransaction,
+                    session_id,
+                    key: req_key.clone(),
+                    label: format!(
+                        "binder request {} code={}",
+                        pair.request_transaction_id, pair.code
+                    ),
+                    sensors: vec![SensorKind::Binder],
+                    artifact: None,
+                    process_instance_id: None,
+                });
+            }
+            if !self.entities.iter().any(|entity| entity.key == reply_key) {
+                self.entities.push(GraphEntity {
+                    kind: GraphEntityKind::BinderTransaction,
+                    session_id,
+                    key: reply_key.clone(),
+                    label: format!(
+                        "binder reply {} ({} ns)",
+                        pair.reply_transaction_id, pair.latency_ns
+                    ),
+                    sensors: vec![SensorKind::Binder],
+                    artifact: None,
+                    process_instance_id: None,
+                });
+            }
+            if !self
+                .edges
+                .iter()
+                .any(|edge| edge.from == client && edge.to == req_key && edge.relation == "issues")
+            {
+                self.edges.push(GraphEdge {
+                    from: client.clone(),
+                    to: req_key.clone(),
+                    relation: "issues".to_owned(),
+                    strength: EdgeStrength::Confirmed,
+                    sensor: Some(SensorKind::Binder),
+                });
+            }
+            if !self.edges.iter().any(|edge| {
+                edge.from == server && edge.to == reply_key && edge.relation == "returns"
+            }) {
+                self.edges.push(GraphEdge {
+                    from: server.clone(),
+                    to: reply_key.clone(),
+                    relation: "returns".to_owned(),
+                    strength: EdgeStrength::Confirmed,
+                    sensor: Some(SensorKind::Binder),
+                });
+            }
+            if !self.edges.iter().any(|edge| {
+                edge.from == reply_key && edge.to == req_key && edge.relation == "replies_to"
+            }) {
+                self.edges.push(GraphEdge {
+                    from: reply_key,
+                    to: req_key,
+                    relation: "replies_to".to_owned(),
+                    strength: EdgeStrength::Confirmed,
+                    sensor: Some(SensorKind::Binder),
+                });
+            }
+            if !self.edges.iter().any(|edge| {
+                edge.from == server && edge.to == client && edge.relation == "binder_reply"
+            }) {
+                self.edges.push(GraphEdge {
+                    from: server,
+                    to: client,
+                    relation: "binder_reply".to_owned(),
+                    strength: EdgeStrength::Confirmed,
+                    sensor: Some(SensorKind::Binder),
+                });
+            }
+        }
+    }
+
+    /// Pair Binder FD send/receive as confirmed `transfers_fd` edges.
+    pub fn attach_binder_fd_transfers(
+        &mut self,
+        session_id: Uuid,
+        transfers: &[BinderFdTransfer],
+        processes: &[ProcessActivity],
+    ) {
+        for transfer in transfers.iter().take(128) {
+            let from_fd = format!("fd:{}:{}", transfer.source_process_id, transfer.source_fd);
+            let to_fd = format!("fd:{}:{}", transfer.target_process_id, transfer.target_fd);
+            if !self.entities.iter().any(|entity| entity.key == from_fd) {
+                self.entities.push(GraphEntity {
+                    kind: GraphEntityKind::Fd,
+                    session_id,
+                    key: from_fd.clone(),
+                    label: format!("fd {} ({})", transfer.source_fd, transfer.origin),
+                    sensors: vec![SensorKind::Binder, SensorKind::File],
+                    artifact: None,
+                    process_instance_id: None,
+                });
+            }
+            if !self.entities.iter().any(|entity| entity.key == to_fd) {
+                self.entities.push(GraphEntity {
+                    kind: GraphEntityKind::Fd,
+                    session_id,
+                    key: to_fd.clone(),
+                    label: format!("fd {} via binder", transfer.target_fd),
+                    sensors: vec![SensorKind::Binder],
+                    artifact: None,
+                    process_instance_id: None,
+                });
+            }
+            let source_label = label_for_pid(processes, transfer.source_process_id);
+            let target_label = label_for_pid(processes, transfer.target_process_id);
+            let from_proc = self.ensure_process_instance(
+                session_id,
+                &source_label,
+                transfer.source_process_id,
+                instance_for_pid(processes, transfer.source_process_id),
+            );
+            let to_proc = self.ensure_process_instance(
+                session_id,
+                &target_label,
+                transfer.target_process_id,
+                instance_for_pid(processes, transfer.target_process_id),
+            );
+            self.edges.push(GraphEdge {
+                from: from_proc,
+                to: from_fd.clone(),
+                relation: "owns".to_owned(),
+                strength: EdgeStrength::Correlated,
+                sensor: Some(SensorKind::File),
+            });
+            self.edges.push(GraphEdge {
+                from: to_proc,
+                to: to_fd.clone(),
+                relation: "owns".to_owned(),
+                strength: EdgeStrength::Correlated,
+                sensor: Some(SensorKind::File),
+            });
+            if !self.edges.iter().any(|edge| {
+                edge.from == from_fd && edge.to == to_fd && edge.relation == "transfers_fd"
+            }) {
+                self.edges.push(GraphEdge {
+                    from: from_fd,
+                    to: to_fd,
+                    relation: "transfers_fd".to_owned(),
+                    strength: EdgeStrength::Confirmed,
+                    sensor: Some(SensorKind::Binder),
+                });
+            }
+        }
+    }
+
+    /// Join ART `DexFileLoader::Open` hits to dump DEX artifacts.
+    ///
+    /// Edges are correlated: an exported Open path/size matched a copied file, which
+    /// is not a Java `ClassLoader` instance and not a kernel mmap fact.
+    pub fn attach_art_open_joins(
+        &mut self,
+        session_id: Uuid,
+        package: &str,
+        joins: &[(u32, String, String)],
+    ) {
+        for (pid, open_path, artifact_key) in joins.iter().take(64) {
+            let proc = self.ensure_process(session_id, package, *pid);
+            let open_key = format!("art_open:{pid}:{open_path}");
+            if !self.entities.iter().any(|entity| entity.key == open_key) {
+                self.entities.push(GraphEntity {
+                    kind: GraphEntityKind::InspectHit,
+                    session_id,
+                    key: open_key.clone(),
+                    label: format!("ART Open {open_path}"),
+                    sensors: Vec::new(),
+                    artifact: None,
+                    process_instance_id: None,
+                });
+            }
+            if !self.edges.iter().any(|edge| {
+                edge.from == proc && edge.to == open_key && edge.relation == "art_opens"
+            }) {
+                self.edges.push(GraphEdge {
+                    from: proc.clone(),
+                    to: open_key.clone(),
+                    relation: "art_opens".to_owned(),
+                    strength: EdgeStrength::Correlated,
+                    sensor: None,
+                });
+            }
+            if !self.edges.iter().any(|edge| {
+                edge.from == open_key && edge.to == *artifact_key && edge.relation == "joined_dex"
+            }) {
+                self.edges.push(GraphEdge {
+                    from: open_key,
+                    to: artifact_key.clone(),
+                    relation: "joined_dex".to_owned(),
+                    strength: EdgeStrength::Correlated,
+                    sensor: None,
+                });
+            }
+        }
+    }
+}
+
 fn best_overlapping_mapping(
     mappings: &[ObservedMapping],
     pid: u32,
@@ -667,6 +1123,8 @@ fn label_for_pid(processes: &[ProcessActivity], pid: u32) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
 
     fn sample_graph() -> SessionGraph {
@@ -680,6 +1138,7 @@ mod tests {
                     label: "a".to_owned(),
                     sensors: vec![SensorKind::Binder],
                     artifact: None,
+                    process_instance_id: None,
                 },
                 GraphEntity {
                     kind: GraphEntityKind::ProcessInstance,
@@ -688,6 +1147,7 @@ mod tests {
                     label: "b".to_owned(),
                     sensors: vec![SensorKind::Binder],
                     artifact: None,
+                    process_instance_id: None,
                 },
                 GraphEntity {
                     kind: GraphEntityKind::SocketFlow,
@@ -696,6 +1156,7 @@ mod tests {
                     label: "10.0.0.1".to_owned(),
                     sensors: vec![SensorKind::Network],
                     artifact: None,
+                    process_instance_id: None,
                 },
             ],
             edges: vec![
@@ -717,6 +1178,77 @@ mod tests {
             limitations: SessionGraph::l0_placeholder().limitations,
             dump_ids: Vec::new(),
         }
+    }
+
+    #[test]
+    fn process_instance_keys_are_first_class() {
+        let processes = [ProcessActivity {
+            label: "com.example".to_owned(),
+            package: Some("com.example".to_owned()),
+            process_ids: vec![10],
+            instances: vec![ProcessInstanceRef {
+                process_instance_id: "boot:10:99".to_owned(),
+                boot_id: Uuid::nil(),
+                pid: 10,
+                start_time_ns: 99,
+            }],
+            event_count: 1,
+            sensor_counts: BTreeMap::new(),
+        }];
+        let binder = [crate::BinderRelation {
+            source: "com.example".to_owned(),
+            source_process_id: 10,
+            target: "system".to_owned(),
+            target_process_id: Some(1),
+            requests: 1,
+            replies: 0,
+            codes: BTreeMap::new(),
+            paired_replies: 0,
+            interfaces: BTreeMap::new(),
+        }];
+        let graph = SessionGraph::from_l0(None, &processes, &binder, &[], &[], &[]);
+        assert!(graph
+            .entities
+            .iter()
+            .any(|entity| entity.key == "procinst:boot:10:99"
+                && entity.process_instance_id.as_deref() == Some("boot:10:99")));
+        assert!(graph
+            .edges
+            .iter()
+            .any(|edge| { edge.relation == "binder" && edge.from == "procinst:boot:10:99" }));
+        let hits = [InspectHitActivity {
+            adapter: "binder_userspace".to_owned(),
+            process_id: 10,
+            process_instance_id: Some("boot:10:99".to_owned()),
+            attached: true,
+            hits: 2,
+            last_detail: "handle=3 code=0x1".to_owned(),
+            binder_handle: Some(3),
+            binder_code: Some(1),
+            binder_interface: Some("android.os.IServiceManager".to_owned()),
+            binder_method: Some("getService".to_owned()),
+            binder_method_source: Some("aosp_stub".to_owned()),
+            binder_strings: Some(vec!["activity".to_owned()]),
+            binder_ints: Some(vec![1]),
+            binder_int64s: None,
+            binder_bools: None,
+            binder_fds: None,
+            binder_blobs: None,
+            binder_binders: None,
+            binder_transaction_id: Some(42),
+            reply_latency_ns: Some(5_000),
+        }];
+        let mut graph = graph;
+        graph.attach_inspect_hits(Uuid::nil(), &hits, &processes);
+        assert!(graph.edges.iter().any(
+            |edge| edge.relation == "inspect_hit" && edge.strength == EdgeStrength::Correlated
+        ));
+        assert!(graph
+            .edges
+            .iter()
+            .any(|edge| edge.relation == "joined_transact"
+                && edge.strength == EdgeStrength::Correlated
+                && edge.to == "binder:req:42"));
     }
 
     #[test]
@@ -823,6 +1355,7 @@ mod tests {
                 end: 0x2000,
                 backing_path: Some("[anon:scudo:secondary]".to_owned()),
                 source: crate::MappingSource::Mmap,
+                mapping_generation: 0,
             }],
         );
         let overlap = graph
@@ -848,6 +1381,7 @@ mod tests {
                 end: 0xa000,
                 backing_path: None,
                 source: crate::MappingSource::Mmap,
+                mapping_generation: 0,
             }],
         );
         assert_eq!(
@@ -891,6 +1425,7 @@ mod tests {
                     end: 0x4000,
                     backing_path: None,
                     source: crate::MappingSource::ProcMaps,
+                    mapping_generation: 0,
                 },
                 crate::ObservedMapping {
                     process_id: 3,
@@ -898,6 +1433,7 @@ mod tests {
                     end: 0x3000,
                     backing_path: Some("[anon:scudo:secondary]".to_owned()),
                     source: crate::MappingSource::ProcMaps,
+                    mapping_generation: 0,
                 },
                 crate::ObservedMapping {
                     process_id: 3,
@@ -905,6 +1441,7 @@ mod tests {
                     end: 0x2000,
                     backing_path: None,
                     source: crate::MappingSource::ProcMaps,
+                    mapping_generation: 0,
                 },
             ],
         );
@@ -916,6 +1453,41 @@ mod tests {
         assert_eq!(overlaps.len(), 1);
         assert_eq!(overlaps[0].strength, EdgeStrength::Correlated);
         assert_eq!(overlaps[0].to, "proc_maps:3:1000-3000");
+    }
+
+    #[test]
+    fn art_open_join_is_correlated_not_confirmed() {
+        let mut graph = SessionGraph::from_package_dump(
+            Uuid::nil(),
+            "pkg",
+            &[8],
+            &[crate::DumpArtifact {
+                kind: "dex".to_owned(),
+                source: "apk-dex".to_owned(),
+                relative_path: "apk-dex/classes.dex".to_owned(),
+                bytes: 32,
+                magic: "dex".to_owned(),
+                pid: None,
+                vma_start: None,
+                vma_end: None,
+                map_path: None,
+                dex_offset: None,
+                sha256: Some("dead".to_owned()),
+            }],
+        );
+        graph.attach_art_open_joins(
+            Uuid::nil(),
+            "pkg",
+            &[(
+                8,
+                "/data/app/pkg/base.apk".to_owned(),
+                "artifact:sha256:dead".to_owned(),
+            )],
+        );
+        assert!(graph.edges.iter().any(|edge| {
+            edge.relation == "joined_dex" && edge.strength == EdgeStrength::Correlated
+        }));
+        assert!(graph.edges.iter().any(|edge| edge.relation == "art_opens"));
     }
 
     #[test]
@@ -948,6 +1520,7 @@ mod tests {
                 end: 0x2000,
                 backing_path: None,
                 source: crate::MappingSource::Mmap,
+                mapping_generation: 0,
             }],
         );
         assert!(graph.edges.iter().any(|edge| {

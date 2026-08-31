@@ -11,7 +11,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use aya::{
-    maps::{perf::PerfEventArray, MapData},
+    maps::{perf::PerfEventArray, Array, HashMap, MapData},
     programs::{uprobe::UProbeLinkId, UProbe},
     Ebpf,
 };
@@ -21,10 +21,12 @@ use super::registers::RegisterContext;
 /// 一次 uprobe 采集会话。
 pub struct UprobeSession {
     bpf: Ebpf,
+    program: String,
     link_id: Option<UProbeLinkId>,
     buffers: Vec<aya::maps::perf::PerfEventArrayBuffer<MapData>>,
     hit_once: bool,
     finished: bool,
+    tgid_keys: Vec<u32>,
 }
 
 impl UprobeSession {
@@ -43,12 +45,28 @@ impl UprobeSession {
         pid: Option<i32>,
         hit_once: bool,
     ) -> Result<Self> {
+        Self::start_program(object, "ksight_uprobe_regs", target, offset, pid, hit_once)
+    }
+
+    /// Attach a named uprobe/uretprobe program from the same object.
+    ///
+    /// # Errors
+    ///
+    /// Returns when the named program cannot be loaded or attached.
+    pub fn start_program(
+        object: &Path,
+        program: &str,
+        target: &Path,
+        offset: u64,
+        pid: Option<i32>,
+        hit_once: bool,
+    ) -> Result<Self> {
         let mut bpf = Ebpf::load_file(object).context("加载 uprobe BPF 对象")?;
 
         let link_id = {
             let probe: &mut UProbe = bpf
-                .program_mut("ksight_uprobe_regs")
-                .context("ksight_uprobe_regs 程序缺失")?
+                .program_mut(program)
+                .with_context(|| format!("{program} 程序缺失"))?
                 .try_into()
                 .context("不是 uprobe 程序")?;
             probe.load().context("加载 uprobe 程序")?;
@@ -63,8 +81,8 @@ impl UprobeSession {
         )
         .context("打开 hwbp_events perf array")?;
         let mut buffers = Vec::new();
-        for cpu in 0..online_cpus() {
-            if let Ok(buffer) = events.open(cpu, Some(64)) {
+        for cpu in crate::cpu_list::online_cpu_ids() {
+            if let Ok(buffer) = events.open(cpu, Some(128)) {
                 buffers.push(buffer);
             }
         }
@@ -74,11 +92,48 @@ impl UprobeSession {
 
         Ok(Self {
             bpf,
+            program: program.to_owned(),
             link_id: Some(link_id),
             buffers,
             hit_once,
             finished: false,
+            tgid_keys: Vec::new(),
         })
+    }
+
+    /// Restrict emission to these thread-group IDs.
+    ///
+    /// `None` records every mapping process. An empty slice still enables the
+    /// filter, so callers should pass `None` until at least one TGID is known.
+    ///
+    /// # Errors
+    ///
+    /// Returns when the filter maps are missing or cannot be updated.
+    pub fn apply_tgid_filter(&mut self, tgids: Option<&[u32]>) -> Result<()> {
+        if let Some(tgids) = tgids {
+            let map = self
+                .bpf
+                .map_mut("tgid_allow")
+                .context("tgid_allow map 缺失")?;
+            let mut allow: HashMap<&mut MapData, u32, u32> =
+                HashMap::try_from(map).context("打开 tgid_allow")?;
+            for old in self.tgid_keys.drain(..) {
+                let _ = allow.remove(&old);
+            }
+            for tgid in tgids.iter().copied().filter(|tgid| *tgid > 0).take(128) {
+                allow.insert(tgid, 1, 0).context("写入 tgid_allow")?;
+                self.tgid_keys.push(tgid);
+            }
+        }
+        let enabled = u32::from(tgids.is_some_and(|tgids| !tgids.is_empty()));
+        let map = self
+            .bpf
+            .map_mut("tgid_filter")
+            .context("tgid_filter map 缺失")?;
+        let mut filter: Array<&mut MapData, u32> =
+            Array::try_from(map).context("打开 tgid_filter")?;
+        filter.set(0, enabled, 0).context("写入 tgid_filter")?;
+        Ok(())
     }
 
     /// 非阻塞排空当前可读命中。
@@ -125,7 +180,7 @@ impl UprobeSession {
         let Some(link_id) = self.link_id.take() else {
             return;
         };
-        let Some(program) = self.bpf.program_mut("ksight_uprobe_regs") else {
+        let Some(program) = self.bpf.program_mut(&self.program) else {
             return;
         };
         let Ok(probe): Result<&mut UProbe, _> = program.try_into() else {
@@ -141,24 +196,18 @@ impl Drop for UprobeSession {
     }
 }
 
-fn online_cpus() -> u32 {
-    std::thread::available_parallelism()
-        .map_or(8, |value| u32::try_from(value.get()).unwrap_or(8))
-        .max(1)
-}
-
 fn drain(buffer: &mut aya::maps::perf::PerfEventArrayBuffer<MapData>) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     loop {
         let mut slots = [
-            bytes::BytesMut::with_capacity(512),
-            bytes::BytesMut::with_capacity(512),
-            bytes::BytesMut::with_capacity(512),
-            bytes::BytesMut::with_capacity(512),
-            bytes::BytesMut::with_capacity(512),
-            bytes::BytesMut::with_capacity(512),
-            bytes::BytesMut::with_capacity(512),
-            bytes::BytesMut::with_capacity(512),
+            bytes::BytesMut::with_capacity(1024),
+            bytes::BytesMut::with_capacity(1024),
+            bytes::BytesMut::with_capacity(1024),
+            bytes::BytesMut::with_capacity(1024),
+            bytes::BytesMut::with_capacity(1024),
+            bytes::BytesMut::with_capacity(1024),
+            bytes::BytesMut::with_capacity(1024),
+            bytes::BytesMut::with_capacity(1024),
         ];
         let Ok(read) = buffer.read_events(&mut slots) else {
             break;

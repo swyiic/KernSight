@@ -133,6 +133,11 @@ fn is_ephemeral_dex(path: &str) -> bool {
 /// True when a mapped/opened native library is a packer, VMP, or gadget.
 #[must_use]
 pub fn is_interesting_native(path: &str) -> bool {
+    let path = path
+        .strip_suffix(" (deleted)")
+        .or_else(|| path.strip_suffix("(deleted)"))
+        .unwrap_or(path)
+        .trim();
     let name = Path::new(path)
         .file_name()
         .and_then(|value| value.to_str())
@@ -143,10 +148,12 @@ pub fn is_interesting_native(path: &str) -> bool {
             "dexhelper",
             "dexjni",
             "dexvmp",
+            "dexloader",
+            "loaddex",
+            "dumpdex",
             "flipped",
             "ssduck",
             "scylla",
-            "icbcencryption",
             "fridagadget",
             "frida-gadget",
             "libgadget",
@@ -156,7 +163,26 @@ pub fn is_interesting_native(path: &str) -> bool {
             "nllvm",
             "iprotect",
             "secneo",
+            "secexe",
+            "secmain",
+            "datajar",
             "apkwrapper",
+            "apkprotect",
+            "nprotect",
+            "jiagu",
+            "legu",
+            "ijiami",
+            "libexec",
+            "execmain",
+            "qihoo",
+            "qvm",
+            "naga",
+            "baiduprotect",
+            "sgmain",
+            "sgsecuritybody",
+            "mobisec",
+            "shella",
+            "shellx",
         ]
         .iter()
         .any(|needle| name.contains(needle))
@@ -385,6 +411,12 @@ mod tests {
         assert!(is_interesting_native("/data/app/x/libiProtectSGCC.so"));
         assert!(is_interesting_native("/data/app/x/libFridaGadget.so"));
         assert!(is_interesting_native("/data/app/x/libbangcle_risk.so"));
+        assert!(is_interesting_native("/data/app/x/libjiagu.so"));
+        assert!(is_interesting_native(
+            "/data/data/pkg/files/libexec.so (deleted)"
+        ));
+        assert!(is_interesting_native("/data/app/x/libshella.so"));
         assert!(!is_interesting_native("/system/lib64/libc.so"));
+        assert!(!is_interesting_native("/data/app/x/libcrypto.so"));
     }
 }

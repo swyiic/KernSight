@@ -1,8 +1,8 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use ksight_model::{
-    BaselineFdKind, BinderTransactionStage, Event, EventPayload, FileDescriptorOperation,
-    MemoryOperation, SensorKind, SocketIoOperation,
+    BaselineFdKind, BinderTransactionFlag, BinderTransactionStage, Event, EventPayload,
+    FileDescriptorOperation, MemoryOperation, SensorKind, SocketIoOperation,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -37,10 +37,87 @@ pub struct ProcessActivity {
     pub package: Option<String>,
     /// Observed process IDs belonging to this group.
     pub process_ids: Vec<u32>,
+    /// Distinct process instances (`boot_id:pid:start_time_ns`) in this group.
+    #[serde(default)]
+    pub instances: Vec<ProcessInstanceRef>,
     /// Total normalized events for this group.
     pub event_count: u64,
     /// Counts split by capture sensor.
     pub sensor_counts: BTreeMap<SensorKind, u64>,
+}
+
+/// One process instance that survives PID reuse within a boot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessInstanceRef {
+    /// `boot_id:pid:start_time_ns`.
+    pub process_instance_id: String,
+    /// Device boot identifier.
+    #[serde(default)]
+    pub boot_id: Uuid,
+    /// Linux process ID.
+    pub pid: u32,
+    /// Kernel monotonic start time in nanoseconds, or zero when unobserved.
+    pub start_time_ns: u64,
+}
+
+/// Aggregated selected-process Inspect adapter activity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InspectHitActivity {
+    /// Adapter identifier, for example `binder_userspace`.
+    pub adapter: String,
+    /// Process ID that produced the hit.
+    pub process_id: u32,
+    /// Process instance id when start time was known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_instance_id: Option<String>,
+    /// Whether the probe attached.
+    pub attached: bool,
+    /// Hit count in the report range.
+    pub hits: u64,
+    /// Last adapter detail string.
+    pub last_detail: String,
+    /// Binder handle from `IPCThreadState::transact` x1, when the adapter recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binder_handle: Option<u32>,
+    /// Binder transaction code from x2, when recorded. Not an AIDL method name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binder_code: Option<u32>,
+    /// Interface token paired from `Parcel::writeInterfaceToken` on the same TID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binder_interface: Option<String>,
+    /// AIDL method from the AOSP Stub table or a process DEX Stub.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binder_method: Option<String>,
+    /// `aosp_stub` or `process_dex`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binder_method_source: Option<String>,
+    /// Last transact's bounded Parcel string arguments on the same TID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binder_strings: Option<Vec<String>>,
+    /// Last `writeInt32` values on the same TID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binder_ints: Option<Vec<i32>>,
+    /// Last `writeInt64` / `writeUint32` / `writeUint64` values on the same TID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binder_int64s: Option<Vec<i64>>,
+    /// Last `writeBool` values on the same TID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binder_bools: Option<Vec<bool>>,
+    /// Last `writeFileDescriptor` values on the same TID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binder_fds: Option<Vec<i32>>,
+    /// Last `writeByteArray` previews on the same TID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binder_blobs: Option<Vec<String>>,
+    /// Last `writeStrongBinder` binder-object pointers on the same TID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binder_binders: Option<Vec<String>>,
+    /// L0 Binder request `debug_id` joined by tid+code. Correlated, not the reply clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binder_transaction_id: Option<i32>,
+    /// Kernel request-to-reply latency copied from the paired L0 reply, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_latency_ns: Option<u64>,
 }
 
 /// Aggregated Binder traffic between two process endpoints.
@@ -60,6 +137,12 @@ pub struct BinderRelation {
     pub replies: u64,
     /// Interface-specific transaction codes and their counts.
     pub codes: BTreeMap<u32, u64>,
+    /// Replies on this edge that named a request `debug_id`.
+    #[serde(default)]
+    pub paired_replies: u64,
+    /// Interface tokens parsed from kernel parcel prefixes on this edge.
+    #[serde(default)]
+    pub interfaces: BTreeMap<String, u64>,
 }
 
 /// Aggregated code, system, or data path activity.
@@ -118,6 +201,63 @@ pub struct NetworkPeerActivity {
     /// Messages completed by observed `recvmmsg` calls.
     #[serde(default)]
     pub received_messages: u64,
+    /// DNS QNAME that answered this peer IP, when a UDP/53 datagram matched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_name: Option<String>,
+    /// TLS `ClientHello` SNI observed on a first write of this flow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sni: Option<String>,
+    /// TLS ALPN list observed on a first write of this flow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alpn: Option<String>,
+    /// HTTP `Host` header from a cleartext first write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_host: Option<String>,
+    /// HTTP method from a cleartext first write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_method: Option<String>,
+    /// `tls`, `http`, `quic`, or a comma-joined mix when more than one kind was seen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handshake_kind: Option<String>,
+}
+
+/// One QNAME observed on UDP/53, with any A/AAAA answers copied from the datagram.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsNameActivity {
+    /// Process that issued or received the datagram.
+    pub process_id: u32,
+    /// First question name, lowercased.
+    pub qname: String,
+    /// A/AAAA presentation strings from the same message.
+    #[serde(default)]
+    pub addresses: Vec<String>,
+}
+
+/// One first-write handshake observation (TLS `ClientHello`, HTTP/1, or QUIC long header).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandshakeNameActivity {
+    /// Process that issued the first write.
+    pub process_id: u32,
+    /// `tls`, `http`, or `quic`.
+    pub kind: String,
+    /// TLS SNI, when parsed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sni: Option<String>,
+    /// TLS ALPN, when parsed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alpn: Option<String>,
+    /// HTTP `Host`, when parsed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_host: Option<String>,
+    /// HTTP method, when parsed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_method: Option<String>,
+    /// Peer address copied from sendto/sendmsg, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer: Option<String>,
+    /// Peer port copied from sendto/sendmsg, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
 }
 
 /// File-descriptor lifecycle consistency within the observed session.
@@ -174,6 +314,9 @@ pub struct ObservedMapping {
     pub backing_path: Option<String>,
     /// How this interval was observed.
     pub source: MappingSource,
+    /// Per-process mmap generation. Zero when the interval came from a snapshot.
+    #[serde(default)]
+    pub mapping_generation: u32,
 }
 
 /// Origin of an [`ObservedMapping`].
@@ -302,6 +445,64 @@ pub struct BinderLifecycleSummary {
     pub maximum_delivery_ns: Option<u64>,
     /// Integer average submitted-to-delivered latency.
     pub average_delivery_ns: Option<u64>,
+    /// Two-way (not `TF_ONE_WAY`) request submissions.
+    #[serde(default)]
+    pub two_way_submitted: u64,
+    /// One-way request submissions.
+    #[serde(default)]
+    pub one_way_submitted: u64,
+    /// Reply submissions (`reply=true`).
+    #[serde(default)]
+    pub reply_submitted: u64,
+    /// Replies whose `reply_to_request_id` matched a retained request.
+    #[serde(default)]
+    pub paired_replies: u64,
+    /// Reply submissions with no matching request `debug_id`.
+    #[serde(default)]
+    pub reply_without_request: u64,
+    /// Minimum request-submit to reply-submit latency for paired replies.
+    #[serde(default)]
+    pub minimum_reply_ns: Option<u64>,
+    /// Maximum request-submit to reply-submit latency for paired replies.
+    #[serde(default)]
+    pub maximum_reply_ns: Option<u64>,
+    /// Integer average paired request-to-reply latency.
+    #[serde(default)]
+    pub average_reply_ns: Option<u64>,
+}
+
+/// One two-way Binder RPC whose reply named the request `debug_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BinderReplyPair {
+    /// Client request transaction identifier.
+    pub request_transaction_id: i32,
+    /// Server reply transaction identifier.
+    pub reply_transaction_id: i32,
+    /// Process that submitted the request.
+    pub client_process_id: u32,
+    /// Process that submitted the reply.
+    pub server_process_id: u32,
+    /// Transaction code from the request.
+    pub code: u32,
+    /// Request-submit to reply-submit latency in nanoseconds.
+    pub latency_ns: u64,
+}
+
+/// One Binder-transferred file descriptor paired from send to receive.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BinderFdTransfer {
+    /// Driver transaction identifier that carried the descriptor.
+    pub transaction_id: i32,
+    /// Sending process.
+    pub source_process_id: u32,
+    /// Descriptor number on the sender.
+    pub source_fd: i32,
+    /// Receiving process.
+    pub target_process_id: u32,
+    /// Descriptor number installed on the receiver.
+    pub target_fd: i32,
+    /// Best-effort origin path or socket peer of the sender descriptor.
+    pub origin: String,
 }
 
 /// Socket descriptor lifetime reconstructed from connect and FD events.
@@ -380,6 +581,18 @@ pub struct SessionReport {
     pub artifacts: Vec<ArtifactActivity>,
     /// Network targets, descending by attempts.
     pub network_peers: Vec<NetworkPeerActivity>,
+    /// UDP/53 datagrams copied this session.
+    #[serde(default)]
+    pub dns_datagrams: u64,
+    /// Distinct QNAMEs parsed from those datagrams.
+    #[serde(default)]
+    pub dns_names: Vec<DnsNameActivity>,
+    /// First-write handshake copies this session.
+    #[serde(default)]
+    pub handshake_events: u64,
+    /// Distinct handshake names (SNI / HTTP Host / QUIC Initial) parsed from those copies.
+    #[serde(default)]
+    pub handshake_names: Vec<HandshakeNameActivity>,
     /// File-descriptor lifetime consistency.
     pub fd_lifecycle: FdLifecycleSummary,
     /// Memory-region syscall lifetime totals.
@@ -389,6 +602,12 @@ pub struct SessionReport {
     pub observed_mappings: Vec<ObservedMapping>,
     /// Binder transaction delivery and buffer correlation.
     pub binder_lifecycle: BinderLifecycleSummary,
+    /// Source-to-destination descriptor transfers paired by transaction ID.
+    #[serde(default)]
+    pub binder_fd_transfers: Vec<BinderFdTransfer>,
+    /// Two-way RPCs whose reply named the request `debug_id` (bounded).
+    #[serde(default)]
+    pub binder_reply_pairs: Vec<BinderReplyPair>,
     /// Socket connect-to-close reconstruction through process FD identity.
     pub socket_lifecycle: SocketLifecycleSummary,
     /// Aggregated scoped wakeup counts, descending by frequency.
@@ -397,6 +616,12 @@ pub struct SessionReport {
     /// Bounded TLS plaintext fragments from Inspect `SSL_write`.
     #[serde(default)]
     pub plaintext: Vec<PlaintextActivity>,
+    /// HTTP/1 (and JSON) calls parsed from those Inspect previews. Token values are redacted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub http_calls: Vec<HttpCallActivity>,
+    /// Selected-process Inspect adapter attach/hit summaries. Never Observe events.
+    #[serde(default)]
+    pub inspect_hits: Vec<InspectHitActivity>,
     /// Collapsed loopback connect storms (for example 127.0.0.1:20000-29999).
     #[serde(default)]
     pub loopback_scans: Vec<LoopbackScanActivity>,
@@ -432,7 +657,7 @@ pub struct PlaintextActivity {
     pub process_id: u32,
     /// Inspect adapter.
     pub adapter: String,
-    /// `send` for `SSL_write`.
+    /// `send` for `SSL_write`, `recv` for `SSL_read`.
     pub direction: String,
     /// Number of captured writes.
     pub count: u64,
@@ -447,6 +672,52 @@ pub struct PlaintextActivity {
     /// Dominant `content_class`: `text`, `tls_record`, or `binary`.
     #[serde(default)]
     pub content_class: String,
+}
+
+/// One HTTP/1 or JSON call aggregated from Inspect TLS plaintext previews.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpCallActivity {
+    /// Process label.
+    pub source: String,
+    /// Process ID.
+    pub process_id: u32,
+    /// `send` for `SSL_write`, `recv` for `SSL_read`.
+    pub direction: String,
+    /// `http1_request`, `http1_response`, `http2_preface`, or `json`.
+    pub kind: String,
+    /// `GET` / `POST` / `HTTP` / `PRI` / `JSON`.
+    pub method: String,
+    /// Host header, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// Path without query.
+    pub path: String,
+    /// Response status, when this is a response line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    /// Query parameter names, in first-seen order.
+    #[serde(default)]
+    pub query_keys: Vec<String>,
+    /// Header names as they appeared.
+    #[serde(default)]
+    pub header_names: Vec<String>,
+    /// Sensitive headers as `Name=[REDACTED]`.
+    #[serde(default)]
+    pub redacted_headers: Vec<String>,
+    /// Form/JSON body keys.
+    #[serde(default)]
+    pub body_keys: Vec<String>,
+    /// Sensitive body keys that were redacted.
+    #[serde(default)]
+    pub redacted_body_keys: Vec<String>,
+    /// Content-Type, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    /// True when the host looks like ads/risk/telemetry rather than app API.
+    #[serde(default)]
+    pub third_party: bool,
+    /// Number of matching Inspect previews.
+    pub count: u64,
 }
 
 /// Collapsed connect storm against loopback ports.
@@ -495,11 +766,49 @@ pub struct SessionReportBuilder {
     binder_transactions: BTreeMap<i32, MutableBinderTransaction>,
     binder_lifecycle: BinderLifecycleSummary,
     binder_latency_total_ns: u64,
+    binder_fd_transfers: Vec<BinderFdTransfer>,
+    binder_reply_pairs: Vec<BinderReplyPair>,
+    binder_reply_latency_total_ns: u64,
     socket_fds: BTreeSet<(u32, i32)>,
     socket_peers: BTreeMap<(u32, i32), (String, Option<u16>)>,
     sched_wakeups: BTreeMap<(u32, u32), u64>,
     plaintext: BTreeMap<(u32, String, String), MutablePlaintext>,
+    http_calls: BTreeMap<HttpCallKey, MutableHttpCall>,
+    inspect_hits: BTreeMap<(u32, String), MutableInspectHit>,
+    pending_inspect_transacts: HashMap<(u32, u32), VecDeque<u32>>,
+    unmatched_binder_submits: HashMap<(u32, u32), VecDeque<i32>>,
+    inspect_joined_txns: HashMap<i32, u32>,
+    mapping_generations: BTreeMap<u32, u32>,
     socket_lifecycle: SocketLifecycleSummary,
+    dns_datagrams: u64,
+    dns_names: BTreeMap<(u32, String), BTreeSet<String>>,
+    dns_by_ip: BTreeMap<(u32, String), String>,
+    dns_by_ip_global: BTreeMap<String, String>,
+    handshake_events: u64,
+    handshake_names: Vec<HandshakeNameActivity>,
+    handshake_by_fd: BTreeMap<(u32, i32), MutableHandshake>,
+}
+
+#[derive(Debug, Default)]
+struct MutableInspectHit {
+    attached: bool,
+    hits: u64,
+    last_detail: String,
+    process_instance_id: Option<String>,
+    binder_handle: Option<u32>,
+    binder_code: Option<u32>,
+    binder_interface: Option<String>,
+    binder_method: Option<String>,
+    binder_method_source: Option<String>,
+    binder_strings: Option<Vec<String>>,
+    binder_ints: Option<Vec<i32>>,
+    binder_int64s: Option<Vec<i64>>,
+    binder_bools: Option<Vec<bool>>,
+    binder_fds: Option<Vec<i32>>,
+    binder_blobs: Option<Vec<String>>,
+    binder_binders: Option<Vec<String>>,
+    binder_transaction_id: Option<i32>,
+    reply_latency_ns: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -510,6 +819,29 @@ struct MutablePlaintext {
     sha256_samples: Vec<String>,
     preview: Option<String>,
     content_class: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct HttpCallKey {
+    process_id: u32,
+    direction: String,
+    kind: String,
+    method: String,
+    host: String,
+    path: String,
+}
+
+#[derive(Debug, Default)]
+struct MutableHttpCall {
+    status: Option<u16>,
+    query_keys: Vec<String>,
+    header_names: Vec<String>,
+    redacted_headers: Vec<String>,
+    body_keys: Vec<String>,
+    redacted_body_keys: Vec<String>,
+    content_type: Option<String>,
+    third_party: bool,
+    count: u64,
 }
 
 #[derive(Debug, Default)]
@@ -523,6 +855,7 @@ struct ObservedIdentity {
 struct MutableProcessActivity {
     package: Option<String>,
     process_ids: BTreeSet<u32>,
+    instances: BTreeMap<(u32, u64), ProcessInstanceRef>,
     event_count: u64,
     sensor_counts: BTreeMap<SensorKind, u64>,
 }
@@ -531,7 +864,9 @@ struct MutableProcessActivity {
 struct MutableBinderRelation {
     requests: u64,
     replies: u64,
+    paired_replies: u64,
     codes: BTreeMap<u32, u64>,
+    interfaces: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Default)]
@@ -554,6 +889,21 @@ struct MutableNetworkPeerActivity {
     received_bytes: u64,
     sent_messages: u64,
     received_messages: u64,
+    resolved_name: Option<String>,
+    sni: Option<String>,
+    alpn: Option<String>,
+    http_host: Option<String>,
+    http_method: Option<String>,
+    handshake_kind: Option<String>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct MutableHandshake {
+    kind: String,
+    sni: Option<String>,
+    alpn: Option<String>,
+    http_host: Option<String>,
+    http_method: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -561,6 +911,11 @@ struct MutableBinderTransaction {
     submitted_ns: u64,
     delivered: bool,
     buffer_observed: bool,
+    source_pid: u32,
+    code: u32,
+    two_way: bool,
+    interface_token: Option<String>,
+    binder_method: Option<String>,
 }
 
 impl SessionReportBuilder {
@@ -626,6 +981,17 @@ impl SessionReportBuilder {
         let activity = self.processes.entry(label).or_default();
         activity.package = package;
         activity.process_ids.insert(pid);
+        let start_time_ns = header.process.key.start_time_ns;
+        let boot_id = header.process.key.boot_id;
+        activity
+            .instances
+            .entry((pid, start_time_ns))
+            .or_insert_with(|| ProcessInstanceRef {
+                process_instance_id: format!("{boot_id}:{pid}:{start_time_ns}"),
+                boot_id,
+                pid,
+                start_time_ns,
+            });
         activity.event_count += 1;
         *activity.sensor_counts.entry(header.sensor).or_default() += 1;
 
@@ -674,6 +1040,8 @@ impl SessionReportBuilder {
             EventPayload::SocketConnect(connect) => self.record_socket_connect(pid, connect),
             EventPayload::SocketAccept(accept) => self.record_socket_accept(pid, accept),
             EventPayload::SocketIo(io) => self.record_socket_io(pid, io),
+            EventPayload::DnsDatagram(datagram) => self.record_dns(pid, datagram),
+            EventPayload::NetworkHandshake(handshake) => self.record_handshake(pid, handshake),
             EventPayload::SessionFdBaseline(baseline) => {
                 self.record_fd_baseline(baseline);
             }
@@ -705,12 +1073,88 @@ impl SessionReportBuilder {
                 } else if activity.content_class != fragment.content_class {
                     "mixed".clone_into(&mut activity.content_class);
                 }
+                if let Some(parsed) =
+                    crate::parse_http_plain(&fragment.preview, &fragment.content_class)
+                {
+                    self.record_http_call(pid, &fragment.direction, parsed);
+                }
+            }
+            EventPayload::InspectObservation(observation) => {
+                {
+                    let activity = self
+                        .inspect_hits
+                        .entry((pid, observation.adapter.clone()))
+                        .or_default();
+                    activity.attached |= observation.attached;
+                    if observation.hit {
+                        activity.hits = activity.hits.saturating_add(1);
+                    }
+                    if !observation.detail.is_empty() {
+                        activity.last_detail.clone_from(&observation.detail);
+                    }
+                    activity.process_instance_id = Some(format!(
+                        "{}:{pid}:{}",
+                        header.process.key.boot_id, header.process.key.start_time_ns
+                    ));
+                    if observation.binder_handle.is_some() {
+                        activity.binder_handle = observation.binder_handle;
+                    }
+                    if observation.binder_code.is_some() {
+                        activity.binder_code = observation.binder_code;
+                    }
+                    if observation.binder_interface.is_some() {
+                        activity
+                            .binder_interface
+                            .clone_from(&observation.binder_interface);
+                    }
+                    if observation.binder_method.is_some() {
+                        activity
+                            .binder_method
+                            .clone_from(&observation.binder_method);
+                    }
+                    if observation.binder_method_source.is_some() {
+                        activity
+                            .binder_method_source
+                            .clone_from(&observation.binder_method_source);
+                    }
+                    if observation.binder_strings.is_some() {
+                        activity
+                            .binder_strings
+                            .clone_from(&observation.binder_strings);
+                    }
+                    if observation.binder_ints.is_some() {
+                        activity.binder_ints.clone_from(&observation.binder_ints);
+                    }
+                    if observation.binder_fds.is_some() {
+                        activity.binder_fds.clone_from(&observation.binder_fds);
+                    }
+                    if observation.binder_blobs.is_some() {
+                        activity.binder_blobs.clone_from(&observation.binder_blobs);
+                    }
+                    if observation.binder_binders.is_some() {
+                        activity
+                            .binder_binders
+                            .clone_from(&observation.binder_binders);
+                    }
+                    if observation.binder_int64s.is_some() {
+                        activity
+                            .binder_int64s
+                            .clone_from(&observation.binder_int64s);
+                    }
+                    if observation.binder_bools.is_some() {
+                        activity.binder_bools.clone_from(&observation.binder_bools);
+                    }
+                }
+                if observation.hit && observation.adapter == "binder_userspace" {
+                    if let Some(code) = observation.binder_code {
+                        self.join_inspect_binder(pid, header.process.tid, code);
+                    }
+                }
             }
             EventPayload::ProcessLifecycle(_)
             | EventPayload::ProcessIdentityChange(_)
             | EventPayload::SessionEnvironment(_)
             | EventPayload::SessionCompletion(_)
-            | EventPayload::InspectObservation(_)
             | EventPayload::Opaque { .. } => {}
         }
     }
@@ -747,6 +1191,92 @@ impl SessionReportBuilder {
         }
     }
 
+    fn record_dns(&mut self, pid: u32, datagram: &ksight_model::DnsDatagram) {
+        self.dns_datagrams = self.dns_datagrams.saturating_add(1);
+        let Some(qname) = datagram.qname.as_deref() else {
+            return;
+        };
+        if qname.is_empty() {
+            return;
+        }
+        let names = self.dns_names.entry((pid, qname.to_owned())).or_default();
+        for address in &datagram.addresses {
+            if address.is_empty() {
+                continue;
+            }
+            names.insert(address.clone());
+            self.dns_by_ip
+                .entry((pid, address.clone()))
+                .or_insert_with(|| qname.to_owned());
+            self.dns_by_ip_global
+                .insert(address.clone(), qname.to_owned());
+        }
+    }
+
+    fn stamp_dns_peers(&mut self) {
+        for ((pid, peer, _), activity) in &mut self.network {
+            if activity.resolved_name.is_some() {
+                continue;
+            }
+            if let Some(name) = self.dns_by_ip.get(&(*pid, peer.clone())) {
+                activity.resolved_name = Some(name.clone());
+            } else if let Some(name) = self.dns_by_ip_global.get(peer) {
+                activity.resolved_name = Some(name.clone());
+            }
+        }
+    }
+
+    fn record_handshake(&mut self, pid: u32, handshake: &ksight_model::NetworkHandshake) {
+        self.handshake_events = self.handshake_events.saturating_add(1);
+        let peer = handshake
+            .peer_address
+            .as_deref()
+            .map(normalize_peer_address);
+        let port = (handshake.peer_port != 0).then_some(handshake.peer_port);
+        self.handshake_names.push(HandshakeNameActivity {
+            process_id: pid,
+            kind: handshake.kind.clone(),
+            sni: handshake.sni.clone(),
+            alpn: handshake.alpn.clone(),
+            http_host: handshake.http_host.clone(),
+            http_method: handshake.http_method.clone(),
+            peer: peer.clone(),
+            port,
+        });
+        let stamp = MutableHandshake {
+            kind: handshake.kind.clone(),
+            sni: handshake.sni.clone(),
+            alpn: handshake.alpn.clone(),
+            http_host: handshake.http_host.clone(),
+            http_method: handshake.http_method.clone(),
+        };
+        merge_handshake(
+            self.handshake_by_fd
+                .entry((pid, handshake.file_descriptor))
+                .or_default(),
+            &stamp,
+        );
+        if let Some(peer) = peer {
+            let activity = self.network.entry((pid, peer, port)).or_default();
+            apply_handshake(activity, &stamp);
+        }
+    }
+
+    fn stamp_handshake_peers(&mut self) {
+        let stamps: Vec<((u32, i32), MutableHandshake)> = self
+            .handshake_by_fd
+            .iter()
+            .map(|(key, value)| (*key, value.clone()))
+            .collect();
+        for ((pid, fd), stamp) in stamps {
+            let Some((peer, port)) = self.socket_peers.get(&(pid, fd)).cloned() else {
+                continue;
+            };
+            let activity = self.network.entry((pid, peer, port)).or_default();
+            apply_handshake(activity, &stamp);
+        }
+    }
+
     fn record_socket_connect(&mut self, pid: u32, connect: &ksight_model::SocketConnect) {
         self.socket_lifecycle.connect_attempts += 1;
         let associated = connect.result == 0 || connect.result == -115;
@@ -767,6 +1297,9 @@ impl SessionReportBuilder {
         activity.attempts += 1;
         activity.successful += u64::from(connect.result == 0);
         activity.in_progress += u64::from(connect.result == -115);
+        if activity.resolved_name.is_none() {
+            activity.resolved_name.clone_from(&connect.resolved_name);
+        }
         if associated {
             self.socket_peers
                 .insert((pid, connect.file_descriptor), (peer, connect.peer_port));
@@ -855,7 +1388,9 @@ impl SessionReportBuilder {
 
     /// Finish aggregation and order high-volume groups by descending activity.
     #[allow(clippy::too_many_lines)] // Final ordering keeps all report sections deterministic.
-    pub fn finish(self) -> SessionReport {
+    pub fn finish(mut self) -> SessionReport {
+        self.stamp_dns_peers();
+        self.stamp_handshake_peers();
         let mut processes = self
             .processes
             .into_iter()
@@ -863,6 +1398,7 @@ impl SessionReportBuilder {
                 label,
                 package: value.package,
                 process_ids: value.process_ids.into_iter().collect(),
+                instances: value.instances.into_values().collect(),
                 event_count: value.event_count,
                 sensor_counts: value.sensor_counts,
             })
@@ -888,6 +1424,8 @@ impl SessionReportBuilder {
                 requests: value.requests,
                 replies: value.replies,
                 codes: value.codes,
+                paired_replies: value.paired_replies,
+                interfaces: value.interfaces,
             })
             .collect::<Vec<_>>();
         binder_relations.sort_by(|left, right| {
@@ -920,6 +1458,33 @@ impl SessionReportBuilder {
                 .then_with(|| left.path.cmp(&right.path))
         });
 
+        let mut dns_names = self
+            .dns_names
+            .into_iter()
+            .map(|((process_id, qname), addresses)| DnsNameActivity {
+                process_id,
+                qname,
+                addresses: addresses.into_iter().collect(),
+            })
+            .collect::<Vec<_>>();
+        dns_names.sort_by(|left, right| {
+            left.qname
+                .cmp(&right.qname)
+                .then_with(|| left.process_id.cmp(&right.process_id))
+        });
+        dns_names.truncate(128);
+        let dns_datagrams = self.dns_datagrams;
+        let handshake_events = self.handshake_events;
+        let mut handshake_names = self.handshake_names;
+        handshake_names.sort_by(|left, right| {
+            left.kind
+                .cmp(&right.kind)
+                .then_with(|| left.sni.cmp(&right.sni))
+                .then_with(|| left.http_host.cmp(&right.http_host))
+                .then_with(|| left.process_id.cmp(&right.process_id))
+        });
+        handshake_names.truncate(128);
+
         let mut network_peers = self
             .network
             .into_iter()
@@ -936,6 +1501,12 @@ impl SessionReportBuilder {
                 received_bytes: value.received_bytes,
                 sent_messages: value.sent_messages,
                 received_messages: value.received_messages,
+                resolved_name: value.resolved_name,
+                sni: value.sni,
+                alpn: value.alpn,
+                http_host: value.http_host,
+                http_method: value.http_method,
+                handshake_kind: value.handshake_kind,
             })
             .collect::<Vec<_>>();
         let loopback_scans = collapse_loopback_scans(&mut network_peers);
@@ -1006,6 +1577,38 @@ impl SessionReportBuilder {
                 .cmp(&left.captured_bytes)
                 .then_with(|| left.source.cmp(&right.source))
         });
+        let mut http_calls = self
+            .http_calls
+            .into_iter()
+            .map(|(key, activity)| HttpCallActivity {
+                source: resolve_label(&self.identities, key.process_id),
+                process_id: key.process_id,
+                direction: key.direction,
+                kind: key.kind,
+                method: key.method,
+                host: (!key.host.is_empty()).then_some(key.host),
+                path: key.path,
+                status: activity.status,
+                query_keys: activity.query_keys,
+                header_names: activity.header_names,
+                redacted_headers: activity.redacted_headers,
+                body_keys: activity.body_keys,
+                redacted_body_keys: activity.redacted_body_keys,
+                content_type: activity.content_type,
+                third_party: activity.third_party,
+                count: activity.count,
+            })
+            .collect::<Vec<_>>();
+        http_calls.sort_by(|left, right| {
+            right
+                .count
+                .cmp(&left.count)
+                .then_with(|| left.host.cmp(&right.host))
+                .then_with(|| left.path.cmp(&right.path))
+                .then_with(|| left.method.cmp(&right.method))
+                .then_with(|| left.process_id.cmp(&right.process_id))
+        });
+        http_calls.truncate(128);
         let mut graph = crate::SessionGraph::from_l0(
             self.session_id,
             &processes,
@@ -1031,6 +1634,7 @@ impl SessionReportBuilder {
                 ),
                 sensors: vec![SensorKind::Network],
                 artifact: None,
+                process_instance_id: None,
             });
             graph.edges.push(crate::GraphEdge {
                 from,
@@ -1056,16 +1660,92 @@ impl SessionReportBuilder {
                 label: row.preview.clone().unwrap_or_else(|| row.adapter.clone()),
                 sensors: vec![SensorKind::Integrity],
                 artifact: None,
+                process_instance_id: None,
             });
             graph.edges.push(crate::GraphEdge {
                 from,
                 to,
-                relation: "tls_send".to_owned(),
+                relation: if row.direction == "recv" {
+                    "tls_recv".to_owned()
+                } else {
+                    "tls_send".to_owned()
+                },
                 strength: crate::EdgeStrength::Confirmed,
                 sensor: Some(SensorKind::Integrity),
             });
         }
+        attach_http_call_graph(&mut graph, session_id, &http_calls);
         graph.attach_observed_mappings(session_id, &observed_mappings, &processes);
+        let mut inspect_hits = self
+            .inspect_hits
+            .into_iter()
+            .map(|((process_id, adapter), activity)| InspectHitActivity {
+                adapter,
+                process_id,
+                process_instance_id: activity.process_instance_id,
+                attached: activity.attached,
+                hits: activity.hits,
+                last_detail: activity.last_detail,
+                binder_handle: activity.binder_handle,
+                binder_code: activity.binder_code,
+                binder_interface: activity.binder_interface,
+                binder_method: activity.binder_method,
+                binder_method_source: activity.binder_method_source,
+                binder_strings: activity.binder_strings,
+                binder_ints: activity.binder_ints,
+                binder_int64s: activity.binder_int64s,
+                binder_bools: activity.binder_bools,
+                binder_fds: activity.binder_fds,
+                binder_blobs: activity.binder_blobs,
+                binder_binders: activity.binder_binders,
+                binder_transaction_id: activity.binder_transaction_id,
+                reply_latency_ns: activity.reply_latency_ns,
+            })
+            .collect::<Vec<_>>();
+        inspect_hits.sort_by(|left, right| {
+            right
+                .hits
+                .cmp(&left.hits)
+                .then_with(|| left.adapter.cmp(&right.adapter))
+                .then_with(|| left.process_id.cmp(&right.process_id))
+        });
+        graph.attach_binder_fd_transfers(session_id, &self.binder_fd_transfers, &processes);
+        graph.attach_binder_replies(session_id, &self.binder_reply_pairs, &processes);
+        graph.attach_inspect_hits(session_id, &inspect_hits, &processes);
+        for (txn, code, token, method) in self
+            .binder_transactions
+            .iter()
+            .filter_map(|(txn, state)| {
+                state
+                    .interface_token
+                    .as_deref()
+                    .map(|token| (*txn, state.code, token, state.binder_method.as_deref()))
+            })
+            .take(64)
+        {
+            let req_key = format!("binder:req:{txn}");
+            let label = match method {
+                Some(method) => format!("binder request {txn} {token}::{method}"),
+                None => format!("binder request {txn} {token} code={code}"),
+            };
+            if let Some(entity) = graph
+                .entities
+                .iter_mut()
+                .find(|entity| entity.key == req_key)
+            {
+                entity.label = label;
+            } else {
+                graph.entities.push(crate::GraphEntity {
+                    kind: crate::GraphEntityKind::BinderTransaction,
+                    session_id,
+                    key: req_key,
+                    label,
+                    sensors: vec![SensorKind::Binder],
+                    artifact: None,
+                    process_instance_id: None,
+                });
+            }
+        }
         SessionReport {
             schema_version: "mobilee.kernsight-session-report/v1".to_owned(),
             session_id: self.session_id,
@@ -1084,6 +1764,10 @@ impl SessionReportBuilder {
             binder_relations,
             artifacts,
             network_peers,
+            dns_datagrams,
+            dns_names,
+            handshake_events,
+            handshake_names,
             fd_lifecycle: FdLifecycleSummary {
                 active_at_end,
                 lineage_complete: fd_lineage_complete,
@@ -1097,19 +1781,55 @@ impl SessionReportBuilder {
             binder_lifecycle: BinderLifecycleSummary {
                 average_delivery_ns: (self.binder_lifecycle.delivered > 0)
                     .then(|| self.binder_latency_total_ns / self.binder_lifecycle.delivered),
+                average_reply_ns: (self.binder_lifecycle.paired_replies > 0).then(|| {
+                    self.binder_reply_latency_total_ns / self.binder_lifecycle.paired_replies
+                }),
                 ..self.binder_lifecycle
             },
+            binder_fd_transfers: self.binder_fd_transfers,
+            binder_reply_pairs: self.binder_reply_pairs,
             socket_lifecycle: SocketLifecycleSummary {
                 active_at_end: active_sockets_at_end,
                 ..self.socket_lifecycle
             },
             sched_wakeups,
             plaintext,
+            http_calls,
+            inspect_hits,
             loopback_scans,
             merged_dumps: Vec::new(),
             graph,
             limitations: report_limitations(),
         }
+    }
+
+    fn record_http_call(&mut self, pid: u32, direction: &str, parsed: crate::ParsedHttpPlain) {
+        let key = HttpCallKey {
+            process_id: pid,
+            direction: direction.to_owned(),
+            kind: parsed.kind.to_owned(),
+            method: parsed.method,
+            host: parsed.host.unwrap_or_default(),
+            path: parsed.path,
+        };
+        let activity = self.http_calls.entry(key).or_default();
+        activity.count = activity.count.saturating_add(1);
+        activity.third_party |= parsed.third_party;
+        if activity.status.is_none() {
+            activity.status = parsed.status;
+        }
+        if activity.content_type.is_none() {
+            activity.content_type.clone_from(&parsed.content_type);
+        }
+        extend_unique(&mut activity.query_keys, &parsed.query_keys, 24);
+        extend_unique(&mut activity.header_names, &parsed.header_names, 24);
+        extend_unique(&mut activity.redacted_headers, &parsed.redacted_headers, 24);
+        extend_unique(&mut activity.body_keys, &parsed.body_keys, 24);
+        extend_unique(
+            &mut activity.redacted_body_keys,
+            &parsed.redacted_body_keys,
+            24,
+        );
     }
 
     fn record_fd(&mut self, pid: u32, change: &ksight_model::FileDescriptorChange) {
@@ -1325,12 +2045,22 @@ impl SessionReportBuilder {
         let slot = self
             .observed_spans
             .entry((pid, start, end))
-            .or_insert_with(|| ObservedMapping {
-                process_id: pid,
-                start,
-                end,
-                backing_path: path.clone(),
-                source,
+            .or_insert_with(|| {
+                let mapping_generation = if source == MappingSource::Mmap {
+                    let generation = self.mapping_generations.entry(pid).or_insert(0);
+                    *generation = generation.saturating_add(1);
+                    *generation
+                } else {
+                    0
+                };
+                ObservedMapping {
+                    process_id: pid,
+                    start,
+                    end,
+                    backing_path: path.clone(),
+                    source,
+                    mapping_generation,
+                }
             });
         if slot.backing_path.is_none() {
             slot.backing_path = path;
@@ -1340,6 +2070,7 @@ impl SessionReportBuilder {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn record_binder(
         &mut self,
         event: &Event,
@@ -1349,14 +2080,43 @@ impl SessionReportBuilder {
         match transaction.stage {
             BinderTransactionStage::Submitted => {
                 self.binder_lifecycle.submitted += 1;
+                let one_way = transaction
+                    .decoded_flags
+                    .contains(&BinderTransactionFlag::OneWay)
+                    || transaction.flags & 0x1 != 0;
+                let two_way = !transaction.reply && !one_way;
+                if transaction.reply {
+                    self.binder_lifecycle.reply_submitted =
+                        self.binder_lifecycle.reply_submitted.saturating_add(1);
+                    self.record_binder_reply(event, transaction, pid);
+                } else if one_way {
+                    self.binder_lifecycle.one_way_submitted =
+                        self.binder_lifecycle.one_way_submitted.saturating_add(1);
+                } else {
+                    self.binder_lifecycle.two_way_submitted =
+                        self.binder_lifecycle.two_way_submitted.saturating_add(1);
+                }
                 self.binder_transactions.insert(
                     transaction.transaction_id,
                     MutableBinderTransaction {
                         submitted_ns: event.header.monotonic_ns,
                         delivered: false,
                         buffer_observed: false,
+                        source_pid: pid,
+                        code: transaction.code,
+                        two_way,
+                        interface_token: transaction.interface_token.clone(),
+                        binder_method: transaction.binder_method.clone(),
                     },
                 );
+                if !transaction.reply {
+                    self.join_binder_submit(
+                        event.header.process.tid,
+                        transaction.code,
+                        transaction.transaction_id,
+                    );
+                    self.stamp_kernel_parcel_on_inspect(pid, transaction);
+                }
                 let relation = self
                     .binder
                     .entry((pid, transaction.target_process_id))
@@ -1367,6 +2127,36 @@ impl SessionReportBuilder {
                     relation.requests += 1;
                 }
                 *relation.codes.entry(transaction.code).or_default() += 1;
+                if let Some(token) = transaction.interface_token.as_deref() {
+                    *relation.interfaces.entry(token.to_owned()).or_default() += 1;
+                }
+            }
+            BinderTransactionStage::ParcelPrefix => {
+                if let Some(state) = self
+                    .binder_transactions
+                    .get_mut(&transaction.transaction_id)
+                {
+                    if state.interface_token.is_none() {
+                        state
+                            .interface_token
+                            .clone_from(&transaction.interface_token);
+                    }
+                    if state.binder_method.is_none() {
+                        state.binder_method.clone_from(&transaction.binder_method);
+                    }
+                }
+                if !transaction.reply {
+                    self.stamp_kernel_parcel_on_inspect(pid, transaction);
+                }
+                if let Some(token) = transaction.interface_token.as_deref() {
+                    *self
+                        .binder
+                        .entry((pid, transaction.target_process_id))
+                        .or_default()
+                        .interfaces
+                        .entry(token.to_owned())
+                        .or_default() += 1;
+                }
             }
             BinderTransactionStage::Received => {
                 let Some(state) = self
@@ -1430,7 +2220,196 @@ impl SessionReportBuilder {
                 } else {
                     self.binder_lifecycle.fd_transfer_without_submission += 1;
                 }
+                if let (Some(origin), Some(source_pid), Some(source_fd), Some(target_fd)) = (
+                    transaction.transferred_fd_origin.clone(),
+                    transaction.transferred_fd_source_pid,
+                    transaction.transferred_fd_source_fd,
+                    transaction.file_descriptor,
+                ) {
+                    self.binder_fd_transfers.push(BinderFdTransfer {
+                        transaction_id: transaction.transaction_id,
+                        source_process_id: source_pid,
+                        source_fd,
+                        target_process_id: pid,
+                        target_fd,
+                        origin,
+                    });
+                }
             }
+        }
+    }
+
+    fn record_binder_reply(
+        &mut self,
+        event: &Event,
+        transaction: &ksight_model::BinderTransaction,
+        server_pid: u32,
+    ) {
+        let Some(request_id) = transaction.reply_to_request_id else {
+            self.binder_lifecycle.reply_without_request = self
+                .binder_lifecycle
+                .reply_without_request
+                .saturating_add(1);
+            return;
+        };
+        let Some((client_pid, code, submitted_ns, two_way)) =
+            self.binder_transactions.get(&request_id).map(|request| {
+                (
+                    request.source_pid,
+                    request.code,
+                    request.submitted_ns,
+                    request.two_way,
+                )
+            })
+        else {
+            self.binder_lifecycle.reply_without_request = self
+                .binder_lifecycle
+                .reply_without_request
+                .saturating_add(1);
+            return;
+        };
+        if !two_way {
+            self.binder_lifecycle.reply_without_request = self
+                .binder_lifecycle
+                .reply_without_request
+                .saturating_add(1);
+            return;
+        }
+        let latency = transaction
+            .reply_latency_ns
+            .unwrap_or_else(|| event.header.monotonic_ns.saturating_sub(submitted_ns));
+        self.binder_lifecycle.paired_replies =
+            self.binder_lifecycle.paired_replies.saturating_add(1);
+        self.binder_reply_latency_total_ns =
+            self.binder_reply_latency_total_ns.saturating_add(latency);
+        self.binder_lifecycle.minimum_reply_ns = Some(
+            self.binder_lifecycle
+                .minimum_reply_ns
+                .map_or(latency, |value| value.min(latency)),
+        );
+        self.binder_lifecycle.maximum_reply_ns = Some(
+            self.binder_lifecycle
+                .maximum_reply_ns
+                .map_or(latency, |value| value.max(latency)),
+        );
+        {
+            let slot = self
+                .binder
+                .entry((server_pid, transaction.target_process_id))
+                .or_default();
+            slot.paired_replies = slot.paired_replies.saturating_add(1);
+        }
+        if self.binder_reply_pairs.len() < 64 {
+            self.binder_reply_pairs.push(BinderReplyPair {
+                request_transaction_id: request_id,
+                reply_transaction_id: transaction.transaction_id,
+                client_process_id: client_pid,
+                server_process_id: server_pid,
+                code,
+                latency_ns: latency,
+            });
+        }
+        if let Some(pid) = self.inspect_joined_txns.get(&request_id).copied() {
+            if let Some(activity) = self
+                .inspect_hits
+                .get_mut(&(pid, "binder_userspace".to_owned()))
+            {
+                activity.reply_latency_ns = Some(latency);
+            }
+        }
+    }
+
+    fn join_inspect_binder(&mut self, pid: u32, tid: u32, code: u32) {
+        let key = (tid, code);
+        if let Some(queue) = self.unmatched_binder_submits.get_mut(&key) {
+            if let Some(txn_id) = queue.pop_front() {
+                if queue.is_empty() {
+                    self.unmatched_binder_submits.remove(&key);
+                }
+                self.stamp_inspect_join(pid, txn_id);
+                return;
+            }
+        }
+        if self.pending_inspect_transacts.len() >= 4096
+            && !self.pending_inspect_transacts.contains_key(&key)
+        {
+            return;
+        }
+        let queue = self.pending_inspect_transacts.entry(key).or_default();
+        if queue.len() >= 8 {
+            queue.pop_front();
+        }
+        queue.push_back(pid);
+    }
+
+    fn join_binder_submit(&mut self, tid: u32, code: u32, txn_id: i32) {
+        let key = (tid, code);
+        if let Some(queue) = self.pending_inspect_transacts.get_mut(&key) {
+            if let Some(pid) = queue.pop_front() {
+                if queue.is_empty() {
+                    self.pending_inspect_transacts.remove(&key);
+                }
+                self.stamp_inspect_join(pid, txn_id);
+                return;
+            }
+        }
+        if self.unmatched_binder_submits.len() >= 4096
+            && !self.unmatched_binder_submits.contains_key(&key)
+        {
+            return;
+        }
+        let queue = self.unmatched_binder_submits.entry(key).or_default();
+        if queue.len() >= 8 {
+            queue.pop_front();
+        }
+        queue.push_back(txn_id);
+    }
+
+    fn stamp_inspect_join(&mut self, pid: u32, txn_id: i32) {
+        if let Some(activity) = self
+            .inspect_hits
+            .get_mut(&(pid, "binder_userspace".to_owned()))
+        {
+            activity.binder_transaction_id = Some(txn_id);
+            if activity.binder_interface.is_none() {
+                if let Some(state) = self.binder_transactions.get(&txn_id) {
+                    activity.binder_interface.clone_from(&state.interface_token);
+                    if activity.binder_method.is_none() {
+                        activity.binder_method.clone_from(&state.binder_method);
+                        if activity.binder_method.is_some() {
+                            activity.binder_method_source = Some("aosp_stub".to_owned());
+                        }
+                    }
+                }
+            }
+        }
+        self.inspect_joined_txns.insert(txn_id, pid);
+    }
+
+    fn stamp_kernel_parcel_on_inspect(
+        &mut self,
+        pid: u32,
+        transaction: &ksight_model::BinderTransaction,
+    ) {
+        let Some(token) = transaction.interface_token.as_ref() else {
+            return;
+        };
+        let Some(activity) = self
+            .inspect_hits
+            .get_mut(&(pid, "binder_userspace".to_owned()))
+        else {
+            return;
+        };
+        if activity.binder_interface.is_none() {
+            activity.binder_interface = Some(token.clone());
+        }
+        if activity.binder_method.is_none() {
+            activity
+                .binder_method
+                .clone_from(&transaction.binder_method);
+            activity
+                .binder_method_source
+                .clone_from(&transaction.binder_method_source);
         }
     }
 
@@ -1537,6 +2516,72 @@ fn fallback_peer(family: u16) -> String {
     }
 }
 
+fn extend_unique(dst: &mut Vec<String>, src: &[String], cap: usize) {
+    for item in src {
+        if dst.len() >= cap {
+            return;
+        }
+        if !dst.iter().any(|seen| seen == item) {
+            dst.push(item.clone());
+        }
+    }
+}
+
+fn attach_http_call_graph(
+    graph: &mut crate::SessionGraph,
+    session_id: Uuid,
+    calls: &[HttpCallActivity],
+) {
+    for row in calls.iter().take(64) {
+        let from = graph.ensure_process(session_id, &row.source, row.process_id);
+        let host = row.host.as_deref().unwrap_or("-");
+        let to = format!(
+            "http_call:{}:{}:{}{}",
+            row.process_id, row.method, host, row.path
+        );
+        if !graph.entities.iter().any(|entity| entity.key == to) {
+            let tracker = if row.third_party { " tracker" } else { "" };
+            graph.entities.push(crate::GraphEntity {
+                kind: crate::GraphEntityKind::SocketFlow,
+                session_id,
+                key: to.clone(),
+                label: format!("{} {host}{}{tracker} ×{}", row.method, row.path, row.count),
+                sensors: vec![SensorKind::Integrity],
+                artifact: None,
+                process_instance_id: None,
+            });
+        }
+        graph.edges.push(crate::GraphEdge {
+            from,
+            to: to.clone(),
+            relation: "http_call".to_owned(),
+            strength: crate::EdgeStrength::Confirmed,
+            sensor: Some(SensorKind::Integrity),
+        });
+        if let Some(name) = row.host.as_deref() {
+            let host_key = format!("host:{name}");
+            if !graph.entities.iter().any(|entity| entity.key == host_key) {
+                graph.entities.push(crate::GraphEntity {
+                    kind: crate::GraphEntityKind::HostName,
+                    session_id,
+                    key: host_key.clone(),
+                    label: name.to_owned(),
+                    sensors: vec![SensorKind::Integrity],
+                    artifact: None,
+                    process_instance_id: None,
+                });
+            }
+            graph.edges.push(crate::GraphEdge {
+                from: host_key,
+                to,
+                relation: "http_host".to_owned(),
+                strength: crate::EdgeStrength::Correlated,
+                sensor: Some(SensorKind::Integrity),
+            });
+        }
+    }
+}
+
 fn inferred_content_class(class: &str, preview: Option<&str>) -> String {
     if !class.is_empty() {
         return class.to_owned();
@@ -1557,6 +2602,52 @@ fn inferred_content_class(class: &str, preview: Option<&str>) -> String {
         "tls_record".to_owned()
     } else {
         String::new()
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn merge_handshake(dst: &mut MutableHandshake, src: &MutableHandshake) {
+    if dst.kind.is_empty() {
+        dst.kind.clone_from(&src.kind);
+    } else if !src.kind.is_empty() && !dst.kind.split(',').any(|part| part == src.kind) {
+        dst.kind = format!("{},{}", dst.kind, src.kind);
+    }
+    if dst.sni.is_none() {
+        dst.sni.clone_from(&src.sni);
+    }
+    if dst.alpn.is_none() {
+        dst.alpn.clone_from(&src.alpn);
+    }
+    if dst.http_host.is_none() {
+        dst.http_host.clone_from(&src.http_host);
+    }
+    if dst.http_method.is_none() {
+        dst.http_method.clone_from(&src.http_method);
+    }
+}
+
+fn apply_handshake(activity: &mut MutableNetworkPeerActivity, stamp: &MutableHandshake) {
+    if activity.sni.is_none() {
+        activity.sni.clone_from(&stamp.sni);
+    }
+    if activity.alpn.is_none() {
+        activity.alpn.clone_from(&stamp.alpn);
+    }
+    if activity.http_host.is_none() {
+        activity.http_host.clone_from(&stamp.http_host);
+    }
+    if activity.http_method.is_none() {
+        activity.http_method.clone_from(&stamp.http_method);
+    }
+    if activity.handshake_kind.is_none() {
+        if !stamp.kind.is_empty() {
+            activity.handshake_kind = Some(stamp.kind.clone());
+        }
+    } else if let Some(existing) = activity.handshake_kind.as_mut() {
+        if !stamp.kind.is_empty() && !existing.split(',').any(|part| part == stamp.kind) {
+            existing.push(',');
+            existing.push_str(&stamp.kind);
+        }
     }
 }
 
@@ -1660,10 +2751,10 @@ fn path_category(path: &str) -> &'static str {
 
 fn report_limitations() -> Vec<String> {
     vec![
-        "Binder driver submission-to-delivery latency is correlated by transaction ID; interface descriptors, AIDL methods, Parcel contents, and full application reply latency remain unresolved.".to_owned(),
+        "Binder driver submission-to-delivery latency is correlated by transaction ID. Two-way RPCs pair reply submit to the request debug_id (binder_reply / replies_to, confirmed). A 128-byte parcel prefix is copied at kprobe binder_transaction (every online CPU) for 32-bit and 64-bit clients (native UAPI after compat conversion) and parsed as writeInterfaceToken String16. Inspect transact joins that request by tid+code as correlated joined_transact and copies reply latency when the kernel pair exists. Inspect pairs writeInterfaceToken and bounded exported Parcel writers on the same TID on ELF64; this GKI rejects AArch32 uprobes. AIDL method names come from on-device AOSP Stub tables (aosp_stub) or that process's loaded DEX TRANSACTION_* (process_dex). Parcel C++ object fields and writeFloat/writeDouble (no FPSIMD in uprobe pt_regs) are not read.".to_owned(),
         "DEX, ELF, connlog, and packed-cache path candidates may include a SHA-256 when a regular file <= 1 MiB is opened; capture also copies those forensic files under the spool forensics directory because apps often delete packed DEX after load.".to_owned(),
-        "Connect/accept and FD baseline/dup/close evidence reconstruct descriptor lifetimes. Optional network-io counts byte-returning socket calls and reports sendmmsg/recvmmsg results as message counts; DNS ownership, TLS/QUIC semantics, and plaintext remain unresolved.".to_owned(),
-        "The L0 graph is queryable (`ksightctl device graph`); process nodes are pid-qualified (`process:pkg:pid`) so isolated app processes stay distinct. Confirmed edges are Binder, socket, loopback scans, sched wakeup identity, and mmap/remap `maps` edges. Dump VMA `overlaps_mmap` is correlated even on an exact address match: a later dump snapshot does not prove the mapping existed at mmap time. Inspect TLS `tls_send` edges are SSL_write copies; content_class tls_record means ciphertext, not HTTP. Time proximity is never a confirmed edge. JNI RegisterNatives, Cronet/QUIC, and app-bundled custom TLS stacks remain unresolved.".to_owned(),
+        "Connect/accept and FD baseline/dup/close evidence reconstruct descriptor lifetimes. Optional network-io counts byte-returning socket calls and reports sendmmsg/recvmmsg results as message counts. UDP/53 datagrams parse QNAME/A/AAAA and stamp later connect() as correlated resolved_name (same-process first, then any resolver that answered the IP). getaddrinfo uprobes and non-53 resolvers remain uncovered. TLS/QUIC plaintext is Inspect-only. HTTP/1 request-line, Host, query keys, and JSON/form body keys are parsed from those Inspect previews into http_calls; Cookie/Authorization/token values are redacted. HTTP/2 frames after the PRI preface, HPACK, Cronet without SSL_write, Flutter, and custom TLS are not decoded.".to_owned(),
+        "The L0 graph is queryable (`ksightctl device graph`). Process instances use `procinst:{boot_id:pid:start_time_ns}` when start time is known; otherwise `process:pkg:pid`. Confirmed edges are Binder, Binder `replies_to`/`binder_reply` (request debug_id), socket, Binder FD `transfers_fd`, loopback scans, sched wakeup identity, and mmap/remap `maps` edges. Dump VMA `overlaps_mmap` is correlated even on an exact address match. Inspect `inspect_hit` and TLS `tls_send`/`tls_recv` are selected-process facts, not Observe. Inspect HTTP `http_call` edges are parsed from those TLS previews (HTTP/1 or JSON), not Observe and not HTTP/2 HPACK. Binder userspace hits record handle/code and join L0 `binder:req` by tid+code as correlated `joined_transact`. The interface token and bounded scalars come from exported Parcel writers on the same TID. AIDL names come from on-device AOSP Stub tables or session process DEX; they are not hardcoded GMS/app names. Parcel C++ fields are not read. JNI RegisterNatives, Cronet/QUIC, and custom TLS remain unresolved. Time proximity is never a confirmed edge.".to_owned(),
         "dup/close file-descriptor events are off unless --files-fd is set. WebView/Chromium dup storms previously overflowed the file ring and dropped millions of records.".to_owned(),
         "Sampling, truncation, source loss, compatibility failures, or target early exit can make application behavior incomplete.".to_owned(),
     ]
@@ -1672,8 +2763,9 @@ fn report_limitations() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use ksight_model::{
-        BinderTransaction, BinderTransactionDirection, CaptureMode, Confidence, DataQuality,
-        EventHeader, PackageCandidate, ProcessIdentity, ProcessKey, SchemaVersion,
+        BinderTransaction, BinderTransactionDirection, BinderTransactionStage, CaptureMode,
+        Confidence, DataQuality, EventHeader, InspectObservation, PackageCandidate,
+        ProcessIdentity, ProcessKey, SchemaVersion,
     };
 
     use super::*;
@@ -1713,6 +2805,18 @@ mod tests {
             .edges
             .iter()
             .any(|edge| edge.relation == "contains"));
+        assert!(report
+            .processes
+            .iter()
+            .any(|process| process.instances.iter().any(
+                |instance| instance.pid == 10 && instance.process_instance_id.contains(":10:")
+            )));
+        assert!(report
+            .graph
+            .entities
+            .iter()
+            .any(|entity| entity.key.starts_with("procinst:")
+                && entity.process_instance_id.is_some()));
     }
 
     #[test]
@@ -1844,6 +2948,191 @@ mod tests {
         assert_eq!(report.binder_lifecycle.submitted, 1);
         assert_eq!(report.binder_lifecycle.delivered, 1);
         assert_eq!(report.binder_lifecycle.average_delivery_ns, Some(60));
+        assert_eq!(report.binder_lifecycle.two_way_submitted, 1);
+        assert_eq!(report.binder_lifecycle.paired_replies, 0);
+    }
+
+    #[test]
+    fn pairs_two_way_binder_request_and_reply() {
+        let session = Uuid::new_v4();
+        let mut builder = SessionReportBuilder::default();
+        let mut request = binder_event(session, 10, Some(20), false, 7);
+        request.header.monotonic_ns = 100;
+        if let EventPayload::BinderTransaction(transaction) = &mut request.payload {
+            transaction.transaction_id = 42;
+        }
+        builder.record(&request);
+        let mut reply = binder_event(session, 20, Some(10), true, 7);
+        reply.header.monotonic_ns = 5_100;
+        if let EventPayload::BinderTransaction(transaction) = &mut reply.payload {
+            transaction.transaction_id = 99;
+            transaction.reply = true;
+            transaction.direction = BinderTransactionDirection::Reply;
+            transaction.reply_to_request_id = Some(42);
+            transaction.reply_latency_ns = Some(5_000);
+        }
+        builder.record(&reply);
+        let report = builder.finish();
+        assert_eq!(report.binder_lifecycle.two_way_submitted, 1);
+        assert_eq!(report.binder_lifecycle.reply_submitted, 1);
+        assert_eq!(report.binder_lifecycle.paired_replies, 1);
+        assert_eq!(report.binder_lifecycle.average_reply_ns, Some(5_000));
+        assert_eq!(report.binder_reply_pairs.len(), 1);
+        assert_eq!(report.binder_reply_pairs[0].request_transaction_id, 42);
+        assert_eq!(report.binder_reply_pairs[0].client_process_id, 10);
+        assert_eq!(report.binder_reply_pairs[0].server_process_id, 20);
+        assert!(report
+            .graph
+            .edges
+            .iter()
+            .any(|edge| edge.relation == "replies_to"
+                && edge.strength == crate::EdgeStrength::Confirmed));
+        assert!(report
+            .graph
+            .edges
+            .iter()
+            .any(|edge| edge.relation == "binder_reply"
+                && edge.strength == crate::EdgeStrength::Confirmed));
+    }
+
+    #[test]
+    fn one_way_binder_is_not_a_reply_pair() {
+        let session = Uuid::new_v4();
+        let mut builder = SessionReportBuilder::default();
+        let mut request = binder_event(session, 10, Some(20), false, 7);
+        if let EventPayload::BinderTransaction(transaction) = &mut request.payload {
+            transaction.transaction_id = 42;
+            transaction.flags = 0x1;
+            transaction.decoded_flags = vec![ksight_model::BinderTransactionFlag::OneWay];
+        }
+        builder.record(&request);
+        let report = builder.finish();
+        assert_eq!(report.binder_lifecycle.one_way_submitted, 1);
+        assert_eq!(report.binder_lifecycle.two_way_submitted, 0);
+        assert_eq!(report.binder_lifecycle.paired_replies, 0);
+        assert!(report.binder_reply_pairs.is_empty());
+    }
+
+    #[test]
+    fn kernel_parcel_token_is_counted_on_binder_relation() {
+        let session = Uuid::new_v4();
+        let mut builder = SessionReportBuilder::default();
+        let mut request = binder_event(session, 10, Some(20), false, 1);
+        if let EventPayload::BinderTransaction(transaction) = &mut request.payload {
+            transaction.transaction_id = 42;
+            transaction.interface_token = Some("android.os.IServiceManager".to_owned());
+            transaction.binder_method = Some("getService".to_owned());
+            transaction.binder_method_source = Some("aosp_stub".to_owned());
+        }
+        builder.record(&request);
+        let report = builder.finish();
+        assert_eq!(
+            report.binder_relations[0]
+                .interfaces
+                .get("android.os.IServiceManager"),
+            Some(&1)
+        );
+        assert!(report.graph.entities.iter().any(|entity| {
+            entity.key == "binder:req:42"
+                && entity
+                    .label
+                    .contains("android.os.IServiceManager::getService")
+        }));
+    }
+
+    #[test]
+    fn inspect_transact_joins_two_way_binder_by_tid_and_code() {
+        let session = Uuid::new_v4();
+        let mut builder = SessionReportBuilder::default();
+        builder.record(&inspect_transact_event(session, 10, 11, 7));
+        let mut request = binder_event(session, 10, Some(20), false, 7);
+        request.header.process.tid = 11;
+        request.header.monotonic_ns = 100;
+        if let EventPayload::BinderTransaction(transaction) = &mut request.payload {
+            transaction.transaction_id = 42;
+        }
+        builder.record(&request);
+        let mut reply = binder_event(session, 20, Some(10), true, 7);
+        reply.header.monotonic_ns = 5_100;
+        if let EventPayload::BinderTransaction(transaction) = &mut reply.payload {
+            transaction.transaction_id = 99;
+            transaction.reply = true;
+            transaction.direction = BinderTransactionDirection::Reply;
+            transaction.reply_to_request_id = Some(42);
+            transaction.reply_latency_ns = Some(5_000);
+        }
+        builder.record(&reply);
+        let report = builder.finish();
+        let hit = report
+            .inspect_hits
+            .iter()
+            .find(|row| row.adapter == "binder_userspace")
+            .expect("inspect hit");
+        assert_eq!(hit.binder_transaction_id, Some(42));
+        assert_eq!(hit.reply_latency_ns, Some(5_000));
+        assert!(report.graph.edges.iter().any(|edge| {
+            edge.relation == "joined_transact"
+                && edge.strength == crate::EdgeStrength::Correlated
+                && edge.to == "binder:req:42"
+        }));
+        assert!(report
+            .graph
+            .edges
+            .iter()
+            .any(|edge| edge.relation == "replies_to"));
+    }
+
+    #[test]
+    fn inspect_transact_does_not_join_mismatched_tid() {
+        let session = Uuid::new_v4();
+        let mut builder = SessionReportBuilder::default();
+        builder.record(&inspect_transact_event(session, 10, 11, 7));
+        let mut request = binder_event(session, 10, Some(20), false, 7);
+        request.header.process.tid = 99;
+        if let EventPayload::BinderTransaction(transaction) = &mut request.payload {
+            transaction.transaction_id = 42;
+        }
+        builder.record(&request);
+        let report = builder.finish();
+        let hit = report
+            .inspect_hits
+            .iter()
+            .find(|row| row.adapter == "binder_userspace")
+            .expect("inspect hit");
+        assert_eq!(hit.binder_transaction_id, None);
+        assert!(report
+            .graph
+            .edges
+            .iter()
+            .all(|edge| edge.relation != "joined_transact"));
+    }
+
+    #[test]
+    fn inspect_transact_joins_one_way_request_without_reply_latency() {
+        let session = Uuid::new_v4();
+        let mut builder = SessionReportBuilder::default();
+        builder.record(&inspect_transact_event(session, 10, 11, 7));
+        let mut request = binder_event(session, 10, Some(20), false, 7);
+        request.header.process.tid = 11;
+        if let EventPayload::BinderTransaction(transaction) = &mut request.payload {
+            transaction.transaction_id = 42;
+            transaction.flags = 0x1;
+            transaction.decoded_flags = vec![ksight_model::BinderTransactionFlag::OneWay];
+        }
+        builder.record(&request);
+        let report = builder.finish();
+        let hit = report
+            .inspect_hits
+            .iter()
+            .find(|row| row.adapter == "binder_userspace")
+            .expect("inspect hit");
+        assert_eq!(hit.binder_transaction_id, Some(42));
+        assert_eq!(hit.reply_latency_ns, None);
+        assert!(report
+            .graph
+            .edges
+            .iter()
+            .any(|edge| { edge.relation == "joined_transact" && edge.to == "binder:req:42" }));
     }
 
     #[test]
@@ -1956,6 +3245,263 @@ mod tests {
         assert_eq!(report.network_peers[0].sent_bytes, 0);
     }
 
+    #[test]
+    fn dns_answer_stamps_connect_at_finish() {
+        let session = Uuid::new_v4();
+        let mut builder = SessionReportBuilder::default();
+        builder.record(&socket_event(session, 5, 0));
+        builder.record(&Event {
+            header: header(session, 10, SensorKind::Network),
+            payload: EventPayload::DnsDatagram(ksight_model::DnsDatagram {
+                file_descriptor: 4,
+                result: 32,
+                address_family: 2,
+                peer_port: 53,
+                peer_address: Some("8.8.8.8".to_owned()),
+                direction: "response".to_owned(),
+                truncated: false,
+                qname: Some("example.com".to_owned()),
+                addresses: vec!["127.0.0.1".to_owned()],
+            }),
+        });
+        let report = builder.finish();
+        assert_eq!(report.dns_datagrams, 1);
+        assert_eq!(report.dns_names[0].qname, "example.com");
+        assert_eq!(
+            report.network_peers[0].resolved_name.as_deref(),
+            Some("example.com")
+        );
+        assert!(report
+            .graph
+            .edges
+            .iter()
+            .any(|edge| edge.relation == "answers"
+                && edge.strength == crate::EdgeStrength::Correlated));
+    }
+
+    #[test]
+    fn handshake_sni_stamps_connect_at_finish() {
+        let session = Uuid::new_v4();
+        let mut builder = SessionReportBuilder::default();
+        builder.record(&socket_event(session, 5, 0));
+        builder.record(&Event {
+            header: header(session, 10, SensorKind::Network),
+            payload: EventPayload::NetworkHandshake(ksight_model::NetworkHandshake {
+                file_descriptor: 5,
+                result: 120,
+                address_family: 2,
+                peer_port: 0,
+                peer_address: None,
+                truncated: false,
+                kind: "tls".to_owned(),
+                sni: Some("bank.example".to_owned()),
+                alpn: Some("h2".to_owned()),
+                ech: false,
+                http_method: None,
+                http_path: None,
+                http_host: None,
+                quic_version: None,
+                quic_packet: None,
+            }),
+        });
+        let report = builder.finish();
+        assert_eq!(report.handshake_events, 1);
+        assert_eq!(
+            report.handshake_names[0].sni.as_deref(),
+            Some("bank.example")
+        );
+        assert_eq!(report.network_peers[0].sni.as_deref(), Some("bank.example"));
+        assert_eq!(report.network_peers[0].alpn.as_deref(), Some("h2"));
+        assert!(report.graph.edges.iter().any(|edge| {
+            edge.relation == "sni" && edge.strength == crate::EdgeStrength::Correlated
+        }));
+    }
+
+    #[test]
+    fn binder_fd_receive_emits_transfers_fd() {
+        let session = Uuid::new_v4();
+        let mut builder = SessionReportBuilder::default();
+        let mut received = binder_event(session, 20, Some(10), false, 1);
+        received.payload = EventPayload::BinderTransaction(BinderTransaction {
+            stage: BinderTransactionStage::FdReceived,
+            transaction_id: 7,
+            target_node: None,
+            target_process_id: Some(20),
+            target_thread_id: None,
+            target_kind: None,
+            reply: false,
+            direction: BinderTransactionDirection::Request,
+            reply_to_request_id: None,
+            reply_latency_ns: None,
+            code: 1,
+            code_kind: None,
+            flags: 0,
+            decoded_flags: Vec::new(),
+            data_size: None,
+            offsets_size: None,
+            extra_buffers_size: None,
+            file_descriptor: Some(9),
+            object_offset: Some(0x10),
+            transferred_fd_origin: Some("/data/app/base.apk".to_owned()),
+            transferred_fd_source_pid: Some(10),
+            transferred_fd_source_fd: Some(7),
+            interface_token: None,
+            binder_method: None,
+            binder_method_source: None,
+            parcel_prefix_hex: None,
+        });
+        builder.record(&received);
+        let report = builder.finish();
+        assert_eq!(report.binder_fd_transfers.len(), 1);
+        assert_eq!(report.binder_fd_transfers[0].origin, "/data/app/base.apk");
+        assert!(report.graph.edges.iter().any(|edge| {
+            edge.relation == "transfers_fd"
+                && edge.strength == crate::EdgeStrength::Confirmed
+                && edge.from == "fd:10:7"
+                && edge.to == "fd:20:9"
+        }));
+    }
+
+    #[test]
+    fn ssl_read_plaintext_graphs_tls_recv() {
+        let session = Uuid::new_v4();
+        let mut builder = SessionReportBuilder::default();
+        builder.record(&file_event(
+            session,
+            "/data/user/0/com.example/code_cache/1.dex",
+        ));
+        builder.record(&Event {
+            header: header(session, 10, SensorKind::Integrity),
+            payload: EventPayload::InspectPlaintext(ksight_model::InspectPlaintext {
+                adapter: "tls_ssl_read".to_owned(),
+                direction: "recv".to_owned(),
+                library: "libssl.so".to_owned(),
+                build_id: None,
+                offset: None,
+                requested_bytes: 64,
+                captured_bytes: 16,
+                truncated: false,
+                sha256: "cafebabe".to_owned(),
+                preview: "17030307a4000000".to_owned(),
+                preview_encoding: "hex".to_owned(),
+                content_class: String::new(),
+            }),
+        });
+        let report = builder.finish();
+        assert_eq!(report.plaintext[0].direction, "recv");
+        assert!(report
+            .graph
+            .edges
+            .iter()
+            .any(|edge| edge.relation == "tls_recv"));
+    }
+
+    #[test]
+    fn parses_http_calls_from_inspect_plaintext_and_redacts_tokens() {
+        let session = Uuid::new_v4();
+        let mut builder = SessionReportBuilder::default();
+        let preview = concat!(
+            "POST /v6/feed/createFeed HTTP/1.1\r\n",
+            "Host: api.coolapk.com\r\n",
+            "Cookie: session=secret\r\n",
+            "X-App-Token: abc\r\n",
+            "Content-Type: application/x-www-form-urlencoded\r\n",
+            "\r\n",
+            "message=hello&status=1&_v2_post_token=xyz"
+        );
+        builder.record(&Event {
+            header: header(session, 10, SensorKind::Integrity),
+            payload: EventPayload::InspectPlaintext(ksight_model::InspectPlaintext {
+                adapter: "tls_ssl_write".to_owned(),
+                direction: "send".to_owned(),
+                library: "libssl.so".to_owned(),
+                build_id: None,
+                offset: None,
+                requested_bytes: preview.len() as u64,
+                captured_bytes: u32::try_from(preview.len()).unwrap_or(u32::MAX),
+                truncated: false,
+                sha256: "feed1".to_owned(),
+                preview: preview.to_owned(),
+                preview_encoding: "utf8_lossy".to_owned(),
+                content_class: "text".to_owned(),
+            }),
+        });
+        builder.record(&Event {
+            header: header(session, 10, SensorKind::Integrity),
+            payload: EventPayload::InspectPlaintext(ksight_model::InspectPlaintext {
+                adapter: "tls_ssl_write".to_owned(),
+                direction: "send".to_owned(),
+                library: "libssl.so".to_owned(),
+                build_id: None,
+                offset: None,
+                requested_bytes: 80,
+                captured_bytes: 80,
+                truncated: false,
+                sha256: "tracker1".to_owned(),
+                preview: "GET /v6/main/indexV8?page=1 HTTP/1.1\r\nHost: log-api.pangle.io\r\n\r\n"
+                    .to_owned(),
+                preview_encoding: "utf8_lossy".to_owned(),
+                content_class: "text".to_owned(),
+            }),
+        });
+        let report = builder.finish();
+        assert_eq!(report.http_calls.len(), 2);
+        let create = report
+            .http_calls
+            .iter()
+            .find(|row| row.path == "/v6/feed/createFeed")
+            .expect("createFeed");
+        assert_eq!(create.method, "POST");
+        assert_eq!(create.host.as_deref(), Some("api.coolapk.com"));
+        assert_eq!(create.count, 1);
+        assert!(!create.third_party);
+        assert!(create
+            .redacted_headers
+            .iter()
+            .any(|row| row.starts_with("Cookie=")));
+        assert!(create
+            .redacted_body_keys
+            .contains(&"_v2_post_token".to_owned()));
+        assert!(!create.body_keys.iter().any(|key| key.contains("xyz")));
+        let tracker = report
+            .http_calls
+            .iter()
+            .find(|row| row.third_party)
+            .expect("tracker");
+        assert_eq!(tracker.host.as_deref(), Some("log-api.pangle.io"));
+        assert!(report
+            .graph
+            .edges
+            .iter()
+            .any(|edge| edge.relation == "http_call"));
+        assert!(report
+            .limitations
+            .iter()
+            .any(|line| line.contains("http_calls")));
+    }
+
+    fn inspect_transact_event(session_id: Uuid, pid: u32, tid: u32, code: u32) -> Event {
+        let mut event = Event {
+            header: header(session_id, pid, SensorKind::Integrity),
+            payload: EventPayload::InspectObservation(InspectObservation {
+                adapter: "binder_userspace".to_owned(),
+                attached: true,
+                hit: true,
+                library: "/system/lib64/libbinder.so".to_owned(),
+                binder_handle: Some(3),
+                binder_code: Some(code),
+                binder_interface: Some("android.os.IServiceManager".to_owned()),
+                binder_method: Some("getService".to_owned()),
+                binder_method_source: Some("aosp_stub".to_owned()),
+                detail: format!("binder transact hit pid={pid} code={code:#x}"),
+                ..InspectObservation::default()
+            }),
+        };
+        event.header.process.tid = tid;
+        event.header.mode = CaptureMode::Inspect;
+        event
+    }
+
     fn binder_event(
         session_id: Uuid,
         pid: u32,
@@ -1986,6 +3532,12 @@ mod tests {
                 file_descriptor: None,
                 object_offset: None,
                 transferred_fd_origin: None,
+                transferred_fd_source_pid: None,
+                transferred_fd_source_fd: None,
+                interface_token: None,
+                binder_method: None,
+                binder_method_source: None,
+                parcel_prefix_hex: None,
             }),
         }
     }
@@ -2041,6 +3593,7 @@ mod tests {
                 peer_address: Some("127.0.0.1".to_owned()),
                 peer_port: Some(443),
                 scope_id: None,
+                resolved_name: None,
             }),
         }
     }

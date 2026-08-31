@@ -98,6 +98,10 @@ pub enum EventPayload {
     SocketAccept(SocketAccept),
     /// Completed socket send or receive operation with byte counts only.
     SocketIo(SocketIo),
+    /// Bounded DNS datagram copied from UDP/53.
+    DnsDatagram(DnsDatagram),
+    /// Bounded first-write handshake metadata (TLS `ClientHello`, HTTP/1, QUIC long header).
+    NetworkHandshake(NetworkHandshake),
     /// Memory mapping or protection transition.
     MemoryRegionChange(MemoryRegionChange),
     /// Binder IPC transaction metadata.
@@ -207,6 +211,75 @@ pub struct SocketConnect {
     pub peer_port: Option<u16>,
     /// IPv6 scope identifier when present.
     pub scope_id: Option<u32>,
+    /// DNS QNAME that resolved to this peer, when a prior UDP/53 answer matched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_name: Option<String>,
+}
+
+/// Bounded DNS query or response copied from sendto/recvfrom on port 53.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsDatagram {
+    /// Socket descriptor used for the datagram.
+    pub file_descriptor: i32,
+    /// Bytes transferred, or a negative errno.
+    pub result: i32,
+    /// Address family of the DNS peer.
+    pub address_family: u16,
+    /// Peer UDP port (53 when identified).
+    pub peer_port: u16,
+    /// Presentation form of the DNS server address when decoded.
+    pub peer_address: Option<String>,
+    /// `query` for sendto, `response` for recvfrom.
+    pub direction: String,
+    /// True when the kernel copy truncated the payload at 512 bytes.
+    pub truncated: bool,
+    /// First question name when parsed.
+    pub qname: Option<String>,
+    /// A/AAAA answers when parsed from a response.
+    pub addresses: Vec<String>,
+}
+
+/// Bounded first-send handshake metadata copied from write/sendto/sendmsg.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkHandshake {
+    /// Socket descriptor used for the first write.
+    pub file_descriptor: i32,
+    /// Bytes transferred, or a negative errno.
+    pub result: i32,
+    /// Address family of the peer when sendto/sendmsg carried a destination.
+    pub address_family: u16,
+    /// Peer port when decoded from the destination address.
+    pub peer_port: u16,
+    /// Presentation form of the peer address when decoded.
+    pub peer_address: Option<String>,
+    /// True when the kernel copy truncated the payload at 512 bytes.
+    pub truncated: bool,
+    /// `tls`, `http`, or `quic`.
+    pub kind: String,
+    /// TLS `ClientHello` SNI hostname.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sni: Option<String>,
+    /// Comma-joined ALPN protocols from the `ClientHello`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alpn: Option<String>,
+    /// True when `encrypted_client_hello` (`0xfe0d`) was present. Inner SNI is not recovered.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ech: bool,
+    /// HTTP/1 method or HTTP/2 preface `PRI`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_method: Option<String>,
+    /// HTTP request-target, bounded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_path: Option<String>,
+    /// HTTP `Host` header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_host: Option<String>,
+    /// QUIC version as `0x` plus eight hex digits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quic_version: Option<String>,
+    /// QUIC long-header packet type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quic_packet: Option<String>,
 }
 
 /// Completed `accept` or `accept4` attempt.
@@ -353,6 +426,25 @@ pub struct BinderTransaction {
     /// receiving side installs the descriptor (best-effort).
     #[serde(default)]
     pub transferred_fd_origin: Option<String>,
+    /// Source process that attached the descriptor, when lineage paired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transferred_fd_source_pid: Option<u32>,
+    /// Source descriptor number on the sending process, when lineage paired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transferred_fd_source_fd: Option<i32>,
+    /// Interface token parsed from a bounded kernel parcel prefix (32-bit and 64-bit clients).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_token: Option<String>,
+    /// AIDL method resolved from `interface_token` and `code` (`aosp_stub` only here).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binder_method: Option<String>,
+    /// `aosp_stub` when the method came from the on-device Stub table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binder_method_source: Option<String>,
+    /// First 32 bytes of the kernel parcel prefix as lowercase hex. Present when
+    /// the prefix was copied, including native protocols without a String16 token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parcel_prefix_hex: Option<String>,
 }
 
 /// Kernel-observable Binder transaction lifecycle stage.
@@ -370,6 +462,8 @@ pub enum BinderTransactionStage {
     FdSent,
     /// Destination process installed a file descriptor from the transaction.
     FdReceived,
+    /// Bounded parcel prefix copied at kernel `binder_transaction()` before submit.
+    ParcelPrefix,
 }
 
 /// Direction of a Binder transaction relative to the emitting process.
@@ -591,7 +685,7 @@ pub enum CaptureStopReason {
 }
 
 /// Auditable Inspect adapter decision or a single authorized hit.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct InspectObservation {
     /// Adapter identifier, for example `linker_so_load`.
     pub adapter: String,
@@ -611,6 +705,43 @@ pub struct InspectObservation {
     pub detail: String,
     /// Operator-visible detectability statement.
     pub detectability_notice: String,
+    /// Binder handle from `IPCThreadState::transact` x1 when the adapter recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binder_handle: Option<u32>,
+    /// Binder transaction code from x2. Not an AIDL name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binder_code: Option<u32>,
+    /// Interface token from exported `Parcel::writeInterfaceToken` on the same TID, when paired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binder_interface: Option<String>,
+    /// AIDL method from the AOSP Stub table or a process DEX Stub. App names are never hardcoded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binder_method: Option<String>,
+    /// `aosp_stub` or `process_dex`. Absent when the method is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binder_method_source: Option<String>,
+    /// Bounded UTF-16/UTF-8 strings from exported Parcel string writers on the same TID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binder_strings: Option<Vec<String>>,
+    /// Last `Parcel::writeInt32` values on the same TID. Not Parcel object fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binder_ints: Option<Vec<i32>>,
+    /// Last `Parcel::writeInt64` / `writeUint32` / `writeUint64` values on the same TID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binder_int64s: Option<Vec<i64>>,
+    /// Last `Parcel::writeBool` values on the same TID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binder_bools: Option<Vec<bool>>,
+    /// Last `Parcel::writeFileDescriptor` fds on the same TID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binder_fds: Option<Vec<i32>>,
+    /// Bounded `Parcel::writeByteArray` previews (`len=` + hex) on the same TID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binder_blobs: Option<Vec<String>>,
+    /// `IBinder*` from exported `Parcel::writeStrongBinder(sp<IBinder> const&)`.
+    /// The 8-byte `sp` payload at x1; `IBinder` C++ fields are not read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binder_binders: Option<Vec<String>>,
 }
 
 /// Bounded plaintext copied from an authorized TLS write.

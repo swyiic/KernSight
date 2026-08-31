@@ -42,4 +42,20 @@ struct ksight_binder_fd_event {
 _Static_assert(sizeof(struct ksight_binder_fd_event) == 112,
                "ksight Binder FD event ABI changed");
 
+/* Bounded parcel prefix copied at kernel binder_transaction().
+ * Works for 32-bit and 64-bit clients: the kernel struct is native-width. */
+#define KSIGHT_BINDER_PARCEL_BYTES 128
+
+struct ksight_binder_parcel_event {
+    struct ksight_raw_event_header header;
+    ksight_s32 transaction_id;
+    ksight_u32 code;
+    ksight_u32 copied;
+    ksight_u32 truncated;
+    ksight_u8 data[KSIGHT_BINDER_PARCEL_BYTES];
+};
+
+_Static_assert(sizeof(struct ksight_binder_parcel_event) == 240,
+               "ksight Binder parcel event ABI changed");
+
 #endif /* KSIGHT_BINDER_EVENT_H */

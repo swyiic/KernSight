@@ -13,6 +13,7 @@ anyhow.workspace = true
 [target.'cfg(any(target_os = "android", target_os = "linux"))'.dependencies]
 aya.workspace = true
 bytes = "1"
+libc = "0.2"
 
 # 硬件断点需要 perf_event_open 的 FFI，本 crate 显式放开 workspace 的 forbid。
 [lints.rust]

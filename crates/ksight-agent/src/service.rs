@@ -311,7 +311,7 @@ impl ServiceConfig {
             memory_object: self.objects.memory.clone(),
             binder_object: self.objects.binder.clone(),
             // 调度 sensor 在长驻服务模式下不启用，仅保留默认对象路径。
-            sched_object: std::path::PathBuf::from("build/bpf/sched_wakeup.bpf.o"),
+            sched_object: std::path::PathBuf::from("/data/local/tmp/ksight/sched_wakeup.bpf.o"),
             sensors: SensorSelection {
                 files: self.sensors.files,
                 file_descriptors: false,
@@ -359,7 +359,7 @@ impl ServiceConfig {
             uid: self.scope.uid,
             package: self.scope.package.clone(),
             inspect: ksight_core::InspectPolicy::default(),
-            inspect_adapter: crate::inspect_runtime::InspectAdapterKind::LinkerSoLoad,
+            inspect_adapters: vec![crate::inspect_runtime::InspectAdapterKind::LinkerSoLoad],
             uprobe_object: PathBuf::from("/data/local/tmp/ksight/uprobe_regs.bpf.o"),
         })
     }

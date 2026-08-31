@@ -55,6 +55,102 @@ pub struct NativeFrameworkMatch {
     pub evidence: Vec<NativeFrameworkEvidence>,
 }
 
+/// Mapped TLS/crypto library class. Used to say whether `--inspect-tls` can attach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsLibraryKind {
+    /// System/Apex Conscrypt `libssl.so`. `--inspect-tls` attaches here.
+    ConscryptSystem,
+    /// Conscrypt JNI helper, not the `SSL_write` boundary.
+    ConscryptJni,
+    /// App-private `libssl.so` / `libboringssl.so`. Inspect attaches if `SSL_write` is exported.
+    AppLibssl,
+    /// Chromium Cronet. Inspect attaches only if that ELF exports `SSL_write`.
+    Cronet,
+    /// Flutter engine. Dart TLS is not Conscrypt `SSL_write`.
+    FlutterEngine,
+    /// Mbed TLS.
+    MbedTls,
+    /// wolfSSL.
+    WolfSsl,
+    /// `GmSSL` / 国密.
+    Gmssl,
+    /// Tencent TASSL.
+    Tassl,
+}
+
+impl TlsLibraryKind {
+    /// Stable identifier for reports.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ConscryptSystem => "conscrypt_system",
+            Self::ConscryptJni => "conscrypt_jni",
+            Self::AppLibssl => "app_libssl",
+            Self::Cronet => "cronet",
+            Self::FlutterEngine => "flutter",
+            Self::MbedTls => "mbedtls",
+            Self::WolfSsl => "wolfssl",
+            Self::Gmssl => "gmssl",
+            Self::Tassl => "tassl",
+        }
+    }
+
+    /// Whether `--inspect-tls` will try exported `SSL_write` on this mapping.
+    #[must_use]
+    pub const fn inspect_tries_ssl_write(self) -> bool {
+        matches!(self, Self::ConscryptSystem | Self::AppLibssl | Self::Cronet)
+    }
+}
+
+/// Classify a mapped or dumped ELF path as a TLS stack, if it looks like one.
+#[must_use]
+pub fn classify_tls_library_path(path: &str) -> Option<TlsLibraryKind> {
+    let lower = path.to_ascii_lowercase();
+    let basename = Path::new(&lower)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    if basename.contains("cronet")
+        || basename == "libchrome.so"
+        || basename.starts_with("libmonochrome")
+        || lower.contains("/cronet")
+    {
+        return Some(TlsLibraryKind::Cronet);
+    }
+    if basename == "libflutter.so" || lower.contains("libflutter") {
+        return Some(TlsLibraryKind::FlutterEngine);
+    }
+    if basename.contains("mbedtls") || basename.contains("mbedcrypto") {
+        return Some(TlsLibraryKind::MbedTls);
+    }
+    if basename.contains("wolfssl") {
+        return Some(TlsLibraryKind::WolfSsl);
+    }
+    if basename.contains("gmssl") || basename.contains("smcrypto") {
+        return Some(TlsLibraryKind::Gmssl);
+    }
+    if basename.contains("tassl") {
+        return Some(TlsLibraryKind::Tassl);
+    }
+    if basename == "libconscrypt_jni.so" || basename == "libjavacrypto.so" {
+        return Some(TlsLibraryKind::ConscryptJni);
+    }
+    if basename == "libssl.so" || basename == "libboringssl.so" || basename == "libcrypto.so" {
+        if lower.contains("conscrypt")
+            || lower.contains("/apex/com.android.conscrypt/")
+            || lower.starts_with("/system/lib/libssl.so")
+            || lower.starts_with("/system/lib64/libssl.so")
+        {
+            return Some(TlsLibraryKind::ConscryptSystem);
+        }
+        if lower.starts_with("/system/") || lower.starts_with("/apex/") {
+            return Some(TlsLibraryKind::ConscryptSystem);
+        }
+        return Some(TlsLibraryKind::AppLibssl);
+    }
+    None
+}
+
 /// Version of the embedded native framework rule document.
 #[must_use]
 pub fn native_framework_rule_version() -> String {
@@ -157,5 +253,34 @@ mod tests {
         assert!(matches
             .iter()
             .any(|item| item.rule_id == "crypto.sqlcipher"));
+        let cronet =
+            classify_native_frameworks(&[artifact("runtime/runtime-so/libcronet.119.0.6045.so")]);
+        assert!(cronet.iter().any(|item| item.rule_id == "tls.cronet"));
+    }
+
+    #[test]
+    fn classifies_tls_library_paths() {
+        assert_eq!(
+            classify_tls_library_path("/apex/com.android.conscrypt/lib64/libssl.so"),
+            Some(TlsLibraryKind::ConscryptSystem)
+        );
+        assert_eq!(
+            classify_tls_library_path("/data/app/foo/lib/arm64/libssl.so"),
+            Some(TlsLibraryKind::AppLibssl)
+        );
+        assert_eq!(
+            classify_tls_library_path("/data/app/foo/lib/arm64/libcronet.119.so"),
+            Some(TlsLibraryKind::Cronet)
+        );
+        assert_eq!(
+            classify_tls_library_path("/apex/com.android.tethering/lib64/stable_cronet_libssl.so"),
+            Some(TlsLibraryKind::Cronet)
+        );
+        assert!(TlsLibraryKind::Cronet.inspect_tries_ssl_write());
+        assert!(!TlsLibraryKind::FlutterEngine.inspect_tries_ssl_write());
+        assert_eq!(
+            classify_tls_library_path("/data/app/foo/lib/arm64/libflutter.so"),
+            Some(TlsLibraryKind::FlutterEngine)
+        );
     }
 }

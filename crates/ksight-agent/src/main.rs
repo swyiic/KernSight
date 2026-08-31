@@ -79,9 +79,15 @@ enum Command {
         /// Force-stop, launch the package, then dump live process images.
         #[arg(long)]
         launch: bool,
-        /// Skip APK/lib copy and only dump live process images.
-        #[arg(long)]
+        /// Skip install APK/lib/oat; dest is the pullable evidence folder for this package.
+        #[arg(long, alias = "evidence-only")]
         runtime_only: bool,
+        /// Yield after ART attach so a hide-debug wrapper can clear USB debugging before launch.
+        #[arg(long)]
+        hide_debug: bool,
+        /// If Magisk is present, add the package to `DenyList` for this dump window. Not a root-hide claim.
+        #[arg(long)]
+        denylist: bool,
         /// Print the full dump-report JSON (default is a short summary).
         #[arg(long)]
         json: bool,
@@ -94,6 +100,30 @@ enum Command {
         /// Print the full dump-report JSON (default is a short summary).
         #[arg(long)]
         json: bool,
+    },
+    /// Copy bounded live mappings of one process. L2 forensic; pauses the target.
+    Snapshot {
+        /// Exact Android package name. Resolves its live PID when `--pid` is omitted.
+        #[arg(long)]
+        package: Option<String>,
+        /// Target process ID.
+        #[arg(long)]
+        pid: Option<u32>,
+        /// Device directory that receives `snapshot-report.json` and range files.
+        #[arg(long)]
+        dest: PathBuf,
+        /// Inclusive hex or decimal virtual address. Requires `--end`.
+        #[arg(long)]
+        start: Option<String>,
+        /// Exclusive hex or decimal virtual address. Requires `--start`.
+        #[arg(long)]
+        end: Option<String>,
+        /// Maximum copied MiB (hard cap per snapshot).
+        #[arg(long, default_value_t = 32)]
+        max_mib: u64,
+        /// Copy without `SIGSTOP`. Pages may tear; report marks `torn=true`.
+        #[arg(long)]
+        no_pause: bool,
     },
     /// Enforce bounded retention under an approved package-dump root.
     PrunePackages {
@@ -133,22 +163,25 @@ enum SpoolCommand {
 #[allow(clippy::struct_excessive_bools)]
 struct CaptureArgs {
     /// Compiled process lifecycle BPF object.
-    #[arg(long, default_value = "build/bpf/process_lifecycle.bpf.o")]
+    #[arg(long, default_value = "/data/local/tmp/ksight/process_lifecycle.bpf.o")]
     object: PathBuf,
     /// Compiled file-open BPF object.
-    #[arg(long, default_value = "build/bpf/file_open.bpf.o")]
+    #[arg(long, default_value = "/data/local/tmp/ksight/file_open.bpf.o")]
     file_object: PathBuf,
     /// Compiled socket-connect BPF object.
-    #[arg(long, default_value = "build/bpf/network_connect.bpf.o")]
+    #[arg(long, default_value = "/data/local/tmp/ksight/network_connect.bpf.o")]
     network_object: PathBuf,
     /// Compiled memory-region BPF object.
-    #[arg(long, default_value = "build/bpf/memory_regions.bpf.o")]
+    #[arg(long, default_value = "/data/local/tmp/ksight/memory_regions.bpf.o")]
     memory_object: PathBuf,
     /// Compiled Binder transaction BPF object.
-    #[arg(long, default_value = "build/bpf/binder_transaction.bpf.o")]
+    #[arg(
+        long,
+        default_value = "/data/local/tmp/ksight/binder_transaction.bpf.o"
+    )]
     binder_object: PathBuf,
     /// Compiled scheduler wakeup BPF object.
-    #[arg(long, default_value = "build/bpf/sched_wakeup.bpf.o")]
+    #[arg(long, default_value = "/data/local/tmp/ksight/sched_wakeup.bpf.o")]
     sched_object: PathBuf,
     /// Enable the experimental file-open sensor.
     #[arg(long)]
@@ -228,7 +261,7 @@ struct CaptureArgs {
     /// Maximum Inspect hits; 0 uses the adapter default.
     #[arg(long, default_value_t = 0)]
     inspect_max_hits: u32,
-    /// Named Inspect adapter. Implies inspect is enabled. Unvalidated adapters refuse to attach.
+    /// Named Inspect adapter. May be combined with `--inspect-tls` (for example `binder_userspace`).
     #[arg(long)]
     inspect_adapter: Option<String>,
     /// Optional GNU build-id that must match before Inspect attach.
@@ -244,12 +277,23 @@ struct CaptureArgs {
     #[arg(long, default_value_t = 0)]
     inspect_max_secs: u32,
     /// Compiled uprobe object used by Inspect adapters.
-    #[arg(long, default_value = "build/bpf/uprobe_regs.bpf.o")]
+    #[arg(long, default_value = "/data/local/tmp/ksight/uprobe_regs.bpf.o")]
     uprobe_object: PathBuf,
 }
 
 fn main() -> Result<()> {
-    match Args::parse().command {
+    let args = Args::parse();
+    if matches!(
+        &args.command,
+        Command::Run { .. }
+            | Command::Status { .. }
+            | Command::Stop { .. }
+            | Command::Capture(_)
+            | Command::DumpPackage { .. }
+    ) {
+        ksight_agent::embedded::prepare_default_layout()?;
+    }
+    match args.command {
         Command::Probe { json } => probe(json),
         Command::Run { config, dry_run } => run_service(&config, dry_run),
         Command::Status { config, json } => show_service_status(&config, json),
@@ -262,9 +306,36 @@ fn main() -> Result<()> {
             dest,
             launch,
             runtime_only,
+            hide_debug,
+            denylist,
             json,
-        } => dump_package(&package, &dest, launch, runtime_only, json),
+        } => dump_package(
+            &package,
+            &dest,
+            launch,
+            runtime_only,
+            hide_debug,
+            denylist,
+            json,
+        ),
         Command::RecatalogPackage { dest, json } => recatalog_package(&dest, json),
+        Command::Snapshot {
+            package,
+            pid,
+            dest,
+            start,
+            end,
+            max_mib,
+            no_pause,
+        } => run_snapshot(
+            package,
+            pid,
+            &dest,
+            start.as_deref(),
+            end.as_deref(),
+            max_mib,
+            no_pause,
+        ),
         Command::PrunePackages {
             root,
             max_total_mib,
@@ -280,20 +351,81 @@ fn main() -> Result<()> {
     }
 }
 
+#[allow(clippy::fn_params_excessive_bools)]
 fn dump_package(
     package: &str,
     dest: &std::path::Path,
     launch: bool,
     runtime_only: bool,
+    hide_debug: bool,
+    denylist: bool,
     json: bool,
 ) -> Result<()> {
-    let report = ksight_agent::dump::dump_package(package, dest, launch, runtime_only)?;
+    let report = ksight_agent::dump::dump_package_with(
+        package,
+        dest,
+        &ksight_agent::dump::DumpOptions {
+            launch,
+            runtime_only,
+            hide_debug,
+            denylist,
+        },
+    )?;
     print_dump_report(dest, &report, json)
 }
 
 fn recatalog_package(dest: &std::path::Path, json: bool) -> Result<()> {
     let report = ksight_agent::dump::recatalog_package(dest)?;
     print_dump_report(dest, &report, json)
+}
+
+fn parse_addr(value: &str) -> Result<u64> {
+    let text = value.trim();
+    if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16)
+            .map_err(|error| anyhow::anyhow!("invalid address {value}: {error}"))
+    } else {
+        text.parse::<u64>()
+            .map_err(|error| anyhow::anyhow!("invalid address {value}: {error}"))
+    }
+}
+
+fn run_snapshot(
+    package: Option<String>,
+    pid: Option<u32>,
+    dest: &std::path::Path,
+    start: Option<&str>,
+    end: Option<&str>,
+    max_mib: u64,
+    no_pause: bool,
+) -> Result<()> {
+    let max_bytes = max_mib
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| anyhow::anyhow!("snapshot byte bound overflows"))?;
+    let report = ksight_agent::snapshot::snapshot(ksight_agent::snapshot::SnapshotRequest {
+        dest: dest.to_path_buf(),
+        package,
+        pid,
+        start: start.map(parse_addr).transpose()?,
+        end: end.map(parse_addr).transpose()?,
+        max_bytes,
+        pause: !no_pause,
+    })?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "pid": report.pid,
+            "package": report.package,
+            "paused": report.paused,
+            "torn": report.torn,
+            "elapsed_ms": report.elapsed_ms,
+            "copied_bytes": report.copied_bytes,
+            "ranges": report.ranges.len(),
+            "truncated": report.truncated,
+            "snapshot_report": dest.join("snapshot-report.json").to_string_lossy(),
+        }))?
+    );
+    Ok(())
 }
 
 fn print_dump_report(
@@ -315,9 +447,22 @@ fn print_dump_report(
             "readable_dex": report.readable_dex,
             "runtime_blob_dex": report.runtime_blob_dex,
             "apk_dex": report.apk_dex,
+            "private_files": report.private_files,
             "runtime_libs": report.runtime_libs,
             "artifacts": report.artifacts.len(),
+            "snapshots": report.snapshots.len(),
+            "stitched_spans": report.stitched_spans,
+            "mapped_code": report.mapped_code.len(),
+            "code_loaders": report.code_loaders.len(),
+            "art_open_joined": report
+                .code_loaders
+                .iter()
+                .filter(|loader| loader.origin == "art_open" && loader.joined_sha256.is_some())
+                .count(),
             "graph_edges": report.graph.edges.len(),
+            "usb_debugging": report.observation_env.usb_debugging,
+            "hide_debug": report.observation_env.hide_debug_requested,
+            "denylist": report.observation_env.denylist_applied,
             "dump_report": dest.join("dump-report.json").to_string_lossy(),
         }))?
     );
@@ -330,29 +475,30 @@ fn run_capture(args: CaptureArgs) -> Result<()> {
         bail!("sampling rate must be greater than zero");
     }
     let inspect_adapter_set = args.inspect_adapter.is_some();
-    let inspect_adapter = if args.inspect_tls {
-        ksight_agent::inspect_runtime::InspectAdapterKind::TlsSslWrite
-    } else {
-        match args.inspect_adapter.as_deref() {
-            Some(name) => name
-                .parse::<ksight_agent::inspect_runtime::InspectAdapterKind>()
-                .map_err(anyhow::Error::msg)?,
-            None => ksight_agent::inspect_runtime::InspectAdapterKind::LinkerSoLoad,
+    let mut inspect_adapters = Vec::new();
+    if args.inspect_tls {
+        inspect_adapters.push(ksight_agent::inspect_runtime::InspectAdapterKind::TlsSslWrite);
+    }
+    if args.inspect_linker {
+        inspect_adapters.push(ksight_agent::inspect_runtime::InspectAdapterKind::LinkerSoLoad);
+    }
+    if let Some(name) = args.inspect_adapter.as_deref() {
+        let parsed = name
+            .parse::<ksight_agent::inspect_runtime::InspectAdapterKind>()
+            .map_err(anyhow::Error::msg)?;
+        if !inspect_adapters.contains(&parsed) {
+            inspect_adapters.push(parsed);
         }
-    };
-    if args.inspect_linker && args.inspect_tls {
-        bail!("--inspect-linker cannot be combined with --inspect-tls");
     }
     if args.inspect_linker
-        && inspect_adapter != ksight_agent::inspect_runtime::InspectAdapterKind::LinkerSoLoad
+        && inspect_adapters.iter().any(|adapter| {
+            *adapter != ksight_agent::inspect_runtime::InspectAdapterKind::LinkerSoLoad
+        })
     {
-        bail!("--inspect-linker cannot be combined with a non-linker --inspect-adapter");
+        bail!("--inspect-linker cannot be combined with --inspect-tls or a non-linker --inspect-adapter");
     }
-    if args.inspect_tls
-        && inspect_adapter_set
-        && inspect_adapter != ksight_agent::inspect_runtime::InspectAdapterKind::TlsSslWrite
-    {
-        bail!("--inspect-tls cannot be combined with a non-TLS --inspect-adapter");
+    if inspect_adapters.is_empty() {
+        inspect_adapters.push(ksight_agent::inspect_runtime::InspectAdapterKind::LinkerSoLoad);
     }
     let inspect_enabled = args.inspect_linker || args.inspect_tls || inspect_adapter_set;
     if args.inspect_all_apps && !inspect_enabled {
@@ -437,7 +583,7 @@ fn run_capture(args: CaptureArgs) -> Result<()> {
         uid: args.uid,
         package: args.package,
         inspect,
-        inspect_adapter,
+        inspect_adapters,
         uprobe_object: args.uprobe_object,
     })
 }

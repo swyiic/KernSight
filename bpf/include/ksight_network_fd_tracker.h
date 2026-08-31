@@ -6,8 +6,21 @@
 #define KSIGHT_ARM64_DUP3 24
 #define KSIGHT_ARM64_FCNTL 25
 #define KSIGHT_ARM64_CLOSE 57
+#define KSIGHT_A32_CLOSE_FD 6
+#define KSIGHT_A32_DUP_FD 41
+#define KSIGHT_A32_FCNTL_FD 55
+#define KSIGHT_A32_DUP2_FD 63
+#define KSIGHT_A32_FCNTL64_FD 221
+#define KSIGHT_A32_DUP3_FD 358
 #define KSIGHT_F_DUPFD 0U
 #define KSIGHT_F_DUPFD_CLOEXEC 1030U
+
+struct {
+    __uint(type, KSIGHT_BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 16384);
+    __type(key, ksight_u64);
+    __type(value, ksight_u8);
+} handshake_seen SEC(".maps");
 
 struct {
     __uint(type, KSIGHT_BPF_MAP_TYPE_LRU_HASH);
@@ -38,7 +51,13 @@ static __always_inline int ksight_is_socket_fd_lifecycle(ksight_s64 syscall_id)
     return syscall_id == KSIGHT_ARM64_CLOSE ||
            syscall_id == KSIGHT_ARM64_DUP ||
            syscall_id == KSIGHT_ARM64_DUP3 ||
-           syscall_id == KSIGHT_ARM64_FCNTL;
+           syscall_id == KSIGHT_ARM64_FCNTL ||
+           syscall_id == KSIGHT_A32_CLOSE_FD ||
+           syscall_id == KSIGHT_A32_DUP_FD ||
+           syscall_id == KSIGHT_A32_DUP2_FD ||
+           syscall_id == KSIGHT_A32_DUP3_FD ||
+           syscall_id == KSIGHT_A32_FCNTL_FD ||
+           syscall_id == KSIGHT_A32_FCNTL64_FD;
 }
 
 static __always_inline int
@@ -50,7 +69,9 @@ ksight_track_socket_fd_enter(struct ksight_raw_sys_enter *context,
 
     if (!ksight_is_socket_fd_lifecycle(context->id))
         return 0;
-    if (context->id == KSIGHT_ARM64_FCNTL) {
+    if (context->id == KSIGHT_ARM64_FCNTL ||
+        context->id == KSIGHT_A32_FCNTL_FD ||
+        context->id == KSIGHT_A32_FCNTL64_FD) {
         command = (ksight_u32)context->arguments[1];
         if (command != KSIGHT_F_DUPFD && command != KSIGHT_F_DUPFD_CLOEXEC)
             return 0;
@@ -76,8 +97,10 @@ ksight_track_socket_fd_exit(struct ksight_raw_sys_exit *context,
         return 1;
     old_key = ksight_socket_key((ksight_u32)(pid_tgid >> 32), pending->fd);
     if (context->result >= 0) {
-        if (context->id == KSIGHT_ARM64_CLOSE) {
+        if (context->id == KSIGHT_ARM64_CLOSE ||
+            context->id == KSIGHT_A32_CLOSE_FD) {
             ksight_bpf_map_delete_elem(&socket_fds, &old_key);
+            ksight_bpf_map_delete_elem(&handshake_seen, &old_key);
         } else {
             ksight_u64 new_key = ksight_socket_key(
                 (ksight_u32)(pid_tgid >> 32), (ksight_s32)context->result);
@@ -91,6 +114,20 @@ ksight_track_socket_fd_exit(struct ksight_raw_sys_exit *context,
             } else {
                 /* dup3 may replace a previously tracked socket with a non-socket. */
                 ksight_bpf_map_delete_elem(&socket_fds, &new_key);
+            }
+            {
+                ksight_u8 *seen = ksight_bpf_map_lookup_elem(&handshake_seen,
+                                                             &old_key);
+
+                if (seen) {
+                    ksight_u8 flags = *seen;
+
+                    if (ksight_bpf_map_update_elem(&handshake_seen, &new_key,
+                                                   &flags, 0) != 0)
+                        ksight_record_drop();
+                } else {
+                    ksight_bpf_map_delete_elem(&handshake_seen, &new_key);
+                }
             }
         }
     }

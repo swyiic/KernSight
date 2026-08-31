@@ -32,6 +32,7 @@ pub(crate) const DEVICE_HIDE_SCRIPT: &str = "/data/local/tmp/ksight/ksight-hide-
 pub(crate) const DEVICE_LAST_SESSION: &str = "/data/local/tmp/ksight/spool/last_session";
 pub(crate) const DEVICE_CAPTURE_LOG: &str = "/data/local/tmp/ksight/capture-live.log";
 pub(crate) const DEVICE_PACKAGES_ROOT: &str = "/data/local/tmp/ksight/packages";
+pub(crate) const DEVICE_SNAPSHOT_ROOT: &str = "/data/local/tmp/ksight/snapshots";
 /// Shared storage path the ADB Toolbox dump-collect button pulls from.
 pub(crate) const DEVICE_DEXDUMP_ROOT: &str = "/storage/emulated/0/Download/dexDump";
 pub(crate) const DEVICE_DAEMON_DISABLED: &str = "/data/local/tmp/ksight/ksightd.disabled";
@@ -118,21 +119,21 @@ pub(crate) fn pull_forensics(serial: Option<&str>, session: Uuid, dest: &Path) -
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 pub(crate) fn pull_package(
     serial: Option<&str>,
     package: &str,
     dest: &Path,
     launch: bool,
     runtime_only: bool,
+    hide_debug: bool,
+    denylist: bool,
+    hide_debug_secs: Option<u64>,
 ) -> Result<()> {
     validate_package(package)?;
     let remote = format!("{DEVICE_PACKAGES_ROOT}/{package}");
     eprintln!("dumping package {package} on device to {remote}");
-    let prepare = if runtime_only {
-        format!("mkdir -p {remote}")
-    } else {
-        format!("rm -rf {remote} && mkdir -p {remote}")
-    };
+    let prepare = format!("rm -rf {remote} && mkdir -p {remote}");
     let mut flags = String::new();
     if launch {
         flags.push_str(" --launch");
@@ -140,12 +141,23 @@ pub(crate) fn pull_package(
     if runtime_only {
         flags.push_str(" --runtime-only");
     }
-    run_device(
-        serial,
-        &format!(
-            "{prepare} && {DEVICE_AGENT} dump-package --package {package} --dest {remote}{flags}"
-        ),
-    )?;
+    if hide_debug {
+        flags.push_str(" --hide-debug");
+    }
+    if denylist {
+        flags.push_str(" --denylist");
+    }
+    let dump = format!("{DEVICE_AGENT} dump-package --package {package} --dest {remote}{flags}");
+    if hide_debug {
+        let secs = hide_debug_secs.unwrap_or(if launch { 120 } else { 60 });
+        eprintln!(
+            "hide-debug: dump will launch after USB debugging is cleared; watchdog restores adb in {secs}s; does not hide root"
+        );
+        run_device(serial, &prepare)?;
+        run_hide_debug_capture(serial, secs, &dump)?;
+    } else {
+        run_device(serial, &format!("{prepare} && {dump}"))?;
+    }
     let _ = run_device(serial, &format!("chmod -R a+rX {remote}"));
     publish_dexdump(serial, package, &remote)?;
     enforce_package_retention(serial)?;
@@ -159,17 +171,28 @@ pub(crate) fn pull_package(
     ensure_success(status)?;
     let package_dir = dest.join(package);
     eprintln!("pulled {remote} -> {}", package_dir.display());
-    eprintln!(
-        "可读 DEX: {}/readable-dex  和  {}/apk-dex/split",
-        package_dir.display(),
-        package_dir.display()
-    );
-    eprintln!(
-        "SO: {}/lib  （安装目录）  {}/apk-assets  （APK assets 壳库）  {}/runtime/runtime-so  （已加载）",
-        package_dir.display(),
-        package_dir.display(),
-        package_dir.display()
-    );
+    if runtime_only {
+        eprintln!(
+            "evidence-only: {}/dump-report.json  {}/data-private  {}/runtime  {}/readable-dex  {}/EVIDENCE.txt",
+            package_dir.display(),
+            package_dir.display(),
+            package_dir.display(),
+            package_dir.display(),
+            package_dir.display()
+        );
+    } else {
+        eprintln!(
+            "可读 DEX: {}/readable-dex  和  {}/apk-dex/split",
+            package_dir.display(),
+            package_dir.display()
+        );
+        eprintln!(
+            "SO: {}/lib  （安装目录）  {}/apk-assets  （APK assets 壳库）  {}/runtime/runtime-so  （已加载）",
+            package_dir.display(),
+            package_dir.display(),
+            package_dir.display()
+        );
+    }
     eprintln!("说明见 {}/HOWTO.txt", package_dir.display());
     if let Ok(text) = std::fs::read_to_string(package_dir.join("dump-report.json")) {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
@@ -193,6 +216,67 @@ pub(crate) fn pull_package(
         ),
         Err(error) => eprintln!("DEX extract/repair skipped: {error}"),
     }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn pull_snapshot(
+    serial: Option<&str>,
+    package: Option<&str>,
+    pid: Option<u32>,
+    dest: &Path,
+    start: Option<&str>,
+    end: Option<&str>,
+    max_mib: u64,
+    no_pause: bool,
+) -> Result<()> {
+    if package.is_none() && pid.is_none() {
+        bail!("snapshot requires --package or --pid");
+    }
+    if let Some(package) = package {
+        validate_package(package)?;
+    }
+    if max_mib == 0 || max_mib > 256 {
+        bail!("snapshot max-mib must be between 1 and 256");
+    }
+    let name = package.map_or_else(|| format!("pid-{}", pid.unwrap_or(0)), ToOwned::to_owned);
+    let remote = format!("{DEVICE_SNAPSHOT_ROOT}/{name}");
+    let mut flags = format!(" --dest {remote} --max-mib {max_mib}");
+    if let Some(package) = package {
+        flags.push_str(" --package ");
+        flags.push_str(package);
+    }
+    if let Some(pid) = pid {
+        use std::fmt::Write as _;
+        let _ = write!(flags, " --pid {pid}");
+    }
+    if let Some(start) = start {
+        flags.push_str(" --start ");
+        flags.push_str(start);
+    }
+    if let Some(end) = end {
+        flags.push_str(" --end ");
+        flags.push_str(end);
+    }
+    if no_pause {
+        flags.push_str(" --no-pause");
+    }
+    eprintln!("snapshot on device to {remote}");
+    run_device(serial, &format!("rm -rf {remote} && mkdir -p {remote}"))?;
+    let _ = run_device_tee(serial, &format!("{DEVICE_AGENT} snapshot{flags}"))?;
+    let _ = run_device(serial, &format!("chmod -R a+rX {remote}"));
+    std::fs::create_dir_all(dest).context("create snapshot destination")?;
+    let dest_str = dest.to_string_lossy().into_owned();
+    let mut adb = adb_command(serial)?;
+    let status = adb
+        .args(["pull", &remote, &dest_str])
+        .status()
+        .context("adb pull snapshot")?;
+    ensure_success(status)?;
+    eprintln!(
+        "pulled {remote} -> {}/{name}  (snapshot-report.json + ranges/)",
+        dest.display()
+    );
     Ok(())
 }
 
@@ -510,6 +594,7 @@ fn merge_dump_reports(serial: Option<&str>, report: &mut SessionReport) {
                     label: format!("{package_name} dump"),
                     sensors: Vec::new(),
                     artifact: None,
+                    process_instance_id: None,
                 });
                 report.graph.edges.push(ksight_core::GraphEdge {
                     from: dump_key,

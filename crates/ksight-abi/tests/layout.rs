@@ -3,10 +3,11 @@
 use core::mem::{align_of, size_of};
 
 use ksight_abi::{
-    DecodeError, RawEventHeader, RawEventType, RawSensorId, RAW_ABI_VERSION, RAW_BINDER_EVENT_SIZE,
-    RAW_BINDER_FD_EVENT_SIZE, RAW_EVENT_HEADER_SIZE, RAW_FD_EVENT_SIZE, RAW_FILE_EVENT_SIZE,
-    RAW_MEMORY_EVENT_SIZE, RAW_NETWORK_EVENT_SIZE, RAW_NETWORK_IO_EVENT_SIZE,
-    RAW_PROCESS_EVENT_SIZE,
+    DecodeError, RawEventHeader, RawEventType, RawSensorId, BINDER_PARCEL_BYTES, RAW_ABI_VERSION,
+    RAW_BINDER_EVENT_SIZE, RAW_BINDER_FD_EVENT_SIZE, RAW_BINDER_PARCEL_EVENT_SIZE,
+    RAW_DNS_EVENT_SIZE, RAW_EVENT_HEADER_SIZE, RAW_FD_EVENT_SIZE, RAW_FILE_EVENT_SIZE,
+    RAW_HANDSHAKE_EVENT_SIZE, RAW_MEMORY_EVENT_SIZE, RAW_NETWORK_EVENT_SIZE,
+    RAW_NETWORK_IO_EVENT_SIZE, RAW_PROCESS_EVENT_SIZE,
 };
 
 #[test]
@@ -23,6 +24,10 @@ fn raw_header_layout_is_stable() {
     assert_eq!(RAW_MEMORY_EVENT_SIZE, 144);
     assert_eq!(RAW_NETWORK_EVENT_SIZE, 240);
     assert_eq!(RAW_NETWORK_IO_EVENT_SIZE, 128);
+    assert_eq!(RAW_DNS_EVENT_SIZE, 640);
+    assert_eq!(RAW_HANDSHAKE_EVENT_SIZE, 640);
+    assert_eq!(RawEventType::NetworkDns as u16, 0x0405);
+    assert_eq!(RawEventType::NetworkHandshake as u16, 0x0406);
     assert_eq!(RAW_BINDER_EVENT_SIZE, 128);
     assert_eq!(RAW_BINDER_FD_EVENT_SIZE, 112);
     assert_eq!(RawEventType::NetworkConnect as u16, 0x0401);
@@ -37,6 +42,9 @@ fn raw_header_layout_is_stable() {
     assert_eq!(RawEventType::FileDescriptorRightsReceive as u16, 0x0206);
     assert_eq!(RawEventType::BinderTransactionReceived as u16, 0x0502);
     assert_eq!(RawEventType::BinderFdReceived as u16, 0x0505);
+    assert_eq!(RawEventType::BinderParcel as u16, 0x0506);
+    assert_eq!(BINDER_PARCEL_BYTES, 128);
+    assert_eq!(RAW_BINDER_PARCEL_EVENT_SIZE, 240);
 }
 
 #[test]

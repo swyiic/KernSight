@@ -28,10 +28,18 @@ pub const SOCKET_ADDRESS_LEN: usize = 128;
 pub const RAW_NETWORK_EVENT_SIZE: usize = RAW_EVENT_HEADER_SIZE + 16 + SOCKET_ADDRESS_LEN;
 /// Fixed socket send/receive byte-count record size.
 pub const RAW_NETWORK_IO_EVENT_SIZE: usize = RAW_EVENT_HEADER_SIZE + 32;
+/// Fixed bounded DNS datagram record size.
+pub const RAW_DNS_EVENT_SIZE: usize = RAW_EVENT_HEADER_SIZE + 32 + 512;
+/// Fixed bounded first-write handshake record size (same layout as DNS).
+pub const RAW_HANDSHAKE_EVENT_SIZE: usize = RAW_DNS_EVENT_SIZE;
 /// Fixed Binder transaction record size.
 pub const RAW_BINDER_EVENT_SIZE: usize = RAW_EVENT_HEADER_SIZE + 32;
 /// Fixed Binder file-descriptor transfer record size.
 pub const RAW_BINDER_FD_EVENT_SIZE: usize = RAW_EVENT_HEADER_SIZE + 16;
+/// Bounded Binder parcel-prefix bytes copied at `binder_transaction()`.
+pub const BINDER_PARCEL_BYTES: usize = 128;
+/// Fixed Binder parcel-prefix record size.
+pub const RAW_BINDER_PARCEL_EVENT_SIZE: usize = RAW_EVENT_HEADER_SIZE + 16 + BINDER_PARCEL_BYTES;
 /// Fixed scheduler wakeup record size.
 pub const RAW_SCHED_EVENT_SIZE: usize = RAW_EVENT_HEADER_SIZE + 16;
 
@@ -101,6 +109,10 @@ pub enum RawEventType {
     NetworkSend = 0x0403,
     /// Socket receive operation completed.
     NetworkReceive = 0x0404,
+    /// Bounded DNS datagram copied from UDP/53 sendto or recvfrom.
+    NetworkDns = 0x0405,
+    /// Bounded first-write handshake copy (TLS `ClientHello` / HTTP/1 / QUIC long header).
+    NetworkHandshake = 0x0406,
     /// Binder transaction was submitted.
     BinderTransaction = 0x0501,
     /// Binder transaction reached its destination thread.
@@ -111,6 +123,8 @@ pub enum RawEventType {
     BinderFdSent = 0x0504,
     /// Destination file descriptor was installed from a Binder transaction.
     BinderFdReceived = 0x0505,
+    /// Bounded parcel prefix copied at kernel `binder_transaction()` (32-bit and 64-bit clients).
+    BinderParcel = 0x0506,
     /// A task was woken by the current task.
     SchedWakeup = 0x0801,
     /// A scheduler context switch occurred.

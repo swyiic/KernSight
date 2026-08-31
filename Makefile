@@ -60,21 +60,12 @@ device-target:
 	rustup target add $(DEVICE_TARGET)
 
 device: bpf device-target
-	RUSTFLAGS="-C linker=$(RUST_LLD)" cargo build --release --target $(DEVICE_TARGET) -p ksight-agent
+	RUSTFLAGS="-C linker=$(RUST_LLD)" cargo build --release --target $(DEVICE_TARGET) -p ksight-agent --bin ksightd --features embedded-assets
 
 deploy: device
 	$(ADB) shell 'rm -rf $(DEVICE_STAGE) && mkdir -p $(DEVICE_STAGE)'
 	$(ADB) push target/$(DEVICE_TARGET)/release/ksightd $(DEVICE_STAGE)/ksightd
-	$(ADB) push build/bpf/process_lifecycle.bpf.o $(DEVICE_STAGE)/process_lifecycle.bpf.o
-	$(ADB) push build/bpf/file_open.bpf.o $(DEVICE_STAGE)/file_open.bpf.o
-	$(ADB) push build/bpf/network_connect.bpf.o $(DEVICE_STAGE)/network_connect.bpf.o
-	$(ADB) push build/bpf/memory_regions.bpf.o $(DEVICE_STAGE)/memory_regions.bpf.o
-	$(ADB) push build/bpf/binder_transaction.bpf.o $(DEVICE_STAGE)/binder_transaction.bpf.o
-	$(ADB) push build/bpf/sched_wakeup.bpf.o $(DEVICE_STAGE)/sched_wakeup.bpf.o
-	$(ADB) push build/bpf/uprobe_regs.bpf.o $(DEVICE_STAGE)/uprobe_regs.bpf.o
-	$(ADB) push android/config/ksightd.json.example $(DEVICE_STAGE)/ksightd.json
-	$(ADB) push android/scripts/ksight-hide-debug.sh $(DEVICE_STAGE)/ksight-hide-debug.sh
-	$(ADB) shell 'su -c "mkdir -p $(DEVICE_DIR) && cp $(DEVICE_STAGE)/ksightd $(DEVICE_DIR)/ksightd && cp $(DEVICE_STAGE)/process_lifecycle.bpf.o $(DEVICE_DIR)/process_lifecycle.bpf.o && cp $(DEVICE_STAGE)/file_open.bpf.o $(DEVICE_DIR)/file_open.bpf.o && cp $(DEVICE_STAGE)/network_connect.bpf.o $(DEVICE_DIR)/network_connect.bpf.o && cp $(DEVICE_STAGE)/memory_regions.bpf.o $(DEVICE_DIR)/memory_regions.bpf.o && cp $(DEVICE_STAGE)/binder_transaction.bpf.o $(DEVICE_DIR)/binder_transaction.bpf.o && cp $(DEVICE_STAGE)/sched_wakeup.bpf.o $(DEVICE_DIR)/sched_wakeup.bpf.o && cp $(DEVICE_STAGE)/uprobe_regs.bpf.o $(DEVICE_DIR)/uprobe_regs.bpf.o && cp $(DEVICE_STAGE)/ksightd.json $(DEVICE_DIR)/ksightd.json && cp $(DEVICE_STAGE)/ksight-hide-debug.sh $(DEVICE_DIR)/ksight-hide-debug.sh && chown root:root $(DEVICE_DIR) $(DEVICE_DIR)/ksightd $(DEVICE_DIR)/process_lifecycle.bpf.o $(DEVICE_DIR)/file_open.bpf.o $(DEVICE_DIR)/network_connect.bpf.o $(DEVICE_DIR)/memory_regions.bpf.o $(DEVICE_DIR)/binder_transaction.bpf.o $(DEVICE_DIR)/sched_wakeup.bpf.o $(DEVICE_DIR)/uprobe_regs.bpf.o $(DEVICE_DIR)/ksightd.json $(DEVICE_DIR)/ksight-hide-debug.sh && chmod 0755 $(DEVICE_DIR) $(DEVICE_DIR)/ksightd $(DEVICE_DIR)/ksight-hide-debug.sh && chmod 0644 $(DEVICE_DIR)/process_lifecycle.bpf.o $(DEVICE_DIR)/file_open.bpf.o $(DEVICE_DIR)/network_connect.bpf.o $(DEVICE_DIR)/memory_regions.bpf.o $(DEVICE_DIR)/binder_transaction.bpf.o $(DEVICE_DIR)/sched_wakeup.bpf.o $(DEVICE_DIR)/uprobe_regs.bpf.o $(DEVICE_DIR)/ksightd.json"'
+	$(ADB) shell 'su -c "mkdir -p $(DEVICE_DIR) && cp $(DEVICE_STAGE)/ksightd $(DEVICE_DIR)/ksightd.new && chown root:root $(DEVICE_DIR) $(DEVICE_DIR)/ksightd.new && chmod 0755 $(DEVICE_DIR) $(DEVICE_DIR)/ksightd.new && mv -f $(DEVICE_DIR)/ksightd.new $(DEVICE_DIR)/ksightd && $(DEVICE_DIR)/ksightd run --dry-run"'
 	$(ADB) shell 'rm -rf $(DEVICE_STAGE)'
 
 probe: deploy

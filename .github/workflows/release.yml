@@ -89,22 +89,14 @@ jobs:
         run: |
           make bpf BPF_CLANG=clang
           make device BPF_CLANG=clang
-      - name: Package Android device bundle
+      - name: Package single-file Android device agent
         shell: bash
         run: |
-          package_dir="kernsight-device-android-arm64"
-          mkdir -p "$package_dir/bpf" "$package_dir/config" "$package_dir/rules"
-          cp target/aarch64-unknown-linux-musl/release/ksightd "$package_dir/ksightd"
-          cp build/bpf/*.bpf.o "$package_dir/bpf/"
-          cp android/config/ksightd.json.example "$package_dir/config/ksightd.json"
-          cp android/scripts/ksight-hide-debug.sh "$package_dir/"
-          cp rules/native_frameworks.json "$package_dir/rules/"
-          cp LICENSE README.md "$package_dir/"
-          tar -czf "${package_dir}.tar.gz" "$package_dir"
+          cp target/aarch64-unknown-linux-musl/release/ksightd ksightd-android-arm64
       - uses: actions/upload-artifact@v4
         with:
           name: kernsight-device-android-arm64
-          path: kernsight-device-android-arm64.tar.gz
+          path: ksightd-android-arm64
           if-no-files-found: error
 
   publish:
@@ -120,9 +112,9 @@ jobs:
       - name: Create checksums
         run: |
           mkdir -p release
-          find artifacts -maxdepth 1 -type f -name '*.tar.gz' -exec cp {} release/ \;
+          find artifacts -maxdepth 1 -type f \( -name '*.tar.gz' -o -name 'ksightd-android-arm64' \) -exec cp {} release/ \;
           cd release
-          sha256sum *.tar.gz > SHA256SUMS
+          sha256sum * > SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
           name: kernsight-release-bundle

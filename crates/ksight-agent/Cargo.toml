@@ -7,6 +7,12 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Device release: compile BPF objects, the default service configuration, and the
+# hide-debug helper into ksightd so deployment only needs one executable.
+embedded-assets = []
+
 [lib]
 name = "ksight_agent"
 path = "src/lib.rs"
@@ -14,6 +20,10 @@ path = "src/lib.rs"
 [[bin]]
 name = "ksightd"
 path = "src/main.rs"
+
+[[bin]]
+name = "ksight-fd-probe"
+path = "src/bin/fd_probe.rs"
 
 [dependencies]
 anyhow.workspace = true
@@ -28,6 +38,7 @@ sha2.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 nix.workspace = true
+zip.workspace = true
 lz4_flex.workspace = true
 
 [target.'cfg(any(target_os = "android", target_os = "linux"))'.dependencies]

@@ -182,8 +182,8 @@ pub struct CaptureRequest {
     pub package: Option<String>,
     /// Explicit Inspect policy. Default is disabled.
     pub inspect: ksight_core::InspectPolicy,
-    /// Inspect adapter selected by the operator.
-    pub inspect_adapter: crate::inspect_runtime::InspectAdapterKind,
+    /// Inspect adapters selected by the operator. TLS and Binder may be combined.
+    pub inspect_adapters: Vec<crate::inspect_runtime::InspectAdapterKind>,
     /// Compiled uprobe object used by Inspect adapters.
     pub uprobe_object: PathBuf,
 }
@@ -504,9 +504,9 @@ fn stream_events(
             inspect_policy.package.clone_from(&request.package);
         }
     }
-    let mut inspect = crate::inspect_runtime::InspectRuntime::prepare(
+    let mut inspect = crate::inspect_runtime::InspectRuntime::prepare_all(
         &inspect_policy,
-        request.inspect_adapter,
+        &request.inspect_adapters,
         &request.uprobe_object,
     );
     if request.inspect.enabled {
@@ -796,6 +796,62 @@ impl ActiveSensor {
     }
 }
 
+#[cfg(any(test, target_os = "android", target_os = "linux"))]
+#[derive(Debug, Clone, Default)]
+struct PendingParcel {
+    interface_token: Option<String>,
+    binder_method: Option<String>,
+    binder_method_source: Option<String>,
+    parcel_prefix_hex: Option<String>,
+}
+
+#[cfg(any(test, target_os = "android", target_os = "linux"))]
+#[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
+fn insert_capped<K: Eq + std::hash::Hash, V>(
+    map: &mut std::collections::HashMap<K, V>,
+    key: K,
+    value: V,
+) {
+    if map.len() >= 4096 && !map.contains_key(&key) {
+        return;
+    }
+    map.insert(key, value);
+}
+
+#[cfg(any(test, target_os = "android", target_os = "linux"))]
+#[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
+fn push_capped_deque<K: Eq + std::hash::Hash, V>(
+    map: &mut std::collections::HashMap<K, std::collections::VecDeque<V>>,
+    key: K,
+    value: V,
+    cap: usize,
+) {
+    if map.len() >= 4096 && !map.contains_key(&key) {
+        return;
+    }
+    let queue = map.entry(key).or_default();
+    if queue.len() >= cap {
+        queue.pop_front();
+    }
+    queue.push_back(value);
+}
+
+#[cfg(any(test, target_os = "android", target_os = "linux"))]
+fn apply_pending_parcel(transaction: &mut ksight_model::BinderTransaction, parcel: PendingParcel) {
+    if transaction.interface_token.is_none() {
+        transaction.interface_token = parcel.interface_token;
+    }
+    if transaction.binder_method.is_none() {
+        transaction.binder_method = parcel.binder_method;
+    }
+    if transaction.binder_method_source.is_none() {
+        transaction.binder_method_source = parcel.binder_method_source;
+    }
+    if transaction.parcel_prefix_hex.is_none() {
+        transaction.parcel_prefix_hex = parcel.parcel_prefix_hex;
+    }
+}
+
 #[cfg(any(target_os = "android", target_os = "linux"))]
 #[derive(Debug, Default)]
 struct CaptureStats {
@@ -822,10 +878,19 @@ struct EventPipeline {
     environment: ksight_model::SessionEnvironment,
     storage_limit_reached: bool,
     binder_transactions_in_scope: std::collections::HashSet<i32>,
+    /// Kernel parcel prefix waiting to join the matching submit `debug_id`.
+    pending_parcels: std::collections::HashMap<i32, PendingParcel>,
+    /// Fallback join when the kprobe event has `transaction_id=0`.
+    pending_parcels_by_tid_code:
+        std::collections::HashMap<(u32, u32), std::collections::VecDeque<PendingParcel>>,
+    /// Last-resort FIFO when the same thread pipelines identical codes.
+    pending_parcels_by_tid:
+        std::collections::HashMap<u32, std::collections::VecDeque<PendingParcel>>,
     /// 已提交且等待回复的请求事务：transaction_id -> 提交时刻（monotonic_ns）。
     binder_request_timestamps: std::collections::HashMap<i32, u64>,
     /// 跨进程文件描述符血缘追踪。
     fd_lineage: crate::fd_lineage::FdLineageTracker,
+    dns_lineage: crate::dns_lineage::DnsLineageTracker,
     session_sequence: u64,
     collector_pid: u32,
     last_event_monotonic_ns: Option<u64>,
@@ -883,8 +948,12 @@ impl EventPipeline {
             environment,
             storage_limit_reached: false,
             binder_transactions_in_scope: std::collections::HashSet::new(),
+            pending_parcels: std::collections::HashMap::new(),
+            pending_parcels_by_tid_code: std::collections::HashMap::new(),
+            pending_parcels_by_tid: std::collections::HashMap::new(),
             binder_request_timestamps: std::collections::HashMap::new(),
             fd_lineage: crate::fd_lineage::FdLineageTracker::default(),
+            dns_lineage: crate::dns_lineage::DnsLineageTracker::default(),
             session_sequence: 0,
             collector_pid: std::process::id(),
             last_event_monotonic_ns: None,
@@ -904,6 +973,9 @@ impl EventPipeline {
                 return Ok(());
             }
         };
+        if self.absorb_or_apply_parcel(&mut event) {
+            return Ok(());
+        }
         let emitted_before = self.stats.emitted;
         self.finalize_event(&mut event)?;
         self.stats.live_emitted = self
@@ -941,9 +1013,15 @@ impl EventPipeline {
 
     fn emit_inspect_output(&mut self, output: crate::inspect_runtime::InspectOutput) -> Result<()> {
         match output {
-            crate::inspect_runtime::InspectOutput::Observation(observation) => {
-                self.emit_inspect(observation)
-            }
+            crate::inspect_runtime::InspectOutput::Observation {
+                pid,
+                tid,
+                observation,
+            } => self.emit_inspect_payload(
+                Some(pid).filter(|pid| *pid > 0),
+                Some(tid).filter(|tid| *tid > 0),
+                ksight_model::EventPayload::InspectObservation(observation),
+            ),
             crate::inspect_runtime::InspectOutput::Plaintext { pid, tid, fragment } => self
                 .emit_inspect_payload(
                     Some(pid),
@@ -1010,6 +1088,7 @@ impl EventPipeline {
             crate::memory::resolve_backing_path(event.header.process.key.pid, change);
         }
         self.fd_lineage.correlate(event);
+        self.dns_lineage.correlate(event);
         if !self.output.include_threads
             && event.header.sensor == SensorKind::Process
             && event.header.process.tid != event.header.process.tgid
@@ -1036,6 +1115,64 @@ impl EventPipeline {
         Ok(())
     }
 
+    fn absorb_or_apply_parcel(&mut self, event: &mut ksight_model::Event) -> bool {
+        use ksight_model::{BinderTransactionStage, EventPayload};
+
+        let EventPayload::BinderTransaction(transaction) = &mut event.payload else {
+            return false;
+        };
+        match transaction.stage {
+            BinderTransactionStage::ParcelPrefix => {
+                let parcel = PendingParcel {
+                    interface_token: transaction.interface_token.clone(),
+                    binder_method: transaction.binder_method.clone(),
+                    binder_method_source: transaction.binder_method_source.clone(),
+                    parcel_prefix_hex: transaction.parcel_prefix_hex.clone(),
+                };
+                if transaction.transaction_id != 0 {
+                    insert_capped(
+                        &mut self.pending_parcels,
+                        transaction.transaction_id,
+                        parcel.clone(),
+                    );
+                }
+                push_capped_deque(
+                    &mut self.pending_parcels_by_tid_code,
+                    (event.header.process.tid, transaction.code),
+                    parcel.clone(),
+                    8,
+                );
+                push_capped_deque(
+                    &mut self.pending_parcels_by_tid,
+                    event.header.process.tid,
+                    parcel,
+                    16,
+                );
+                true
+            }
+            BinderTransactionStage::Submitted => {
+                let parcel = self
+                    .pending_parcels
+                    .remove(&transaction.transaction_id)
+                    .or_else(|| {
+                        self.pending_parcels_by_tid_code
+                            .get_mut(&(event.header.process.tid, transaction.code))
+                            .and_then(std::collections::VecDeque::pop_front)
+                    })
+                    .or_else(|| {
+                        self.pending_parcels_by_tid
+                            .get_mut(&event.header.process.tid)
+                            .and_then(std::collections::VecDeque::pop_front)
+                    });
+                if let Some(parcel) = parcel {
+                    apply_pending_parcel(transaction, parcel);
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
     /// Correlate a Binder request transaction with its reply to expose latency.
     fn correlate_binder_request_reply(&mut self, event: &mut ksight_model::Event) {
         use ksight_model::{BinderTransactionStage, EventPayload};
@@ -1053,7 +1190,11 @@ impl EventPipeline {
                     .remove(&request_id)
                     .map(|submitted_ns| event.header.monotonic_ns.saturating_sub(submitted_ns));
             }
-        } else {
+        } else if (transaction.flags & 0x1) == 0
+            && !transaction
+                .decoded_flags
+                .contains(&ksight_model::BinderTransactionFlag::OneWay)
+        {
             self.binder_request_timestamps
                 .insert(transaction.transaction_id, event.header.monotonic_ns);
         }
@@ -1334,7 +1475,7 @@ fn format_payload(payload: &ksight_model::EventPayload) -> (String, String) {
         EventPayload::SocketConnect(connect) => (
             "SocketConnect".to_owned(),
             format!(
-                " fd={} result={} family={} addr_len={}/{} peer={} port={}",
+                " fd={} result={} family={} addr_len={}/{} peer={} port={} name={}",
                 connect.file_descriptor,
                 connect.result,
                 connect.address_family,
@@ -1343,7 +1484,44 @@ fn format_payload(payload: &ksight_model::EventPayload) -> (String, String) {
                 connect.peer_address.as_deref().unwrap_or("unknown"),
                 connect
                     .peer_port
-                    .map_or_else(|| "-".to_owned(), |port| port.to_string())
+                    .map_or_else(|| "-".to_owned(), |port| port.to_string()),
+                connect.resolved_name.as_deref().unwrap_or("-")
+            ),
+        ),
+        EventPayload::DnsDatagram(datagram) => (
+            "DnsDatagram".to_owned(),
+            format!(
+                " fd={} result={} dir={} port={} peer={} qname={} addrs={} trunc={}",
+                datagram.file_descriptor,
+                datagram.result,
+                datagram.direction,
+                datagram.peer_port,
+                datagram.peer_address.as_deref().unwrap_or("-"),
+                datagram.qname.as_deref().unwrap_or("-"),
+                datagram.addresses.join(","),
+                datagram.truncated
+            ),
+        ),
+        EventPayload::NetworkHandshake(handshake) => (
+            "NetworkHandshake".to_owned(),
+            format!(
+                " fd={} result={} kind={} port={} peer={} sni={} alpn={} ech={} http={} host={} quic={} trunc={}",
+                handshake.file_descriptor,
+                handshake.result,
+                handshake.kind,
+                handshake.peer_port,
+                handshake.peer_address.as_deref().unwrap_or("-"),
+                handshake.sni.as_deref().unwrap_or("-"),
+                handshake.alpn.as_deref().unwrap_or("-"),
+                handshake.ech,
+                handshake.http_method.as_deref().unwrap_or("-"),
+                handshake.http_host.as_deref().unwrap_or("-"),
+                handshake
+                    .quic_packet
+                    .as_deref()
+                    .or(handshake.quic_version.as_deref())
+                    .unwrap_or("-"),
+                handshake.truncated
             ),
         ),
         EventPayload::SocketAccept(accept) => (
@@ -1394,7 +1572,7 @@ fn format_payload(payload: &ksight_model::EventPayload) -> (String, String) {
         EventPayload::BinderTransaction(transaction) => (
             format!("Binder{:?}", transaction.stage),
             format!(
-                " tx={} target={}:{} node={} reply={} code={:#x} flags={:#x} bytes={}/{}/{} fd={} object_offset={}",
+                " tx={} target={}:{} node={} reply={} code={:#x} flags={:#x} bytes={}/{}/{} fd={} object_offset={} origin={} src={}:{} token={} method={} prefix={}",
                 transaction.transaction_id,
                 transaction
                     .target_process_id
@@ -1422,7 +1600,20 @@ fn format_payload(payload: &ksight_model::EventPayload) -> (String, String) {
                     .map_or_else(|| "-".to_owned(), |fd| fd.to_string()),
                 transaction
                     .object_offset
-                    .map_or_else(|| "-".to_owned(), |offset| offset.to_string())
+                    .map_or_else(|| "-".to_owned(), |offset| offset.to_string()),
+                transaction.transferred_fd_origin.as_deref().unwrap_or("-"),
+                transaction
+                    .transferred_fd_source_pid
+                    .map_or_else(|| "-".to_owned(), |pid| pid.to_string()),
+                transaction
+                    .transferred_fd_source_fd
+                    .map_or_else(|| "-".to_owned(), |fd| fd.to_string()),
+                transaction
+                    .interface_token
+                    .as_deref()
+                    .unwrap_or("-"),
+                transaction.binder_method.as_deref().unwrap_or("-"),
+                transaction.parcel_prefix_hex.as_deref().unwrap_or("-")
             ),
         ),
         EventPayload::SessionFdBaseline(baseline) => (
@@ -1505,7 +1696,10 @@ mod tests {
         BinderTransaction, BinderTransactionDirection, BinderTransactionStage, EventPayload,
     };
 
-    use super::binder_event_matches_scope;
+    use super::{
+        apply_pending_parcel, binder_event_matches_scope, insert_capped, push_capped_deque,
+        PendingParcel,
+    };
 
     #[test]
     fn binder_follow_on_stages_keep_the_originating_process_scope() {
@@ -1533,6 +1727,43 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn pending_parcel_fills_submit_token_and_hex() {
+        let EventPayload::BinderTransaction(mut transaction) =
+            binder(BinderTransactionStage::Submitted, 42)
+        else {
+            panic!("binder");
+        };
+        apply_pending_parcel(
+            &mut transaction,
+            PendingParcel {
+                interface_token: Some("android.os.IServiceManager".to_owned()),
+                binder_method: Some("getService".to_owned()),
+                binder_method_source: Some("aosp_stub".to_owned()),
+                parcel_prefix_hex: Some("04000000".to_owned()),
+            },
+        );
+        assert_eq!(
+            transaction.interface_token.as_deref(),
+            Some("android.os.IServiceManager")
+        );
+        assert_eq!(transaction.binder_method.as_deref(), Some("getService"));
+        assert_eq!(transaction.parcel_prefix_hex.as_deref(), Some("04000000"));
+        let mut map = std::collections::HashMap::new();
+        insert_capped(&mut map, 1_i32, 1_u8);
+        assert_eq!(map.get(&1), Some(&1));
+        let mut queues = std::collections::HashMap::new();
+        push_capped_deque(&mut queues, 7_u32, "a", 2);
+        push_capped_deque(&mut queues, 7_u32, "b", 2);
+        push_capped_deque(&mut queues, 7_u32, "c", 2);
+        assert_eq!(
+            queues
+                .get_mut(&7)
+                .and_then(std::collections::VecDeque::pop_front),
+            Some("b")
+        );
+    }
+
     fn binder(stage: BinderTransactionStage, transaction_id: i32) -> EventPayload {
         EventPayload::BinderTransaction(BinderTransaction {
             stage,
@@ -1555,6 +1786,12 @@ mod tests {
             file_descriptor: None,
             object_offset: None,
             transferred_fd_origin: None,
+            transferred_fd_source_pid: None,
+            transferred_fd_source_fd: None,
+            interface_token: None,
+            binder_method: None,
+            binder_method_source: None,
+            parcel_prefix_hex: None,
         })
     }
 }

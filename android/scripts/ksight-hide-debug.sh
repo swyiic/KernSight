@@ -16,6 +16,7 @@ LOG=$KSIGHT_DIR/capture-live.log
 STATE=$KSIGHT_DIR/debug-restore.state
 PIDFILE=$KSIGHT_DIR/capture.pid
 WATCHDOG=$KSIGHT_DIR/restore-watchdog.pid
+DUMP_READY=$KSIGHT_DIR/dump-ready
 
 mkdir -p "$KSIGHT_DIR"
 : > "$LOG"
@@ -46,13 +47,27 @@ fi
 echo $! > "$PIDFILE"
 CAP_PID=$(cat "$PIDFILE")
 
+is_dump=0
+case " $* " in
+    *" dump-package "*) is_dump=1 ;;
+esac
+
 i=0
-while [ "$i" -lt 100 ]; do
-    if grep -q 'session=' "$LOG" 2>/dev/null; then
-        break
-    fi
-    if [ -s "$KSIGHT_DIR/spool/last_session" ]; then
-        break
+# Capture: wait for session=. Dump: wait for dump-ready (after ART attach, before launch).
+# Do not treat leftover last_session as dump-ready or USB hide races launch.
+max_i=200
+while [ "$i" -lt "$max_i" ]; do
+    if [ "$is_dump" = 1 ]; then
+        if [ -f "$DUMP_READY" ]; then
+            break
+        fi
+    else
+        if grep -q 'session=' "$LOG" 2>/dev/null; then
+            break
+        fi
+        if [ -s "$KSIGHT_DIR/spool/last_session" ]; then
+            break
+        fi
     fi
     if ! kill -0 "$CAP_PID" 2>/dev/null; then
         restore

@@ -148,4 +148,16 @@ static __always_inline int ksight_syscall_is_network_io(ksight_s64 id)
            id == KSIGHT_A32_SENDMMSG || id == KSIGHT_A32_RECVMMSG;
 }
 
+static __always_inline int ksight_syscall_is_handshake_send(ksight_s64 id)
+{
+    return id == KSIGHT_A64_WRITE || id == KSIGHT_A64_SENDTO ||
+           id == KSIGHT_A64_SENDMSG || id == KSIGHT_A32_WRITE ||
+           id == KSIGHT_A32_SENDTO || id == KSIGHT_A32_SENDMSG;
+}
+
+static __always_inline int ksight_syscall_is_write(ksight_s64 id)
+{
+    return id == KSIGHT_A64_WRITE || id == KSIGHT_A32_WRITE;
+}
+
 #endif /* KSIGHT_SYSCALL_COMPAT_H */
