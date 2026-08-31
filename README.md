@@ -1,24 +1,23 @@
-# KernSight
+<img width="926" height="923" alt="image" src="https://github.com/user-attachments/assets/ea3e1780-0ca9-4feb-94fc-aea81b7148ad" /># KernSight
 
-KernSight 是一个面向自有或明确授权 Android 设备的内核可观测项目。
+KernSight 是 Android 设备的内核观测项目。
 基于 eBPF 采集进程、文件、内存映射、网络、Binder 和调度事实，由设备端 `ksightd` 归一化并持久化，
-再通过 `ksightctl` 或 MobileE 完成控制、回放、聚合和可视化。
+再通过 `ksightctl` 完成控制、回放、聚合。
 
-当前版本为 **0.2.2**，主要开发基线是 Pixel 6a、Android 14、ARM64。项目仍处于实验
-阶段，不应被视为通用的生产级 Android 监控组件。
-持续开发ing....
+开发基线是 Pixel 6a、Android 16 (SDK 36) 、arm64-v8a。
 
 ## 测试应用
 - 测试应用，网上国网，大陆四大行，同花顺，平安证劵，政务相关，花旗银行，汇丰US均可获取可观测dex/so，明文信息等
+- （金融类）中行部分数据图
+  <img width="895" height="924" alt="image" src="https://github.com/user-attachments/assets/dc43f886-f795-4f9d-923f-8f525fe2066a" />
+  爱存不存部分数据图，
+  <img width="926" height="920" alt="image" src="https://github.com/user-attachments/assets/7dcbc276-7707-45d6-9ecb-f83848b04cba" />
+- （政务类）随申办部分数据图
+  <img width="926" height="923" alt="image" src="https://github.com/user-attachments/assets/c65cb4e4-b20c-4e11-b3c9-f44d0d8f2e03" />
+- 爱国网，爱国当前版本比较特殊，挂载的是arch32架构，uprobe没有等价内核钩子，没有进行深入分析
+  <img width="927" height="803" alt="image" src="https://github.com/user-attachments/assets/df0712bb-51a6-4eee-a746-bde1486362f6" />
 
-## 组件
-
-- `ksightd`：运行在 Android 设备上的采集代理。
-- `ksightctl`：运行在 PC 上的命令行客户端。
-- `ksight-core`：报告、关联图、DEX 聚合和 SO 规则识别。
-- `ksight-protocol`：MobileE 与设备端共享的版本化通信协议。
-- `bpf/`：按传感器拆分的 eBPF 程序。
-- `rules/native_frameworks.json`：壳、加固及密码框架候选规则库。
+- 当前仅为通用规则，针对某个App需要做深入优化和重新分析，binder对其，kprobe和uprobe等
 
 ## 编译环境
 
@@ -177,11 +176,48 @@ make probe ADB="adb -s <serial>"
 
 ## 基本用法
 
-以下示例使用 Cargo 启动 CLI。若已编译 release 版本，可将
-`cargo run -q -p ksight-cli --` 替换为 `target/release/ksightctl`。
-
+已编译 release 版本，选择android版本即可。
+推送文件：
 ```bash
-SERIAL=<adb-serial>
+adb push ~/../ksightd-android-arm64 /data/local/tmp/ksightd
+adb shell su -c 'chmod 0755 /data/local/tmp/ksightd'
+```
+能力检测：
+```bash
+adb shell su -c '/data/local/tmp/ksightd probe --json'
+```
+全设备采集：
+```bash
+adb shell su -c '/data/local/tmp/ksightd capture \
+  --all \
+  --duration-seconds 30 \
+  --spool-dir /data/local/tmp/ksight/spool \
+  --json'
+```
+指定应用采集：
+```bash
+adb shell su -c '/data/local/tmp/ksightd capture \
+  --package com.example.app \
+  --files --network --memory --binder \
+  --duration-seconds 60 \
+  --spool-dir /data/local/tmp/ksight/spool \
+  --json'
+```
+查看 Session：
+```bash
+adb shell su -c '/data/local/tmp/ksightd spool replay <SESSION_UUID>'
+```
+回放指定 Session：
+```bash
+adb shell su -c '/data/local/tmp/ksightd spool replay <SESSION_UUID>'
+```
+采集某个包的 L2 证据：
+```bash
+adb shell su -c '/data/local/tmp/ksightd dump-package \
+  --package com.example.app \
+  --dest /data/local/tmp/ksight/packages/com.example.app \
+  --launch \
+  --json'
 ```
 
 ### 查看能力
@@ -222,6 +258,7 @@ cargo run -q -p ksight-cli -- device --serial "$SERIAL" capture \
   --duration-seconds 30 --spool
 ```
 
+## 以下针对开发环境
 ### 查看和解析会话
 
 ```bash
