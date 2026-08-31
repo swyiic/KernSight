@@ -176,6 +176,7 @@ make probe ADB="adb -s <serial>"
 ## 基本用法
 
 已编译 release 版本，选择android版本即可。
+
 推送文件：
 ```bash
 adb push ~/../ksightd-android-arm64 /data/local/tmp/ksightd
