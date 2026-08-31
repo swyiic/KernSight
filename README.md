@@ -1,4 +1,4 @@
-<img width="926" height="923" alt="image" src="https://github.com/user-attachments/assets/ea3e1780-0ca9-4feb-94fc-aea81b7148ad" /># KernSight
+KernSight
 
 KernSight 是 Android 设备的内核观测项目。
 基于 eBPF 采集进程、文件、内存映射、网络、Binder 和调度事实，由设备端 `ksightd` 归一化并持久化，
@@ -55,8 +55,7 @@ make bpf BPF_CLANG=/absolute/path/to/clang
 - 内核支持 eBPF、BTF、tracefs、ring buffer 及所用 tracepoint
 - 测试环境：6.1.124-android14，其他 Android/内核版本必须重新执行能力探测
 
-KernSight 目前部署到 `/data/local/tmp/ksight`。AOSP init、独立 SELinux 域、AVB 签名
-及锁定自定义信任根仍属于后续系统集成工作。
+KernSight 目前部署到 `/data/local/tmp/ksight`。AOSP init、独立 SELinux 域、AVB 签名及锁定自定义信任根仍属于后续系统集成工作。
 
 ## 获取源码
 
