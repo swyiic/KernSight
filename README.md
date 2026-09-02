@@ -7,7 +7,7 @@ KernSight 是 Android 设备的内核观测项目。
 开发基线是 Pixel 6a、Android 16 (SDK 36) 、arm64-v8a。
 
 ## 测试应用
-- 测试应用，网上国网，大陆四大行，同花顺，平安证劵，政务相关，花旗银行，汇丰US均可获取可观测dex/so，明文信息等
+- 测试应用，网上国网，大陆四大行，同花顺，平安证劵，政务相关，花旗银行，汇丰US均可获取可加密dex/so，明文信息等
 - （金融类）中行部分数据图：
   <img width="895" height="924" alt="image" src="https://github.com/user-attachments/assets/dc43f886-f795-4f9d-923f-8f525fe2066a" />
 - 爱存不存部分数据图：
