@@ -9,5 +9,6 @@
 /packages/
 /forensics/
 
-# All markdown stays local; nothing md is published to GitHub.
+# Architecture and design notes stay local; publish only the repository README.
 *.md
+!/README.md
