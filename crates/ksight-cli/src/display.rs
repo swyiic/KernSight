@@ -238,8 +238,13 @@ pub(crate) fn print_session_report(report: &SessionReport, top: usize) {
             .collect::<Vec<_>>()
             .join(",");
         let redacted = row.redacted_body_keys.join(",");
+        let origin = if row.origin.is_empty() {
+            "inspect"
+        } else {
+            row.origin.as_str()
+        };
         println!(
-            "  {}({}) {} {} {host}{}{tracker} ×{} status={} keys=[{keys}] redacted=[{redacted}]",
+            "  {}({}) {origin} {} {} {host}{}{tracker} ×{} status={} keys=[{keys}] redacted=[{redacted}]",
             row.source,
             row.process_id,
             row.direction,

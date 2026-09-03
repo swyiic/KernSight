@@ -32,7 +32,9 @@ pub use graph::{
     ranges_overlap, EdgeStrength, GraphEdge, GraphEntity, GraphEntityKind, GraphQuery, SessionGraph,
 };
 pub use handshake::{parse_handshake, HandshakeMeta};
-pub use http_plain::{is_third_party_host, parse_http_plain, ParsedHttpPlain};
+pub use http_plain::{
+    is_third_party_host, parse_http_plain, parse_http_plain_bytes, ParsedHttpPlain,
+};
 pub use identity::IdentityRegistry;
 pub use inspect::{InspectAuditEvent, InspectPolicy};
 pub use native_rules::{

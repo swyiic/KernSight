@@ -320,6 +320,9 @@ pub struct PackageDumpReport {
     /// Sensitive candidate files retained by explicit package-dump operation.
     #[serde(default)]
     pub sensitive_files: Vec<DumpEvidenceFile>,
+    /// HTTP/1 or JSON calls parsed from `runtime/plaintext` heap windows. Token values redacted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub http_calls: Vec<ksight_core::HttpCallActivity>,
     /// Total bytes under this package dump root at catalog time.
     #[serde(default)]
     pub total_bytes: u64,
@@ -444,6 +447,7 @@ pub fn dump_package_with(
         native_framework_matches: Vec::new(),
         graph: ksight_core::SessionGraph::l0_placeholder(),
         sensitive_files: Vec::new(),
+        http_calls: Vec::new(),
         total_bytes: 0,
         warnings: default_dump_warnings(),
         snapshots: Vec::new(),
@@ -651,6 +655,7 @@ pub fn recatalog_package(dest: &Path) -> Result<PackageDumpReport> {
             native_framework_matches: Vec::new(),
             graph: ksight_core::SessionGraph::l0_placeholder(),
             sensitive_files: Vec::new(),
+            http_calls: Vec::new(),
             total_bytes: 0,
             warnings: default_dump_warnings(),
             snapshots: Vec::new(),
@@ -679,6 +684,7 @@ fn finalize_catalog(report: &mut PackageDumpReport, dest: &Path) -> Result<()> {
     report.native_rule_version = ksight_core::native_framework_rule_version();
     report.native_framework_matches = ksight_core::classify_native_frameworks(&report.artifacts);
     report.sensitive_files = catalog_sensitive_files(dest);
+    report.http_calls = catalog_plaintext_http_calls(dest, &report.package);
     report.snapshots = catalog_snapshots(dest);
     report.mapped_code = catalog_mapped_code(dest);
     report.code_loaders = catalog_code_loaders(dest);
@@ -733,6 +739,8 @@ fn finalize_catalog(report: &mut PackageDumpReport, dest: &Path) -> Result<()> {
 fn default_dump_warnings() -> Vec<String> {
     vec![
         "plaintext_windows and key_slots are bounded candidate counts, not confirmed secrets"
+            .to_owned(),
+        "dump http_calls are parsed from runtime/plaintext heap windows (HTTP/1 or JSON, NUL or CRLF); they are correlated heap facts, not Inspect SSL_write and not HTTP/2 HPACK. Responses have no URL path."
             .to_owned(),
         "package dump uses root procfs memory access and is L2 forensic evidence, not eBPF Observe"
             .to_owned(),
@@ -839,6 +847,7 @@ fn build_dex_sets(
 
     let mut class_owners = BTreeMap::<String, BTreeSet<String>>::new();
     let mut method_names = BTreeSet::new();
+    let mut method_prototypes = BTreeSet::new();
     let mut semantic_parse_failures = 0_usize;
     let mut semantic_index_truncated = false;
     for set in &sets {
@@ -846,8 +855,9 @@ fn build_dex_sets(
             semantic_parse_failures = semantic_parse_failures.saturating_add(1);
             continue;
         };
-        semantic_index_truncated |=
-            semantic.class_descriptors_truncated || semantic.method_names_truncated;
+        semantic_index_truncated |= semantic.class_descriptors_truncated
+            || semantic.method_names_truncated
+            || semantic.method_prototypes_truncated;
         for descriptor in &semantic.class_descriptors {
             class_owners
                 .entry(descriptor.clone())
@@ -855,6 +865,7 @@ fn build_dex_sets(
                 .insert(set.sha256.clone());
         }
         method_names.extend(semantic.method_names.iter().cloned());
+        method_prototypes.extend(semantic.method_prototypes.iter().cloned());
     }
     let class_conflicts = class_owners
         .iter()
@@ -870,6 +881,7 @@ fn build_dex_sets(
         observations: sets.iter().map(|set| set.observations.len()).sum(),
         indexed_class_samples: class_owners.len(),
         indexed_method_name_samples: method_names.len(),
+        indexed_method_prototype_samples: method_prototypes.len(),
         class_conflicts,
         semantic_parse_failures,
         semantic_index_truncated,
@@ -922,6 +934,73 @@ fn catalog_sensitive_files(dest: &Path) -> Vec<DumpEvidenceFile> {
     }
     files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     files
+}
+
+fn catalog_plaintext_http_calls(dest: &Path, package: &str) -> Vec<ksight_core::HttpCallActivity> {
+    let mut calls =
+        BTreeMap::<(u32, String, String, String, String), ksight_core::HttpCallActivity>::new();
+    visit_files(&dest.join("runtime/plaintext"), &mut |path| {
+        let Ok(bytes) = std::fs::read(path) else {
+            return;
+        };
+        if bytes.len() > 8 * 1024 {
+            return;
+        }
+        let Some(parsed) = ksight_core::parse_http_plain_bytes(&bytes, "text") else {
+            return;
+        };
+        let process_id = pid_from_plaintext_name(path);
+        let host = parsed.host.clone().unwrap_or_default();
+        let key = (
+            process_id,
+            parsed.kind.to_owned(),
+            parsed.method.clone(),
+            host,
+            parsed.path.clone(),
+        );
+        let activity = calls
+            .entry(key)
+            .or_insert_with(|| ksight_core::HttpCallActivity {
+                source: package.to_owned(),
+                process_id,
+                direction: "heap".to_owned(),
+                kind: parsed.kind.to_owned(),
+                method: parsed.method.clone(),
+                host: parsed.host.clone(),
+                path: parsed.path.clone(),
+                status: parsed.status,
+                query_keys: parsed.query_keys.clone(),
+                header_names: parsed.header_names.clone(),
+                redacted_headers: parsed.redacted_headers.clone(),
+                body_keys: parsed.body_keys.clone(),
+                redacted_body_keys: parsed.redacted_body_keys.clone(),
+                content_type: parsed.content_type.clone(),
+                third_party: parsed.third_party,
+                count: 0,
+                origin: "heap".to_owned(),
+            });
+        activity.count = activity.count.saturating_add(1);
+        activity.third_party |= parsed.third_party;
+    });
+    let mut out = calls.into_values().collect::<Vec<_>>();
+    out.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| left.method.cmp(&right.method))
+    });
+    out.truncate(128);
+    out
+}
+
+fn pid_from_plaintext_name(path: &Path) -> u32 {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("mem-"))
+        .and_then(|name| name.split(['-', '+']).next())
+        .and_then(|name| name.parse().ok())
+        .unwrap_or(0)
 }
 
 fn recount_static_trees(report: &mut PackageDumpReport, dest: &Path) {
@@ -2731,6 +2810,26 @@ mod tests {
         assert_eq!(files.len(), 2);
         assert!(files.iter().all(|file| file.sha256.len() == 64));
         assert!(files.iter().all(|file| !file.confirmed));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn catalog_parses_nul_http_response_without_fake_path() {
+        let dir = std::env::temp_dir().join(format!("ksight-http-calls-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("runtime/plaintext")).expect("plaintext dir");
+        let mut bytes = vec![0_u8; 0x40];
+        bytes[0x28..0x2c].copy_from_slice(&[0x9d, 0xb8, 0x2f, 0x00]);
+        bytes.extend_from_slice(
+            b"HTTP/1.1 200 OK\0Content-Type: image/jpeg\0Content-Length: 73045\0",
+        );
+        std::fs::write(dir.join("runtime/plaintext/mem-4321-7b00+40.txt"), &bytes).expect("window");
+        let calls = catalog_plaintext_http_calls(&dir, "com.example");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].origin, "heap");
+        assert_eq!(calls[0].process_id, 4321);
+        assert_eq!(calls[0].status, Some(200));
+        assert!(calls[0].path.is_empty());
+        assert_eq!(calls[0].content_type.as_deref(), Some("image/jpeg"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -99,10 +99,23 @@ pub struct ParsedHttpPlain {
 /// Parse an Inspect plaintext preview. `tls_record` / empty / binary hex is ignored.
 #[must_use]
 pub fn parse_http_plain(preview: &str, content_class: &str) -> Option<ParsedHttpPlain> {
+    parse_http_plain_bytes(preview.as_bytes(), content_class)
+}
+
+/// Parse Inspect previews or dump heap windows. Leading object headers are skipped.
+/// NUL-separated in-memory header tables are treated as HTTP/1 lines.
+#[must_use]
+pub fn parse_http_plain_bytes(bytes: &[u8], content_class: &str) -> Option<ParsedHttpPlain> {
     if content_class == "tls_record" {
         return None;
     }
-    let text = preview.trim();
+    let start = skip_to_http(bytes)?;
+    let lossy = String::from_utf8_lossy(&bytes[start..]);
+    let text = lossy
+        .replace('\0', "\n")
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    let text = text.trim();
     if text.is_empty() {
         return None;
     }
@@ -111,7 +124,7 @@ pub fn parse_http_plain(preview: &str, content_class: &str) -> Option<ParsedHttp
             kind: "http2_preface",
             method: "PRI".to_owned(),
             host: None,
-            path: "*".to_owned(),
+            path: String::new(),
             status: None,
             query_keys: Vec::new(),
             header_names: Vec::new(),
@@ -125,9 +138,49 @@ pub fn parse_http_plain(preview: &str, content_class: &str) -> Option<ParsedHttp
     parse_http1(text).or_else(|| parse_json_only(text))
 }
 
+fn skip_to_http(bytes: &[u8]) -> Option<usize> {
+    let mut json = None;
+    let mut index = 0_usize;
+    while index < bytes.len() {
+        if is_token_boundary(bytes, index) {
+            if http_starts_at(bytes, index) {
+                return Some(index);
+            }
+            if json.is_none() && bytes[index] == b'{' {
+                json = Some(index);
+            }
+        }
+        index += 1;
+    }
+    json
+}
+
+fn is_token_boundary(bytes: &[u8], index: usize) -> bool {
+    index == 0 || {
+        let previous = bytes[index - 1];
+        previous == 0 || previous.is_ascii_whitespace() || !previous.is_ascii_graphic()
+    }
+}
+
+fn http_starts_at(bytes: &[u8], index: usize) -> bool {
+    const STARTS: [&[u8]; 10] = [
+        b"GET ",
+        b"POST ",
+        b"HEAD ",
+        b"PUT ",
+        b"DELETE ",
+        b"PATCH ",
+        b"OPTIONS ",
+        b"CONNECT ",
+        b"HTTP/1.",
+        b"PRI * HTTP/2.0",
+    ];
+    let rest = &bytes[index..];
+    STARTS.iter().any(|needle| rest.starts_with(needle))
+}
+
 fn parse_http1(text: &str) -> Option<ParsedHttpPlain> {
-    let text = text.replace("\r\n", "\n").replace('\r', "\n");
-    let (head, body) = text.split_once("\n\n").unwrap_or((text.as_str(), ""));
+    let (head, body) = text.split_once("\n\n").unwrap_or((text, ""));
     let mut lines = head.lines();
     let request_line = lines.next().unwrap_or("");
     let (method, path_and_query, status) = parse_start_line(request_line)?;
@@ -157,12 +210,18 @@ fn parse_http1(text: &str) -> Option<ParsedHttpPlain> {
     }
     let (body_keys, redacted_body_keys) = parse_body_keys(body, content_type.as_deref());
     let third_party = host.as_deref().is_some_and(is_third_party_host);
+    let kind = if status.is_some() {
+        "http1_response"
+    } else {
+        "http1_request"
+    };
+    let path = if kind == "http1_response" {
+        String::new()
+    } else {
+        path
+    };
     Some(ParsedHttpPlain {
-        kind: if status.is_some() {
-            "http1_response"
-        } else {
-            "http1_request"
-        },
+        kind,
         method,
         host,
         path,
@@ -182,7 +241,7 @@ fn parse_start_line(line: &str) -> Option<(String, &str, Option<u16>)> {
     let first = parts.next()?;
     if first.starts_with("HTTP/") {
         let status = parts.next()?.parse::<u16>().ok();
-        return Some(("HTTP".to_owned(), "/", status));
+        return Some(("HTTP".to_owned(), "", status));
     }
     if !matches!(
         first,
@@ -299,7 +358,7 @@ fn parse_json_only(text: &str) -> Option<ParsedHttpPlain> {
         kind: "json",
         method: "JSON".to_owned(),
         host: None,
-        path: "/".to_owned(),
+        path: String::new(),
         status: None,
         query_keys: Vec::new(),
         header_names: Vec::new(),
@@ -408,6 +467,31 @@ mod tests {
         assert_eq!(parsed.kind, "json");
         assert!(parsed.body_keys.contains(&"feed_id".to_owned()));
         assert!(parsed.redacted_body_keys.contains(&"token".to_owned()));
+    }
+
+    #[test]
+    fn skips_heap_object_header_and_parses_nul_response() {
+        let mut bytes = vec![0_u8; 0x40];
+        bytes[0x28..0x2c].copy_from_slice(&[0x9d, 0xb8, 0x2f, 0x00]);
+        bytes[0x3c..0x40].copy_from_slice(&[0xea, 0x03, 0x00, 0x00]);
+        bytes.extend_from_slice(b"HTTP/1.1 200 OK\0");
+        bytes.extend_from_slice(b"Date: Thu, 27 Aug 2026 13:35:57 GMT\0");
+        bytes.extend_from_slice(b"Content-Type: image/jpeg\0");
+        bytes.extend_from_slice(b"Content-Length: 73045\0");
+        bytes.extend_from_slice(b"Server: unknown\0");
+        let parsed = parse_http_plain_bytes(&bytes, "text").expect("http");
+        assert_eq!(parsed.kind, "http1_response");
+        assert_eq!(parsed.status, Some(200));
+        assert!(
+            parsed.path.is_empty(),
+            "responses have no URL path: {:?}",
+            parsed.path
+        );
+        assert_eq!(parsed.content_type.as_deref(), Some("image/jpeg"));
+        assert!(!parsed
+            .header_names
+            .iter()
+            .any(|name| name.contains('\u{fffd}')));
     }
 
     #[test]

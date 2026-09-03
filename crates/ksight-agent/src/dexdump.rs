@@ -303,7 +303,7 @@ fn dump_plaintext_windows(pid: u32, dest_dir: &Path, deadline: Instant) -> usize
                     break;
                 };
                 let at = from.saturating_add(rel);
-                let begin = at.saturating_sub(64);
+                let begin = plaintext_window_begin(&bytes, at, needle);
                 let stop = (at.saturating_add(PLAINTEXT_WINDOW)).min(bytes.len());
                 let slice = &bytes[begin..stop];
                 let name = format!("mem-{pid}-{start:x}+{at:x}.txt");
@@ -317,6 +317,27 @@ fn dump_plaintext_windows(pid: u32, dest_dir: &Path, deadline: Instant) -> usize
         }
     }
     dumped
+}
+
+/// HTTP status/request needles start at the token. JSON/token needles keep 64 bytes of context.
+/// Response `HTTP/1.1` lookbehind is neighboring heap, not a URL path.
+fn plaintext_window_begin(bytes: &[u8], at: usize, needle: &[u8]) -> usize {
+    if needle == b"HTTP/1." {
+        let mut index = at;
+        while index > 0 {
+            let previous = bytes[index - 1];
+            if previous.is_ascii_graphic() || previous == b' ' || previous == b'\t' {
+                index -= 1;
+                continue;
+            }
+            break;
+        }
+        return index;
+    }
+    if needle == b"GET /" || needle == b"POST /" {
+        return at;
+    }
+    at.saturating_sub(64)
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -2253,5 +2274,18 @@ mod tests {
             0x1000,
             &packer
         ));
+    }
+
+    #[test]
+    fn plaintext_window_starts_at_http_response_not_object_header() {
+        let mut bytes = vec![0_u8; 0x40];
+        bytes[0x28..0x2c].copy_from_slice(&[0x9d, 0xb8, 0x2f, 0x00]);
+        bytes.extend_from_slice(b"HTTP/1.1 200 OK\0Content-Type: image/jpeg\0");
+        let at = find_bytes(&bytes, b"HTTP/1.").expect("needle");
+        assert_eq!(plaintext_window_begin(&bytes, at, b"HTTP/1."), at);
+        let request = b"GET /v6/feed HTTP/1.1\r\nHost: api.example\r\n\r\n";
+        let at = find_bytes(request, b"HTTP/1.").expect("request");
+        assert_eq!(plaintext_window_begin(request, at, b"HTTP/1."), 0);
+        assert_eq!(plaintext_window_begin(request, 0, b"GET /"), 0);
     }
 }

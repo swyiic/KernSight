@@ -718,6 +718,9 @@ pub struct HttpCallActivity {
     pub third_party: bool,
     /// Number of matching Inspect previews.
     pub count: u64,
+    /// `inspect` from TLS buffers, `heap` from dump plaintext windows.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub origin: String,
 }
 
 /// Collapsed connect storm against loopback ports.
@@ -825,6 +828,7 @@ struct MutablePlaintext {
 struct HttpCallKey {
     process_id: u32,
     direction: String,
+    origin: String,
     kind: String,
     method: String,
     host: String,
@@ -1076,7 +1080,7 @@ impl SessionReportBuilder {
                 if let Some(parsed) =
                     crate::parse_http_plain(&fragment.preview, &fragment.content_class)
                 {
-                    self.record_http_call(pid, &fragment.direction, parsed);
+                    self.record_http_call(pid, &fragment.direction, "inspect", parsed);
                 }
             }
             EventPayload::InspectObservation(observation) => {
@@ -1584,6 +1588,7 @@ impl SessionReportBuilder {
                 source: resolve_label(&self.identities, key.process_id),
                 process_id: key.process_id,
                 direction: key.direction,
+                origin: key.origin,
                 kind: key.kind,
                 method: key.method,
                 host: (!key.host.is_empty()).then_some(key.host),
@@ -1675,6 +1680,7 @@ impl SessionReportBuilder {
             });
         }
         attach_http_call_graph(&mut graph, session_id, &http_calls);
+        pair_http_replies(&mut graph, session_id, &http_calls);
         graph.attach_observed_mappings(session_id, &observed_mappings, &processes);
         let mut inspect_hits = self
             .inspect_hits
@@ -1803,10 +1809,17 @@ impl SessionReportBuilder {
         }
     }
 
-    fn record_http_call(&mut self, pid: u32, direction: &str, parsed: crate::ParsedHttpPlain) {
+    fn record_http_call(
+        &mut self,
+        pid: u32,
+        direction: &str,
+        origin: &str,
+        parsed: crate::ParsedHttpPlain,
+    ) {
         let key = HttpCallKey {
             process_id: pid,
             direction: direction.to_owned(),
+            origin: origin.to_owned(),
             kind: parsed.kind.to_owned(),
             method: parsed.method,
             host: parsed.host.unwrap_or_default(),
@@ -2527,6 +2540,32 @@ fn extend_unique(dst: &mut Vec<String>, src: &[String], cap: usize) {
     }
 }
 
+fn http_call_key(row: &HttpCallActivity) -> String {
+    let host = row.host.as_deref().unwrap_or("-");
+    let origin = if row.origin.is_empty() {
+        "inspect"
+    } else {
+        row.origin.as_str()
+    };
+    format!(
+        "http_call:{origin}:{}:{}:{}{}",
+        row.process_id, row.method, host, row.path
+    )
+}
+
+fn http_call_label(row: &HttpCallActivity) -> String {
+    let tracker = if row.third_party { " tracker" } else { "" };
+    if row.kind == "http1_response" {
+        let status = row
+            .status
+            .map_or_else(|| "?".to_owned(), |value| value.to_string());
+        let content = row.content_type.as_deref().unwrap_or("");
+        return format!("HTTP {status} {content}{tracker} ×{}", row.count);
+    }
+    let host = row.host.as_deref().unwrap_or("-");
+    format!("{} {host}{}{tracker} ×{}", row.method, row.path, row.count)
+}
+
 fn attach_http_call_graph(
     graph: &mut crate::SessionGraph,
     session_id: Uuid,
@@ -2534,28 +2573,28 @@ fn attach_http_call_graph(
 ) {
     for row in calls.iter().take(64) {
         let from = graph.ensure_process(session_id, &row.source, row.process_id);
-        let host = row.host.as_deref().unwrap_or("-");
-        let to = format!(
-            "http_call:{}:{}:{}{}",
-            row.process_id, row.method, host, row.path
-        );
+        let to = http_call_key(row);
         if !graph.entities.iter().any(|entity| entity.key == to) {
-            let tracker = if row.third_party { " tracker" } else { "" };
             graph.entities.push(crate::GraphEntity {
                 kind: crate::GraphEntityKind::SocketFlow,
                 session_id,
                 key: to.clone(),
-                label: format!("{} {host}{}{tracker} ×{}", row.method, row.path, row.count),
+                label: http_call_label(row),
                 sensors: vec![SensorKind::Integrity],
                 artifact: None,
                 process_instance_id: None,
             });
         }
+        let strength = if row.origin == "heap" {
+            crate::EdgeStrength::Correlated
+        } else {
+            crate::EdgeStrength::Confirmed
+        };
         graph.edges.push(crate::GraphEdge {
             from,
             to: to.clone(),
             relation: "http_call".to_owned(),
-            strength: crate::EdgeStrength::Confirmed,
+            strength,
             sensor: Some(SensorKind::Integrity),
         });
         if let Some(name) = row.host.as_deref() {
@@ -2579,6 +2618,67 @@ fn attach_http_call_graph(
                 sensor: Some(SensorKind::Integrity),
             });
         }
+    }
+}
+
+fn pair_http_replies(
+    graph: &mut crate::SessionGraph,
+    _session_id: Uuid,
+    calls: &[HttpCallActivity],
+) {
+    let requests: Vec<&HttpCallActivity> = calls
+        .iter()
+        .filter(|row| row.kind == "http1_request" && row.host.is_some())
+        .take(64)
+        .collect();
+    let responses: Vec<&HttpCallActivity> = calls
+        .iter()
+        .filter(|row| row.kind == "http1_response" && row.host.is_some())
+        .take(64)
+        .collect();
+    let mut paired = 0_usize;
+    for request in requests {
+        for response in &responses {
+            if paired >= 32 {
+                return;
+            }
+            if request.process_id != response.process_id {
+                continue;
+            }
+            if request.host != response.host {
+                continue;
+            }
+            graph.edges.push(crate::GraphEdge {
+                from: http_call_key(request),
+                to: http_call_key(response),
+                relation: "http_reply".to_owned(),
+                strength: crate::EdgeStrength::Correlated,
+                sensor: Some(SensorKind::Integrity),
+            });
+            paired = paired.saturating_add(1);
+        }
+    }
+}
+
+impl SessionReport {
+    /// Join dump-package heap HTTP catalog. Heap edges stay correlated.
+    pub fn ingest_dump_http_calls(&mut self, calls: Vec<HttpCallActivity>) {
+        if calls.is_empty() {
+            return;
+        }
+        let session_id = self.session_id.unwrap_or(Uuid::nil());
+        attach_http_call_graph(&mut self.graph, session_id, &calls);
+        pair_http_replies(&mut self.graph, session_id, &calls);
+        self.http_calls.extend(calls);
+        self.http_calls.sort_by(|left, right| {
+            right
+                .count
+                .cmp(&left.count)
+                .then_with(|| left.host.cmp(&right.host))
+                .then_with(|| left.path.cmp(&right.path))
+                .then_with(|| left.method.cmp(&right.method))
+        });
+        self.http_calls.truncate(128);
     }
 }
 
@@ -2753,8 +2853,8 @@ fn report_limitations() -> Vec<String> {
     vec![
         "Binder driver submission-to-delivery latency is correlated by transaction ID. Two-way RPCs pair reply submit to the request debug_id (binder_reply / replies_to, confirmed). A 128-byte parcel prefix is copied at kprobe binder_transaction (every online CPU) for 32-bit and 64-bit clients (native UAPI after compat conversion) and parsed as writeInterfaceToken String16. Inspect transact joins that request by tid+code as correlated joined_transact and copies reply latency when the kernel pair exists. Inspect pairs writeInterfaceToken and bounded exported Parcel writers on the same TID on ELF64; this GKI rejects AArch32 uprobes. AIDL method names come from on-device AOSP Stub tables (aosp_stub) or that process's loaded DEX TRANSACTION_* (process_dex). Parcel C++ object fields and writeFloat/writeDouble (no FPSIMD in uprobe pt_regs) are not read.".to_owned(),
         "DEX, ELF, connlog, and packed-cache path candidates may include a SHA-256 when a regular file <= 1 MiB is opened; capture also copies those forensic files under the spool forensics directory because apps often delete packed DEX after load.".to_owned(),
-        "Connect/accept and FD baseline/dup/close evidence reconstruct descriptor lifetimes. Optional network-io counts byte-returning socket calls and reports sendmmsg/recvmmsg results as message counts. UDP/53 datagrams parse QNAME/A/AAAA and stamp later connect() as correlated resolved_name (same-process first, then any resolver that answered the IP). getaddrinfo uprobes and non-53 resolvers remain uncovered. TLS/QUIC plaintext is Inspect-only. HTTP/1 request-line, Host, query keys, and JSON/form body keys are parsed from those Inspect previews into http_calls; Cookie/Authorization/token values are redacted. HTTP/2 frames after the PRI preface, HPACK, Cronet without SSL_write, Flutter, and custom TLS are not decoded.".to_owned(),
-        "The L0 graph is queryable (`ksightctl device graph`). Process instances use `procinst:{boot_id:pid:start_time_ns}` when start time is known; otherwise `process:pkg:pid`. Confirmed edges are Binder, Binder `replies_to`/`binder_reply` (request debug_id), socket, Binder FD `transfers_fd`, loopback scans, sched wakeup identity, and mmap/remap `maps` edges. Dump VMA `overlaps_mmap` is correlated even on an exact address match. Inspect `inspect_hit` and TLS `tls_send`/`tls_recv` are selected-process facts, not Observe. Inspect HTTP `http_call` edges are parsed from those TLS previews (HTTP/1 or JSON), not Observe and not HTTP/2 HPACK. Binder userspace hits record handle/code and join L0 `binder:req` by tid+code as correlated `joined_transact`. The interface token and bounded scalars come from exported Parcel writers on the same TID. AIDL names come from on-device AOSP Stub tables or session process DEX; they are not hardcoded GMS/app names. Parcel C++ fields are not read. JNI RegisterNatives, Cronet/QUIC, and custom TLS remain unresolved. Time proximity is never a confirmed edge.".to_owned(),
+        "Connect/accept and FD baseline/dup/close evidence reconstruct descriptor lifetimes. Optional network-io counts byte-returning socket calls and reports sendmmsg/recvmmsg results as message counts. UDP/53 datagrams parse QNAME/A/AAAA and stamp later connect() as correlated resolved_name (same-process first, then any resolver that answered the IP). getaddrinfo uprobes and non-53 resolvers remain uncovered. TLS/QUIC plaintext is Inspect-only. HTTP/1 request-line, Host, query keys, and JSON/form body keys are parsed from Inspect previews and dump heap windows into http_calls; Cookie/Authorization/token values are redacted. HTTP responses have no URL path. Heap windows that start at HTTP/1.1 are in-memory header tables (NUL or CRLF), not socket bytes. Same-process same-host request/response pairs are correlated http_reply. HTTP/2 frames after the PRI preface, HPACK, Cronet without SSL_write, Flutter, and custom TLS are not decoded.".to_owned(),
+        "The L0 graph is queryable (`ksightctl device graph`). Process instances use `procinst:{boot_id:pid:start_time_ns}` when start time is known; otherwise `process:pkg:pid`. Confirmed edges are Binder, Binder `replies_to`/`binder_reply` (request debug_id), socket, Binder FD `transfers_fd`, loopback scans, sched wakeup identity, and mmap/remap `maps` edges. Dump VMA `overlaps_mmap` is correlated even on an exact address match. Inspect `inspect_hit` and TLS `tls_send`/`tls_recv` are selected-process facts, not Observe. Inspect HTTP `http_call` edges are parsed from those TLS previews (HTTP/1 or JSON); dump heap `http_call` edges are correlated. Same-host `http_reply` is correlated, not a stream id. Binder userspace hits record handle/code and join L0 `binder:req` by tid+code as correlated `joined_transact`. The interface token and bounded scalars come from exported Parcel writers on the same TID. AIDL names come from on-device AOSP Stub tables or session process DEX; they are not hardcoded GMS/app names. Parcel C++ fields are not read. JNI RegisterNatives, Cronet/QUIC, and custom TLS remain unresolved. Time proximity is never a confirmed edge.".to_owned(),
         "dup/close file-descriptor events are off unless --files-fd is set. WebView/Chromium dup storms previously overflowed the file ring and dropped millions of records.".to_owned(),
         "Sampling, truncation, source loss, compatibility failures, or target early exit can make application behavior incomplete.".to_owned(),
     ]
@@ -3478,6 +3578,87 @@ mod tests {
             .limitations
             .iter()
             .any(|line| line.contains("http_calls")));
+        assert_eq!(
+            report
+                .http_calls
+                .iter()
+                .find(|row| row.path == "/v6/feed/createFeed")
+                .map(|row| row.origin.as_str()),
+            Some("inspect")
+        );
+    }
+
+    #[test]
+    fn ingest_heap_http_calls_are_correlated_and_pair_by_host() {
+        let session = Uuid::new_v4();
+        let mut builder = SessionReportBuilder::default();
+        builder.record(&Event {
+            header: header(session, 10, SensorKind::Integrity),
+            payload: EventPayload::InspectPlaintext(ksight_model::InspectPlaintext {
+                adapter: "tls_ssl_write".to_owned(),
+                direction: "send".to_owned(),
+                library: "libssl.so".to_owned(),
+                build_id: None,
+                offset: None,
+                requested_bytes: 40,
+                captured_bytes: 40,
+                truncated: false,
+                sha256: "req".to_owned(),
+                preview: "POST /v1/login HTTP/1.1\r\nHost: pay.example\r\n\r\n".to_owned(),
+                preview_encoding: "utf8_lossy".to_owned(),
+                content_class: "text".to_owned(),
+            }),
+        });
+        builder.record(&Event {
+            header: header(session, 10, SensorKind::Integrity),
+            payload: EventPayload::InspectPlaintext(ksight_model::InspectPlaintext {
+                adapter: "tls_ssl_read".to_owned(),
+                direction: "recv".to_owned(),
+                library: "libssl.so".to_owned(),
+                build_id: None,
+                offset: None,
+                requested_bytes: 40,
+                captured_bytes: 40,
+                truncated: false,
+                sha256: "resp".to_owned(),
+                preview: "HTTP/1.1 200 OK\r\nHost: pay.example\r\nContent-Type: application/json\r\n\r\n{}".to_owned(),
+                preview_encoding: "utf8_lossy".to_owned(),
+                content_class: "text".to_owned(),
+            }),
+        });
+        let mut report = builder.finish();
+        report.ingest_dump_http_calls(vec![HttpCallActivity {
+            source: "com.example".to_owned(),
+            process_id: 10,
+            direction: "heap".to_owned(),
+            kind: "http1_response".to_owned(),
+            method: "HTTP".to_owned(),
+            host: None,
+            path: String::new(),
+            status: Some(200),
+            query_keys: Vec::new(),
+            header_names: vec!["Content-Type".to_owned()],
+            redacted_headers: Vec::new(),
+            body_keys: Vec::new(),
+            redacted_body_keys: Vec::new(),
+            content_type: Some("image/jpeg".to_owned()),
+            third_party: false,
+            count: 1,
+            origin: "heap".to_owned(),
+        }]);
+        assert!(report
+            .http_calls
+            .iter()
+            .any(|row| row.origin == "heap" && row.status == Some(200) && row.path.is_empty()));
+        assert!(report
+            .graph
+            .edges
+            .iter()
+            .any(|edge| edge.relation == "http_reply"
+                && edge.strength == crate::EdgeStrength::Correlated));
+        assert!(report.graph.edges.iter().any(|edge| {
+            edge.relation == "http_call" && edge.strength == crate::EdgeStrength::Correlated
+        }));
     }
 
     fn inspect_transact_event(session_id: Uuid, pid: u32, tid: u32, code: u32) -> Event {

@@ -161,8 +161,10 @@ pub struct PackageDexIndex {
     /// Number of distinct class descriptors in the published bounded samples.
     pub indexed_class_samples: usize,
     /// Number of distinct `class->method` names in the published bounded samples.
-    /// Overload prototypes are not yet distinguished.
     pub indexed_method_name_samples: usize,
+    /// Number of distinct `class->name(params)return` prototypes when `proto_ids` parsed.
+    #[serde(default)]
+    pub indexed_method_prototype_samples: usize,
     /// Classes declared by multiple content-distinct DEX files.
     pub class_conflicts: Vec<DexClassConflict>,
     /// DEX sets whose semantic table could not be safely parsed.

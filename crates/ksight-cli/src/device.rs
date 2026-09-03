@@ -531,6 +531,8 @@ struct PackageDumpFile {
     artifacts: Vec<ksight_core::DumpArtifact>,
     #[serde(default)]
     graph: ksight_core::SessionGraph,
+    #[serde(default)]
+    http_calls: Vec<ksight_core::HttpCallActivity>,
 }
 
 fn merge_dump_reports(serial: Option<&str>, report: &mut SessionReport) {
@@ -609,6 +611,7 @@ fn merge_dump_reports(serial: Option<&str>, report: &mut SessionReport) {
         report
             .graph
             .correlate_dump_vmas(session_id, &dump.artifacts, &report.observed_mappings);
+        report.ingest_dump_http_calls(dump.http_calls);
     }
 }
 

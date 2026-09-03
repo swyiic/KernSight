@@ -51,6 +51,12 @@ pub struct DexSemanticSummary {
     pub method_names: Vec<String>,
     /// True when more method names existed than were published.
     pub method_names_truncated: bool,
+    /// Bounded `class->name(params)return` prototypes when `proto_ids` parsed.
+    #[serde(default)]
+    pub method_prototypes: Vec<String>,
+    /// True when more prototypes existed than were published.
+    #[serde(default)]
+    pub method_prototypes_truncated: bool,
 }
 
 const DEX_SEMANTIC_SAMPLE_LIMIT: usize = 1024;
@@ -76,6 +82,8 @@ pub fn parse_dex_semantics(bytes: &[u8]) -> Option<DexSemanticSummary> {
     let string_ids_off = read_dex_u32(bytes, 60)?;
     let type_ids = read_dex_u32(bytes, 64)?;
     let type_ids_off = read_dex_u32(bytes, 68)?;
+    let proto_ids = read_dex_u32(bytes, 72)?;
+    let proto_ids_off = read_dex_u32(bytes, 76)?;
     let field_ids = read_dex_u32(bytes, 80)?;
     let method_ids = read_dex_u32(bytes, 88)?;
     let method_ids_off = read_dex_u32(bytes, 92)?;
@@ -83,6 +91,7 @@ pub fn parse_dex_semantics(bytes: &[u8]) -> Option<DexSemanticSummary> {
     let class_defs_off = read_dex_u32(bytes, 100)?;
     validate_dex_table(bytes, string_ids_off, string_ids, 4)?;
     validate_dex_table(bytes, type_ids_off, type_ids, 4)?;
+    validate_dex_table(bytes, proto_ids_off, proto_ids, 12)?;
     validate_dex_table(bytes, method_ids_off, method_ids, 8)?;
     validate_dex_table(bytes, class_defs_off, class_defs, 32)?;
 
@@ -121,22 +130,15 @@ pub fn parse_dex_semantics(bytes: &[u8]) -> Option<DexSemanticSummary> {
     class_descriptors.sort();
     class_descriptors.dedup();
 
-    let mut method_names = Vec::new();
-    for index in 0..method_ids {
-        if method_names.len() >= DEX_SEMANTIC_SAMPLE_LIMIT {
-            break;
-        }
-        let entry = usize::try_from(method_ids_off)
-            .ok()?
-            .checked_add(usize::try_from(index).ok()?.checked_mul(8)?)?;
-        let class_idx = u32::from(read_dex_u16(bytes, entry)?);
-        let name_idx = read_dex_u32(bytes, entry.checked_add(4)?)?;
-        if let (Some(class), Some(name)) = (descriptor_at(class_idx), string_at(name_idx)) {
-            method_names.push(format!("{class}->{name}"));
-        }
-    }
-    method_names.sort();
-    method_names.dedup();
+    let (method_names, method_prototypes) = index_method_names(
+        bytes,
+        method_ids,
+        method_ids_off,
+        proto_ids,
+        proto_ids_off,
+        &descriptor_at,
+        &string_at,
+    )?;
 
     Some(DexSemanticSummary {
         version: String::from_utf8_lossy(&bytes[4..7]).into_owned(),
@@ -152,7 +154,84 @@ pub fn parse_dex_semantics(bytes: &[u8]) -> Option<DexSemanticSummary> {
         method_names,
         method_names_truncated: usize::try_from(method_ids).unwrap_or(usize::MAX)
             > DEX_SEMANTIC_SAMPLE_LIMIT,
+        method_prototypes,
+        method_prototypes_truncated: usize::try_from(method_ids).unwrap_or(usize::MAX)
+            > DEX_SEMANTIC_SAMPLE_LIMIT,
     })
+}
+
+fn index_method_names(
+    bytes: &[u8],
+    method_ids: u32,
+    method_ids_off: u32,
+    proto_count: u32,
+    proto_table: u32,
+    descriptor_at: &dyn Fn(u32) -> Option<String>,
+    string_at: &dyn Fn(u32) -> Option<String>,
+) -> Option<(Vec<String>, Vec<String>)> {
+    let mut method_names = Vec::new();
+    let mut method_prototypes = Vec::new();
+    for index in 0..method_ids {
+        if method_names.len() >= DEX_SEMANTIC_SAMPLE_LIMIT {
+            break;
+        }
+        let entry = usize::try_from(method_ids_off)
+            .ok()?
+            .checked_add(usize::try_from(index).ok()?.checked_mul(8)?)?;
+        let class_idx = u32::from(read_dex_u16(bytes, entry)?);
+        let prototype = u32::from(read_dex_u16(bytes, entry.checked_add(2)?)?);
+        let name_idx = read_dex_u32(bytes, entry.checked_add(4)?)?;
+        if let (Some(class), Some(name)) = (descriptor_at(class_idx), string_at(name_idx)) {
+            method_names.push(format!("{class}->{name}"));
+            if method_prototypes.len() < DEX_SEMANTIC_SAMPLE_LIMIT {
+                if let Some(proto) =
+                    proto_descriptor(bytes, prototype, proto_count, proto_table, descriptor_at)
+                {
+                    method_prototypes.push(format!("{class}->{name}{proto}"));
+                }
+            }
+        }
+    }
+    method_names.sort();
+    method_names.dedup();
+    method_prototypes.sort();
+    method_prototypes.dedup();
+    Some((method_names, method_prototypes))
+}
+
+fn proto_descriptor(
+    bytes: &[u8],
+    prototype: u32,
+    proto_count: u32,
+    proto_table: u32,
+    descriptor_at: &dyn Fn(u32) -> Option<String>,
+) -> Option<String> {
+    if prototype >= proto_count {
+        return None;
+    }
+    let entry = usize::try_from(proto_table)
+        .ok()?
+        .checked_add(usize::try_from(prototype).ok()?.checked_mul(12)?)?;
+    let return_type = descriptor_at(read_dex_u32(bytes, entry.checked_add(4)?)?)?;
+    let parameters_off = read_dex_u32(bytes, entry.checked_add(8)?)?;
+    let mut proto = String::from("(");
+    if parameters_off != 0 {
+        let list_off = usize::try_from(parameters_off).ok()?;
+        let count = read_dex_u32(bytes, list_off)?;
+        if count > 32 {
+            return None;
+        }
+        for index in 0..count {
+            let item = list_off
+                .checked_add(4)?
+                .checked_add(usize::try_from(index).ok()?.checked_mul(2)?)?;
+            let type_idx = u32::from(read_dex_u16(bytes, item)?);
+            proto.push_str(&descriptor_at(type_idx)?);
+        }
+    }
+    proto.push(')');
+    proto.push_str(&return_type);
+    Some(proto)
 }
 
 fn read_dex_u16(bytes: &[u8], offset: usize) -> Option<u16> {
