@@ -25,17 +25,21 @@ const LINKER_PATHS: [&str; 4] = [
     "/apex/com.android.runtime/bin/linker",
     "/system/bin/linker",
 ];
-const TLS_NAMES: [&str; 4] = [
+const TLS_NAMES: [&str; 6] = [
     "SSL_write",
     "SSL_write_ex",
     "mbedtls_ssl_write",
     "wolfSSL_write",
+    "sslWrite",
+    "sslWriteEx",
 ];
-const TLS_READ_NAMES: [&str; 4] = [
+const TLS_READ_NAMES: [&str; 6] = [
     "SSL_read",
     "SSL_read_ex",
     "mbedtls_ssl_read",
     "wolfSSL_read",
+    "sslRead",
+    "sslReadEx",
 ];
 const TLS_PATHS: [&str; 6] = [
     "/apex/com.android.conscrypt/lib64/libssl.so",
@@ -334,6 +338,7 @@ impl InspectAdapterKind {
                 "wolfssl",
                 "gmssl",
                 "tassl",
+                "hssl",
             ],
             Self::ArtDexLoad | Self::ArtDexMemory => &["libdexfile.so"],
             Self::LinkerSoLoad => &["linker64", "linker"],
@@ -1000,8 +1005,12 @@ fn evaluate_one(
                 .offset
                 .map(|offset| (String::new(), offset))
                 .or_else(|| {
-                    symbol_match(&elf, adapter.symbols())
-                        .map(|(name, offset)| (name.to_owned(), offset))
+                    let found = if adapter.is_tls() {
+                        crate::elf::symbol_match_exact(&elf, adapter.symbols())
+                    } else {
+                        symbol_match(&elf, adapter.symbols())
+                    };
+                    found.map(|(name, offset)| (name.to_owned(), offset))
                 });
             observation.build_id.clone_from(&elf.build_id);
             observation.offset = matched.as_ref().map(|(_, offset)| *offset);
@@ -1404,7 +1413,27 @@ fn resolve_libraries(policy: &InspectPolicy, adapter: InspectAdapterKind) -> Vec
         discover_mapped_libraries(needles)
     };
     found.extend(mapped);
-    found.into_iter().take(16).collect()
+    let mut libs: Vec<String> = found.into_iter().collect();
+    libs.sort_by(|left, right| {
+        tls_attach_rank(left)
+            .cmp(&tls_attach_rank(right))
+            .then_with(|| left.cmp(right))
+    });
+    libs.truncate(16);
+    libs
+}
+
+fn tls_attach_rank(path: &str) -> u8 {
+    let file = path.rsplit('/').next().unwrap_or(path);
+    if file.contains("hssl") {
+        0
+    } else if path.contains("/data/app/") {
+        1
+    } else if file.contains("cronet") {
+        3
+    } else {
+        2
+    }
 }
 
 fn mapping_path_matches(path: &str, needle: &str) -> bool {
@@ -1432,6 +1461,9 @@ fn mapping_path_matches(path: &str, needle: &str) -> bool {
     }
     if needle == "tassl" {
         return file.contains("tassl");
+    }
+    if needle == "hssl" {
+        return file.contains("hssl");
     }
     file == needle
 }
@@ -1473,7 +1505,7 @@ fn discover_mapped_libraries_in(pids: &[u32], needles: &[&str]) -> Vec<String> {
             {
                 found.insert(path.to_owned());
             }
-            if found.len() >= 8 {
+            if found.len() >= 24 {
                 return found.into_iter().collect();
             }
         }
@@ -3676,9 +3708,25 @@ mod tests {
         assert!(InspectAdapterKind::TlsSslWrite
             .symbols()
             .contains(&"mbedtls_ssl_write"));
+        assert!(InspectAdapterKind::TlsSslWrite
+            .symbols()
+            .contains(&"sslWrite"));
         assert!(InspectAdapterKind::TlsSslRead
             .symbols()
             .contains(&"wolfSSL_read"));
+        assert!(InspectAdapterKind::TlsSslRead.symbols().contains(&"sslRead"));
+        assert!(mapping_path_matches(
+            "/data/app/foo/lib/arm64/libhssl-2.1.so",
+            "hssl"
+        ));
+        assert_eq!(
+            tls_attach_rank("/data/app/foo/lib/arm64/libhssl-2.1.so"),
+            0
+        );
+        assert!(
+            tls_attach_rank("/data/app/foo/lib/arm64/libhssl-2.1.so")
+                < tls_attach_rank("/apex/com.android.conscrypt/lib64/libssl.so")
+        );
         let libs = InspectAdapterKind::BinderUserspace.libraries();
         assert!(libs
             .iter()

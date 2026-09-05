@@ -232,6 +232,16 @@ pub fn symbol_match<'a>(elf: &'a ElfIdentity, names: &[&str]) -> Option<(&'a str
     matching_symbols(elf, names).into_iter().next()
 }
 
+/// First exact dynsym name in `names` order. Avoids `sslRead` matching `sslReadEx`.
+pub fn symbol_match_exact<'a>(elf: &'a ElfIdentity, names: &[&str]) -> Option<(&'a str, u64)> {
+    for wanted in names {
+        if let Some((name, offset)) = elf.symbols.iter().find(|(name, _)| name == wanted) {
+            return Some((name.as_str(), *offset));
+        }
+    }
+    None
+}
+
 /// Every exported symbol whose name equals or starts with one of `names`.
 /// Unique by file offset, dynsym order.
 pub fn matching_symbols<'a>(elf: &'a ElfIdentity, names: &[&str]) -> Vec<(&'a str, u64)> {

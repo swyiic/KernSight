@@ -1218,6 +1218,7 @@ mod tests {
             .any(|edge| { edge.relation == "binder" && edge.from == "procinst:boot:10:99" }));
         let hits = [InspectHitActivity {
             adapter: "binder_userspace".to_owned(),
+            library: String::new(),
             process_id: 10,
             process_instance_id: Some("boot:10:99".to_owned()),
             attached: true,

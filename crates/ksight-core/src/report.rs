@@ -65,6 +65,9 @@ pub struct ProcessInstanceRef {
 pub struct InspectHitActivity {
     /// Adapter identifier, for example `binder_userspace`.
     pub adapter: String,
+    /// ELF that the adapter attached to, when known.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub library: String,
     /// Process ID that produced the hit.
     pub process_id: u32,
     /// Process instance id when start time was known.
@@ -806,7 +809,7 @@ pub struct SessionReportBuilder {
     sched_wakeups: BTreeMap<(u32, u32), u64>,
     plaintext: BTreeMap<(u32, String, String), MutablePlaintext>,
     http_calls: BTreeMap<HttpCallKey, MutableHttpCall>,
-    inspect_hits: BTreeMap<(u32, String), MutableInspectHit>,
+    inspect_hits: BTreeMap<(u32, String, String), MutableInspectHit>,
     pending_inspect_transacts: HashMap<(u32, u32), VecDeque<u32>>,
     unmatched_binder_submits: HashMap<(u32, u32), VecDeque<i32>>,
     inspect_joined_txns: HashMap<i32, u32>,
@@ -1109,7 +1112,7 @@ impl SessionReportBuilder {
                 }
                 let inspect = self
                     .inspect_hits
-                    .entry((pid, fragment.adapter.clone()))
+                    .entry((pid, fragment.adapter.clone(), fragment.library.clone()))
                     .or_default();
                 inspect.attached = true;
                 inspect.hits = inspect.hits.saturating_add(1);
@@ -1175,7 +1178,11 @@ impl SessionReportBuilder {
                 {
                     let activity = self
                         .inspect_hits
-                        .entry((pid, observation.adapter.clone()))
+                        .entry((
+                            pid,
+                            observation.adapter.clone(),
+                            observation.library.clone(),
+                        ))
                         .or_default();
                     activity.attached |= observation.attached;
                     if observation.hit {
@@ -1773,8 +1780,9 @@ impl SessionReportBuilder {
         let mut inspect_hits = self
             .inspect_hits
             .into_iter()
-            .map(|((process_id, adapter), activity)| InspectHitActivity {
+            .map(|((process_id, adapter, library), activity)| InspectHitActivity {
                 adapter,
+                library,
                 process_id,
                 process_instance_id: activity.process_instance_id,
                 attached: activity.attached,
@@ -2412,10 +2420,7 @@ impl SessionReportBuilder {
             });
         }
         if let Some(pid) = self.inspect_joined_txns.get(&request_id).copied() {
-            if let Some(activity) = self
-                .inspect_hits
-                .get_mut(&(pid, "binder_userspace".to_owned()))
-            {
+            if let Some(activity) = self.inspect_hit_mut(pid, "binder_userspace") {
                 activity.reply_latency_ns = Some(latency);
             }
         }
@@ -2467,20 +2472,32 @@ impl SessionReportBuilder {
         queue.push_back(txn_id);
     }
 
-    fn stamp_inspect_join(&mut self, pid: u32, txn_id: i32) {
-        if let Some(activity) = self
+    fn inspect_hit_mut(&mut self, pid: u32, adapter: &str) -> Option<&mut MutableInspectHit> {
+        let key = self
             .inspect_hits
-            .get_mut(&(pid, "binder_userspace".to_owned()))
-        {
+            .keys()
+            .find(|(process_id, name, _)| *process_id == pid && name == adapter)
+            .cloned()?;
+        self.inspect_hits.get_mut(&key)
+    }
+
+    fn stamp_inspect_join(&mut self, pid: u32, txn_id: i32) {
+        let token = self
+            .binder_transactions
+            .get(&txn_id)
+            .and_then(|state| state.interface_token.clone());
+        let method = self
+            .binder_transactions
+            .get(&txn_id)
+            .and_then(|state| state.binder_method.clone());
+        if let Some(activity) = self.inspect_hit_mut(pid, "binder_userspace") {
             activity.binder_transaction_id = Some(txn_id);
             if activity.binder_interface.is_none() {
-                if let Some(state) = self.binder_transactions.get(&txn_id) {
-                    activity.binder_interface.clone_from(&state.interface_token);
-                    if activity.binder_method.is_none() {
-                        activity.binder_method.clone_from(&state.binder_method);
-                        if activity.binder_method.is_some() {
-                            activity.binder_method_source = Some("aosp_stub".to_owned());
-                        }
+                activity.binder_interface = token;
+                if activity.binder_method.is_none() {
+                    activity.binder_method = method;
+                    if activity.binder_method.is_some() {
+                        activity.binder_method_source = Some("aosp_stub".to_owned());
                     }
                 }
             }
@@ -2496,10 +2513,7 @@ impl SessionReportBuilder {
         let Some(token) = transaction.interface_token.as_ref() else {
             return;
         };
-        let Some(activity) = self
-            .inspect_hits
-            .get_mut(&(pid, "binder_userspace".to_owned()))
-        else {
+        let Some(activity) = self.inspect_hit_mut(pid, "binder_userspace") else {
             return;
         };
         if activity.binder_interface.is_none() {
