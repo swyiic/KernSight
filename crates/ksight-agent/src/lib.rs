@@ -37,6 +37,8 @@ pub mod identity;
 pub mod inspect_runtime;
 /// Capture and deployment integrity reporting.
 pub mod integrity;
+/// `JNIEnv` plaintext functions from exported `GetFunctionTable` + `jni.h` slots.
+pub mod jni_env;
 /// Sensor loading and attachment lifecycle.
 pub mod loader;
 /// Best-effort virtual-memory semantic enrichment.

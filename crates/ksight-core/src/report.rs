@@ -619,6 +619,9 @@ pub struct SessionReport {
     /// HTTP/1 (and JSON) calls parsed from those Inspect previews. Token values are redacted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub http_calls: Vec<HttpCallActivity>,
+    /// DEX strings/methods that name the same host or path. Correlated, not JNI execution.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub http_code_refs: Vec<HttpCodeRef>,
     /// Selected-process Inspect adapter attach/hit summaries. Never Observe events.
     #[serde(default)]
     pub inspect_hits: Vec<InspectHitActivity>,
@@ -667,8 +670,11 @@ pub struct PlaintextActivity {
     pub captured_bytes: u64,
     /// Sample SHA-256 digests of captured fragments.
     pub sha256_samples: Vec<String>,
-    /// First preview retained for operator triage.
+    /// Best URL/JSON/HTTP preview retained for operator triage.
     pub preview: Option<String>,
+    /// `http(s)://` hosts and paths taken from every fragment, not only the kept preview.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub urls: Vec<String>,
     /// Dominant `content_class`: `text`, `tls_record`, or `binary`.
     #[serde(default)]
     pub content_class: String,
@@ -721,6 +727,29 @@ pub struct HttpCallActivity {
     /// `inspect` from TLS buffers, `heap` from dump plaintext windows.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub origin: String,
+}
+
+/// Correlated DEX string/method that names the same host or path as an HTTP call.
+///
+/// This is dump-side string matching, not an ART/JNI execution trace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpCodeRef {
+    /// HTTP method from the catalog.
+    pub http_method: String,
+    /// Host, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// Path or empty for responses.
+    pub path: String,
+    /// DEX SHA-256 that contained the match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dex_sha256: Option<String>,
+    /// Evidence path of that DEX.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relative_path: Option<String>,
+    /// Matching DEX API strings or `class->method` names.
+    #[serde(default)]
+    pub matches: Vec<String>,
 }
 
 /// Collapsed connect storm against loopback ports.
@@ -821,6 +850,7 @@ struct MutablePlaintext {
     captured_bytes: u64,
     sha256_samples: Vec<String>,
     preview: Option<String>,
+    urls: Vec<String>,
     content_class: String,
 }
 
@@ -1059,6 +1089,7 @@ impl SessionReportBuilder {
                     .or_default() += 1;
             }
             EventPayload::InspectPlaintext(fragment) => {
+                let (preview, class) = decode_inspect_preview(fragment);
                 let activity = self
                     .plaintext
                     .entry((pid, fragment.adapter.clone(), fragment.direction.clone()))
@@ -1069,17 +1100,39 @@ impl SessionReportBuilder {
                 if activity.sha256_samples.len() < 8 {
                     activity.sha256_samples.push(fragment.sha256.clone());
                 }
-                if activity.preview.is_none() && !fragment.preview.is_empty() {
-                    activity.preview = Some(fragment.preview.clone());
-                }
+                absorb_plaintext_preview(activity, &preview, &class);
                 if activity.content_class.is_empty() {
-                    activity.content_class.clone_from(&fragment.content_class);
-                } else if activity.content_class != fragment.content_class {
+                    activity.content_class.clone_from(&class);
+                } else if activity.content_class != class {
                     "mixed".clone_into(&mut activity.content_class);
                 }
-                if let Some(parsed) =
-                    crate::parse_http_plain(&fragment.preview, &fragment.content_class)
-                {
+                let inspect = self
+                    .inspect_hits
+                    .entry((pid, fragment.adapter.clone()))
+                    .or_default();
+                inspect.attached = true;
+                inspect.hits = inspect.hits.saturating_add(1);
+                if inspect.last_detail.is_empty() && !preview.is_empty() {
+                    inspect.last_detail = format!(
+                        "{} {} class={} {}",
+                        fragment.adapter,
+                        fragment.direction,
+                        class,
+                        preview.replace('\n', " ")
+                    );
+                    inspect.last_detail.truncate(240);
+                }
+                for parsed in crate::parse_http_plain_all(&preview, &class) {
+                    if parsed.kind == "url"
+                        && crate::format_inspect_url(
+                            parsed.scheme,
+                            parsed.host.as_deref().unwrap_or(""),
+                            &parsed.path,
+                        )
+                        .is_none()
+                    {
+                        continue;
+                    }
                     self.record_http_call(pid, &fragment.direction, "inspect", parsed);
                 }
             }
@@ -1571,14 +1624,26 @@ impl SessionReportBuilder {
                     captured_bytes: activity.captured_bytes,
                     sha256_samples: activity.sha256_samples,
                     preview: activity.preview,
+                    urls: activity.urls,
                     content_class,
                 }
             })
             .collect::<Vec<_>>();
         plaintext.sort_by(|left, right| {
             right
-                .captured_bytes
-                .cmp(&left.captured_bytes)
+                .urls
+                .len()
+                .cmp(&left.urls.len())
+                .then_with(|| {
+                    preview_evidence_score(
+                        right.preview.as_deref().unwrap_or(""),
+                        &right.content_class,
+                    )
+                    .cmp(&preview_evidence_score(
+                        left.preview.as_deref().unwrap_or(""),
+                        &left.content_class,
+                    ))
+                })
                 .then_with(|| left.source.cmp(&right.source))
         });
         let mut http_calls = self
@@ -1670,11 +1735,7 @@ impl SessionReportBuilder {
             graph.edges.push(crate::GraphEdge {
                 from,
                 to,
-                relation: if row.direction == "recv" {
-                    "tls_recv".to_owned()
-                } else {
-                    "tls_send".to_owned()
-                },
+                relation: plaintext_graph_relation(&row.adapter, &row.direction).to_owned(),
                 strength: crate::EdgeStrength::Confirmed,
                 sensor: Some(SensorKind::Integrity),
             });
@@ -1801,6 +1862,7 @@ impl SessionReportBuilder {
             sched_wakeups,
             plaintext,
             http_calls,
+            http_code_refs: Vec::new(),
             inspect_hits,
             loopback_scans,
             merged_dumps: Vec::new(),
@@ -2680,6 +2742,219 @@ impl SessionReport {
         });
         self.http_calls.truncate(128);
     }
+
+    /// Join dump-side DEX string/method names onto HTTP calls. Always correlated.
+    pub fn ingest_http_code_refs(&mut self, refs: Vec<HttpCodeRef>) {
+        if refs.is_empty() {
+            return;
+        }
+        self.http_code_refs.extend(refs);
+        self.http_code_refs.truncate(128);
+    }
+}
+
+/// Match HTTP catalog paths/hosts to DEX string-pool and method names.
+///
+/// Hits are correlated identifiers in the same dump, not JNI/ART call traces.
+#[must_use]
+pub fn correlate_http_calls_to_dex(
+    calls: &[HttpCallActivity],
+    sets: &[crate::DexArtifactSet],
+) -> Vec<HttpCodeRef> {
+    let mut refs = Vec::new();
+    for call in calls.iter().take(64) {
+        let path = call.path.trim();
+        let host = call.host.as_deref().unwrap_or("");
+        if path.len() < 4 && host.len() < 4 {
+            continue;
+        }
+        let path_tail = path.rsplit('/').next().unwrap_or(path);
+        for set in sets {
+            let Some(semantic) = set.semantic.as_ref() else {
+                continue;
+            };
+            let mut matches = Vec::new();
+            for sample in semantic
+                .api_strings
+                .iter()
+                .chain(semantic.method_names.iter())
+                .chain(semantic.method_prototypes.iter())
+            {
+                if matches.len() >= 8 {
+                    break;
+                }
+                let hit = (!path.is_empty() && path.len() >= 4 && sample.contains(path))
+                    || (!host.is_empty() && sample.to_ascii_lowercase().contains(host))
+                    || (path_tail.len() >= 6 && sample.contains(path_tail));
+                if hit && !matches.iter().any(|seen: &String| seen == sample) {
+                    matches.push(sample.clone());
+                }
+            }
+            if matches.is_empty() {
+                continue;
+            }
+            refs.push(HttpCodeRef {
+                http_method: call.method.clone(),
+                host: call.host.clone(),
+                path: call.path.clone(),
+                dex_sha256: Some(set.sha256.clone()),
+                relative_path: Some(set.canonical_relative_path.clone()),
+                matches,
+            });
+            if refs.len() >= 64 {
+                return refs;
+            }
+        }
+    }
+    refs
+}
+
+const PREVIEW_STITCH_CAP: usize = 16 * 1024;
+
+fn decode_inspect_preview(fragment: &ksight_model::InspectPlaintext) -> (String, String) {
+    let raw = if fragment.preview_encoding == "hex" || preview_is_hex(&fragment.preview) {
+        crate::decode_hex_bytes(&fragment.preview)
+            .unwrap_or_else(|| fragment.preview.as_bytes().to_vec())
+    } else {
+        fragment.preview.as_bytes().to_vec()
+    };
+    if let Some(plain) = crate::inflate_inspect_buffer(&raw) {
+        let text = String::from_utf8_lossy(&plain).into_owned();
+        let class = if looks_mostly_printable(plain.as_slice()) {
+            "text".to_owned()
+        } else {
+            "binary".to_owned()
+        };
+        return (text, class);
+    }
+    let class = if fragment.content_class.is_empty() {
+        inferred_content_class("", Some(&fragment.preview))
+    } else {
+        fragment.content_class.clone()
+    };
+    if class == "tls_record" {
+        return (fragment.preview.clone(), class);
+    }
+    (fragment.preview.clone(), class)
+}
+
+fn absorb_plaintext_preview(activity: &mut MutablePlaintext, preview: &str, class: &str) {
+    if preview.is_empty() {
+        return;
+    }
+    extend_unique(&mut activity.urls, &preview_url_list(preview), 32);
+    let new_score = preview_evidence_score(preview, class);
+    activity.preview = Some(match activity.preview.take() {
+        None => preview.to_owned(),
+        Some(existing) => {
+            let old_score = preview_evidence_score(&existing, "");
+            let new_urls = new_score.0;
+            let old_urls = old_score.0;
+            if new_urls > 0
+                && old_urls > 0
+                && !preview_is_hex(preview)
+                && !preview_is_hex(&existing)
+                && !preview_is_tls_record_text(preview)
+                && !preview_is_tls_record_text(&existing)
+            {
+                stitch_preview(&existing, preview)
+            } else if new_score > old_score {
+                preview.to_owned()
+            } else {
+                existing
+            }
+        }
+    });
+}
+
+fn preview_url_list(preview: &str) -> Vec<String> {
+    crate::parse_http_plain_all(preview, "text")
+        .into_iter()
+        .filter(|parsed| parsed.kind == "url")
+        .filter_map(|parsed| {
+            crate::format_inspect_url(parsed.scheme, parsed.host.as_deref()?, &parsed.path)
+        })
+        .collect()
+}
+
+fn preview_evidence_score(preview: &str, class: &str) -> (u32, u8, u8, usize) {
+    if preview.is_empty() || class == "tls_record" || preview_is_tls_record_text(preview) {
+        return (0, 0, 0, 0);
+    }
+    if preview_is_hex(preview) {
+        return (0, 0, 0, 0);
+    }
+    let urls = u32::try_from(preview_url_list(preview).len()).unwrap_or(u32::MAX);
+    let kind = if preview.contains("HTTP/1.")
+        || preview.starts_with("GET ")
+        || preview.starts_with("POST ")
+    {
+        3_u8
+    } else if preview.contains("\"url\"")
+        || preview.contains("https://")
+        || preview.contains("http://")
+        || preview.contains('{')
+    {
+        2
+    } else {
+        u8::from(class == "text" || looks_mostly_printable(preview.as_bytes()))
+    };
+    (
+        urls,
+        1,
+        kind,
+        if urls > 0 {
+            preview.len().min(PREVIEW_STITCH_CAP)
+        } else {
+            0
+        },
+    )
+}
+
+fn stitch_preview(existing: &str, next: &str) -> String {
+    let mut out = String::with_capacity(
+        existing
+            .len()
+            .saturating_add(next.len())
+            .saturating_add(1)
+            .min(PREVIEW_STITCH_CAP),
+    );
+    out.push_str(existing);
+    let next_trim = next.trim_start();
+    if !existing.ends_with('\n')
+        && (next_trim.starts_with("http://")
+            || next_trim.starts_with("https://")
+            || next_trim.starts_with("HTTP/"))
+    {
+        out.push('\n');
+    }
+    out.push_str(next);
+    if out.len() > PREVIEW_STITCH_CAP {
+        out.truncate(PREVIEW_STITCH_CAP);
+    }
+    out
+}
+
+fn preview_is_hex(preview: &str) -> bool {
+    let trimmed = preview.trim();
+    trimmed.len() >= 8
+        && trimmed.len() % 2 == 0
+        && trimmed.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn preview_is_tls_record_text(preview: &str) -> bool {
+    preview.starts_with("TLS ") || inferred_content_class("", Some(preview)) == "tls_record"
+}
+
+fn looks_mostly_printable(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+    let printable = bytes
+        .iter()
+        .filter(|byte| byte.is_ascii_graphic() || byte.is_ascii_whitespace())
+        .count();
+    printable.saturating_mul(4) >= bytes.len().saturating_mul(3)
 }
 
 fn inferred_content_class(class: &str, preview: Option<&str>) -> String {
@@ -2689,7 +2964,7 @@ fn inferred_content_class(class: &str, preview: Option<&str>) -> String {
     let Some(preview) = preview.map(str::trim) else {
         return String::new();
     };
-    if preview.len() < 6 {
+    if preview.len() < 6 || !preview.is_ascii() {
         return String::new();
     }
     let Ok(record) = u8::from_str_radix(&preview[..2], 16) else {
@@ -2849,12 +3124,26 @@ fn path_category(path: &str) -> &'static str {
     }
 }
 
+fn plaintext_graph_relation(adapter: &str, direction: &str) -> &'static str {
+    if adapter.starts_with("jni_") {
+        match direction {
+            "java_to_native" => "jni_from_java",
+            "native_to_java" => "jni_to_java",
+            _ => "jni_plain",
+        }
+    } else if direction == "recv" {
+        "tls_recv"
+    } else {
+        "tls_send"
+    }
+}
+
 fn report_limitations() -> Vec<String> {
     vec![
         "Binder driver submission-to-delivery latency is correlated by transaction ID. Two-way RPCs pair reply submit to the request debug_id (binder_reply / replies_to, confirmed). A 128-byte parcel prefix is copied at kprobe binder_transaction (every online CPU) for 32-bit and 64-bit clients (native UAPI after compat conversion) and parsed as writeInterfaceToken String16. Inspect transact joins that request by tid+code as correlated joined_transact and copies reply latency when the kernel pair exists. Inspect pairs writeInterfaceToken and bounded exported Parcel writers on the same TID on ELF64; this GKI rejects AArch32 uprobes. AIDL method names come from on-device AOSP Stub tables (aosp_stub) or that process's loaded DEX TRANSACTION_* (process_dex). Parcel C++ object fields and writeFloat/writeDouble (no FPSIMD in uprobe pt_regs) are not read.".to_owned(),
         "DEX, ELF, connlog, and packed-cache path candidates may include a SHA-256 when a regular file <= 1 MiB is opened; capture also copies those forensic files under the spool forensics directory because apps often delete packed DEX after load.".to_owned(),
-        "Connect/accept and FD baseline/dup/close evidence reconstruct descriptor lifetimes. Optional network-io counts byte-returning socket calls and reports sendmmsg/recvmmsg results as message counts. UDP/53 datagrams parse QNAME/A/AAAA and stamp later connect() as correlated resolved_name (same-process first, then any resolver that answered the IP). getaddrinfo uprobes and non-53 resolvers remain uncovered. TLS/QUIC plaintext is Inspect-only. HTTP/1 request-line, Host, query keys, and JSON/form body keys are parsed from Inspect previews and dump heap windows into http_calls; Cookie/Authorization/token values are redacted. HTTP responses have no URL path. Heap windows that start at HTTP/1.1 are in-memory header tables (NUL or CRLF), not socket bytes. Same-process same-host request/response pairs are correlated http_reply. HTTP/2 frames after the PRI preface, HPACK, Cronet without SSL_write, Flutter, and custom TLS are not decoded.".to_owned(),
-        "The L0 graph is queryable (`ksightctl device graph`). Process instances use `procinst:{boot_id:pid:start_time_ns}` when start time is known; otherwise `process:pkg:pid`. Confirmed edges are Binder, Binder `replies_to`/`binder_reply` (request debug_id), socket, Binder FD `transfers_fd`, loopback scans, sched wakeup identity, and mmap/remap `maps` edges. Dump VMA `overlaps_mmap` is correlated even on an exact address match. Inspect `inspect_hit` and TLS `tls_send`/`tls_recv` are selected-process facts, not Observe. Inspect HTTP `http_call` edges are parsed from those TLS previews (HTTP/1 or JSON); dump heap `http_call` edges are correlated. Same-host `http_reply` is correlated, not a stream id. Binder userspace hits record handle/code and join L0 `binder:req` by tid+code as correlated `joined_transact`. The interface token and bounded scalars come from exported Parcel writers on the same TID. AIDL names come from on-device AOSP Stub tables or session process DEX; they are not hardcoded GMS/app names. Parcel C++ fields are not read. JNI RegisterNatives, Cronet/QUIC, and custom TLS remain unresolved. Time proximity is never a confirmed edge.".to_owned(),
+        "Connect/accept and FD baseline/dup/close evidence reconstruct descriptor lifetimes. Optional network-io counts byte-returning socket calls and reports sendmmsg/recvmmsg results as message counts. UDP/53 datagrams parse QNAME/A/AAAA and stamp later connect() as correlated resolved_name (same-process first, then any resolver that answered the IP). getaddrinfo uprobes and non-53 resolvers remain uncovered. TLS/QUIC plaintext is Inspect-only. Consecutive SSL_read/SSL_write text previews for one process are stitched up to 16 KiB. gzip/zlib magic in those buffers is inflated before HTTP/JSON/`http(s)://` URL parse. HTTP/1 request-line, Host, query keys, JSON/form keys, and embedded URLs go into http_calls; Cookie/Authorization/token values are redacted. HTTP responses have no URL path. Heap windows that start at HTTP/1.1 are in-memory header tables (NUL or CRLF), not socket bytes. Same-process same-host request/response pairs are correlated http_reply. HTTP/2 frames after the PRI preface, HPACK, Cronet without SSL_write, Flutter, and custom TLS are not decoded.".to_owned(),
+        "The L0 graph is queryable (`ksightctl device graph`). Process instances use `procinst:{boot_id:pid:start_time_ns}` when start time is known; otherwise `process:pkg:pid`. Confirmed edges are Binder, Binder `replies_to`/`binder_reply` (request debug_id), socket, Binder FD `transfers_fd`, loopback scans, sched wakeup identity, and mmap/remap `maps` edges. Dump VMA `overlaps_mmap` is correlated even on an exact address match. Inspect `inspect_hit` and TLS `tls_send`/`tls_recv` are selected-process facts, not Observe. JNIEnv UTF-8/`byte[]` Inspect previews graph as `jni_from_java`/`jni_to_java` (confirmed selected-process, not Observe). Inspect HTTP `http_call` edges are parsed from those TLS or JNI previews (HTTP/1 or JSON); dump heap `http_call` edges are correlated. Same-host `http_reply` is correlated, not a stream id. Binder userspace hits record handle/code and join L0 `binder:req` by tid+code as correlated `joined_transact`. The interface token and bounded scalars come from exported Parcel writers on the same TID. AIDL names come from on-device AOSP Stub tables or session process DEX; they are not hardcoded GMS/app names. Parcel C++ fields are not read. RegisterNatives copies JNINativeMethod name/signature/fnPtr from the JNINativeInterface slot; jclass fields and Java/native stacks remain unresolved. Cronet/QUIC and custom TLS remain unresolved. Time proximity is never a confirmed edge.".to_owned(),
         "dup/close file-descriptor events are off unless --files-fd is set. WebView/Chromium dup storms previously overflowed the file ring and dropped millions of records.".to_owned(),
         "Sampling, truncation, source loss, compatibility failures, or target early exit can make application behavior incomplete.".to_owned(),
     ]
@@ -3497,6 +3786,217 @@ mod tests {
     }
 
     #[test]
+    fn stitches_ssl_read_text_and_extracts_split_urls() {
+        let session = Uuid::new_v4();
+        let mut builder = SessionReportBuilder::default();
+        builder.record(&Event {
+            header: header(session, 22, SensorKind::Integrity),
+            payload: EventPayload::InspectPlaintext(ksight_model::InspectPlaintext {
+                adapter: "tls_ssl_read".to_owned(),
+                direction: "recv".to_owned(),
+                library: "libssl.so".to_owned(),
+                build_id: None,
+                offset: None,
+                requested_bytes: 64,
+                captured_bytes: 64,
+                truncated: true,
+                sha256: "aa".to_owned(),
+                preview: r#"{"type":"hummer","url":"https://s.thsi.cn/cd/acrossBar.zip""#
+                    .to_owned(),
+                preview_encoding: "utf8_lossy".to_owned(),
+                content_class: "text".to_owned(),
+            }),
+        });
+        builder.record(&Event {
+            header: header(session, 22, SensorKind::Integrity),
+            payload: EventPayload::InspectPlaintext(ksight_model::InspectPlaintext {
+                adapter: "tls_ssl_read".to_owned(),
+                direction: "recv".to_owned(),
+                library: "libssl.so".to_owned(),
+                build_id: None,
+                offset: None,
+                requested_bytes: 40,
+                captured_bytes: 40,
+                truncated: true,
+                sha256: "bb".to_owned(),
+                preview: r#","md5":"abc","url":"https://sp.thsi.cn/pkg/e5.zip"}"#.to_owned(),
+                preview_encoding: "utf8_lossy".to_owned(),
+                content_class: "text".to_owned(),
+            }),
+        });
+        let report = builder.finish();
+        let preview = report.plaintext[0].preview.as_deref().unwrap_or("");
+        assert!(preview.contains("s.thsi.cn"));
+        assert!(preview.contains("sp.thsi.cn"));
+        assert!(report.http_calls.iter().any(|call| {
+            call.host.as_deref() == Some("s.thsi.cn") && call.path.contains("acrossBar.zip")
+        }));
+        assert!(report
+            .http_calls
+            .iter()
+            .any(|call| call.host.as_deref() == Some("sp.thsi.cn")));
+    }
+
+    #[test]
+    fn utf8_inspect_preview_does_not_panic_on_content_class() {
+        let session = Uuid::new_v4();
+        let mut builder = SessionReportBuilder::default();
+        builder.record(&Event {
+            header: header(session, 11, SensorKind::Integrity),
+            payload: EventPayload::InspectPlaintext(ksight_model::InspectPlaintext {
+                adapter: "tls_ssl_read".to_owned(),
+                direction: "recv".to_owned(),
+                library: "libssl.so".to_owned(),
+                build_id: None,
+                offset: None,
+                requested_bytes: 32,
+                captured_bytes: 32,
+                truncated: false,
+                sha256: "cc".to_owned(),
+                preview: "证指数".to_owned(),
+                preview_encoding: "utf8_lossy".to_owned(),
+                content_class: String::new(),
+            }),
+        });
+        let report = builder.finish();
+        assert_eq!(report.plaintext[0].preview.as_deref(), Some("证指数"));
+    }
+
+    #[test]
+    fn keeps_url_json_over_longer_jni_javascript() {
+        let session = Uuid::new_v4();
+        let mut builder = SessionReportBuilder::default();
+        let urls = r#"{"type":"hummer","url":"https://s.thsi.cn/cd/acrossBar_v1.8.zip"}"#;
+        builder.record(&Event {
+            header: header(session, 30, SensorKind::Integrity),
+            payload: EventPayload::InspectPlaintext(ksight_model::InspectPlaintext {
+                adapter: "jni_get_string_utf_chars".to_owned(),
+                direction: "java_to_native".to_owned(),
+                library: "libart.so".to_owned(),
+                build_id: None,
+                offset: None,
+                requested_bytes: urls.len() as u64,
+                captured_bytes: u32::try_from(urls.len()).unwrap_or(u32::MAX),
+                truncated: false,
+                sha256: "urljson".to_owned(),
+                preview: urls.to_owned(),
+                preview_encoding: "utf8_lossy".to_owned(),
+                content_class: "text".to_owned(),
+            }),
+        });
+        let long_js = "dth\",\"height\",\"render\"];".repeat(80);
+        builder.record(&Event {
+            header: header(session, 30, SensorKind::Integrity),
+            payload: EventPayload::InspectPlaintext(ksight_model::InspectPlaintext {
+                adapter: "jni_get_string_utf_chars".to_owned(),
+                direction: "java_to_native".to_owned(),
+                library: "libart.so".to_owned(),
+                build_id: None,
+                offset: None,
+                requested_bytes: long_js.len() as u64,
+                captured_bytes: u32::try_from(long_js.len()).unwrap_or(u32::MAX),
+                truncated: false,
+                sha256: "webpack".to_owned(),
+                preview: long_js,
+                preview_encoding: "utf8_lossy".to_owned(),
+                content_class: "text".to_owned(),
+            }),
+        });
+        let report = builder.finish();
+        let preview = report.plaintext[0].preview.as_deref().unwrap_or("");
+        assert!(
+            preview.contains("s.thsi.cn/cd/acrossBar_v1.8.zip"),
+            "longer JS must not replace URL JSON: {preview}"
+        );
+        assert!(report.plaintext[0]
+            .urls
+            .iter()
+            .any(|url| url.contains("s.thsi.cn")));
+    }
+
+    #[test]
+    fn tls_hex_does_not_hide_later_zip_urls() {
+        let session = Uuid::new_v4();
+        let mut builder = SessionReportBuilder::default();
+        builder.record(&Event {
+            header: header(session, 31, SensorKind::Integrity),
+            payload: EventPayload::InspectPlaintext(ksight_model::InspectPlaintext {
+                adapter: "tls_ssl_read".to_owned(),
+                direction: "recv".to_owned(),
+                library: "libssl.so".to_owned(),
+                build_id: None,
+                offset: None,
+                requested_bytes: 32,
+                captured_bytes: 32,
+                truncated: false,
+                sha256: "h2".to_owned(),
+                preview: "000000000100000005886196dc34fd28".to_owned(),
+                preview_encoding: "hex".to_owned(),
+                content_class: "binary".to_owned(),
+            }),
+        });
+        let json = r#"{"url":"https://s.thsi.cn/cd/mobileweb-eq-homepage-v2-front-container/acrossBar_v1.8.zip"}"#;
+        builder.record(&Event {
+            header: header(session, 31, SensorKind::Integrity),
+            payload: EventPayload::InspectPlaintext(ksight_model::InspectPlaintext {
+                adapter: "tls_ssl_read".to_owned(),
+                direction: "recv".to_owned(),
+                library: "libssl.so".to_owned(),
+                build_id: None,
+                offset: None,
+                requested_bytes: json.len() as u64,
+                captured_bytes: u32::try_from(json.len()).unwrap_or(u32::MAX),
+                truncated: false,
+                sha256: "zip".to_owned(),
+                preview: json.to_owned(),
+                preview_encoding: "utf8_lossy".to_owned(),
+                content_class: "text".to_owned(),
+            }),
+        });
+        let report = builder.finish();
+        let preview = report.plaintext[0].preview.as_deref().unwrap_or("");
+        assert!(
+            preview.contains("acrossBar_v1.8.zip"),
+            "HTTP/2 hex must not hide zip URL JSON: {preview}"
+        );
+        assert!(!preview.starts_with("00000000"), "{preview}");
+    }
+
+    #[test]
+    fn jni_plaintext_graphs_jni_from_java() {
+        let session = Uuid::new_v4();
+        let mut builder = SessionReportBuilder::default();
+        builder.record(&Event {
+            header: header(session, 10, SensorKind::Integrity),
+            payload: EventPayload::InspectPlaintext(ksight_model::InspectPlaintext {
+                adapter: "jni_get_string_utf_chars".to_owned(),
+                direction: "java_to_native".to_owned(),
+                library: "/apex/com.android.art/lib64/libart.so".to_owned(),
+                build_id: None,
+                offset: Some(0x0080_d02c),
+                requested_bytes: 12,
+                captured_bytes: 11,
+                truncated: false,
+                sha256: "aabbccdd".to_owned(),
+                preview: "hello world".to_owned(),
+                preview_encoding: "utf8_lossy".to_owned(),
+                content_class: "text".to_owned(),
+            }),
+        });
+        let report = builder.finish();
+        assert_eq!(report.plaintext[0].adapter, "jni_get_string_utf_chars");
+        assert!(report
+            .graph
+            .edges
+            .iter()
+            .any(|edge| edge.relation == "jni_from_java"));
+        assert!(report
+            .inspect_hits
+            .iter()
+            .any(|hit| hit.adapter == "jni_get_string_utf_chars" && hit.hits >= 1));
+    }
+
+    #[test]
     fn parses_http_calls_from_inspect_plaintext_and_redacts_tokens() {
         let session = Uuid::new_v4();
         let mut builder = SessionReportBuilder::default();
@@ -3659,6 +4159,46 @@ mod tests {
         assert!(report.graph.edges.iter().any(|edge| {
             edge.relation == "http_call" && edge.strength == crate::EdgeStrength::Correlated
         }));
+    }
+
+    #[test]
+    fn correlates_http_path_to_dex_string_and_method() {
+        let calls = vec![HttpCallActivity {
+            source: "com.example".to_owned(),
+            process_id: 1,
+            direction: "send".to_owned(),
+            kind: "http1_request".to_owned(),
+            method: "POST".to_owned(),
+            host: Some("api.coolapk.com".to_owned()),
+            path: "/v6/feed/createFeed".to_owned(),
+            status: None,
+            query_keys: Vec::new(),
+            header_names: Vec::new(),
+            redacted_headers: Vec::new(),
+            body_keys: Vec::new(),
+            redacted_body_keys: Vec::new(),
+            content_type: None,
+            third_party: false,
+            count: 1,
+            origin: "inspect".to_owned(),
+        }];
+        let semantic = crate::DexSemanticSummary {
+            api_strings: vec!["https://api.coolapk.com/v6/feed/createFeed".to_owned()],
+            method_names: vec!["Lcom/coolapk/Market;->createFeed".to_owned()],
+            ..crate::DexSemanticSummary::default()
+        };
+        let set = crate::DexArtifactSet {
+            sha256: "abc".to_owned(),
+            bytes: 10,
+            canonical_relative_path: "readable-dex/x.dex".to_owned(),
+            sources: vec!["heap-blob".to_owned()],
+            observations: Vec::new(),
+            semantic: Some(semantic),
+        };
+        let refs = correlate_http_calls_to_dex(&calls, &[set]);
+        assert_eq!(refs.len(), 1);
+        assert!(refs[0].matches.iter().any(|row| row.contains("createFeed")));
+        assert_eq!(refs[0].relative_path.as_deref(), Some("readable-dex/x.dex"));
     }
 
     fn inspect_transact_event(session_id: Uuid, pid: u32, tid: u32, code: u32) -> Event {

@@ -27,6 +27,16 @@ pub const PACKAGE_DUMP_SCHEMA: &str = "mobilee.kernsight-package-dump/v2";
 const PRIVATE_PACKAGE_ROOT: &str = "/data/local/tmp/ksight/packages";
 const PUBLIC_PACKAGE_ROOT: &str = "/storage/emulated/0/Download/dexDump";
 
+/// Exported JNI symbols observed in a dumped ELF.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DumpJniExport {
+    /// Path relative to the dump root.
+    pub relative_path: String,
+    /// `Java_*` and `JNI_OnLoad` dynamic symbols. Empty means stripped / RegisterNatives-only.
+    #[serde(default)]
+    pub names: Vec<String>,
+}
+
 /// One sensitive evidence file intentionally retained for operator review.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DumpEvidenceFile {
@@ -323,6 +333,12 @@ pub struct PackageDumpReport {
     /// HTTP/1 or JSON calls parsed from `runtime/plaintext` heap windows. Token values redacted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub http_calls: Vec<ksight_core::HttpCallActivity>,
+    /// DEX string/method names that match HTTP catalog paths. Correlated, not JNI execution.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub http_code_refs: Vec<ksight_core::HttpCodeRef>,
+    /// Exported `Java_*` / `JNI_OnLoad` names from dumped ELF. Empty when the SO is stripped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub jni_exports: Vec<DumpJniExport>,
     /// Total bytes under this package dump root at catalog time.
     #[serde(default)]
     pub total_bytes: u64,
@@ -448,6 +464,8 @@ pub fn dump_package_with(
         graph: ksight_core::SessionGraph::l0_placeholder(),
         sensitive_files: Vec::new(),
         http_calls: Vec::new(),
+        http_code_refs: Vec::new(),
+        jni_exports: Vec::new(),
         total_bytes: 0,
         warnings: default_dump_warnings(),
         snapshots: Vec::new(),
@@ -656,6 +674,8 @@ pub fn recatalog_package(dest: &Path) -> Result<PackageDumpReport> {
             graph: ksight_core::SessionGraph::l0_placeholder(),
             sensitive_files: Vec::new(),
             http_calls: Vec::new(),
+            http_code_refs: Vec::new(),
+            jni_exports: Vec::new(),
             total_bytes: 0,
             warnings: default_dump_warnings(),
             snapshots: Vec::new(),
@@ -685,6 +705,9 @@ fn finalize_catalog(report: &mut PackageDumpReport, dest: &Path) -> Result<()> {
     report.native_framework_matches = ksight_core::classify_native_frameworks(&report.artifacts);
     report.sensitive_files = catalog_sensitive_files(dest);
     report.http_calls = catalog_plaintext_http_calls(dest, &report.package);
+    report.http_code_refs =
+        ksight_core::correlate_http_calls_to_dex(&report.http_calls, &report.dex_sets);
+    report.jni_exports = catalog_jni_exports(dest, &report.artifacts);
     report.snapshots = catalog_snapshots(dest);
     report.mapped_code = catalog_mapped_code(dest);
     report.code_loaders = catalog_code_loaders(dest);
@@ -740,7 +763,9 @@ fn default_dump_warnings() -> Vec<String> {
     vec![
         "plaintext_windows and key_slots are bounded candidate counts, not confirmed secrets"
             .to_owned(),
-        "dump http_calls are parsed from runtime/plaintext heap windows (HTTP/1 or JSON, NUL or CRLF); they are correlated heap facts, not Inspect SSL_write and not HTTP/2 HPACK. Responses have no URL path."
+        "dump http_calls are parsed from runtime/plaintext heap windows (HTTP/1 or JSON, NUL or CRLF); they are correlated heap facts, not Inspect SSL_write and not HTTP/2 HPACK. Responses have no URL path. Windows are a 2048-byte cut around a needle then trimmed of trailing NULs; mostly-zero slices are not written."
+            .to_owned(),
+        "http_code_refs match HTTP host/path to DEX string-pool and class->method names. That is correlated identifier overlap, not an ART/JNI call stack. jni_exports lists dynsym Java_*/JNI_OnLoad; empty names mean the SO is stripped. Inspect --inspect-adapter jni_plaintext attaches JNINativeInterface GetStringUTFChars/NewStringUTF/GetByteArray* via exported GetFunctionTable and jni.h slots, not Java_* exports."
             .to_owned(),
         "package dump uses root procfs memory access and is L2 forensic evidence, not eBPF Observe"
             .to_owned(),
@@ -991,6 +1016,35 @@ fn catalog_plaintext_http_calls(dest: &Path, package: &str) -> Vec<ksight_core::
             .then_with(|| left.method.cmp(&right.method))
     });
     out.truncate(128);
+    out
+}
+
+fn catalog_jni_exports(dest: &Path, artifacts: &[ksight_core::DumpArtifact]) -> Vec<DumpJniExport> {
+    let mut out = Vec::new();
+    for artifact in artifacts.iter().filter(|row| row.kind == "elf").take(48) {
+        let path = dest.join(&artifact.relative_path);
+        let Ok(elf) = crate::elf::inspect_elf(&path) else {
+            continue;
+        };
+        let names = elf
+            .symbols
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .filter(|name| name.starts_with("Java_") || *name == "JNI_OnLoad")
+            .take(24)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if names.is_empty() && !artifact.relative_path.contains("runtime-so") {
+            continue;
+        }
+        if out.len() >= 32 {
+            break;
+        }
+        out.push(DumpJniExport {
+            relative_path: artifact.relative_path.clone(),
+            names,
+        });
+    }
     out
 }
 

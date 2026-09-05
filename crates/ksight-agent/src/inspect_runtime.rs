@@ -57,7 +57,12 @@ const ART_DEX_PATHS: [&str; 2] = [
     "/apex/com.android.art/lib64/libdexfile.so",
     "/apex/com.android.art/lib/libdexfile.so",
 ];
+const ART_JNI_PATHS: [&str; 2] = [
+    "/apex/com.android.art/lib64/libart.so",
+    "/apex/com.android.art/lib/libart.so",
+];
 const ART_OPEN_ATTACH_CAP: usize = 12;
+const JNI_ENV_ATTACH_CAP: usize = 64;
 const CODE_PATH_MARKERS: [&str; 8] = [
     ".apk", ".dex", ".jar", ".vdex", ".zip", ".oat", ".art", "memfd:",
 ];
@@ -114,8 +119,48 @@ pub enum InspectAdapterKind {
     ArtDexLoad,
     /// ART in-memory DEX via exported `Open`/`OpenCommon(uint8_t const*, size_t, ...)`.
     ArtDexMemory,
-    /// JNI native registration. No exported JNI table boundary on this build.
+    /// JNI `RegisterNatives` via `JNINativeInterface` (jni.h slot from exported `GetFunctionTable`).
     JniRegistration,
+    /// Operator alias: `JNIEnv` UTF-8 / `byte[]` plaintext plus `RegisterNatives`.
+    JniPlaintext,
+    /// `JNINativeInterface::NewStringUTF` (native UTF-8 → Java `String`).
+    JniNewStringUtf,
+    /// `JNINativeInterface::GetStringUTFChars` (Java `String` → native UTF-8).
+    JniGetStringUtfChars,
+    /// `JNINativeInterface::GetStringUTFLength`. Pairs length to `GetStringUTFChars` by jobject.
+    JniGetStringUtfLength,
+    /// `JNINativeInterface::GetStringUTFRegion` (explicit `len` into caller buffer).
+    JniGetStringUtfRegion,
+    /// `JNINativeInterface::GetArrayLength`. Pairs length to `GetByteArrayElements` by jobject.
+    JniGetArrayLength,
+    /// `JNINativeInterface::GetByteArrayElements` (Java `byte[]` → native, length from `GetArrayLength`).
+    JniGetByteArrayElements,
+    /// `JNINativeInterface::GetByteArrayRegion` (Java `byte[]` → caller buffer).
+    JniGetByteArrayRegion,
+    /// `JNINativeInterface::SetByteArrayRegion` (native buffer → Java `byte[]`).
+    JniSetByteArrayRegion,
+    /// `JNINativeInterface::NewString` (native UTF-16 → Java `String`).
+    JniNewString,
+    /// `JNINativeInterface::GetStringLength`. Pairs UTF-16 length by jobject.
+    JniGetStringLength,
+    /// `JNINativeInterface::GetStringChars` (Java `String` → UTF-16).
+    JniGetStringChars,
+    /// `JNINativeInterface::GetStringRegion` (UTF-16 into caller buffer).
+    JniGetStringRegion,
+    /// `JNINativeInterface::GetStringCritical` (Java `String` → UTF-16).
+    JniGetStringCritical,
+    /// `JNINativeInterface::GetCharArrayElements` (Java `char[]` → UTF-16).
+    JniGetCharArrayElements,
+    /// `JNINativeInterface::GetCharArrayRegion`.
+    JniGetCharArrayRegion,
+    /// `JNINativeInterface::SetCharArrayRegion`.
+    JniSetCharArrayRegion,
+    /// `JNINativeInterface::GetPrimitiveArrayCritical`.
+    JniGetPrimitiveArrayCritical,
+    /// `JNINativeInterface::GetDirectBufferAddress`.
+    JniGetDirectBufferAddress,
+    /// `JNINativeInterface::GetDirectBufferCapacity`. Pairs with `GetDirectBufferAddress`.
+    JniGetDirectBufferCapacity,
     /// Userspace Binder `IPCThreadState::transact`.
     BinderUserspace,
     /// Userspace Binder `Parcel::writeInterfaceToken` (UTF-16 descriptor).
@@ -162,6 +207,26 @@ impl InspectAdapterKind {
             Self::ArtDexLoad => "art_dex_load",
             Self::ArtDexMemory => "art_dex_memory",
             Self::JniRegistration => "jni_registration",
+            Self::JniPlaintext => "jni_plaintext",
+            Self::JniNewStringUtf => "jni_new_string_utf",
+            Self::JniGetStringUtfChars => "jni_get_string_utf_chars",
+            Self::JniGetStringUtfLength => "jni_get_string_utf_length",
+            Self::JniGetStringUtfRegion => "jni_get_string_utf_region",
+            Self::JniGetArrayLength => "jni_get_array_length",
+            Self::JniGetByteArrayElements => "jni_get_byte_array_elements",
+            Self::JniGetByteArrayRegion => "jni_get_byte_array_region",
+            Self::JniSetByteArrayRegion => "jni_set_byte_array_region",
+            Self::JniNewString => "jni_new_string",
+            Self::JniGetStringLength => "jni_get_string_length",
+            Self::JniGetStringChars => "jni_get_string_chars",
+            Self::JniGetStringRegion => "jni_get_string_region",
+            Self::JniGetStringCritical => "jni_get_string_critical",
+            Self::JniGetCharArrayElements => "jni_get_char_array_elements",
+            Self::JniGetCharArrayRegion => "jni_get_char_array_region",
+            Self::JniSetCharArrayRegion => "jni_set_char_array_region",
+            Self::JniGetPrimitiveArrayCritical => "jni_get_primitive_array_critical",
+            Self::JniGetDirectBufferAddress => "jni_get_direct_buffer_address",
+            Self::JniGetDirectBufferCapacity => "jni_get_direct_buffer_capacity",
             Self::BinderUserspace => "binder_userspace",
             Self::BinderInterfaceToken => "binder_interface_token",
             Self::BinderParcelString => "binder_parcel_string",
@@ -191,6 +256,7 @@ impl InspectAdapterKind {
             Self::LinkerSoLoad => &LINKER_PATHS,
             Self::ArtDexLoad | Self::ArtDexMemory => &ART_DEX_PATHS,
             Self::TlsSslWrite | Self::TlsSslRead => &TLS_PATHS,
+            adapter if adapter.is_jni() => &ART_JNI_PATHS,
             _ => &[],
         }
     }
@@ -200,7 +266,27 @@ impl InspectAdapterKind {
             Self::LinkerSoLoad => &LINKER_NAMES,
             Self::ArtDexLoad => &ART_DEX_NAMES,
             Self::ArtDexMemory => &ART_DEX_MEMORY_NAMES,
-            Self::JniRegistration => &[],
+            Self::JniRegistration
+            | Self::JniPlaintext
+            | Self::JniNewStringUtf
+            | Self::JniGetStringUtfChars
+            | Self::JniGetStringUtfLength
+            | Self::JniGetStringUtfRegion
+            | Self::JniGetArrayLength
+            | Self::JniGetByteArrayElements
+            | Self::JniGetByteArrayRegion
+            | Self::JniSetByteArrayRegion
+            | Self::JniNewString
+            | Self::JniGetStringLength
+            | Self::JniGetStringChars
+            | Self::JniGetStringRegion
+            | Self::JniGetStringCritical
+            | Self::JniGetCharArrayElements
+            | Self::JniGetCharArrayRegion
+            | Self::JniSetCharArrayRegion
+            | Self::JniGetPrimitiveArrayCritical
+            | Self::JniGetDirectBufferAddress
+            | Self::JniGetDirectBufferCapacity => &[],
             Self::BinderUserspace => &BINDER_NAMES,
             Self::BinderInterfaceToken => &BINDER_TOKEN_NAMES,
             Self::BinderParcelString => &BINDER_STRING_NAMES,
@@ -230,6 +316,7 @@ impl InspectAdapterKind {
             Self::TlsSslWrite | Self::TlsSslRead => &["libssl.so", "libcronet.so"],
             Self::ArtDexLoad | Self::ArtDexMemory => &["libdexfile.so"],
             Self::LinkerSoLoad => &["linker64", "linker"],
+            adapter if adapter.is_jni() => &["libart.so"],
             _ => &[],
         }
     }
@@ -237,6 +324,33 @@ impl InspectAdapterKind {
     #[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
     const fn is_tls(self) -> bool {
         matches!(self, Self::TlsSslWrite | Self::TlsSslRead)
+    }
+
+    const fn is_jni(self) -> bool {
+        matches!(
+            self,
+            Self::JniRegistration
+                | Self::JniPlaintext
+                | Self::JniNewStringUtf
+                | Self::JniGetStringUtfChars
+                | Self::JniGetStringUtfLength
+                | Self::JniGetStringUtfRegion
+                | Self::JniGetArrayLength
+                | Self::JniGetByteArrayElements
+                | Self::JniGetByteArrayRegion
+                | Self::JniSetByteArrayRegion
+                | Self::JniNewString
+                | Self::JniGetStringLength
+                | Self::JniGetStringChars
+                | Self::JniGetStringRegion
+                | Self::JniGetStringCritical
+                | Self::JniGetCharArrayElements
+                | Self::JniGetCharArrayRegion
+                | Self::JniSetCharArrayRegion
+                | Self::JniGetPrimitiveArrayCritical
+                | Self::JniGetDirectBufferAddress
+                | Self::JniGetDirectBufferCapacity
+        )
     }
 
     const fn is_binder(self) -> bool {
@@ -269,7 +383,9 @@ impl InspectAdapterKind {
     fn default_max_hits(self) -> u32 {
         match self {
             Self::ArtDexLoad | Self::ArtDexMemory => 64,
-            Self::LinkerSoLoad | Self::JniRegistration => 1,
+            Self::LinkerSoLoad => 1,
+            Self::JniRegistration => 256,
+            adapter if adapter.is_jni() => 1024,
             _ => 1024,
         }
     }
@@ -322,6 +438,26 @@ impl FromStr for InspectAdapterKind {
             "art_dex_load" => Ok(Self::ArtDexLoad),
             "art_dex_memory" => Ok(Self::ArtDexMemory),
             "jni_registration" => Ok(Self::JniRegistration),
+            "jni_plaintext" => Ok(Self::JniPlaintext),
+            "jni_new_string_utf" => Ok(Self::JniNewStringUtf),
+            "jni_get_string_utf_chars" => Ok(Self::JniGetStringUtfChars),
+            "jni_get_string_utf_length" => Ok(Self::JniGetStringUtfLength),
+            "jni_get_string_utf_region" => Ok(Self::JniGetStringUtfRegion),
+            "jni_get_array_length" => Ok(Self::JniGetArrayLength),
+            "jni_get_byte_array_elements" => Ok(Self::JniGetByteArrayElements),
+            "jni_get_byte_array_region" => Ok(Self::JniGetByteArrayRegion),
+            "jni_set_byte_array_region" => Ok(Self::JniSetByteArrayRegion),
+            "jni_new_string" => Ok(Self::JniNewString),
+            "jni_get_string_length" => Ok(Self::JniGetStringLength),
+            "jni_get_string_chars" => Ok(Self::JniGetStringChars),
+            "jni_get_string_region" => Ok(Self::JniGetStringRegion),
+            "jni_get_string_critical" => Ok(Self::JniGetStringCritical),
+            "jni_get_char_array_elements" => Ok(Self::JniGetCharArrayElements),
+            "jni_get_char_array_region" => Ok(Self::JniGetCharArrayRegion),
+            "jni_set_char_array_region" => Ok(Self::JniSetCharArrayRegion),
+            "jni_get_primitive_array_critical" => Ok(Self::JniGetPrimitiveArrayCritical),
+            "jni_get_direct_buffer_address" => Ok(Self::JniGetDirectBufferAddress),
+            "jni_get_direct_buffer_capacity" => Ok(Self::JniGetDirectBufferCapacity),
             "binder_userspace" => Ok(Self::BinderUserspace),
             "binder_interface_token" => Ok(Self::BinderInterfaceToken),
             "binder_parcel_string" => Ok(Self::BinderParcelString),
@@ -341,7 +477,7 @@ impl FromStr for InspectAdapterKind {
             "tls_ssl_write" => Ok(Self::TlsSslWrite),
             "tls_ssl_read" => Ok(Self::TlsSslRead),
             other => Err(format!(
-                "unknown inspect adapter {other}; expected linker_so_load, art_dex_load, art_dex_memory, jni_registration, binder_userspace, binder_interface_token, binder_parcel_string, binder_parcel_utf8, binder_parcel_int32, binder_parcel_int64, binder_parcel_uint32, binder_parcel_uint64, binder_parcel_bool, binder_parcel_cstring, binder_parcel_bytes, binder_parcel_fd, binder_parcel_dup_fd, binder_parcel_binder, binder_parcel_byte, binder_parcel_char, tls_ssl_write, or tls_ssl_read"
+                "unknown inspect adapter {other}; expected linker_so_load, art_dex_load, art_dex_memory, jni_registration, jni_plaintext, jni_new_string_utf, jni_get_string_utf_chars, jni_get_string_utf_length, jni_get_string_utf_region, jni_get_array_length, jni_get_byte_array_elements, jni_get_byte_array_region, jni_set_byte_array_region, jni_new_string, jni_get_string_length, jni_get_string_chars, jni_get_string_region, jni_get_string_critical, jni_get_char_array_elements, jni_get_char_array_region, jni_set_char_array_region, jni_get_primitive_array_critical, jni_get_direct_buffer_address, jni_get_direct_buffer_capacity, binder_userspace, binder_interface_token, binder_parcel_string, binder_parcel_utf8, binder_parcel_int32, binder_parcel_int64, binder_parcel_uint32, binder_parcel_uint64, binder_parcel_bool, binder_parcel_cstring, binder_parcel_bytes, binder_parcel_fd, binder_parcel_dup_fd, binder_parcel_binder, binder_parcel_byte, binder_parcel_char, tls_ssl_write, or tls_ssl_read"
             )),
         }
     }
@@ -398,7 +534,7 @@ impl InspectPlan {
 
     /// Whether a live probe should be attempted.
     pub fn should_attach(&self) -> bool {
-        self.adapter != InspectAdapterKind::JniRegistration
+        self.adapter != InspectAdapterKind::JniPlaintext
             && self.policy.may_attach()
             && self.offset.is_some()
             && self.elf_path.is_some()
@@ -431,6 +567,32 @@ impl InspectPlan {
             Self::evaluate(policy, adapter, uprobe_object)
         } else {
             plans
+        }
+    }
+
+    /// Attach `JNIEnv` functions resolved from exported `GetFunctionTable` + `jni.h` slots.
+    fn evaluate_jni_exports(
+        policy: InspectPolicy,
+        adapter: InspectAdapterKind,
+        uprobe_object: PathBuf,
+    ) -> Vec<Self> {
+        let libraries = resolve_libraries(&policy, adapter);
+        if libraries.is_empty() {
+            return Self::evaluate(policy, adapter, uprobe_object);
+        }
+        let wanted = jni_wanted_slots(adapter);
+        let mut plans = Vec::new();
+        for library in libraries {
+            if let Some(mut found) =
+                evaluate_jni_env_exports(&policy, adapter, &uprobe_object, &library, wanted)
+            {
+                plans.append(&mut found);
+            }
+        }
+        if plans.iter().any(|plan| plan.offset.is_some()) {
+            plans
+        } else {
+            Self::evaluate(policy, adapter, uprobe_object)
         }
     }
 }
@@ -466,11 +628,19 @@ pub struct InspectRuntime {
     max_duration: Duration,
     max_hits: u32,
     hits: u32,
+    #[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
+    hits_by_adapter: HashMap<String, u32>,
+    #[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
+    per_adapter_budget: bool,
     expired: bool,
     #[cfg(any(target_os = "android", target_os = "linux"))]
     sessions: Vec<LiveProbe>,
     #[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
     ssl_read_pending: HashMap<u32, PendingSslRead>,
+    #[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
+    jni_region_pending: HashMap<u32, PendingSslRead>,
+    #[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
+    jni_pair: JniPairPending,
     #[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
     binder_pending: BinderPending,
     #[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
@@ -492,6 +662,44 @@ struct BinderPending {
     binders: HashMap<u32, Vec<String>>,
 }
 
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+struct PendingJniLen {
+    obj: u64,
+    len: i32,
+}
+
+#[derive(Debug, Default)]
+#[allow(dead_code)]
+struct JniPairPending {
+    array_len_obj: HashMap<u32, u64>,
+    array_len: HashMap<u32, PendingJniLen>,
+    string_len_obj: HashMap<u32, u64>,
+    string_len: HashMap<u32, PendingJniLen>,
+    u16_len_obj: HashMap<u32, u64>,
+    u16_len: HashMap<u32, PendingJniLen>,
+    elements_obj: HashMap<u32, u64>,
+    char_elements_obj: HashMap<u32, u64>,
+    utfchars_obj: HashMap<u32, u64>,
+    u16chars_obj: HashMap<u32, u64>,
+    utf_region: HashMap<u32, PendingSslRead>,
+    u16_region: HashMap<u32, PendingSslRead>,
+    direct_obj: HashMap<u32, u64>,
+    direct_cap_obj: HashMap<u32, u64>,
+    direct_cap: HashMap<u32, PendingJniLen>,
+}
+
+#[cfg_attr(
+    not(any(test, target_os = "android", target_os = "linux")),
+    allow(dead_code)
+)]
+fn take_paired_len(pending: &mut HashMap<u32, PendingJniLen>, tid: u32, obj: u64) -> Option<i32> {
+    pending
+        .remove(&tid)
+        .and_then(|pair| (pair.obj == obj && pair.len > 0).then_some(pair.len))
+}
+
+#[derive(Debug)]
 struct PendingSslRead {
     #[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
     pid: u32,
@@ -530,6 +738,7 @@ impl InspectRuntime {
             adapters.to_vec()
         };
         let mut policy = policy.clone();
+        let per_adapter_budget = policy.max_hits == 0;
         if policy.max_hits == 0 {
             policy.max_hits = selected_adapters
                 .iter()
@@ -566,6 +775,12 @@ impl InspectRuntime {
                     *adapter,
                     uprobe_object.clone(),
                 ));
+            } else if adapter.is_jni() {
+                plans.extend(InspectPlan::evaluate_jni_exports(
+                    policy.clone(),
+                    *adapter,
+                    uprobe_object.clone(),
+                ));
             } else {
                 plans.extend(InspectPlan::evaluate(
                     policy.clone(),
@@ -592,6 +807,7 @@ impl InspectRuntime {
             }
         }
         prune_redundant_elf32_tls(&mut plans);
+        prune_redundant_elf32_jni(&mut plans);
         Self {
             plans,
             selected_adapters,
@@ -599,10 +815,14 @@ impl InspectRuntime {
             max_duration,
             max_hits,
             hits: 0,
+            hits_by_adapter: HashMap::new(),
+            per_adapter_budget,
             expired: false,
             #[cfg(any(target_os = "android", target_os = "linux"))]
             sessions: Vec::new(),
             ssl_read_pending: HashMap::new(),
+            jni_region_pending: HashMap::new(),
+            jni_pair: JniPairPending::default(),
             binder_pending: BinderPending::default(),
             binder_dex_cache: crate::binder_dex::ProcessDexAidlCache::default(),
             #[cfg(any(target_os = "android", target_os = "linux"))]
@@ -634,7 +854,7 @@ impl InspectRuntime {
     /// Revoke unused probes after the authorized window or hit budget.
     pub fn expire_if_needed(&mut self) -> Option<InspectObservation> {
         let over_time = self.started.elapsed() >= self.max_duration;
-        let over_hits = self.hits >= self.max_hits;
+        let over_hits = inspect_budget_exhausted(self);
         if self.expired || (!over_time && !over_hits) {
             return None;
         }
@@ -681,8 +901,8 @@ fn evaluate_one(
             observation,
         );
     }
-    if adapter == InspectAdapterKind::JniRegistration {
-        "jni_registration has no exported JNI RegisterNatives boundary on this Android build; refusing to guess"
+    if !policy.may_attach() {
+        "inspect enabled but no app selector; pass --package, --pid, or --uid"
             .clone_into(&mut observation.detail);
         return plan(
             policy,
@@ -694,8 +914,8 @@ fn evaluate_one(
             observation,
         );
     }
-    if !policy.may_attach() {
-        "inspect enabled but no app selector; pass --package, --pid, or --uid"
+    if adapter.is_jni() {
+        "JNIEnv plaintext/RegisterNatives are not dynsym names; resolve JNINativeInterface from exported art::JNIEnvExt::GetFunctionTable using jni.h slots (no ART object offsets). Table was not found in this ELF."
             .clone_into(&mut observation.detail);
         return plan(
             policy,
@@ -882,6 +1102,174 @@ fn evaluate_art_open_exports(
     )
 }
 
+fn jni_wanted_slots(adapter: InspectAdapterKind) -> &'static [(&'static str, usize)] {
+    match adapter {
+        InspectAdapterKind::JniPlaintext => &crate::jni_env::JNI_PLAINTEXT_SLOTS,
+        InspectAdapterKind::JniNewStringUtf => {
+            &[("NewStringUTF", crate::jni_env::SLOT_NEW_STRING_UTF)]
+        }
+        InspectAdapterKind::JniGetStringUtfChars => &[(
+            "GetStringUTFChars",
+            crate::jni_env::SLOT_GET_STRING_UTF_CHARS,
+        )],
+        InspectAdapterKind::JniGetStringUtfLength => &[(
+            "GetStringUTFLength",
+            crate::jni_env::SLOT_GET_STRING_UTF_LENGTH,
+        )],
+        InspectAdapterKind::JniGetStringUtfRegion => &[(
+            "GetStringUTFRegion",
+            crate::jni_env::SLOT_GET_STRING_UTF_REGION,
+        )],
+        InspectAdapterKind::JniGetArrayLength => {
+            &[("GetArrayLength", crate::jni_env::SLOT_GET_ARRAY_LENGTH)]
+        }
+        InspectAdapterKind::JniGetByteArrayElements => &[(
+            "GetByteArrayElements",
+            crate::jni_env::SLOT_GET_BYTE_ARRAY_ELEMENTS,
+        )],
+        InspectAdapterKind::JniGetByteArrayRegion => &[(
+            "GetByteArrayRegion",
+            crate::jni_env::SLOT_GET_BYTE_ARRAY_REGION,
+        )],
+        InspectAdapterKind::JniSetByteArrayRegion => &[(
+            "SetByteArrayRegion",
+            crate::jni_env::SLOT_SET_BYTE_ARRAY_REGION,
+        )],
+        InspectAdapterKind::JniRegistration => {
+            &[("RegisterNatives", crate::jni_env::SLOT_REGISTER_NATIVES)]
+        }
+        InspectAdapterKind::JniNewString => &[("NewString", crate::jni_env::SLOT_NEW_STRING)],
+        InspectAdapterKind::JniGetStringLength => {
+            &[("GetStringLength", crate::jni_env::SLOT_GET_STRING_LENGTH)]
+        }
+        InspectAdapterKind::JniGetStringChars => {
+            &[("GetStringChars", crate::jni_env::SLOT_GET_STRING_CHARS)]
+        }
+        InspectAdapterKind::JniGetStringRegion => {
+            &[("GetStringRegion", crate::jni_env::SLOT_GET_STRING_REGION)]
+        }
+        InspectAdapterKind::JniGetStringCritical => &[(
+            "GetStringCritical",
+            crate::jni_env::SLOT_GET_STRING_CRITICAL,
+        )],
+        InspectAdapterKind::JniGetCharArrayElements => &[(
+            "GetCharArrayElements",
+            crate::jni_env::SLOT_GET_CHAR_ARRAY_ELEMENTS,
+        )],
+        InspectAdapterKind::JniGetCharArrayRegion => &[(
+            "GetCharArrayRegion",
+            crate::jni_env::SLOT_GET_CHAR_ARRAY_REGION,
+        )],
+        InspectAdapterKind::JniSetCharArrayRegion => &[(
+            "SetCharArrayRegion",
+            crate::jni_env::SLOT_SET_CHAR_ARRAY_REGION,
+        )],
+        InspectAdapterKind::JniGetPrimitiveArrayCritical => &[(
+            "GetPrimitiveArrayCritical",
+            crate::jni_env::SLOT_GET_PRIMITIVE_ARRAY_CRITICAL,
+        )],
+        InspectAdapterKind::JniGetDirectBufferAddress => &[(
+            "GetDirectBufferAddress",
+            crate::jni_env::SLOT_GET_DIRECT_BUFFER_ADDRESS,
+        )],
+        InspectAdapterKind::JniGetDirectBufferCapacity => &[(
+            "GetDirectBufferCapacity",
+            crate::jni_env::SLOT_GET_DIRECT_BUFFER_CAPACITY,
+        )],
+        _ => &[],
+    }
+}
+
+fn jni_adapter_for_slot(name: &str) -> InspectAdapterKind {
+    match name {
+        "NewStringUTF" => InspectAdapterKind::JniNewStringUtf,
+        "GetStringUTFChars" => InspectAdapterKind::JniGetStringUtfChars,
+        "GetStringUTFLength" => InspectAdapterKind::JniGetStringUtfLength,
+        "GetStringUTFRegion" => InspectAdapterKind::JniGetStringUtfRegion,
+        "GetArrayLength" => InspectAdapterKind::JniGetArrayLength,
+        "GetByteArrayElements" => InspectAdapterKind::JniGetByteArrayElements,
+        "GetByteArrayRegion" => InspectAdapterKind::JniGetByteArrayRegion,
+        "SetByteArrayRegion" => InspectAdapterKind::JniSetByteArrayRegion,
+        "RegisterNatives" => InspectAdapterKind::JniRegistration,
+        "NewString" => InspectAdapterKind::JniNewString,
+        "GetStringLength" => InspectAdapterKind::JniGetStringLength,
+        "GetStringChars" => InspectAdapterKind::JniGetStringChars,
+        "GetStringRegion" => InspectAdapterKind::JniGetStringRegion,
+        "GetStringCritical" => InspectAdapterKind::JniGetStringCritical,
+        "GetCharArrayElements" => InspectAdapterKind::JniGetCharArrayElements,
+        "GetCharArrayRegion" => InspectAdapterKind::JniGetCharArrayRegion,
+        "SetCharArrayRegion" => InspectAdapterKind::JniSetCharArrayRegion,
+        "GetPrimitiveArrayCritical" => InspectAdapterKind::JniGetPrimitiveArrayCritical,
+        "GetDirectBufferAddress" => InspectAdapterKind::JniGetDirectBufferAddress,
+        "GetDirectBufferCapacity" => InspectAdapterKind::JniGetDirectBufferCapacity,
+        _ => InspectAdapterKind::JniPlaintext,
+    }
+}
+
+fn evaluate_jni_env_exports(
+    policy: &InspectPolicy,
+    _selected: InspectAdapterKind,
+    uprobe_object: &Path,
+    elf_path: &str,
+    wanted: &[(&str, usize)],
+) -> Option<Vec<InspectPlan>> {
+    if wanted.is_empty() {
+        return None;
+    }
+    let elf = crate::elf::inspect_elf(elf_path).ok()?;
+    if let Some(required) = policy.build_id.as_deref() {
+        match elf.build_id.as_deref() {
+            Some(actual) if actual == required => {}
+            _ => return None,
+        }
+    }
+    let matched = crate::jni_env::resolve_jni_env_functions(elf_path, wanted).ok()?;
+    if matched.is_empty() {
+        return None;
+    }
+    Some(
+        matched
+            .into_iter()
+            .take(JNI_ENV_ATTACH_CAP)
+            .map(|function| {
+                let adapter = jni_adapter_for_slot(function.name);
+                let offset = function.offset;
+                let mut observation = InspectObservation {
+                    adapter: adapter.as_str().to_owned(),
+                    library: elf_path.to_owned(),
+                    build_id: elf.build_id.clone(),
+                    offset: Some(offset),
+                    detectability_notice: policy.detectability_notice.clone(),
+                    ..InspectObservation::default()
+                };
+                observation.detail = format!(
+                    "ready to attach {} uprobe JNINativeInterface::{} offset={offset:#x} (GetFunctionTable + jni.h slot)",
+                    adapter.as_str(),
+                    function.name
+                );
+                if !Path::new(uprobe_object).is_file() {
+                    let _ = write!(
+                        observation.detail,
+                        "; uprobe object missing: {}",
+                        uprobe_object.display()
+                    );
+                }
+                InspectPlan {
+                    policy: policy.clone(),
+                    adapter,
+                    uprobe_object: uprobe_object.to_path_buf(),
+                    elf_path: Some(elf_path.to_owned()),
+                    offset: Some(offset),
+                    build_id: elf.build_id.clone(),
+                    symbol: Some(function.name.to_owned()),
+                    pointer_width: (elf.bits / 8).max(4),
+                    observation,
+                }
+            })
+            .collect(),
+    )
+}
+
 fn plan(
     policy: InspectPolicy,
     adapter: InspectAdapterKind,
@@ -906,9 +1294,57 @@ fn plan(
 
 #[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
 fn adapter_is_live(selected: &[InspectAdapterKind], adapter: InspectAdapterKind) -> bool {
-    selected
+    selected.iter().any(|item| {
+        *item == adapter
+            || item.companions().contains(&adapter)
+            || (*item == InspectAdapterKind::JniPlaintext
+                && adapter.is_jni()
+                && adapter != InspectAdapterKind::JniPlaintext)
+    })
+}
+
+#[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
+fn adapter_probe_programs(adapter: InspectAdapterKind) -> &'static [&'static str] {
+    match adapter {
+        InspectAdapterKind::TlsSslRead
+        | InspectAdapterKind::JniGetByteArrayRegion
+        | InspectAdapterKind::JniGetStringUtfRegion
+        | InspectAdapterKind::JniGetArrayLength
+        | InspectAdapterKind::JniGetStringUtfLength
+        | InspectAdapterKind::JniGetByteArrayElements
+        | InspectAdapterKind::JniGetStringUtfChars
+        | InspectAdapterKind::JniGetStringLength
+        | InspectAdapterKind::JniGetStringChars
+        | InspectAdapterKind::JniGetStringRegion
+        | InspectAdapterKind::JniGetStringCritical
+        | InspectAdapterKind::JniGetCharArrayElements
+        | InspectAdapterKind::JniGetCharArrayRegion
+        | InspectAdapterKind::JniGetPrimitiveArrayCritical
+        | InspectAdapterKind::JniGetDirectBufferAddress
+        | InspectAdapterKind::JniGetDirectBufferCapacity => {
+            &["ksight_uprobe_regs", "ksight_uretprobe_regs"]
+        }
+        _ => &["ksight_uprobe_regs"],
+    }
+}
+
+fn prune_redundant_elf32_jni(plans: &mut [InspectPlan]) {
+    let has_elf64 = plans
         .iter()
-        .any(|item| *item == adapter || item.companions().contains(&adapter))
+        .any(|plan| plan.adapter.is_jni() && plan.pointer_width >= 8 && plan.offset.is_some());
+    if !has_elf64 {
+        return;
+    }
+    for plan in plans {
+        if plan.adapter.is_jni() && plan.pointer_width == 4 {
+            plan.offset = None;
+            if !plan.observation.detail.contains("skipped ELF32 JNI") {
+                plan.observation.detail.push_str(
+                    "; skipped ELF32 libart on this arm64 GKI because an ELF64 JNINativeInterface table is available",
+                );
+            }
+        }
+    }
 }
 
 fn prune_redundant_elf32_tls(plans: &mut [InspectPlan]) {
@@ -1089,6 +1525,43 @@ fn refresh_tgid_filter(runtime: &mut InspectRuntime) {
     }
 }
 
+#[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
+fn adapter_hit_cap(runtime: &InspectRuntime, adapter: InspectAdapterKind) -> u32 {
+    if runtime.per_adapter_budget {
+        adapter.default_max_hits()
+    } else {
+        runtime.max_hits
+    }
+}
+
+#[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
+fn adapter_hits(runtime: &InspectRuntime, adapter: InspectAdapterKind) -> u32 {
+    runtime
+        .hits_by_adapter
+        .get(adapter.as_str())
+        .copied()
+        .unwrap_or(0)
+}
+
+fn inspect_budget_exhausted(runtime: &InspectRuntime) -> bool {
+    if !runtime.per_adapter_budget {
+        return runtime.hits >= runtime.max_hits;
+    }
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    {
+        if runtime.sessions.is_empty() {
+            return false;
+        }
+        runtime.sessions.iter().all(|probe| {
+            adapter_hits(runtime, probe.plan.adapter) >= probe.plan.adapter.default_max_hits()
+        })
+    }
+    #[cfg(not(any(target_os = "android", target_os = "linux")))]
+    {
+        runtime.hits >= runtime.max_hits
+    }
+}
+
 fn take_attached_sessions(runtime: &mut InspectRuntime) -> bool {
     #[cfg(any(target_os = "android", target_os = "linux"))]
     {
@@ -1173,11 +1646,7 @@ fn attach_all(runtime: &mut InspectRuntime) -> Vec<InspectObservation> {
             continue;
         };
         let hit_once = plan.adapter.hit_once() && !plan.policy.whole_device;
-        let programs: &[&str] = if plan.adapter == InspectAdapterKind::TlsSslRead {
-            &["ksight_uprobe_regs", "ksight_uretprobe_regs"]
-        } else {
-            &["ksight_uprobe_regs"]
-        };
+        let programs: &[&str] = adapter_probe_programs(plan.adapter);
         for program in programs {
             let retprobe = *program == "ksight_uretprobe_regs";
             match start_uprobe_session(
@@ -1277,7 +1746,10 @@ fn poll_all(runtime: &mut InspectRuntime) -> Vec<InspectOutput> {
     }
     batch.sort_by_key(|(_, _, hit)| hit.time_ns);
     for (plan, retprobe, hit) in batch {
-        if runtime.hits >= runtime.max_hits {
+        if adapter_hits(runtime, plan.adapter) >= adapter_hit_cap(runtime, plan.adapter) {
+            continue;
+        }
+        if !runtime.per_adapter_budget && runtime.hits >= runtime.max_hits {
             break;
         }
         if let Some(output) = decode_hit(
@@ -1286,9 +1758,15 @@ fn poll_all(runtime: &mut InspectRuntime) -> Vec<InspectOutput> {
             max_payload,
             retprobe,
             &mut runtime.ssl_read_pending,
+            &mut runtime.jni_region_pending,
+            &mut runtime.jni_pair,
             &mut runtime.binder_pending,
             &mut runtime.binder_dex_cache,
         ) {
+            *runtime
+                .hits_by_adapter
+                .entry(plan.adapter.as_str().to_owned())
+                .or_default() += 1;
             runtime.hits = runtime.hits.saturating_add(1);
             out.push(output);
         }
@@ -1308,6 +1786,8 @@ fn decode_hit(
     max_payload: usize,
     retprobe: bool,
     ssl_read_pending: &mut HashMap<u32, PendingSslRead>,
+    jni_region_pending: &mut HashMap<u32, PendingSslRead>,
+    jni_pair: &mut JniPairPending,
     binder: &mut BinderPending,
     binder_dex_cache: &mut crate::binder_dex::ProcessDexAidlCache,
 ) -> Option<InspectOutput> {
@@ -1534,7 +2014,521 @@ fn decode_hit(
             );
             None
         }
-        InspectAdapterKind::JniRegistration => None,
+        InspectAdapterKind::JniNewStringUtf => {
+            let buf = hit.regs.get(1).copied().unwrap_or(0);
+            decode_jni_cstring(plan, pid, hit.tid, buf, max_payload, "native_to_java")
+        }
+        InspectAdapterKind::JniGetStringUtfLength => {
+            if retprobe {
+                let obj = jni_pair.string_len_obj.remove(&hit.tid)?;
+                let len = i32::try_from(hit.regs.first().copied().unwrap_or(0) as i64).unwrap_or(0);
+                if obj != 0 && len > 0 && jni_pair.string_len.len() < 4096 {
+                    jni_pair
+                        .string_len
+                        .insert(hit.tid, PendingJniLen { obj, len });
+                }
+            } else if let Some(obj) = hit.regs.get(1).copied().filter(|obj| *obj != 0) {
+                jni_pair.string_len_obj.insert(hit.tid, obj);
+            }
+            None
+        }
+        InspectAdapterKind::JniGetStringUtfChars => {
+            if retprobe {
+                let obj = jni_pair.utfchars_obj.remove(&hit.tid).unwrap_or(0);
+                let cap = take_paired_len(&mut jni_pair.string_len, hit.tid, obj)
+                    .and_then(|len| usize::try_from(len).ok())
+                    .unwrap_or(max_payload)
+                    .min(max_payload);
+                let buf = hit.regs.first().copied().unwrap_or(0);
+                decode_jni_cstring(plan, pid, hit.tid, buf, cap, "java_to_native")
+            } else if let Some(obj) = hit.regs.get(1).copied().filter(|obj| *obj != 0) {
+                jni_pair.utfchars_obj.insert(hit.tid, obj);
+                None
+            } else {
+                None
+            }
+        }
+        InspectAdapterKind::JniGetStringUtfRegion => {
+            if retprobe {
+                let pending = jni_pair.utf_region.remove(&hit.tid)?;
+                decode_tls_plaintext(
+                    plan,
+                    pending.pid,
+                    hit.tid,
+                    pending.buf,
+                    pending.requested,
+                    max_payload,
+                    "java_to_native",
+                )
+            } else {
+                let requested =
+                    i32::try_from(hit.regs.get(3).copied().unwrap_or(0) as i64).unwrap_or(0);
+                let buf = hit.regs.get(4).copied().unwrap_or(0);
+                if requested > 0 && buf != 0 && jni_pair.utf_region.len() < 4096 {
+                    jni_pair.utf_region.insert(
+                        hit.tid,
+                        PendingSslRead {
+                            pid,
+                            buf,
+                            requested,
+                        },
+                    );
+                }
+                None
+            }
+        }
+        InspectAdapterKind::JniGetArrayLength => {
+            if retprobe {
+                let obj = jni_pair.array_len_obj.remove(&hit.tid)?;
+                let len = i32::try_from(hit.regs.first().copied().unwrap_or(0) as i64).unwrap_or(0);
+                if obj != 0 && len > 0 && jni_pair.array_len.len() < 4096 {
+                    jni_pair
+                        .array_len
+                        .insert(hit.tid, PendingJniLen { obj, len });
+                }
+            } else if let Some(obj) = hit.regs.get(1).copied().filter(|obj| *obj != 0) {
+                jni_pair.array_len_obj.insert(hit.tid, obj);
+            }
+            None
+        }
+        InspectAdapterKind::JniSetByteArrayRegion => {
+            let len = i32::try_from(hit.regs.get(3).copied().unwrap_or(0) as i64).unwrap_or(0);
+            let buf = hit.regs.get(4).copied().unwrap_or(0);
+            decode_tls_plaintext(plan, pid, hit.tid, buf, len, max_payload, "native_to_java")
+        }
+        InspectAdapterKind::JniGetByteArrayElements => {
+            if retprobe {
+                let obj = jni_pair.elements_obj.remove(&hit.tid)?;
+                let len = take_paired_len(&mut jni_pair.array_len, hit.tid, obj)?;
+                let buf = hit.regs.first().copied().unwrap_or(0);
+                decode_jni_bytes_with_len(
+                    plan,
+                    pid,
+                    hit.tid,
+                    buf,
+                    len,
+                    max_payload,
+                    "java_to_native",
+                )
+            } else if let Some(obj) = hit.regs.get(1).copied().filter(|obj| *obj != 0) {
+                jni_pair.elements_obj.insert(hit.tid, obj);
+                None
+            } else {
+                None
+            }
+        }
+        InspectAdapterKind::JniGetByteArrayRegion => {
+            if retprobe {
+                let pending = jni_region_pending.remove(&hit.tid)?;
+                decode_tls_plaintext(
+                    plan,
+                    pending.pid,
+                    hit.tid,
+                    pending.buf,
+                    pending.requested,
+                    max_payload,
+                    "java_to_native",
+                )
+            } else {
+                let requested =
+                    i32::try_from(hit.regs.get(3).copied().unwrap_or(0) as i64).unwrap_or(0);
+                let buf = hit.regs.get(4).copied().unwrap_or(0);
+                if requested > 0 && buf != 0 && jni_region_pending.len() < 4096 {
+                    jni_region_pending.insert(
+                        hit.tid,
+                        PendingSslRead {
+                            pid,
+                            buf,
+                            requested,
+                        },
+                    );
+                }
+                None
+            }
+        }
+        InspectAdapterKind::JniNewString => {
+            let units = i32::try_from(hit.regs.get(2).copied().unwrap_or(0) as i64).unwrap_or(0);
+            decode_jni_utf16_units(
+                plan,
+                pid,
+                hit.tid,
+                hit.regs.get(1).copied().unwrap_or(0),
+                units,
+                max_payload,
+                "native_to_java",
+            )
+        }
+        InspectAdapterKind::JniGetStringLength => {
+            if retprobe {
+                let obj = jni_pair.u16_len_obj.remove(&hit.tid)?;
+                let len = i32::try_from(hit.regs.first().copied().unwrap_or(0) as i64).unwrap_or(0);
+                if obj != 0 && len > 0 && jni_pair.u16_len.len() < 4096 {
+                    jni_pair.u16_len.insert(hit.tid, PendingJniLen { obj, len });
+                }
+            } else if let Some(obj) = hit.regs.get(1).copied().filter(|obj| *obj != 0) {
+                jni_pair.u16_len_obj.insert(hit.tid, obj);
+            }
+            None
+        }
+        InspectAdapterKind::JniGetStringChars | InspectAdapterKind::JniGetStringCritical => {
+            if retprobe {
+                let obj = jni_pair.u16chars_obj.remove(&hit.tid).unwrap_or(0);
+                let cap = take_paired_len(&mut jni_pair.u16_len, hit.tid, obj)
+                    .unwrap_or(i32::try_from(max_payload).unwrap_or(i32::MAX));
+                decode_jni_utf16_units(
+                    plan,
+                    pid,
+                    hit.tid,
+                    hit.regs.first().copied().unwrap_or(0),
+                    cap,
+                    max_payload,
+                    "java_to_native",
+                )
+            } else if let Some(obj) = hit.regs.get(1).copied().filter(|obj| *obj != 0) {
+                jni_pair.u16chars_obj.insert(hit.tid, obj);
+                None
+            } else {
+                None
+            }
+        }
+        InspectAdapterKind::JniGetStringRegion => {
+            if retprobe {
+                let pending = jni_pair.u16_region.remove(&hit.tid)?;
+                decode_jni_utf16_units(
+                    plan,
+                    pending.pid,
+                    hit.tid,
+                    pending.buf,
+                    pending.requested,
+                    max_payload,
+                    "java_to_native",
+                )
+            } else {
+                let requested =
+                    i32::try_from(hit.regs.get(3).copied().unwrap_or(0) as i64).unwrap_or(0);
+                let buf = hit.regs.get(4).copied().unwrap_or(0);
+                if requested > 0 && buf != 0 && jni_pair.u16_region.len() < 4096 {
+                    jni_pair.u16_region.insert(
+                        hit.tid,
+                        PendingSslRead {
+                            pid,
+                            buf,
+                            requested,
+                        },
+                    );
+                }
+                None
+            }
+        }
+        InspectAdapterKind::JniGetCharArrayElements => {
+            if retprobe {
+                let obj = jni_pair.char_elements_obj.remove(&hit.tid)?;
+                let len = take_paired_len(&mut jni_pair.array_len, hit.tid, obj)?;
+                decode_jni_utf16_units(
+                    plan,
+                    pid,
+                    hit.tid,
+                    hit.regs.first().copied().unwrap_or(0),
+                    len,
+                    max_payload,
+                    "java_to_native",
+                )
+            } else if let Some(obj) = hit.regs.get(1).copied().filter(|obj| *obj != 0) {
+                jni_pair.char_elements_obj.insert(hit.tid, obj);
+                None
+            } else {
+                None
+            }
+        }
+        InspectAdapterKind::JniGetCharArrayRegion | InspectAdapterKind::JniSetCharArrayRegion => {
+            if plan.adapter == InspectAdapterKind::JniSetCharArrayRegion {
+                let units =
+                    i32::try_from(hit.regs.get(3).copied().unwrap_or(0) as i64).unwrap_or(0);
+                return decode_jni_utf16_units(
+                    plan,
+                    pid,
+                    hit.tid,
+                    hit.regs.get(4).copied().unwrap_or(0),
+                    units,
+                    max_payload,
+                    "native_to_java",
+                );
+            }
+            if retprobe {
+                let pending = jni_pair.u16_region.remove(&hit.tid)?;
+                decode_jni_utf16_units(
+                    plan,
+                    pending.pid,
+                    hit.tid,
+                    pending.buf,
+                    pending.requested,
+                    max_payload,
+                    "java_to_native",
+                )
+            } else {
+                let requested =
+                    i32::try_from(hit.regs.get(3).copied().unwrap_or(0) as i64).unwrap_or(0);
+                let buf = hit.regs.get(4).copied().unwrap_or(0);
+                if requested > 0 && buf != 0 && jni_pair.u16_region.len() < 4096 {
+                    jni_pair.u16_region.insert(
+                        hit.tid,
+                        PendingSslRead {
+                            pid,
+                            buf,
+                            requested,
+                        },
+                    );
+                }
+                None
+            }
+        }
+        InspectAdapterKind::JniGetPrimitiveArrayCritical => {
+            if retprobe {
+                let obj = jni_pair.elements_obj.remove(&hit.tid)?;
+                let len = take_paired_len(&mut jni_pair.array_len, hit.tid, obj)?;
+                decode_jni_bytes_with_len(
+                    plan,
+                    pid,
+                    hit.tid,
+                    hit.regs.first().copied().unwrap_or(0),
+                    len,
+                    max_payload,
+                    "java_to_native",
+                )
+            } else if let Some(obj) = hit.regs.get(1).copied().filter(|obj| *obj != 0) {
+                jni_pair.elements_obj.insert(hit.tid, obj);
+                None
+            } else {
+                None
+            }
+        }
+        InspectAdapterKind::JniGetDirectBufferCapacity => {
+            if retprobe {
+                let obj = jni_pair.direct_cap_obj.remove(&hit.tid)?;
+                let len = i32::try_from(hit.regs.first().copied().unwrap_or(0) as i64).unwrap_or(0);
+                if obj != 0 && len > 0 && jni_pair.direct_cap.len() < 4096 {
+                    jni_pair
+                        .direct_cap
+                        .insert(hit.tid, PendingJniLen { obj, len });
+                }
+            } else if let Some(obj) = hit.regs.get(1).copied().filter(|obj| *obj != 0) {
+                jni_pair.direct_cap_obj.insert(hit.tid, obj);
+            }
+            None
+        }
+        InspectAdapterKind::JniGetDirectBufferAddress => {
+            if retprobe {
+                let obj = jni_pair.direct_obj.remove(&hit.tid).unwrap_or(0);
+                let len = take_paired_len(&mut jni_pair.direct_cap, hit.tid, obj)
+                    .unwrap_or(i32::try_from(max_payload).unwrap_or(i32::MAX));
+                decode_jni_bytes_with_len(
+                    plan,
+                    pid,
+                    hit.tid,
+                    hit.regs.first().copied().unwrap_or(0),
+                    len,
+                    max_payload,
+                    "java_to_native",
+                )
+            } else if let Some(obj) = hit.regs.get(1).copied().filter(|obj| *obj != 0) {
+                jni_pair.direct_obj.insert(hit.tid, obj);
+                None
+            } else {
+                None
+            }
+        }
+        InspectAdapterKind::JniRegistration => decode_jni_register_natives(plan, pid, hit),
+        InspectAdapterKind::JniPlaintext => None,
+    }
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn decode_jni_bytes_with_len(
+    plan: &InspectPlan,
+    pid: u32,
+    tid: u32,
+    buf: u64,
+    len: i32,
+    max_payload: usize,
+    direction: &str,
+) -> Option<InspectOutput> {
+    if len <= 0 {
+        return None;
+    }
+    let want = usize::try_from(u64::try_from(len).unwrap_or(0))
+        .unwrap_or(0)
+        .min(max_payload);
+    let raw = read_remote_bytes(pid, buf, want)?;
+    let clipped = clip_jni_elements(trim_trailing_zeros(&raw));
+    if !keep_jni_elements(clipped) {
+        return None;
+    }
+    let bytes = clipped.to_vec();
+    let truncated = u64::try_from(len).unwrap_or(0) > u64::try_from(raw.len()).unwrap_or(0);
+    let content_class = classify_buffer(&bytes);
+    let (preview, preview_encoding) = preview_bytes(&bytes);
+    Some(InspectOutput::Plaintext {
+        pid,
+        tid,
+        fragment: InspectPlaintext {
+            adapter: plan.adapter.as_str().to_owned(),
+            direction: direction.to_owned(),
+            library: plan.elf_path.clone().unwrap_or_default(),
+            build_id: plan.build_id.clone(),
+            offset: plan.offset,
+            requested_bytes: u64::try_from(len).unwrap_or(0),
+            captured_bytes: u32::try_from(bytes.len()).unwrap_or(u32::MAX),
+            truncated,
+            sha256: hex_sha256(&bytes),
+            preview,
+            preview_encoding,
+            content_class: content_class.to_owned(),
+        },
+    })
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn decode_jni_cstring(
+    plan: &InspectPlan,
+    pid: u32,
+    tid: u32,
+    buf: u64,
+    max_payload: usize,
+    direction: &str,
+) -> Option<InspectOutput> {
+    let bytes = read_remote_cstring_bytes(pid, buf, max_payload)?;
+    if !keep_jni_plaintext(&bytes) {
+        return None;
+    }
+    let requested = u64::try_from(bytes.len().saturating_add(1)).unwrap_or(0);
+    let truncated = bytes.len() >= max_payload;
+    let content_class = classify_buffer(&bytes);
+    let (preview, preview_encoding) = preview_bytes(&bytes);
+    Some(InspectOutput::Plaintext {
+        pid,
+        tid,
+        fragment: InspectPlaintext {
+            adapter: plan.adapter.as_str().to_owned(),
+            direction: direction.to_owned(),
+            library: plan.elf_path.clone().unwrap_or_default(),
+            build_id: plan.build_id.clone(),
+            offset: plan.offset,
+            requested_bytes: requested,
+            captured_bytes: u32::try_from(bytes.len()).unwrap_or(u32::MAX),
+            truncated,
+            sha256: hex_sha256(&bytes),
+            preview,
+            preview_encoding,
+            content_class: content_class.to_owned(),
+        },
+    })
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn decode_jni_utf16_units(
+    plan: &InspectPlan,
+    pid: u32,
+    tid: u32,
+    buf: u64,
+    units: i32,
+    max_payload: usize,
+    direction: &str,
+) -> Option<InspectOutput> {
+    if units <= 0 || buf == 0 {
+        return None;
+    }
+    let count = usize::try_from(units).ok()?.min(max_payload / 2).min(2048);
+    let text = read_remote_utf16(pid, buf, u64::try_from(count).ok()?)?;
+    if !keep_jni_plaintext(text.as_bytes()) {
+        return None;
+    }
+    let truncated = usize::try_from(units).unwrap_or(0) > count;
+    let content_class = classify_buffer(text.as_bytes());
+    let (preview, preview_encoding) = preview_bytes(text.as_bytes());
+    Some(InspectOutput::Plaintext {
+        pid,
+        tid,
+        fragment: InspectPlaintext {
+            adapter: plan.adapter.as_str().to_owned(),
+            direction: direction.to_owned(),
+            library: plan.elf_path.clone().unwrap_or_default(),
+            build_id: plan.build_id.clone(),
+            offset: plan.offset,
+            requested_bytes: u64::try_from(units.saturating_mul(2)).unwrap_or(0),
+            captured_bytes: u32::try_from(text.len()).unwrap_or(u32::MAX),
+            truncated,
+            sha256: hex_sha256(text.as_bytes()),
+            preview,
+            preview_encoding,
+            content_class: content_class.to_owned(),
+        },
+    })
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn read_remote_cstring_bytes(pid: u32, address: u64, max_bytes: usize) -> Option<Vec<u8>> {
+    let mut buffer = read_remote_bytes(pid, address, max_bytes)?;
+    if let Some(end) = buffer.iter().position(|byte| *byte == 0) {
+        buffer.truncate(end);
+    }
+    (!buffer.is_empty()).then_some(buffer)
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn decode_jni_register_natives(
+    plan: &InspectPlan,
+    pid: u32,
+    hit: &ksight_hwbp::RegisterContext,
+) -> Option<InspectOutput> {
+    let methods = hit.regs.get(2).copied().unwrap_or(0);
+    let count = i32::try_from(hit.regs.get(3).copied().unwrap_or(0) as i64).unwrap_or(0);
+    if methods == 0 || count <= 0 {
+        return None;
+    }
+    let n = usize::try_from(count).unwrap_or(0).min(32);
+    let width = usize::from(plan.pointer_width.max(4));
+    let stride = width.saturating_mul(3);
+    let raw = read_remote_bytes(pid, methods, stride.saturating_mul(n))?;
+    let mut names = Vec::new();
+    for chunk in raw.chunks(stride).take(n) {
+        if chunk.len() < width.saturating_mul(2) {
+            break;
+        }
+        let name_ptr = read_ptr_le(&chunk[..width]);
+        let sig_ptr = read_ptr_le(&chunk[width..width.saturating_mul(2)]);
+        let fn_ptr = if chunk.len() >= stride {
+            read_ptr_le(&chunk[width.saturating_mul(2)..stride])
+        } else {
+            0
+        };
+        let name = read_remote_cstring(pid, name_ptr, 128).unwrap_or_default();
+        let sig = read_remote_cstring(pid, sig_ptr, 128).unwrap_or_default();
+        if name.is_empty() {
+            continue;
+        }
+        names.push(format!("{name}{sig} @{fn_ptr:#x}"));
+    }
+    if names.is_empty() {
+        return None;
+    }
+    let mut observation = plan.observation.clone();
+    observation.attached = true;
+    observation.hit = true;
+    observation.path_hint = names.first().cloned();
+    observation.detail = format!(
+        "RegisterNatives hit pid={pid} n={count} methods={} (JNINativeMethod name/signature/fnPtr from jni.h; jclass fields not read)",
+        names.join("; ")
+    );
+    observation.binder_strings = Some(names);
+    Some(inspect_observation(pid, hit.tid, observation))
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn read_ptr_le(bytes: &[u8]) -> u64 {
+    match bytes.len() {
+        8 => u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8])),
+        4 => u64::from(u32::from_le_bytes(bytes.try_into().unwrap_or([0; 4]))),
+        _ => 0,
     }
 }
 
@@ -1740,8 +2734,22 @@ fn decode_tls_plaintext(
     let want = usize::try_from(requested_bytes)
         .unwrap_or(0)
         .min(max_payload);
-    let bytes = read_remote_bytes(pid, buf, want).unwrap_or_default();
+    let mut bytes = read_remote_bytes(pid, buf, want).unwrap_or_default();
     let truncated = requested_bytes > u64::try_from(bytes.len()).unwrap_or(0);
+    let captured_bytes = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+    let digest = hex_sha256(&bytes);
+    if let Some(plain) = ksight_core::inflate_inspect_buffer(&bytes) {
+        bytes = plain;
+    }
+    if plan.adapter.is_jni() {
+        let clipped = clip_jni_elements(trim_trailing_zeros(&bytes));
+        if !keep_jni_elements(clipped) {
+            return None;
+        }
+        bytes = clipped.to_vec();
+    } else if bytes.is_empty() {
+        return None;
+    }
     let content_class = classify_buffer(&bytes);
     let (preview, preview_encoding) = if content_class == "tls_record" {
         (tls_record_preview(&bytes), "tls_record".to_owned())
@@ -1758,14 +2766,119 @@ fn decode_tls_plaintext(
             build_id: plan.build_id.clone(),
             offset: plan.offset,
             requested_bytes,
-            captured_bytes: u32::try_from(bytes.len()).unwrap_or(u32::MAX),
+            captured_bytes,
             truncated,
-            sha256: hex_sha256(&bytes),
+            sha256: digest,
             preview,
             preview_encoding,
             content_class: content_class.to_owned(),
         },
     })
+}
+
+#[allow(dead_code)]
+fn jni_bytes_worth_keeping(bytes: &[u8]) -> bool {
+    !bytes.is_empty() && bytes.iter().any(|byte| *byte != 0)
+}
+
+/// `GetByteArrayElements` does not return a length. Stop at 8 NULs so we do not
+/// copy the following heap (pointers / allocator padding) as if it were the array.
+#[cfg_attr(
+    not(any(test, target_os = "android", target_os = "linux")),
+    allow(dead_code)
+)]
+fn clip_jni_elements(bytes: &[u8]) -> &[u8] {
+    const RUN: usize = 8;
+    if bytes.len() < RUN {
+        return bytes;
+    }
+    match bytes
+        .windows(RUN)
+        .position(|window| window.iter().all(|byte| *byte == 0))
+    {
+        Some(index) => &bytes[..index],
+        None => bytes,
+    }
+}
+
+#[cfg_attr(
+    not(any(test, target_os = "android", target_os = "linux")),
+    allow(dead_code)
+)]
+fn trim_trailing_zeros(bytes: &[u8]) -> &[u8] {
+    match bytes.iter().rposition(|byte| *byte != 0) {
+        Some(end) => &bytes[..=end],
+        None => &[],
+    }
+}
+
+#[cfg_attr(
+    not(any(test, target_os = "android", target_os = "linux")),
+    allow(dead_code)
+)]
+fn keep_jni_elements(bytes: &[u8]) -> bool {
+    keep_jni_plaintext(bytes)
+}
+
+#[cfg_attr(
+    not(any(test, target_os = "android", target_os = "linux")),
+    allow(dead_code)
+)]
+fn bytes_contains(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
+
+/// JNI UTF-8 / `byte[]` is kept only when it names an HTTP/JSON interface.
+/// Webpack, hex, `ComponentInfo`, and APK paths are not interfaces.
+#[cfg_attr(
+    not(any(test, target_os = "android", target_os = "linux")),
+    allow(dead_code)
+)]
+fn keep_jni_plaintext(bytes: &[u8]) -> bool {
+    if bytes.len() < 8 {
+        return false;
+    }
+    let mut zeros = 0_usize;
+    for byte in bytes {
+        zeros += usize::from(*byte == 0);
+    }
+    if zeros.saturating_mul(2) >= bytes.len() {
+        return false;
+    }
+    if bytes.starts_with(b"HTTP/")
+        || bytes.starts_with(b"GET ")
+        || bytes.starts_with(b"POST ")
+        || bytes.starts_with(b"PK")
+        || ksight_core::looks_like_gzip(bytes)
+    {
+        return true;
+    }
+    let printable = bytes
+        .iter()
+        .filter(|byte| byte.is_ascii_graphic() || byte.is_ascii_whitespace())
+        .count();
+    if printable.saturating_mul(4) < bytes.len().saturating_mul(3) {
+        return false;
+    }
+    if bytes_contains(bytes, b"https://") || bytes_contains(bytes, b"http://") {
+        return true;
+    }
+    if bytes_contains(bytes, b"ComponentInfo{")
+        || bytes_contains(bytes, b"];a(")
+        || bytes_contains(bytes, b"function(")
+    {
+        return false;
+    }
+    bytes_contains(bytes, b"\"url\"")
+        || bytes_contains(bytes, b"\"host\"")
+        || bytes_contains(bytes, b"\"path\"")
+        || bytes_contains(bytes, b"/api/")
+        || bytes_contains(bytes, b"/v1/")
+        || bytes_contains(bytes, b"/v2/")
+        || bytes_contains(bytes, b"/v3/")
 }
 
 #[cfg_attr(
@@ -2701,7 +3814,50 @@ mod tests {
             PathBuf::from("/nonexistent"),
         );
         assert!(plans.iter().all(|plan| !plan.should_attach()));
-        assert!(plans[0].observation.detail.contains("refusing to guess"));
+        assert!(
+            plans[0].observation.detail.contains("GetFunctionTable")
+                || plans[0].observation.detail.contains("JNINativeInterface")
+        );
+    }
+
+    #[test]
+    fn jni_plaintext_parses_and_expands_when_libart_present() {
+        assert_eq!(
+            "jni_plaintext".parse::<InspectAdapterKind>().unwrap(),
+            InspectAdapterKind::JniPlaintext
+        );
+        let policy = InspectPolicy {
+            enabled: true,
+            package: Some("com.example.app".to_owned()),
+            elf_path: Some("/tmp/libart.so".to_owned()),
+            ..InspectPolicy::default()
+        };
+        if !Path::new("/tmp/libart.so").is_file() {
+            return;
+        }
+        let runtime = InspectRuntime::prepare(
+            &policy,
+            InspectAdapterKind::JniPlaintext,
+            Path::new("/nonexistent"),
+        );
+        let adapters: BTreeSet<_> = runtime
+            .initial_observations()
+            .into_iter()
+            .map(|observation| observation.adapter)
+            .collect();
+        assert!(adapters.contains("jni_get_string_utf_chars"));
+        assert!(adapters.contains("jni_new_string_utf"));
+        assert!(adapters.contains("jni_registration"));
+        assert!(runtime
+            .initial_observations()
+            .iter()
+            .any(|observation| observation.offset.is_some()
+                && observation.detail.contains("GetFunctionTable")));
+        assert!(runtime.initial_observations().iter().all(|observation| {
+            !observation
+                .detail
+                .contains("Table was not found in this ELF")
+        }));
     }
 
     #[test]
@@ -2756,6 +3912,130 @@ mod tests {
                 InspectAdapterKind::BinderUserspace,
             ],
             InspectAdapterKind::BinderParcelString
+        ));
+    }
+
+    #[test]
+    fn per_adapter_budget_when_max_hits_unspecified() {
+        let policy = InspectPolicy {
+            enabled: true,
+            package: Some("com.example.app".to_owned()),
+            max_hits: 0,
+            ..InspectPolicy::default()
+        };
+        let runtime = InspectRuntime::prepare_all(
+            &policy,
+            &[
+                InspectAdapterKind::TlsSslWrite,
+                InspectAdapterKind::JniPlaintext,
+            ],
+            Path::new("/nonexistent"),
+        );
+        assert!(runtime.per_adapter_budget);
+        assert_eq!(
+            adapter_hit_cap(&runtime, InspectAdapterKind::TlsSslWrite),
+            InspectAdapterKind::TlsSslWrite.default_max_hits()
+        );
+        assert_eq!(
+            adapter_hit_cap(&runtime, InspectAdapterKind::JniGetStringUtfChars),
+            InspectAdapterKind::JniGetStringUtfChars.default_max_hits()
+        );
+        assert!(!jni_bytes_worth_keeping(&[]));
+        assert!(!jni_bytes_worth_keeping(&[0, 0, 0]));
+        assert!(jni_bytes_worth_keeping(b"TLSv1.2"));
+        let mut smeared = b"\x07\x06\x01\xef".to_vec();
+        smeared.extend_from_slice(&[0_u8; 200]);
+        smeared.extend_from_slice(&0x6f_1b_9a_d0_u32.to_le_bytes());
+        assert!(!keep_jni_elements(clip_jni_elements(&smeared)));
+        assert!(keep_jni_elements(
+            b"HTTP/1.1 200 OK\r\nHost: api.example\r\n"
+        ));
+        assert!(keep_jni_elements(
+            b"{\"host\":\"api.boc.cn\",\"path\":\"/v1\"}"
+        ));
+        assert!(!keep_jni_elements(&[
+            0x7b, 0x8d, 0x01, 0xc4, 0x07, 0x01, 0xd6, 0xa1, 0x02, 0x37, 0x7e, 0x8d
+        ]));
+        let mut boc_padded = vec![
+            0x07, 0x06, 0x01, 0xd7, 0x9f, 0x73, 0x3b, 0xba, 0x57, 0x00, 0x00, 0x00, 0xe4, 0x00,
+            0x00, 0x00,
+        ];
+        boc_padded.extend_from_slice(&[0_u8; 480]);
+        assert!(!keep_jni_elements(clip_jni_elements(trim_trailing_zeros(
+            &boc_padded
+        ))));
+        let hexin = ksight_core::decode_hex_bytes(
+            "f75412021214140589e10200770793ae01000c005500bb44380003000e007100f7d800000a007110",
+        )
+        .expect("hex");
+        assert!(!keep_jni_elements(&hexin));
+        assert!(keep_jni_plaintext(
+            br#"{"url":"https://s.thsi.cn/cd/acrossBar_v1.8.zip"}"#
+        ));
+        assert!(keep_jni_plaintext(
+            b"https://eq.10jqka.com.cn/eq/open/api/homepage_v2/v3/homepage_data"
+        ));
+        assert!(!keep_jni_plaintext(
+            b"dth\",\"height\",\"render\"];a(3110),a(8335);var o=a(8817)"
+        ));
+        assert!(!keep_jni_plaintext(
+            b"ComponentInfo{com.hexin.plat.android/com.myhexin.android.b2c.advrtising.oaid.InitService}"
+        ));
+        assert!(!keep_jni_plaintext(
+            b"/data/app/~~42Ti3pHV53fUYgIpxOEbtA==/com.hexin.plat.android/base.apk"
+        ));
+        let mut lens = HashMap::new();
+        lens.insert(
+            7,
+            PendingJniLen {
+                obj: 0x1000,
+                len: 32,
+            },
+        );
+        assert_eq!(take_paired_len(&mut lens, 7, 0x1000), Some(32));
+        assert_eq!(take_paired_len(&mut lens, 7, 0x1000), None);
+        lens.insert(
+            8,
+            PendingJniLen {
+                obj: 0x2000,
+                len: 4,
+            },
+        );
+        assert_eq!(take_paired_len(&mut lens, 8, 0x21), None);
+    }
+
+    #[test]
+    fn inspect_tls_binder_and_jni_plan_together() {
+        let policy = InspectPolicy {
+            enabled: true,
+            package: Some("com.example.app".to_owned()),
+            ..InspectPolicy::default()
+        };
+        let runtime = InspectRuntime::prepare_all(
+            &policy,
+            &[
+                InspectAdapterKind::TlsSslWrite,
+                InspectAdapterKind::BinderUserspace,
+                InspectAdapterKind::JniPlaintext,
+            ],
+            Path::new("/nonexistent"),
+        );
+        let adapters: BTreeSet<_> = runtime
+            .initial_observations()
+            .into_iter()
+            .map(|observation| observation.adapter)
+            .collect();
+        assert!(adapters.contains("tls_ssl_write"));
+        assert!(adapters.contains("tls_ssl_read"));
+        assert!(adapters.contains("binder_userspace"));
+        assert!(
+            adapters.contains("jni_plaintext")
+                || adapters.contains("jni_get_string_utf_chars")
+                || adapters.contains("jni_registration")
+        );
+        assert!(adapter_is_live(
+            &[InspectAdapterKind::JniPlaintext],
+            InspectAdapterKind::JniGetStringUtfChars
         ));
     }
 

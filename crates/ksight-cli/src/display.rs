@@ -200,16 +200,17 @@ pub(crate) fn print_session_report(report: &SessionReport, top: usize) {
         );
     }
 
-    println!("\nTLS plaintext (Inspect, top {top})");
+    println!("\nInspect plaintext (TLS/JNI, top {top})");
     if report.plaintext.is_empty() {
         println!("  none captured");
     }
     for row in report.plaintext.iter().take(top) {
         println!(
-            "  {}({}) {} class={} {} writes requested/captured={}/{} preview={}",
+            "  {}({}) {} {} class={} ×{} requested/captured={}/{} preview={}",
             row.source,
             row.process_id,
             row.adapter,
+            row.direction,
             if row.content_class.is_empty() {
                 "unknown"
             } else {
@@ -222,7 +223,7 @@ pub(crate) fn print_session_report(report: &SessionReport, top: usize) {
         );
     }
 
-    println!("\nHTTP calls from TLS plaintext (Inspect, top {top})");
+    println!("\nHTTP calls from Inspect/heap plaintext (top {top})");
     if report.http_calls.is_empty() {
         println!("  none parsed (need HTTP/1 or JSON preview; HTTP/2 frames are not decoded)");
     }
@@ -254,6 +255,21 @@ pub(crate) fn print_session_report(report: &SessionReport, top: usize) {
             row.status
                 .map_or_else(|| "-".to_owned(), |value| value.to_string()),
         );
+    }
+
+    if !report.http_code_refs.is_empty() {
+        println!("\nHTTP ↔ DEX (correlated, top {top})");
+        for row in report.http_code_refs.iter().take(top) {
+            let host = row.host.as_deref().unwrap_or("-");
+            let hit = row.matches.first().cloned().unwrap_or_default();
+            println!(
+                "  {} {host}{} ← {} ({})",
+                row.http_method,
+                row.path,
+                hit,
+                row.relative_path.as_deref().unwrap_or("-")
+            );
+        }
     }
 
     if !report.loopback_scans.is_empty() {

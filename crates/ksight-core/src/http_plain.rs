@@ -76,6 +76,8 @@ pub struct ParsedHttpPlain {
     pub method: String,
     /// Host header, lowercased.
     pub host: Option<String>,
+    /// `http` / `https` when this row was parsed from a URL, not a Host header.
+    pub scheme: Option<&'static str>,
     /// Path without query.
     pub path: String,
     /// Response status, when this is a response line.
@@ -99,7 +101,71 @@ pub struct ParsedHttpPlain {
 /// Parse an Inspect plaintext preview. `tls_record` / empty / binary hex is ignored.
 #[must_use]
 pub fn parse_http_plain(preview: &str, content_class: &str) -> Option<ParsedHttpPlain> {
-    parse_http_plain_bytes(preview.as_bytes(), content_class)
+    parse_http_plain_all(preview, content_class)
+        .into_iter()
+        .next()
+}
+
+/// HTTP/1, JSON keys, and `http(s)://` URLs from one Inspect preview.
+///
+/// Gzip/zlib hex previews are inflated first. Truncated JSON that does not start
+/// with `{` still yields URL hosts. HTTP/2 HPACK is not decoded.
+#[must_use]
+pub fn parse_http_plain_all(preview: &str, content_class: &str) -> Vec<ParsedHttpPlain> {
+    if content_class == "tls_record" {
+        return Vec::new();
+    }
+    let (bytes, class) = normalize_preview_bytes(preview, content_class);
+    let mut out = Vec::new();
+    if let Some(parsed) = parse_http_plain_bytes(&bytes, &class) {
+        out.push(parsed);
+    }
+    for parsed in embedded_http_urls(&bytes) {
+        if !out.iter().any(|seen| {
+            seen.host == parsed.host && seen.path == parsed.path && seen.kind == parsed.kind
+        }) {
+            out.push(parsed);
+        }
+        if out.len() >= 16 {
+            break;
+        }
+    }
+    out
+}
+
+fn normalize_preview_bytes(preview: &str, content_class: &str) -> (Vec<u8>, String) {
+    let raw = if content_class == "binary" || preview_looks_hex(preview) {
+        crate::decode_hex_bytes(preview).unwrap_or_else(|| preview.as_bytes().to_vec())
+    } else {
+        preview.as_bytes().to_vec()
+    };
+    if let Some(plain) = crate::inflate_inspect_buffer(&raw) {
+        return (plain, "text".to_owned());
+    }
+    let class = if content_class.is_empty() && looks_mostly_text(&raw) {
+        "text".to_owned()
+    } else {
+        content_class.to_owned()
+    };
+    (raw, class)
+}
+
+fn preview_looks_hex(preview: &str) -> bool {
+    let trimmed = preview.trim();
+    trimmed.len() >= 8
+        && trimmed.len() % 2 == 0
+        && trimmed.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn looks_mostly_text(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+    let printable = bytes
+        .iter()
+        .filter(|byte| byte.is_ascii_graphic() || byte.is_ascii_whitespace())
+        .count();
+    printable.saturating_mul(4) >= bytes.len().saturating_mul(3)
 }
 
 /// Parse Inspect previews or dump heap windows. Leading object headers are skipped.
@@ -109,7 +175,7 @@ pub fn parse_http_plain_bytes(bytes: &[u8], content_class: &str) -> Option<Parse
     if content_class == "tls_record" {
         return None;
     }
-    let start = skip_to_http(bytes)?;
+    let start = skip_to_http(bytes).unwrap_or(0);
     let lossy = String::from_utf8_lossy(&bytes[start..]);
     let text = lossy
         .replace('\0', "\n")
@@ -124,6 +190,7 @@ pub fn parse_http_plain_bytes(bytes: &[u8], content_class: &str) -> Option<Parse
             kind: "http2_preface",
             method: "PRI".to_owned(),
             host: None,
+            scheme: None,
             path: String::new(),
             status: None,
             query_keys: Vec::new(),
@@ -224,6 +291,7 @@ fn parse_http1(text: &str) -> Option<ParsedHttpPlain> {
         kind,
         method,
         host,
+        scheme: None,
         path,
         status,
         query_keys,
@@ -347,10 +415,19 @@ fn json_keys(body: &str) -> (Vec<String>, Vec<String>) {
 
 fn parse_json_only(text: &str) -> Option<ParsedHttpPlain> {
     let trimmed = text.trim();
-    if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
+    let json = if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        trimmed
+    } else {
+        let bytes = trimmed.as_bytes();
+        let start = bytes
+            .iter()
+            .position(|byte| *byte == b'{' || *byte == b'[')?;
+        std::str::from_utf8(&bytes[start..]).ok()?.trim()
+    };
+    if !(json.starts_with('{') || json.starts_with('[')) {
         return None;
     }
-    let (body_keys, redacted_body_keys) = json_keys(trimmed);
+    let (body_keys, redacted_body_keys) = json_keys(json);
     if body_keys.is_empty() {
         return None;
     }
@@ -358,6 +435,7 @@ fn parse_json_only(text: &str) -> Option<ParsedHttpPlain> {
         kind: "json",
         method: "JSON".to_owned(),
         host: None,
+        scheme: None,
         path: String::new(),
         status: None,
         query_keys: Vec::new(),
@@ -368,6 +446,77 @@ fn parse_json_only(text: &str) -> Option<ParsedHttpPlain> {
         content_type: Some("application/json".to_owned()),
         third_party: false,
     })
+}
+
+fn embedded_http_urls(bytes: &[u8]) -> Vec<ParsedHttpPlain> {
+    let mut out: Vec<ParsedHttpPlain> = Vec::new();
+    let mut index = 0_usize;
+    while index + 8 < bytes.len() && out.len() < 16 {
+        let rest = &bytes[index..];
+        let scheme = if rest.starts_with(b"https://") {
+            8_usize
+        } else if rest.starts_with(b"http://") {
+            7_usize
+        } else {
+            index += 1;
+            continue;
+        };
+        if index > 0 {
+            let previous = bytes[index - 1];
+            if previous.is_ascii_alphanumeric() {
+                index += 1;
+                continue;
+            }
+        }
+        let host_start = index + scheme;
+        let host_end = bytes[host_start..]
+            .iter()
+            .position(|byte| !matches!(byte, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'-' | b'_'))
+            .map_or(bytes.len(), |rel| host_start + rel);
+        if host_end <= host_start {
+            index += 1;
+            continue;
+        }
+        let host = String::from_utf8_lossy(&bytes[host_start..host_end]).to_ascii_lowercase();
+        let path_end = bytes[host_end..]
+            .iter()
+            .position(|byte| {
+                *byte <= 0x20
+                    || matches!(
+                        byte,
+                        b'"' | b'\'' | b'<' | b'>' | b'\\' | b')' | b']' | b'}' | b','
+                    )
+            })
+            .map_or(bytes.len(), |rel| host_end + rel);
+        let path_and_query = if host_end < path_end && bytes[host_end] == b'/' {
+            String::from_utf8_lossy(&bytes[host_end..path_end]).into_owned()
+        } else {
+            String::new()
+        };
+        let (path, query_keys) = split_path_query(path_and_query.split('#').next().unwrap_or(""));
+        if !out
+            .iter()
+            .any(|seen| seen.host.as_deref() == Some(host.as_str()) && seen.path == path)
+        {
+            out.push(ParsedHttpPlain {
+                kind: "url",
+                method: "URL".to_owned(),
+                host: Some(host.clone()),
+                scheme: Some(if scheme == 8 { "https" } else { "http" }),
+                path,
+                status: None,
+                query_keys,
+                header_names: Vec::new(),
+                redacted_headers: Vec::new(),
+                body_keys: Vec::new(),
+                redacted_body_keys: Vec::new(),
+                content_type: None,
+                third_party: is_third_party_host(&host),
+            });
+        }
+        index = path_end.max(index + 1);
+    }
+    out
 }
 
 fn sanitize_host(value: &str) -> Option<String> {
@@ -395,6 +544,41 @@ fn sensitive_key(name: &str) -> bool {
     SENSITIVE_KEY
         .iter()
         .any(|needle| lower == *needle || lower.ends_with("_token"))
+}
+
+/// Reconstruct a URL with scheme. Image paths are dropped; `.txt` / `.json` / `.html` stay.
+#[must_use]
+pub fn format_inspect_url(scheme: Option<&str>, host: &str, path: &str) -> Option<String> {
+    if host.is_empty() {
+        return None;
+    }
+    let scheme = scheme.unwrap_or("https");
+    let url = if path.is_empty() {
+        format!("{scheme}://{host}")
+    } else if path.starts_with('/') {
+        format!("{scheme}://{host}{path}")
+    } else {
+        format!("{scheme}://{host}/{path}")
+    };
+    is_kept_inspect_url(&url).then_some(url)
+}
+
+/// PNG/JPEG and PKI URLs are not app interface catalog rows. `.txt` is kept.
+#[must_use]
+pub fn is_kept_inspect_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    let path = lower.split(['?', '#']).next().unwrap_or(lower.as_str());
+    let ext = path.rsplit_once('.').map_or("", |(_, ext)| ext);
+    if matches!(
+        ext,
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "ico" | "bmp" | "svg" | "crl"
+    ) {
+        return false;
+    }
+    if path.contains("digicert") || path.contains("/ocsp") {
+        return false;
+    }
+    true
 }
 
 /// Host is ads/risk/telemetry rather than first-party API.
@@ -462,11 +646,70 @@ mod tests {
     }
 
     #[test]
+    fn drops_png_keeps_txt_with_scheme() {
+        let preview = r#"{"img":"https://s.thsi.cn/a.png","cfg":"https://hxapp.10jqka.com.cn/config/sc_public_android.v2.txt"}"#;
+        let parsed = parse_http_plain_all(preview, "text");
+        let urls: Vec<String> = parsed
+            .iter()
+            .filter(|row| row.kind == "url")
+            .filter_map(|row| format_inspect_url(row.scheme, row.host.as_deref()?, &row.path))
+            .collect();
+        assert!(
+            urls.iter()
+                .any(|url| url == "https://hxapp.10jqka.com.cn/config/sc_public_android.v2.txt"),
+            "{urls:?}"
+        );
+        assert!(!urls.iter().any(|url| url.contains(".png")), "{urls:?}");
+    }
+
+    #[test]
     fn json_top_level_keys() {
         let parsed = parse_http_plain("{\"feed_id\":\"1\",\"token\":\"x\"}", "text").expect("json");
         assert_eq!(parsed.kind, "json");
         assert!(parsed.body_keys.contains(&"feed_id".to_owned()));
         assert!(parsed.redacted_body_keys.contains(&"token".to_owned()));
+    }
+
+    #[test]
+    fn extracts_urls_from_truncated_json() {
+        let preview = concat!(
+            r#"9fa5b256894d4a31","esType":-1,"url":"https://s.thsi.cn/cd/acrossBar_v1.8.zip","status":1}"#,
+            r#",{"url":"https://sp.thsi.cn/staticS3/pkg/e5db.zip"}"#
+        );
+        let parsed = parse_http_plain_all(preview, "mixed");
+        assert!(
+            parsed.iter().any(|row| {
+                row.host.as_deref() == Some("s.thsi.cn") && row.path == "/cd/acrossBar_v1.8.zip"
+            }),
+            "{parsed:?}"
+        );
+        assert!(parsed
+            .iter()
+            .any(|row| row.host.as_deref() == Some("sp.thsi.cn")));
+    }
+
+    #[test]
+    fn inflates_gzip_hex_preview_to_json() {
+        use std::io::Write as _;
+        let plain = br#"{"url":"https://ebsnew.boc.cn/api/login"}"#;
+        let mut gz = Vec::new();
+        {
+            let mut encoder =
+                flate2::write::GzEncoder::new(&mut gz, flate2::Compression::default());
+            encoder.write_all(plain).expect("gzip");
+            encoder.finish().expect("gzip finish");
+        }
+        let mut hex = String::new();
+        for byte in &gz {
+            let _ = std::fmt::Write::write_fmt(&mut hex, format_args!("{byte:02x}"));
+        }
+        let parsed = parse_http_plain_all(&hex, "binary");
+        assert!(
+            parsed
+                .iter()
+                .any(|row| row.host.as_deref() == Some("ebsnew.boc.cn")),
+            "{parsed:?}"
+        );
     }
 
     #[test]

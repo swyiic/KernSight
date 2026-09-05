@@ -25,7 +25,7 @@ pub struct InspectPolicy {
     pub max_duration_secs: u32,
     /// Attach with no app filter. Noisy; prefer `--package` during a short test.
     pub whole_device: bool,
-    /// Maximum plaintext bytes copied from a single TLS write.
+    /// Maximum plaintext bytes copied from a single TLS read/write (hard cap 4096).
     pub max_payload_bytes: u32,
     /// Operator-visible statement that the mechanism is detectable.
     pub detectability_notice: String,

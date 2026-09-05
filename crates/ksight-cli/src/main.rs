@@ -273,19 +273,22 @@ struct CaptureOptions {
     /// Enable the linker SO-load Inspect adapter. Default off; pair with `--package` or `--pid`.
     #[arg(long)]
     inspect_linker: bool,
-    /// Enable bounded `SSL_write` plaintext for one app. May be combined with `--inspect-adapter binder_userspace`.
+    /// Enable bounded `SSL_write` plaintext for one app. May be combined with `--inspect-adapter binder_userspace` and `--inspect-jni`.
     #[arg(long)]
     inspect_tls: bool,
+    /// Enable `JNIEnv` UTF-8/`byte[]` Inspect. May combine with `--inspect-tls` and `binder_userspace`.
+    #[arg(long)]
+    inspect_jni: bool,
     /// Inspect every app mapping the adapter ELF. Noisy; prefer `--package`.
     #[arg(long)]
     inspect_all_apps: bool,
-    /// Maximum `SSL_write` bytes copied per hit (hard cap 4096).
-    #[arg(long, default_value_t = 256)]
+    /// Maximum `SSL_write`/`SSL_read` bytes copied per hit (hard cap 4096).
+    #[arg(long, default_value_t = 4096)]
     inspect_max_bytes: u32,
     /// Maximum Inspect hits; 0 uses the adapter default.
     #[arg(long, default_value_t = 0)]
     inspect_max_hits: u32,
-    /// Named Inspect adapter. Combine with `--inspect-tls` for Binder plus TLS in one session.
+    /// Named Inspect adapter (`binder_userspace`, `jni_plaintext`, ...). Combine with `--inspect-tls`.
     #[arg(long)]
     inspect_adapter: Option<String>,
     /// Optional GNU build-id that must match before Inspect attach.
@@ -494,19 +497,26 @@ fn run_capture(serial: Option<&str>, options: &CaptureOptions) -> Result<()> {
     };
     if options.inspect_linker
         && (options.inspect_tls
+            || options.inspect_jni
             || options
                 .inspect_adapter
                 .as_deref()
                 .is_some_and(|name| name != "linker_so_load"))
     {
-        bail!("--inspect-linker cannot be combined with --inspect-tls or a non-linker --inspect-adapter");
+        bail!("--inspect-linker cannot be combined with --inspect-tls, --inspect-jni, or a non-linker --inspect-adapter");
     }
     if options.inspect_all_apps
-        && !(options.inspect_linker || options.inspect_tls || options.inspect_adapter.is_some())
+        && !(options.inspect_linker
+            || options.inspect_tls
+            || options.inspect_jni
+            || options.inspect_adapter.is_some())
     {
-        bail!("--inspect-all-apps requires --inspect-tls, --inspect-linker, or --inspect-adapter");
+        bail!("--inspect-all-apps requires --inspect-tls, --inspect-jni, --inspect-linker, or --inspect-adapter");
     }
-    if (options.inspect_linker || options.inspect_tls || options.inspect_adapter.is_some())
+    if (options.inspect_linker
+        || options.inspect_tls
+        || options.inspect_jni
+        || options.inspect_adapter.is_some())
         && !options.inspect_all_apps
         && options.pid.is_none()
         && options.uid.is_none()
@@ -521,6 +531,11 @@ fn run_capture(serial: Option<&str>, options: &CaptureOptions) -> Result<()> {
     };
     let inspect_tls_flag = if options.inspect_tls {
         " --inspect-tls"
+    } else {
+        ""
+    };
+    let inspect_jni_flag = if options.inspect_jni {
+        " --inspect-jni"
     } else {
         ""
     };
@@ -548,7 +563,7 @@ fn run_capture(serial: Option<&str>, options: &CaptureOptions) -> Result<()> {
         .map_or_else(String::new, |value| format!(" --inspect-offset {value}"));
     let inspect_max_flag = format!(" --inspect-max-secs {}", options.inspect_max_secs);
     let command = format!(
-        "{DEVICE_AGENT} capture --object {DEVICE_PROCESS_OBJECT} --file-object {DEVICE_FILE_OBJECT} --network-object {DEVICE_NETWORK_OBJECT} --memory-object {DEVICE_MEMORY_OBJECT} --binder-object {DEVICE_BINDER_OBJECT} --sched-object {DEVICE_SCHED_OBJECT} --uprobe-object {DEVICE_UPROBE_OBJECT} --count {} --duration-seconds {}{json_flag}{quiet_flag}{threads_flag}{files_flag}{files_fd_flag}{network_flag}{network_io_flag}{memory_flag}{memory_all_flag}{binder_flag}{sched_flag}{all_flag}{pid_flag}{uid_flag}{package_flag}{spool_flag}{sampling_flag}{inspect_linker_flag}{inspect_tls_flag}{inspect_all_apps_flag}{inspect_adapter_flag}{inspect_build_id_flag}{inspect_elf_flag}{inspect_offset_flag}{inspect_max_flag}{inspect_max_bytes_flag}{inspect_max_hits_flag}",
+        "{DEVICE_AGENT} capture --object {DEVICE_PROCESS_OBJECT} --file-object {DEVICE_FILE_OBJECT} --network-object {DEVICE_NETWORK_OBJECT} --memory-object {DEVICE_MEMORY_OBJECT} --binder-object {DEVICE_BINDER_OBJECT} --sched-object {DEVICE_SCHED_OBJECT} --uprobe-object {DEVICE_UPROBE_OBJECT} --count {} --duration-seconds {}{json_flag}{quiet_flag}{threads_flag}{files_flag}{files_fd_flag}{network_flag}{network_io_flag}{memory_flag}{memory_all_flag}{binder_flag}{sched_flag}{all_flag}{pid_flag}{uid_flag}{package_flag}{spool_flag}{sampling_flag}{inspect_linker_flag}{inspect_tls_flag}{inspect_jni_flag}{inspect_all_apps_flag}{inspect_adapter_flag}{inspect_build_id_flag}{inspect_elf_flag}{inspect_offset_flag}{inspect_max_flag}{inspect_max_bytes_flag}{inspect_max_hits_flag}",
         options.count, options.duration_seconds
     );
     eprintln!(

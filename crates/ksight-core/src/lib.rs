@@ -7,6 +7,7 @@ mod graph;
 mod handshake;
 mod http_plain;
 mod identity;
+mod inflate;
 mod inspect;
 mod native_rules;
 mod policy;
@@ -33,9 +34,14 @@ pub use graph::{
 };
 pub use handshake::{parse_handshake, HandshakeMeta};
 pub use http_plain::{
-    is_third_party_host, parse_http_plain, parse_http_plain_bytes, ParsedHttpPlain,
+    format_inspect_url, is_kept_inspect_url, is_third_party_host, parse_http_plain,
+    parse_http_plain_all, parse_http_plain_bytes, ParsedHttpPlain,
 };
 pub use identity::IdentityRegistry;
+pub use inflate::{
+    decode_hex_bytes, inflate_gzip_bounded, inflate_inspect_buffer, looks_like_gzip,
+    looks_like_zlib,
+};
 pub use inspect::{InspectAuditEvent, InspectPolicy};
 pub use native_rules::{
     classify_native_frameworks, classify_tls_library_path, native_framework_rule_version,
@@ -47,12 +53,12 @@ pub use provenance::{
     DexArtifactSet, DexClassConflict, DumpArtifact, PackageDexIndex, ProvenanceClass,
 };
 pub use report::{
-    rank_observed_mappings, ArtifactActivity, BinderFdTransfer, BinderLifecycleSummary,
-    BinderRelation, BinderReplyPair, DnsNameActivity, FdLifecycleSummary, HandshakeNameActivity,
-    HttpCallActivity, InspectHitActivity, LoopbackScanActivity, MappingSource,
-    MemoryLifecycleSummary, MergedDumpRef, NetworkPeerActivity, ObservedMapping, PlaintextActivity,
-    ProcessActivity, ProcessInstanceRef, QualitySummary, SchedWakeupActivity, SessionReport,
-    SessionReportBuilder, SocketLifecycleSummary,
+    correlate_http_calls_to_dex, rank_observed_mappings, ArtifactActivity, BinderFdTransfer,
+    BinderLifecycleSummary, BinderRelation, BinderReplyPair, DnsNameActivity, FdLifecycleSummary,
+    HandshakeNameActivity, HttpCallActivity, HttpCodeRef, InspectHitActivity, LoopbackScanActivity,
+    MappingSource, MemoryLifecycleSummary, MergedDumpRef, NetworkPeerActivity, ObservedMapping,
+    PlaintextActivity, ProcessActivity, ProcessInstanceRef, QualitySummary, SchedWakeupActivity,
+    SessionReport, SessionReportBuilder, SocketLifecycleSummary,
 };
 pub use sequence::{SequenceError, SequenceGap, SequenceTracker};
 pub use sm4::{

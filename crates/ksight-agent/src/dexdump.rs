@@ -305,7 +305,10 @@ fn dump_plaintext_windows(pid: u32, dest_dir: &Path, deadline: Instant) -> usize
                 let at = from.saturating_add(rel);
                 let begin = plaintext_window_begin(&bytes, at, needle);
                 let stop = (at.saturating_add(PLAINTEXT_WINDOW)).min(bytes.len());
-                let slice = &bytes[begin..stop];
+                let Some(slice) = keep_plaintext_window(&bytes[begin..stop]) else {
+                    from = at.saturating_add(needle.len().max(1));
+                    continue;
+                };
                 let name = format!("mem-{pid}-{start:x}+{at:x}.txt");
                 let dest = out_dir.join(&name);
                 if !dest.exists() {
@@ -338,6 +341,24 @@ fn plaintext_window_begin(bytes: &[u8], at: usize, needle: &[u8]) -> usize {
         return at;
     }
     at.saturating_sub(64)
+}
+
+/// Heap windows are a fixed 2048-byte cut around a needle, not a URL extractor.
+/// Drop trailing NULs (allocator padding) and skip slices that are mostly binary.
+fn keep_plaintext_window(slice: &[u8]) -> Option<&[u8]> {
+    let end = slice
+        .iter()
+        .rposition(|byte| *byte != 0)
+        .map_or(0, |index| index + 1);
+    let trimmed = slice.get(..end)?;
+    if trimmed.len() < 24 {
+        return None;
+    }
+    let printable = trimmed
+        .iter()
+        .filter(|byte| byte.is_ascii_graphic() || byte.is_ascii_whitespace())
+        .count();
+    (printable.saturating_mul(4) >= trimmed.len().saturating_mul(3)).then_some(trimmed)
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -2287,5 +2308,20 @@ mod tests {
         let at = find_bytes(request, b"HTTP/1.").expect("request");
         assert_eq!(plaintext_window_begin(request, at, b"HTTP/1."), 0);
         assert_eq!(plaintext_window_begin(request, 0, b"GET /"), 0);
+    }
+
+    #[test]
+    fn plaintext_window_drops_nul_padding_and_keeps_http_text() {
+        let mut padded = b"GET /v1/login HTTP/1.1\r\nHost: api.example\r\n\r\n".to_vec();
+        padded.resize(2048, 0);
+        let kept = keep_plaintext_window(&padded).expect("http text");
+        assert!(kept.starts_with(b"GET /v1/login"));
+        assert!(!kept.ends_with(&[0]));
+        assert!(kept.len() < 80);
+        let zeros = vec![0_u8; 2048];
+        assert!(keep_plaintext_window(&zeros).is_none());
+        let mut sparse = vec![0_u8; 2048];
+        sparse[10..17].copy_from_slice(b"HTTP/1.");
+        assert!(keep_plaintext_window(&sparse).is_none());
     }
 }

@@ -252,16 +252,19 @@ struct CaptureArgs {
     /// Enable bounded `SSL_write` plaintext for one app. Pair with `--package` during a short test.
     #[arg(long)]
     inspect_tls: bool,
+    /// Enable `JNIEnv` UTF-8/`byte[]` Inspect via exported `GetFunctionTable`. May combine with `--inspect-tls` and `binder_userspace`.
+    #[arg(long)]
+    inspect_jni: bool,
     /// Inspect every app mapping the adapter ELF. Noisy; prefer `--package`.
     #[arg(long)]
     inspect_all_apps: bool,
-    /// Maximum `SSL_write` bytes copied per hit (hard cap 4096).
-    #[arg(long, default_value_t = 256)]
+    /// Maximum `SSL_write`/`SSL_read` bytes copied per hit (hard cap 4096).
+    #[arg(long, default_value_t = 4096)]
     inspect_max_bytes: u32,
     /// Maximum Inspect hits; 0 uses the adapter default.
     #[arg(long, default_value_t = 0)]
     inspect_max_hits: u32,
-    /// Named Inspect adapter. May be combined with `--inspect-tls` (for example `binder_userspace`).
+    /// Named Inspect adapter (`binder_userspace`, `jni_plaintext`, ...). May be combined with `--inspect-tls`.
     #[arg(long)]
     inspect_adapter: Option<String>,
     /// Optional GNU build-id that must match before Inspect attach.
@@ -479,6 +482,9 @@ fn run_capture(args: CaptureArgs) -> Result<()> {
     if args.inspect_tls {
         inspect_adapters.push(ksight_agent::inspect_runtime::InspectAdapterKind::TlsSslWrite);
     }
+    if args.inspect_jni {
+        inspect_adapters.push(ksight_agent::inspect_runtime::InspectAdapterKind::JniPlaintext);
+    }
     if args.inspect_linker {
         inspect_adapters.push(ksight_agent::inspect_runtime::InspectAdapterKind::LinkerSoLoad);
     }
@@ -495,14 +501,15 @@ fn run_capture(args: CaptureArgs) -> Result<()> {
             *adapter != ksight_agent::inspect_runtime::InspectAdapterKind::LinkerSoLoad
         })
     {
-        bail!("--inspect-linker cannot be combined with --inspect-tls or a non-linker --inspect-adapter");
+        bail!("--inspect-linker cannot be combined with --inspect-tls, --inspect-jni, or a non-linker --inspect-adapter");
     }
     if inspect_adapters.is_empty() {
         inspect_adapters.push(ksight_agent::inspect_runtime::InspectAdapterKind::LinkerSoLoad);
     }
-    let inspect_enabled = args.inspect_linker || args.inspect_tls || inspect_adapter_set;
+    let inspect_enabled =
+        args.inspect_linker || args.inspect_tls || args.inspect_jni || inspect_adapter_set;
     if args.inspect_all_apps && !inspect_enabled {
-        bail!("--inspect-all-apps requires --inspect-tls, --inspect-linker, or --inspect-adapter");
+        bail!("--inspect-all-apps requires --inspect-tls, --inspect-jni, --inspect-linker, or --inspect-adapter");
     }
     if inspect_enabled
         && !args.inspect_all_apps

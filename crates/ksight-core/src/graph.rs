@@ -777,7 +777,7 @@ impl SessionGraph {
         processes: &[ProcessActivity],
     ) {
         self.push_limitation(
-            "inspect_hit edges are selected-process adapter observations; they are not L0 kernel facts. Parcel C++ fields and JNI offsets are not decoded. Exported Parcel writers are paired by TID. transact joins L0 binder:req by tid+code as correlated joined_transact",
+            "inspect_hit edges are selected-process adapter observations; they are not L0 kernel facts. Parcel C++ fields are not decoded. JNIEnv plaintext uses exported GetFunctionTable + jni.h slots. Exported Parcel writers are paired by TID. transact joins L0 binder:req by tid+code as correlated joined_transact",
         );
         for hit in hits.iter().take(64) {
             if hit.hits == 0 && !hit.attached {

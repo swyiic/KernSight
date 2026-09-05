@@ -57,6 +57,9 @@ pub struct DexSemanticSummary {
     /// True when more prototypes existed than were published.
     #[serde(default)]
     pub method_prototypes_truncated: bool,
+    /// Bounded URL / API-path strings from the DEX string pool. Not a Java execution trace.
+    #[serde(default)]
+    pub api_strings: Vec<String>,
 }
 
 const DEX_SEMANTIC_SAMPLE_LIMIT: usize = 1024;
@@ -139,6 +142,7 @@ pub fn parse_dex_semantics(bytes: &[u8]) -> Option<DexSemanticSummary> {
         &descriptor_at,
         &string_at,
     )?;
+    let api_strings = collect_api_strings(string_ids, &string_at);
 
     Some(DexSemanticSummary {
         version: String::from_utf8_lossy(&bytes[4..7]).into_owned(),
@@ -157,7 +161,45 @@ pub fn parse_dex_semantics(bytes: &[u8]) -> Option<DexSemanticSummary> {
         method_prototypes,
         method_prototypes_truncated: usize::try_from(method_ids).unwrap_or(usize::MAX)
             > DEX_SEMANTIC_SAMPLE_LIMIT,
+        api_strings,
     })
+}
+
+fn collect_api_strings(string_ids: u32, string_at: &dyn Fn(u32) -> Option<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for index in 0..string_ids {
+        if out.len() >= 256 {
+            break;
+        }
+        let Some(value) = string_at(index) else {
+            continue;
+        };
+        if is_api_string(&value) {
+            out.push(value);
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn is_api_string(value: &str) -> bool {
+    if value.len() < 5 || value.len() > 256 || !value.is_ascii() {
+        return false;
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_graphic() || byte == b' ')
+    {
+        return false;
+    }
+    let lower = value.to_ascii_lowercase();
+    lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || (value.starts_with('/') && value[1..].contains('/') && !value.contains(' '))
+        || ((lower.contains(".com") || lower.contains(".cn") || lower.contains(".net"))
+            && value.contains('.')
+            && !value.contains(' '))
 }
 
 fn index_method_names(
