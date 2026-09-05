@@ -110,6 +110,9 @@ const BINDER_FDS_PER_TID: usize = 4;
 const BINDER_BLOBS_PER_TID: usize = 4;
 const BINDER_PATHS: [&str; 2] = ["/system/lib64/libbinder.so", "/system/lib/libbinder.so"];
 const BINDER_INTERFACE_UNITS_CAP: usize = 192;
+/// JNI `GetStringChars` / `GetStringCritical` unit cap. Must exceed the Binder
+/// token cap: a 192-unit clamp truncated HSBC `"url":"ht` JSON.
+const JNI_UTF16_UNITS_CAP: usize = 2048;
 #[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
 const BINDER_STRINGS_PER_TID: usize = 8;
 #[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
@@ -2470,7 +2473,10 @@ fn decode_jni_utf16_units(
     if units <= 0 || buf == 0 {
         return None;
     }
-    let count = usize::try_from(units).ok()?.min(max_payload / 2).min(2048);
+    let count = usize::try_from(units)
+        .ok()?
+        .min(max_payload / 2)
+        .min(JNI_UTF16_UNITS_CAP);
     let text = read_remote_utf16(pid, buf, u64::try_from(count).ok()?)?;
     if !keep_jni_plaintext(text.as_bytes()) {
         return None;
@@ -3072,7 +3078,7 @@ pub fn read_remote_bytes(pid: u32, address: u64, max_bytes: usize) -> Option<Vec
 
 #[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
 fn read_remote_utf16(pid: u32, address: u64, units: u64) -> Option<String> {
-    let count = usize::try_from(units).ok()?.min(BINDER_INTERFACE_UNITS_CAP);
+    let count = usize::try_from(units).ok()?.min(JNI_UTF16_UNITS_CAP);
     if count == 0 {
         return None;
     }
@@ -3800,6 +3806,22 @@ mod tests {
         assert!(looks_like_binder_string("activity"));
         assert!(looks_like_binder_string("/data/user/0/com.example/files/x"));
         assert!(!looks_like_binder_string("has\u{0007}bell"));
+    }
+
+    #[test]
+    fn jni_utf16_is_not_clamped_to_binder_token_cap() {
+        let json = format!(
+            "{{\"type\":\"network-request\",\"pad\":\"{}\",\"url\":\"https://www.us.hsbc.com/api/wpb-dsvc\"}}",
+            "x".repeat(160)
+        );
+        assert!(json.encode_utf16().count() > BINDER_INTERFACE_UNITS_CAP);
+        let mut bytes = Vec::new();
+        for unit in json.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        let decoded = decode_utf16le(&bytes, json.encode_utf16().count()).expect("utf16");
+        assert!(decoded.contains("https://www.us.hsbc.com/api/wpb-dsvc"));
+        assert_eq!(decoded, json);
     }
 
     #[test]

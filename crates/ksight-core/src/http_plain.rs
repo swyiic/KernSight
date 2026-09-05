@@ -63,7 +63,37 @@ const THIRD_PARTY_HOST: &[&str] = &[
     "talkingdata",
     "amap.com",
     "alicdn",
+    "alipayobjects",
     "taobao",
+    "baidu.com",
+    "bdimg.com",
+    "bdstatic",
+    "cnzz.com",
+    "unpkg.com",
+    "tiqcdn",
+    "appdynamics",
+    "ucweb.com",
+    "uc.cn",
+    "github.com",
+    "githubusercontent",
+    "cloudflare",
+    "3g.qq.com",
+    "jsdelivr",
+    "bootstrapcdn",
+    "medallia",
+    "omtrdc",
+    "adobedtm",
+    "app-measurement",
+    "map.qq.com",
+    "demdex",
+    "khms",
+    "images.apple.com",
+    "douyin",
+    "zijieapi",
+    "amemv.com",
+    "volces.com",
+    "cdn-static",
+    "xiaojukeji",
 ];
 
 /// One parsed HTTP/1 call, HTTP/2 HEADERS row, JSON object, or embedded URL.
@@ -155,6 +185,17 @@ pub fn parse_http_plain_all_bytes(bytes: &[u8], content_class: &str) -> Vec<Pars
             break;
         }
     }
+    if out.len() < 48 {
+        for parsed in embedded_cookie_hosts(bytes) {
+            if !out.iter().any(|seen| seen.host == parsed.host) {
+                out.push(parsed);
+            }
+            if out.len() >= 48 {
+                break;
+            }
+        }
+    }
+    drop_truncated_hosts(&mut out);
     out
 }
 
@@ -503,7 +544,11 @@ pub(crate) fn embedded_http_urls(bytes: &[u8]) -> Vec<ParsedHttpPlain> {
             index += 1;
             continue;
         }
-        let host = String::from_utf8_lossy(&bytes[host_start..host_end]).to_ascii_lowercase();
+        let host_raw = String::from_utf8_lossy(&bytes[host_start..host_end]).to_ascii_lowercase();
+        let Some(host) = sanitize_host(&host_raw) else {
+            index = host_end.max(index + 1);
+            continue;
+        };
         let path_end = bytes[host_end..]
             .iter()
             .position(|byte| {
@@ -545,6 +590,130 @@ pub(crate) fn embedded_http_urls(bytes: &[u8]) -> Vec<ParsedHttpPlain> {
     out
 }
 
+/// Packed Chromium `host_key` values (`mywap2.icbc.com.cnCK_...`) without `https://`.
+pub(crate) fn embedded_cookie_hosts(bytes: &[u8]) -> Vec<ParsedHttpPlain> {
+    const TLDS: [&[u8]; 8] = [
+        b".com.cn",
+        b".com.hk",
+        b".co.uk",
+        b".com",
+        b".net",
+        b".org",
+        b".cn",
+        b".hk",
+    ];
+    let mut out = Vec::new();
+    let lower: Vec<u8> = bytes.iter().map(u8::to_ascii_lowercase).collect();
+    for tld in TLDS {
+        let mut from = 0_usize;
+        while from + tld.len() < lower.len() && out.len() < 48 {
+            let Some(rel) = lower[from..]
+                .windows(tld.len())
+                .position(|window| window == tld)
+            else {
+                break;
+            };
+            let mut end = from.saturating_add(rel).saturating_add(tld.len());
+            if tld == b".com"
+                && lower
+                    .get(end..)
+                    .is_some_and(|rest| rest.starts_with(b".cn") || rest.starts_with(b".hk"))
+            {
+                end = end.saturating_add(3);
+            }
+            let mut start = from.saturating_add(rel);
+            while start > 0 {
+                let previous = bytes[start - 1];
+                if previous.is_ascii_alphanumeric() || previous == b'-' || previous == b'.' {
+                    start -= 1;
+                    continue;
+                }
+                break;
+            }
+            if start < end {
+                if let Some(host) = sanitize_host(
+                    &String::from_utf8_lossy(&bytes[start..end]).replace(['[', ']'], ""),
+                ) {
+                    if !out
+                        .iter()
+                        .any(|seen: &ParsedHttpPlain| seen.host.as_deref() == Some(host.as_str()))
+                    {
+                        let third_party = is_third_party_host(&host);
+                        out.push(ParsedHttpPlain {
+                            kind: "url",
+                            method: "URL".to_owned(),
+                            host: Some(host),
+                            scheme: Some("https"),
+                            path: String::new(),
+                            status: None,
+                            query_keys: Vec::new(),
+                            header_names: Vec::new(),
+                            redacted_headers: Vec::new(),
+                            body_keys: Vec::new(),
+                            redacted_body_keys: Vec::new(),
+                            content_type: None,
+                            third_party,
+                        });
+                    }
+                }
+            }
+            from = end;
+        }
+    }
+    drop_prefixed_cookie_hosts(&mut out);
+    drop_truncated_hosts(&mut out);
+    out
+}
+
+fn drop_prefixed_cookie_hosts(out: &mut Vec<ParsedHttpPlain>) {
+    let hosts: Vec<String> = out
+        .iter()
+        .filter_map(|row| row.host.clone())
+        .collect();
+    out.retain(|row| {
+        let Some(host) = row.host.as_deref() else {
+            return true;
+        };
+        let first = host.split('.').next().unwrap_or("");
+        if first
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_digit())
+            && first.bytes().any(|byte| byte.is_ascii_alphabetic())
+        {
+            return false;
+        }
+        !hosts.iter().any(|other| {
+            other != host
+                && host.ends_with(other)
+                && host.len() > other.len()
+                && host.len() - other.len() <= 3
+                && host
+                    .as_bytes()
+                    .get(host.len() - other.len() - 1)
+                    .is_none_or(|byte| *byte != b'.')
+        })
+    });
+}
+
+fn drop_truncated_hosts(out: &mut Vec<ParsedHttpPlain>) {
+    let hosts: Vec<String> = out.iter().filter_map(|row| row.host.clone()).collect();
+    out.retain(|row| {
+        let Some(host) = row.host.as_deref() else {
+            return true;
+        };
+        !hosts.iter().any(|other| is_truncated_host(host, other))
+    });
+}
+
+pub(crate) fn is_truncated_host(host: &str, other: &str) -> bool {
+    other.len() > host.len()
+        && other.starts_with(host)
+        && other.as_bytes().get(host.len()).is_some_and(|byte| {
+            byte.is_ascii_alphanumeric() || *byte == b'.'
+        })
+}
+
 pub(crate) fn parse_host_token(value: &str) -> Option<String> {
     sanitize_host(value)
 }
@@ -557,7 +726,7 @@ fn sanitize_host(value: &str) -> Option<String> {
     let host = value
         .trim()
         .trim_matches(|ch: char| ch == '[' || ch == ']')
-        .trim_end_matches('.');
+        .trim_matches('.');
     if host.len() < 4 || host.len() > 253 || !host.contains('.') {
         return None;
     }
@@ -568,10 +737,29 @@ fn sanitize_host(value: &str) -> Option<String> {
     }
     let host_no_port = host.split(':').next().unwrap_or(host);
     let tld = host_no_port.rsplit('.').next().unwrap_or("");
-    if tld.len() < 2 || tld.len() > 24 || !tld.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+    if tld.len() < 2 || tld.len() > 10 || !tld.bytes().all(|byte| byte.is_ascii_alphabetic()) {
         return None;
     }
     if matches!(tld, "invalid" | "local" | "localhost") {
+        return None;
+    }
+    let labels: Vec<&str> = host_no_port.split('.').collect();
+    if matches!(host_no_port, "com.cn" | "com.hk" | "co.uk") || labels.len() < 2 {
+        return None;
+    }
+    if labels.len() == 2 && labels[0].len() < 2 {
+        return None;
+    }
+    if labels.len() > 5 {
+        return None;
+    }
+    if labels
+        .get(labels.len().saturating_sub(2))
+        .copied()
+        .is_some_and(|label| {
+            matches!(label, "constructor" | "prototype" | "vuemodel" | "jquery")
+        })
+    {
         return None;
     }
     let lower = host.to_ascii_lowercase();
@@ -579,6 +767,7 @@ fn sanitize_host(value: &str) -> Option<String> {
         || lower.ends_with(".w3.org")
         || lower.starts_with("ns.google.")
         || lower.starts_with("ns.adobe.")
+        || lower.starts_with("android.hardware.")
         || lower.contains("xmlsoap")
     {
         return None;
@@ -639,7 +828,22 @@ pub fn is_kept_inspect_url(url: &str) -> bool {
             | "crt"
             | "der"
             | "pem"
+            | "mp4"
+            | "mp3"
+            | "pdf"
     ) {
+        return false;
+    }
+    if path.ends_with(".min.js") || path.ends_with("vue.min.js") {
+        return false;
+    }
+    if path.contains('*')
+        || path.ends_with('{')
+        || path.contains("{*")
+        || path.contains("&quot;")
+        || path.contains(".*")
+        || path.contains('|')
+    {
         return false;
     }
     if path.contains("digicert")
@@ -661,6 +865,9 @@ pub fn is_kept_inspect_url(url: &str) -> bool {
         .split('/')
         .next()
         .unwrap_or("");
+    if path.contains(".crt") {
+        return false;
+    }
     if matches!(
         host,
         "jquery.com"
@@ -670,6 +877,13 @@ pub fn is_kept_inspect_url(url: &str) -> bool {
             | "github.com"
             | "www.apache.org"
             | "www.unicode.org"
+            | "goo.gl"
+            | "bit.ly"
+            | "t.co"
+            | "flutter.dev"
+            | "pub.dev"
+            | "dart.dev"
+            | "api.flutter.dev"
     ) {
         return false;
     }
@@ -772,6 +986,54 @@ mod tests {
         assert!(is_kept_inspect_url("https://ecs.abchina.com.cn/mbfront/"));
         assert!(!is_kept_inspect_url("https://i.pki.goog/we1.crt0"));
         assert!(!is_kept_inspect_url("https://c.pki.goog/r/gsr1.crl0"));
+    }
+
+    #[test]
+    fn packed_cookie_host_keys_are_split_from_names() {
+        let bytes =
+            b"\0mywap2.icbc.com.cnCK_ISW_WAPB-PORTAL\0cmywap2.icbc.com.cnCK_\0.b2c.icbc.com.cnCK_ISW_EPAY";
+        let parsed = parse_http_plain_all_bytes(bytes, "binary");
+        assert!(
+            parsed
+                .iter()
+                .any(|row| row.host.as_deref() == Some("mywap2.icbc.com.cn")),
+            "{parsed:?}"
+        );
+        assert!(
+            parsed
+                .iter()
+                .any(|row| row.host.as_deref() == Some("b2c.icbc.com.cn")),
+            "{parsed:?}"
+        );
+        assert!(!parsed.iter().any(|row| row.host.as_deref() == Some("com.cn")));
+        assert!(!parsed
+            .iter()
+            .any(|row| row.host.as_deref() == Some("cmywap2.icbc.com.cn")));
+    }
+
+    #[test]
+    fn drops_truncated_host_prefix_of_a_longer_host() {
+        let bytes = b"https://data.10jqka.co\0https://data.10jqka.com.cn/api/quote";
+        let parsed = parse_http_plain_all_bytes(bytes, "text");
+        assert!(
+            parsed
+                .iter()
+                .any(|row| row.host.as_deref() == Some("data.10jqka.com.cn")),
+            "{parsed:?}"
+        );
+        assert!(
+            !parsed
+                .iter()
+                .any(|row| row.host.as_deref() == Some("data.10jqka.co")),
+            "{parsed:?}"
+        );
+        assert!(sanitize_host("t.com").is_none());
+        assert!(sanitize_host("this.constructor.com").is_none());
+        assert!(!is_kept_inspect_url(
+            "https://www.citibank.com.hk/english/insurance/pdf/terms.pdf"
+        ));
+        assert!(!is_kept_inspect_url("https://khms0.google.com/*"));
+        assert!(sanitize_host("alipay.kylinbridge").is_none());
     }
 
     #[test]

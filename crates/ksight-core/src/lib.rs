@@ -55,7 +55,8 @@ pub use provenance::{
 };
 pub use report::{
     correlate_http_calls_to_dex, http_calls_from_plaintext_dir, http_calls_from_private_dir,
-    rank_observed_mappings, ArtifactActivity, BinderFdTransfer, BinderLifecycleSummary,
+    rank_observed_mappings, sort_http_catalog, ArtifactActivity, BinderFdTransfer,
+    BinderLifecycleSummary,
     BinderRelation, BinderReplyPair, DnsNameActivity, FdLifecycleSummary, HandshakeNameActivity,
     HttpCallActivity, HttpCodeRef, InspectHitActivity, LoopbackScanActivity, MappingSource,
     MemoryLifecycleSummary, MergedDumpRef, NetworkPeerActivity, ObservedMapping, PlaintextActivity,

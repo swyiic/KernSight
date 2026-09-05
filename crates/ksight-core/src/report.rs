@@ -1704,16 +1704,8 @@ impl SessionReportBuilder {
                 count: activity.count,
             })
             .collect::<Vec<_>>();
-        http_calls.sort_by(|left, right| {
-            right
-                .count
-                .cmp(&left.count)
-                .then_with(|| left.host.cmp(&right.host))
-                .then_with(|| left.path.cmp(&right.path))
-                .then_with(|| left.method.cmp(&right.method))
-                .then_with(|| left.process_id.cmp(&right.process_id))
-        });
-        http_calls.truncate(128);
+        stamp_empty_hosts_from_sni(&mut http_calls, &handshake_names);
+        sort_http_catalog(&mut http_calls);
         let mut graph = crate::SessionGraph::from_l0(
             self.session_id,
             &processes,
@@ -2799,22 +2791,21 @@ fn http_calls_from_store(
             if parsed.kind == "http2_preface" {
                 continue;
             }
-            if parsed.kind == "url"
-                && crate::format_inspect_url(
-                    parsed.scheme,
-                    parsed.host.as_deref().unwrap_or(""),
-                    &parsed.path,
-                )
-                .is_none()
+            let host = parsed.host.clone().unwrap_or_default();
+            let is_response = parsed.status.is_some() && parsed.kind.contains("response");
+            if host.is_empty() && !is_response {
+                continue;
+            }
+            if !host.is_empty()
+                && crate::format_inspect_url(parsed.scheme, &host, &parsed.path).is_none()
             {
                 continue;
             }
-            let host = parsed.host.clone().unwrap_or_default();
             let key = (
                 process_id,
                 parsed.kind.to_owned(),
                 parsed.method.clone(),
-                host,
+                host.clone(),
                 parsed.path.clone(),
             );
             let activity = calls.entry(key).or_insert_with(|| HttpCallActivity {
@@ -2823,7 +2814,7 @@ fn http_calls_from_store(
                 direction: origin.to_owned(),
                 kind: parsed.kind.to_owned(),
                 method: parsed.method.clone(),
-                host: parsed.host.clone(),
+                host: (!host.is_empty()).then_some(host.clone()),
                 path: parsed.path.clone(),
                 status: parsed.status,
                 query_keys: parsed.query_keys.clone(),
@@ -2841,15 +2832,198 @@ fn http_calls_from_store(
         }
     }
     let mut out = calls.into_values().collect::<Vec<_>>();
-    out.sort_by(|left, right| {
-        right
-            .count
-            .cmp(&left.count)
+    sort_http_catalog(&mut out);
+    out
+}
+
+/// First-party inspect/private/heap paths outrank tracker/CDN so the 256-row cap keeps APIs.
+pub fn sort_http_catalog(calls: &mut Vec<HttpCallActivity>) {
+    calls.retain(keep_catalog_row);
+    drop_truncated_catalog_hosts(calls);
+    drop_truncated_catalog_paths(calls);
+    for row in calls.iter_mut() {
+        if let Some(host) = row.host.as_deref() {
+            row.third_party |= crate::is_third_party_host(host);
+        }
+    }
+    calls.sort_by(|left, right| {
+        catalog_weight(right)
+            .cmp(&catalog_weight(left))
+            .then_with(|| right.count.cmp(&left.count))
+            .then_with(|| left.origin.cmp(&right.origin))
             .then_with(|| left.path.cmp(&right.path))
             .then_with(|| left.method.cmp(&right.method))
     });
-    out.truncate(128);
-    out
+    calls.truncate(256);
+}
+
+fn stamp_empty_hosts_from_sni(
+    calls: &mut [HttpCallActivity],
+    handshakes: &[HandshakeNameActivity],
+) {
+    let mut by_pid: BTreeMap<u32, BTreeSet<String>> = BTreeMap::new();
+    for handshake in handshakes {
+        if let Some(sni) = handshake.sni.as_deref().filter(|value| !value.is_empty()) {
+            by_pid
+                .entry(handshake.process_id)
+                .or_default()
+                .insert(sni.to_ascii_lowercase());
+        }
+        if let Some(host) = handshake
+            .http_host
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            by_pid
+                .entry(handshake.process_id)
+                .or_default()
+                .insert(host.to_ascii_lowercase());
+        }
+    }
+    for call in calls {
+        if call.host.as_deref().is_some_and(|host| !host.is_empty()) {
+            continue;
+        }
+        let Some(names) = by_pid.get(&call.process_id) else {
+            continue;
+        };
+        if names.len() != 1 {
+            continue;
+        }
+        let Some(host) = names.iter().next().cloned() else {
+            continue;
+        };
+        if crate::format_inspect_url(Some("https"), &host, &call.path).is_some() {
+            call.host = Some(host);
+        }
+    }
+}
+
+fn keep_catalog_row(row: &HttpCallActivity) -> bool {
+    if row.host.as_deref().is_some_and(|host| {
+        crate::format_inspect_url(Some("https"), host, &row.path).is_some()
+    }) {
+        return true;
+    }
+    row.status.is_some() && row.kind.contains("response")
+}
+
+fn drop_truncated_catalog_hosts(calls: &mut Vec<HttpCallActivity>) {
+    let hosts: Vec<String> = calls.iter().filter_map(|row| row.host.clone()).collect();
+    calls.retain(|row| {
+        let Some(host) = row.host.as_deref() else {
+            return row.status.is_some() && row.kind.contains("response");
+        };
+        !hosts
+            .iter()
+            .any(|other| crate::http_plain::is_truncated_host(host, other))
+    });
+}
+
+fn drop_truncated_catalog_paths(calls: &mut Vec<HttpCallActivity>) {
+    let keys: Vec<(String, String)> = calls
+        .iter()
+        .map(|row| (row.host.clone().unwrap_or_default(), row.path.clone()))
+        .collect();
+    calls.retain(|row| {
+        let host = row.host.clone().unwrap_or_default();
+        let path = &row.path;
+        if path.is_empty() {
+            return true;
+        }
+        !keys.iter().any(|(other_host, other_path)| {
+            other_host == &host
+                && other_path.len() > path.len()
+                && other_path.starts_with(path)
+                && other_path.as_bytes().get(path.len()).is_some_and(|byte| {
+                    *byte == b'/' || byte.is_ascii_alphanumeric()
+                })
+        })
+    });
+}
+
+fn catalog_weight(row: &HttpCallActivity) -> u8 {
+    let Some(host) = row.host.as_deref().filter(|value| !value.is_empty()) else {
+        return 0;
+    };
+    if row.third_party {
+        return 1;
+    }
+    let host_l = host.to_ascii_lowercase();
+    let path = row.path.to_ascii_lowercase();
+    let static_like = host_l.contains("cdn")
+        || host_l.contains("static")
+        || host_l.starts_with("image")
+        || path.contains("/static/")
+        || path.contains("/assets/")
+        || path.contains("/img/")
+        || path.contains("/huamei_")
+        || path.contains("/www/js/")
+        || path.contains("/file/download/");
+    let ext = std::path::Path::new(&path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+    let static_like = static_like
+        || ext.eq_ignore_ascii_case("js")
+        || ext.eq_ignore_ascii_case("css");
+    let api_like = path.contains("/api")
+        || path.contains("/mbfront")
+        || path.contains("/login")
+        || path.contains("/ebs")
+        || path.contains("/phone")
+        || path.contains("/wap")
+        || path.contains("/interface/")
+        || row.kind.contains("request");
+    let has_path = !path.is_empty();
+    let mut weight: u8 = match row.origin.as_str() {
+        "inspect" if api_like || (has_path && !static_like) => 6,
+        "private" | "heap" if api_like => 5,
+        "inspect" => 4,
+        "private" | "heap" if has_path && !static_like => 4,
+        "private" | "heap" if has_path => 3,
+        _ => 2,
+    };
+    if source_matches_host(&row.source, host) && !static_like {
+        weight = weight.saturating_add(2);
+    }
+    weight
+}
+
+fn source_matches_host(source: &str, host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    source
+        .to_ascii_lowercase()
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .flat_map(|token| {
+            let mut tokens = Vec::new();
+            if token.len() >= 4 {
+                tokens.push(token.to_owned());
+            }
+            for suffix in ["gphone", "phone", "mobile", "android"] {
+                if let Some(stem) = token.strip_suffix(suffix) {
+                    if stem.len() >= 4 {
+                        tokens.push(stem.to_owned());
+                    }
+                }
+            }
+            tokens
+        })
+        .filter(|token| {
+            !matches!(
+                token.as_str(),
+                "android"
+                    | "phone"
+                    | "mobile"
+                    | "plat"
+                    | "apps"
+                    | "gphone"
+                    | "main"
+                    | "studio"
+                    | "winner"
+            )
+        })
+        .any(|token| host.contains(&token))
 }
 
 fn collect_store_files(
@@ -2875,12 +3049,32 @@ fn collect_store_files(
             }
             continue;
         }
+        if path.components().any(|part| {
+            skip_store_dir_name(&part.as_os_str().to_string_lossy())
+        }) {
+            continue;
+        }
         if !keep_store_file(&path) {
             continue;
         }
         out.push(path);
         *remaining = remaining.saturating_sub(1);
     }
+}
+
+fn skip_store_dir_name(name: &str) -> bool {
+    matches!(
+        name,
+        "fresco_disk_cache"
+            | "image_manager_disk_cache"
+            | "Crash Reports"
+            | "HTTP Cache"
+            | "Code Cache"
+            | "Cache_Data"
+            | "oat_primary"
+            | "shaders_cache"
+            | "com.android.opengl.shaders_cache.multifile"
+    )
 }
 
 fn keep_store_file(path: &std::path::Path) -> bool {
@@ -2924,15 +3118,7 @@ impl SessionReport {
         attach_http_call_graph(&mut self.graph, session_id, &calls);
         pair_http_replies(&mut self.graph, session_id, &calls);
         self.http_calls.extend(calls);
-        self.http_calls.sort_by(|left, right| {
-            right
-                .count
-                .cmp(&left.count)
-                .then_with(|| left.host.cmp(&right.host))
-                .then_with(|| left.path.cmp(&right.path))
-                .then_with(|| left.method.cmp(&right.method))
-        });
-        self.http_calls.truncate(128);
+        sort_http_catalog(&mut self.http_calls);
     }
 
     /// Join dump-side DEX string/method names onto HTTP calls. Always correlated.
@@ -3346,7 +3532,7 @@ fn report_limitations() -> Vec<String> {
     vec![
         "Binder driver submission-to-delivery latency is correlated by transaction ID. Two-way RPCs pair reply submit to the request debug_id (binder_reply / replies_to, confirmed). A 128-byte parcel prefix is copied at kprobe binder_transaction (every online CPU) for 32-bit and 64-bit clients (native UAPI after compat conversion) and parsed as writeInterfaceToken String16. Inspect transact joins that request by tid+code as correlated joined_transact and copies reply latency when the kernel pair exists. Inspect pairs writeInterfaceToken and bounded exported Parcel writers on the same TID on ELF64; this GKI rejects AArch32 uprobes. AIDL method names come from on-device AOSP Stub tables (aosp_stub) or that process's loaded DEX TRANSACTION_* (process_dex). Parcel C++ object fields and writeFloat/writeDouble (no FPSIMD in uprobe pt_regs) are not read.".to_owned(),
         "DEX, ELF, connlog, and packed-cache path candidates may include a SHA-256 when a regular file <= 1 MiB is opened; capture also copies those forensic files under the spool forensics directory because apps often delete packed DEX after load.".to_owned(),
-        "Connect/accept and FD baseline/dup/close evidence reconstruct descriptor lifetimes. Optional network-io counts byte-returning socket calls and reports sendmmsg/recvmmsg results as message counts. UDP/53 datagrams parse QNAME/A/AAAA and stamp later connect() as correlated resolved_name (same-process first, then any resolver that answered the IP). getaddrinfo uprobes and non-53 resolvers remain uncovered. TLS/QUIC plaintext is Inspect-only. Consecutive SSL_read/SSL_write text previews for one process are stitched up to 16 KiB. gzip/zlib magic in those buffers is inflated before HTTP/JSON/`http(s)://` URL parse. HTTP/1 request-line, Host, query keys, JSON/form keys, embedded URLs, and HTTP/2 HEADERS HPACK (`:method`/`:path`/`:authority`) go into http_calls; Cookie/Authorization/token values are redacted. HTTP responses have no URL path. Heap windows that start at HTTP/1.1, GET/POST, `https://`, `\"url\"`, `/api/`, or `:path`/`:authority` are 4096-byte cuts (NUL or CRLF), not a full memory image. CE/DE shared_prefs/SQLite copies contribute origin=private URL rows. Same-process same-host request/response pairs are correlated http_reply. HPACK is report-side analysis of already-copied Inspect/dump buffers, not MITM. QUIC/HTTP/3 bodies, Cronet without SSL_write, Flutter Dart TLS, WebView/Chromium, and custom TLS without that export are not decoded.".to_owned(),
+        "Connect/accept and FD baseline/dup/close evidence reconstruct descriptor lifetimes. Optional network-io counts byte-returning socket calls and reports sendmmsg/recvmmsg results as message counts. UDP/53 datagrams parse QNAME/A/AAAA and stamp later connect() as correlated resolved_name (same-process first, then any resolver that answered the IP). getaddrinfo uprobes and non-53 resolvers remain uncovered. TLS/QUIC plaintext is Inspect-only. Consecutive SSL_read/SSL_write text previews for one process are stitched up to 16 KiB. gzip/zlib magic in those buffers is inflated before HTTP/JSON/`http(s)://` URL parse. HTTP/1 request-line, Host, query keys, JSON/form keys, embedded URLs, and HTTP/2 HEADERS HPACK (`:method`/`:path`/`:authority`) go into http_calls; Cookie/Authorization/token values are redacted. HTTP responses have no URL path. Heap windows that start at HTTP/1.1, GET/POST, `https://`, `\"url\"`, `/api/`, `/login`, `/mbfront`, or `:path`/`:authority` are 8192-byte cuts (NUL or CRLF), not a full memory image. CE/DE shared_prefs/SQLite copies contribute origin=private URL rows. Same-process same-host request/response pairs are correlated http_reply. HPACK is report-side analysis of already-copied Inspect/dump buffers, not MITM. QUIC/HTTP/3 bodies, Cronet without SSL_write, Flutter Dart TLS, WebView/Chromium, and custom TLS without that export are not decoded.".to_owned(),
         "The L0 graph is queryable (`ksightctl device graph`). Process instances use `procinst:{boot_id:pid:start_time_ns}` when start time is known; otherwise `process:pkg:pid`. Confirmed edges are Binder, Binder `replies_to`/`binder_reply` (request debug_id), socket, Binder FD `transfers_fd`, loopback scans, sched wakeup identity, and mmap/remap `maps` edges. Dump VMA `overlaps_mmap` is correlated even on an exact address match. Inspect `inspect_hit` and TLS `tls_send`/`tls_recv` are selected-process facts, not Observe. JNIEnv UTF-8/`byte[]` Inspect previews graph as `jni_from_java`/`jni_to_java` (confirmed selected-process, not Observe). Inspect HTTP `http_call` edges are parsed from those TLS or JNI previews (HTTP/1, HTTP/2 HPACK, JSON, or embedded URLs); dump heap `http_call` edges are correlated. Same-host `http_reply` is correlated, not a stream id. Binder userspace hits record handle/code and join L0 `binder:req` by tid+code as correlated `joined_transact`. The interface token and bounded scalars come from exported Parcel writers on the same TID. AIDL names come from on-device AOSP Stub tables or session process DEX; they are not hardcoded GMS/app names. Parcel C++ fields are not read. RegisterNatives copies JNINativeMethod name/signature/fnPtr from the JNINativeInterface slot; jclass fields and Java/native stacks remain unresolved. Cronet/QUIC and custom TLS remain unresolved. Time proximity is never a confirmed edge.".to_owned(),
         "dup/close file-descriptor events are off unless --files-fd is set. WebView/Chromium dup storms previously overflowed the file ring and dropped millions of records.".to_owned(),
         "Sampling, truncation, source loss, compatibility failures, or target early exit can make application behavior incomplete.".to_owned(),
@@ -3873,6 +4059,41 @@ mod tests {
     }
 
     #[test]
+    fn unique_sni_stamps_empty_inspect_http_host() {
+        let mut calls = vec![HttpCallActivity {
+            source: "us.hsbc.hsbcus".to_owned(),
+            process_id: 7554,
+            direction: "recv".to_owned(),
+            kind: "http1_response".to_owned(),
+            method: "HTTP".to_owned(),
+            host: None,
+            path: String::new(),
+            status: Some(200),
+            query_keys: Vec::new(),
+            header_names: vec!["Content-Type".to_owned()],
+            redacted_headers: Vec::new(),
+            body_keys: Vec::new(),
+            redacted_body_keys: Vec::new(),
+            content_type: Some("application/json".to_owned()),
+            third_party: false,
+            count: 1,
+            origin: "inspect".to_owned(),
+        }];
+        let handshakes = vec![HandshakeNameActivity {
+            process_id: 7554,
+            kind: "tls".to_owned(),
+            sni: Some("www.us.hsbc.com".to_owned()),
+            alpn: Some("h2".to_owned()),
+            http_host: None,
+            http_method: None,
+            peer: None,
+            port: None,
+        }];
+        stamp_empty_hosts_from_sni(&mut calls, &handshakes);
+        assert_eq!(calls[0].host.as_deref(), Some("www.us.hsbc.com"));
+    }
+
+    #[test]
     fn handshake_sni_stamps_connect_at_finish() {
         let session = Uuid::new_v4();
         let mut builder = SessionReportBuilder::default();
@@ -4348,6 +4569,246 @@ mod tests {
             "{calls:?}"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn catalog_keeps_first_party_paths_ahead_of_cdn() {
+        let mut calls = vec![
+            HttpCallActivity {
+                source: "app".to_owned(),
+                process_id: 1,
+                direction: "private".to_owned(),
+                kind: "url".to_owned(),
+                method: "URL".to_owned(),
+                host: Some("mdn.alipayobjects.com".to_owned()),
+                path: "/img/x".to_owned(),
+                status: None,
+                query_keys: Vec::new(),
+                header_names: Vec::new(),
+                redacted_headers: Vec::new(),
+                body_keys: Vec::new(),
+                redacted_body_keys: Vec::new(),
+                content_type: None,
+                third_party: true,
+                count: 99,
+                origin: "private".to_owned(),
+            },
+            HttpCallActivity {
+                source: "app".to_owned(),
+                process_id: 1,
+                direction: "private".to_owned(),
+                kind: "url".to_owned(),
+                method: "URL".to_owned(),
+                host: Some("render.alipay.com".to_owned()),
+                path: "/api/pay".to_owned(),
+                status: None,
+                query_keys: Vec::new(),
+                header_names: Vec::new(),
+                redacted_headers: Vec::new(),
+                body_keys: Vec::new(),
+                redacted_body_keys: Vec::new(),
+                content_type: None,
+                third_party: false,
+                count: 1,
+                origin: "private".to_owned(),
+            },
+        ];
+        sort_http_catalog(&mut calls);
+        assert_eq!(calls[0].host.as_deref(), Some("render.alipay.com"));
+        calls[1].source = "com.eg.android.AlipayGphone".to_owned();
+        calls[1].host = Some("clientsc.alipay.com".to_owned());
+        calls[1].path = "/account/gateway.htm".to_owned();
+        calls[1].third_party = false;
+        calls.push(HttpCallActivity {
+            source: "com.eg.android.AlipayGphone".to_owned(),
+            process_id: 1,
+            direction: "private".to_owned(),
+            kind: "url".to_owned(),
+            method: "URL".to_owned(),
+            host: Some("account.chsi.com.cn".to_owned()),
+            path: "/passport/login".to_owned(),
+            status: None,
+            query_keys: Vec::new(),
+            header_names: Vec::new(),
+            redacted_headers: Vec::new(),
+            body_keys: Vec::new(),
+            redacted_body_keys: Vec::new(),
+            content_type: None,
+            third_party: false,
+            count: 9,
+            origin: "private".to_owned(),
+        });
+        sort_http_catalog(&mut calls);
+        assert_eq!(calls[0].host.as_deref(), Some("clientsc.alipay.com"));
+    }
+
+    #[test]
+    fn catalog_drops_empty_host_and_truncated_prefix() {
+        let mut calls = vec![
+            HttpCallActivity {
+                source: "app".to_owned(),
+                process_id: 1,
+                direction: "heap".to_owned(),
+                kind: "url".to_owned(),
+                method: "URL".to_owned(),
+                host: None,
+                path: String::new(),
+                status: None,
+                query_keys: Vec::new(),
+                header_names: Vec::new(),
+                redacted_headers: Vec::new(),
+                body_keys: Vec::new(),
+                redacted_body_keys: Vec::new(),
+                content_type: None,
+                third_party: false,
+                count: 9,
+                origin: "heap".to_owned(),
+            },
+            HttpCallActivity {
+                source: "app".to_owned(),
+                process_id: 1,
+                direction: "heap".to_owned(),
+                kind: "url".to_owned(),
+                method: "URL".to_owned(),
+                host: Some("data.10jqka.co".to_owned()),
+                path: String::new(),
+                status: None,
+                query_keys: Vec::new(),
+                header_names: Vec::new(),
+                redacted_headers: Vec::new(),
+                body_keys: Vec::new(),
+                redacted_body_keys: Vec::new(),
+                content_type: None,
+                third_party: false,
+                count: 3,
+                origin: "heap".to_owned(),
+            },
+            HttpCallActivity {
+                source: "app".to_owned(),
+                process_id: 1,
+                direction: "heap".to_owned(),
+                kind: "url".to_owned(),
+                method: "URL".to_owned(),
+                host: Some("data.10jqka.com.cn".to_owned()),
+                path: "/api/quote".to_owned(),
+                status: None,
+                query_keys: Vec::new(),
+                header_names: Vec::new(),
+                redacted_headers: Vec::new(),
+                body_keys: Vec::new(),
+                redacted_body_keys: Vec::new(),
+                content_type: None,
+                third_party: false,
+                count: 1,
+                origin: "heap".to_owned(),
+            },
+        ];
+        sort_http_catalog(&mut calls);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].host.as_deref(), Some("data.10jqka.com.cn"));
+        calls.push(HttpCallActivity {
+            source: "app".to_owned(),
+            process_id: 1,
+            direction: "heap".to_owned(),
+            kind: "url".to_owned(),
+            method: "URL".to_owned(),
+            host: Some("data.10jqka.com.cn".to_owned()),
+            path: "/api".to_owned(),
+            status: None,
+            query_keys: Vec::new(),
+            header_names: Vec::new(),
+            redacted_headers: Vec::new(),
+            body_keys: Vec::new(),
+            redacted_body_keys: Vec::new(),
+            content_type: None,
+            third_party: false,
+            count: 4,
+            origin: "heap".to_owned(),
+        });
+        sort_http_catalog(&mut calls);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].path, "/api/quote");
+    }
+
+    #[test]
+    fn recatalog_on_disk_reports_if_requested() {
+        if std::env::var_os("KSIGHT_RECATALOG").is_none() {
+            return;
+        }
+        let root = std::path::Path::new("/Users/swyiic/Desktop/KernSight-reports");
+        if !root.is_dir() {
+            return;
+        }
+        for entry in std::fs::read_dir(root).expect("reports") {
+            let dest = entry.expect("entry").path();
+            let report_path = dest.join("dump-report.json");
+            if !report_path.is_file() {
+                continue;
+            }
+            let package = dest
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            let mut calls =
+                http_calls_from_plaintext_dir(&dest.join("runtime/plaintext"), package);
+            calls.extend(http_calls_from_private_dir(
+                &dest.join("data-private"),
+                package,
+            ));
+            sort_http_catalog(&mut calls);
+            let text = std::fs::read_to_string(&report_path).expect("read dump");
+            let mut value: serde_json::Value = serde_json::from_str(&text).expect("json");
+            value["http_calls"] = serde_json::to_value(&calls).expect("ser");
+            std::fs::write(
+                &report_path,
+                serde_json::to_vec_pretty(&value).expect("bytes"),
+            )
+            .expect("write dump");
+            eprintln!("dump {package} http_calls={}", calls.len());
+        }
+        for entry in std::fs::read_dir(root).expect("reports") {
+            let path = entry.expect("entry").path();
+            let name = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("");
+            if !name.ends_with("-report.json") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("read session");
+            let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                continue;
+            };
+            let Some(arr) = value.get("http_calls").cloned() else {
+                continue;
+            };
+            let Ok(mut calls) = serde_json::from_value::<Vec<HttpCallActivity>>(arr) else {
+                continue;
+            };
+            sort_http_catalog(&mut calls);
+            value["http_calls"] = serde_json::to_value(&calls).expect("ser");
+            std::fs::write(&path, serde_json::to_vec_pretty(&value).expect("bytes"))
+                .expect("write session");
+            eprintln!("session {name} http_calls={}", calls.len());
+        }
+    }
+
+    #[test]
+    fn icbc_private_store_on_disk_if_present() {
+        let dir = std::path::Path::new(
+            "/Users/swyiic/Desktop/KernSight-reports/com.icbc/data-private",
+        );
+        if !dir.is_dir() {
+            return;
+        }
+        let calls = http_calls_from_private_dir(dir, "com.icbc");
+        assert!(
+            calls.iter().any(|call| call
+                .host
+                .as_deref()
+                .is_some_and(|host| host.contains("icbc.com.cn"))),
+            "{calls:?}"
+        );
     }
 
     #[test]

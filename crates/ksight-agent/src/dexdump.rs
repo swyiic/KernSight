@@ -245,7 +245,7 @@ pub fn pids_for_package(package: &str) -> Vec<u32> {
     pids
 }
 
-const PLAINTEXT_NEEDLES: [&[u8]; 16] = [
+const PLAINTEXT_NEEDLES: [&[u8]; 18] = [
     b"https://",
     b"HTTP/1.",
     b"POST /",
@@ -254,6 +254,8 @@ const PLAINTEXT_NEEDLES: [&[u8]; 16] = [
     b"\"host\"",
     b"\"path\"",
     b"/api/",
+    b"/login",
+    b"/mbfront",
     b":path",
     b":authority",
     b":method",
@@ -263,9 +265,9 @@ const PLAINTEXT_NEEDLES: [&[u8]; 16] = [
     b"Authorization:",
     b"http://",
 ];
-const PLAINTEXT_WINDOW: usize = 4096;
-const PLAINTEXT_CAP: usize = 64;
-const PLAINTEXT_PER_NEEDLE: usize = 12;
+const PLAINTEXT_WINDOW: usize = 8192;
+const PLAINTEXT_CAP: usize = 96;
+const PLAINTEXT_PER_NEEDLE: usize = 16;
 
 fn dump_plaintext_windows(pid: u32, dest_dir: &Path, deadline: Instant) -> usize {
     let Ok(maps) = std::fs::read_to_string(format!("/proc/{pid}/maps")) else {
@@ -365,7 +367,7 @@ fn plaintext_window_begin(bytes: &[u8], at: usize, needle: &[u8]) -> usize {
     at.saturating_sub(64)
 }
 
-/// Heap windows are a fixed 4096-byte cut around a needle, not a URL extractor.
+/// Heap windows are a fixed 8192-byte cut around a needle, not a URL extractor.
 /// Drop trailing NULs (allocator padding) and skip slices that are mostly binary.
 fn keep_plaintext_window(slice: &[u8]) -> Option<&[u8]> {
     let end = slice

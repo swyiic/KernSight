@@ -719,14 +719,7 @@ fn finalize_catalog(report: &mut PackageDumpReport, dest: &Path) -> Result<()> {
             &dest.join("data-private"),
             &report.package,
         ));
-    report.http_calls.sort_by(|left, right| {
-        right
-            .count
-            .cmp(&left.count)
-            .then_with(|| left.origin.cmp(&right.origin))
-            .then_with(|| left.path.cmp(&right.path))
-    });
-    report.http_calls.truncate(128);
+    ksight_core::sort_http_catalog(&mut report.http_calls);
     report.http_code_refs =
         ksight_core::correlate_http_calls_to_dex(&report.http_calls, &report.dex_sets);
     report.jni_exports = catalog_jni_exports(dest, &report.artifacts);
@@ -785,7 +778,7 @@ fn default_dump_warnings() -> Vec<String> {
     vec![
         "plaintext_windows and key_slots are bounded candidate counts, not confirmed secrets"
             .to_owned(),
-        "dump http_calls are parsed from runtime/plaintext heap windows and data-private CE/DE copies (HTTP/1, JSON, embedded URLs, or HTTP/2 HEADERS HPACK; NUL or CRLF). Heap rows are correlated, not Inspect SSL_write. Responses have no URL path. Windows are a 4096-byte cut around HTTP/1.1, GET/POST, https://, \"url\", /api/, or :path/:authority then trimmed of trailing NULs; mostly-zero slices are not written."
+        "dump http_calls are parsed from runtime/plaintext heap windows and data-private CE/DE copies (HTTP/1, JSON, embedded URLs, or HTTP/2 HEADERS HPACK; NUL or CRLF). Heap rows are correlated, not Inspect SSL_write. Responses have no URL path. Windows are an 8192-byte cut around HTTP/1.1, GET/POST, https://, \"url\", /api/, /login, /mbfront, or :path/:authority then trimmed of trailing NULs; mostly-zero slices are not written."
             .to_owned(),
         "http_code_refs match HTTP host/path to DEX string-pool and class->method names. That is correlated identifier overlap, not an ART/JNI call stack. jni_exports lists dynsym Java_*/JNI_OnLoad; empty names mean the SO is stripped. Inspect --inspect-adapter jni_plaintext attaches JNINativeInterface GetStringUTFChars/NewStringUTF/GetByteArray* via exported GetFunctionTable and jni.h slots, not Java_* exports."
             .to_owned(),
@@ -2546,6 +2539,9 @@ fn copy_private_tree(
         }
         let path = entry.path();
         if path.is_dir() {
+            if skip_private_dir(&entry.file_name().to_string_lossy()) {
+                continue;
+            }
             copied = copied.saturating_add(copy_private_tree(
                 &path,
                 &dest.join(entry.file_name()),
@@ -2576,7 +2572,26 @@ fn copy_private_tree(
     Ok(copied)
 }
 
+fn skip_private_dir(name: &str) -> bool {
+    matches!(
+        name,
+        "fresco_disk_cache"
+            | "image_manager_disk_cache"
+            | "Crash Reports"
+            | "HTTP Cache"
+            | "Code Cache"
+            | "Cache_Data"
+            | "oat_primary"
+            | "shaders_cache"
+            | "com.android.opengl.shaders_cache.multifile"
+            | "com.android.skia.shaders_cache"
+    )
+}
+
 fn skip_private_file(path: &Path) -> bool {
+    if has_ext(path, "cnt") || has_ext(path, "baj") || has_ext(path, "baf") {
+        return true;
+    }
     [
         "jpg", "jpeg", "png", "webp", "mp4", "webm", "gif", "so", "apk", "dex", "jar", "oat",
         "vdex", "odex", "mp3", "aac", "wav",
