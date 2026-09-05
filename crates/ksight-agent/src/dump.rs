@@ -21,7 +21,15 @@ const MAX_APK_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_TREE_FILE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_PRIVATE_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_PRIVATE_FILES: usize = 512;
-const APP_PRIVATE_DIRS: [&str; 4] = ["shared_prefs", "databases", "files", "no_backup"];
+const APP_PRIVATE_DIRS: [&str; 7] = [
+    "shared_prefs",
+    "databases",
+    "files",
+    "no_backup",
+    "app_webview",
+    "app_webview_chromium",
+    "cache",
+];
 /// Versioned package-dump document consumed by `MobileE`.
 pub const PACKAGE_DUMP_SCHEMA: &str = "mobilee.kernsight-package-dump/v2";
 const PRIVATE_PACKAGE_ROOT: &str = "/data/local/tmp/ksight/packages";
@@ -2569,9 +2577,12 @@ fn copy_private_tree(
 }
 
 fn skip_private_file(path: &Path) -> bool {
-    ["jpg", "jpeg", "png", "webp", "mp4", "webm", "gif"]
-        .iter()
-        .any(|ext| has_ext(path, ext))
+    [
+        "jpg", "jpeg", "png", "webp", "mp4", "webm", "gif", "so", "apk", "dex", "jar", "oat",
+        "vdex", "odex", "mp3", "aac", "wav",
+    ]
+    .iter()
+    .any(|ext| has_ext(path, ext))
 }
 
 fn copy_capped_path(src: &Path, dest: &Path, cap: u64) -> Result<()> {

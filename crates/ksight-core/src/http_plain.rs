@@ -626,11 +626,51 @@ pub fn is_kept_inspect_url(url: &str) -> bool {
     let ext = path.rsplit_once('.').map_or("", |(_, ext)| ext);
     if matches!(
         ext,
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "ico" | "bmp" | "svg" | "crl"
+        "png"
+            | "jpg"
+            | "jpeg"
+            | "gif"
+            | "webp"
+            | "ico"
+            | "bmp"
+            | "svg"
+            | "crl"
+            | "cer"
+            | "crt"
+            | "der"
+            | "pem"
     ) {
         return false;
     }
-    if path.contains("digicert") || path.contains("/ocsp") {
+    if path.contains("digicert")
+        || path.contains("/ocsp")
+        || path.contains("pki.goog")
+        || path.contains("amazontrust")
+        || path.contains(".crl")
+        || path.contains("/crl")
+        || path.contains("globalsign.com/repository")
+        || path.contains("/data/user/0/")
+        || path.contains("apache.org/licenses")
+    {
+        return false;
+    }
+    let host = lower
+        .split("://")
+        .nth(1)
+        .unwrap_or(lower.as_str())
+        .split('/')
+        .next()
+        .unwrap_or("");
+    if matches!(
+        host,
+        "jquery.com"
+            | "sizzlejs.com"
+            | "getbootstrap.com"
+            | "swiperjs.com"
+            | "github.com"
+            | "www.apache.org"
+            | "www.unicode.org"
+    ) {
         return false;
     }
     true
@@ -729,6 +769,9 @@ mod tests {
             "{urls:?}"
         );
         assert!(!urls.iter().any(|url| url.contains(".png")), "{urls:?}");
+        assert!(is_kept_inspect_url("https://ecs.abchina.com.cn/mbfront/"));
+        assert!(!is_kept_inspect_url("https://i.pki.goog/we1.crt0"));
+        assert!(!is_kept_inspect_url("https://c.pki.goog/r/gsr1.crl0"));
     }
 
     #[test]

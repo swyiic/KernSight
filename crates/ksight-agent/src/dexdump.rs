@@ -63,22 +63,25 @@ pub fn dump_live_process(pid: u32, dest_dir: &Path, deadline: Instant) -> LiveDu
         paused: pause.active,
         ..LiveDump::default()
     };
-    let memory = dump_process_dex_from_maps(pid, dest_dir, deadline, &maps);
-    dump.memory_images = memory.dex;
-    dump.vdex_images = memory.vdex;
-    dump.stitched_spans = dump.stitched_spans.saturating_add(memory.stitched);
-    dump.fd_images = dump_process_fds(pid, dest_dir, deadline);
-    write_open_code(pid, dest_dir);
+    // Interface catalog first: Inspect shutdown used to spend the 8s budget on DEX heaps.
+    dump.plaintext_windows = dump_plaintext_windows(pid, dest_dir, deadline);
     dump.native_libs = dump_loaded_sos(pid, dest_dir, deadline);
+    write_open_code(pid, dest_dir);
     let packer = maps_have_packer_so(&maps);
-    if packer {
+    if packer && Instant::now() < deadline {
         dump.packer_regions = dump_packer_regions(pid, dest_dir, deadline);
         dump.key_slots = dump_followed_keys(pid, dest_dir, deadline);
     }
-    dump.plaintext_windows = dump_plaintext_windows(pid, dest_dir, deadline);
-    let harvest = harvest_payload_blobs(pid, dest_dir, &maps, 0);
-    dump.blob_dex = harvest.dex;
-    dump.stitched_spans = dump.stitched_spans.saturating_add(harvest.stitched);
+    if Instant::now() < deadline {
+        let memory = dump_process_dex_from_maps(pid, dest_dir, deadline, &maps);
+        dump.memory_images = memory.dex;
+        dump.vdex_images = memory.vdex;
+        dump.stitched_spans = dump.stitched_spans.saturating_add(memory.stitched);
+        dump.fd_images = dump_process_fds(pid, dest_dir, deadline);
+        let harvest = harvest_payload_blobs(pid, dest_dir, &maps, 0);
+        dump.blob_dex = harvest.dex;
+        dump.stitched_spans = dump.stitched_spans.saturating_add(harvest.stitched);
+    }
     dump.snapshot_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     drop(pause);
     write_snapshot_sidecar(pid, dest_dir, &dump);

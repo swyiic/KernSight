@@ -2901,6 +2901,8 @@ fn keep_store_file(path: &std::path::Path) -> bool {
         ext.as_str(),
         "xml" | "json" | "txt" | "html" | "db" | "sqlite" | "sqlite3" | ""
     ) || name.starts_with("mem-")
+        || name == "cookies"
+        || name.contains("webview")
 }
 
 fn pid_from_plaintext_name(path: &std::path::Path) -> u32 {

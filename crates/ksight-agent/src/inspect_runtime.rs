@@ -25,8 +25,18 @@ const LINKER_PATHS: [&str; 4] = [
     "/apex/com.android.runtime/bin/linker",
     "/system/bin/linker",
 ];
-const TLS_NAMES: [&str; 2] = ["SSL_write", "SSL_write_ex"];
-const TLS_READ_NAMES: [&str; 2] = ["SSL_read", "SSL_read_ex"];
+const TLS_NAMES: [&str; 4] = [
+    "SSL_write",
+    "SSL_write_ex",
+    "mbedtls_ssl_write",
+    "wolfSSL_write",
+];
+const TLS_READ_NAMES: [&str; 4] = [
+    "SSL_read",
+    "SSL_read_ex",
+    "mbedtls_ssl_read",
+    "wolfSSL_read",
+];
 const TLS_PATHS: [&str; 6] = [
     "/apex/com.android.conscrypt/lib64/libssl.so",
     "/system/lib64/libssl.so",
@@ -313,7 +323,15 @@ impl InspectAdapterKind {
             return &["libbinder.so"];
         }
         match self {
-            Self::TlsSslWrite | Self::TlsSslRead => &["libssl.so", "libcronet.so"],
+            Self::TlsSslWrite | Self::TlsSslRead => &[
+                "libssl.so",
+                "libcronet.so",
+                "libflutter.so",
+                "mbedtls",
+                "wolfssl",
+                "gmssl",
+                "tassl",
+            ],
             Self::ArtDexLoad | Self::ArtDexMemory => &["libdexfile.so"],
             Self::LinkerSoLoad => &["linker64", "linker"],
             adapter if adapter.is_jni() => &["libart.so"],
@@ -1383,7 +1401,7 @@ fn resolve_libraries(policy: &InspectPolicy, adapter: InspectAdapterKind) -> Vec
         discover_mapped_libraries(needles)
     };
     found.extend(mapped);
-    found.into_iter().take(8).collect()
+    found.into_iter().take(16).collect()
 }
 
 fn mapping_path_matches(path: &str, needle: &str) -> bool {
@@ -1395,7 +1413,22 @@ fn mapping_path_matches(path: &str, needle: &str) -> bool {
         return file.contains("cronet");
     }
     if needle == "libssl.so" {
-        return file == "libssl.so" || file.ends_with("_libssl.so");
+        return file == "libssl.so" || file.ends_with("_libssl.so") || file == "libboringssl.so";
+    }
+    if needle == "libflutter.so" {
+        return file == "libflutter.so" || file.starts_with("libflutter.");
+    }
+    if needle == "mbedtls" {
+        return file.contains("mbedtls") || file.contains("mbedcrypto");
+    }
+    if needle == "wolfssl" {
+        return file.contains("wolfssl");
+    }
+    if needle == "gmssl" {
+        return file.contains("gmssl") || file.contains("smcrypto");
+    }
+    if needle == "tassl" {
+        return file.contains("tassl");
     }
     file == needle
 }
@@ -3622,6 +3655,24 @@ mod tests {
             "/apex/com.android.tethering/lib64/stable_cronet_libssl.so",
             "libcronet.so"
         ));
+        assert!(mapping_path_matches(
+            "/data/app/foo/lib/arm64/libflutter.so",
+            "libflutter.so"
+        ));
+        assert!(mapping_path_matches(
+            "/data/app/foo/lib/arm64/libmbedtls.so",
+            "mbedtls"
+        ));
+        assert!(mapping_path_matches(
+            "/data/app/foo/lib/arm64/libwolfssl.so",
+            "wolfssl"
+        ));
+        assert!(InspectAdapterKind::TlsSslWrite
+            .symbols()
+            .contains(&"mbedtls_ssl_write"));
+        assert!(InspectAdapterKind::TlsSslRead
+            .symbols()
+            .contains(&"wolfSSL_read"));
         let libs = InspectAdapterKind::BinderUserspace.libraries();
         assert!(libs
             .iter()
