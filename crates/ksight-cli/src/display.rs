@@ -225,7 +225,7 @@ pub(crate) fn print_session_report(report: &SessionReport, top: usize) {
 
     println!("\nHTTP calls from Inspect/heap plaintext (top {top})");
     if report.http_calls.is_empty() {
-        println!("  none parsed (need HTTP/1 or JSON preview; HTTP/2 frames are not decoded)");
+        println!("  none parsed (need HTTP/1, JSON, embedded URL, or HTTP/2 HPACK preview)");
     }
     for row in report.http_calls.iter().take(top) {
         let host = row.host.as_deref().unwrap_or("-");

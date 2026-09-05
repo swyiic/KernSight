@@ -5,6 +5,7 @@ mod dex;
 mod dns;
 mod graph;
 mod handshake;
+mod http2;
 mod http_plain;
 mod identity;
 mod inflate;
@@ -35,7 +36,7 @@ pub use graph::{
 pub use handshake::{parse_handshake, HandshakeMeta};
 pub use http_plain::{
     format_inspect_url, is_kept_inspect_url, is_third_party_host, parse_http_plain,
-    parse_http_plain_all, parse_http_plain_bytes, ParsedHttpPlain,
+    parse_http_plain_all, parse_http_plain_all_bytes, parse_http_plain_bytes, ParsedHttpPlain,
 };
 pub use identity::IdentityRegistry;
 pub use inflate::{
@@ -53,12 +54,13 @@ pub use provenance::{
     DexArtifactSet, DexClassConflict, DumpArtifact, PackageDexIndex, ProvenanceClass,
 };
 pub use report::{
-    correlate_http_calls_to_dex, rank_observed_mappings, ArtifactActivity, BinderFdTransfer,
-    BinderLifecycleSummary, BinderRelation, BinderReplyPair, DnsNameActivity, FdLifecycleSummary,
-    HandshakeNameActivity, HttpCallActivity, HttpCodeRef, InspectHitActivity, LoopbackScanActivity,
-    MappingSource, MemoryLifecycleSummary, MergedDumpRef, NetworkPeerActivity, ObservedMapping,
-    PlaintextActivity, ProcessActivity, ProcessInstanceRef, QualitySummary, SchedWakeupActivity,
-    SessionReport, SessionReportBuilder, SocketLifecycleSummary,
+    correlate_http_calls_to_dex, http_calls_from_plaintext_dir, rank_observed_mappings,
+    ArtifactActivity, BinderFdTransfer, BinderLifecycleSummary, BinderRelation, BinderReplyPair,
+    DnsNameActivity, FdLifecycleSummary, HandshakeNameActivity, HttpCallActivity, HttpCodeRef,
+    InspectHitActivity, LoopbackScanActivity, MappingSource, MemoryLifecycleSummary, MergedDumpRef,
+    NetworkPeerActivity, ObservedMapping, PlaintextActivity, ProcessActivity, ProcessInstanceRef,
+    QualitySummary, SchedWakeupActivity, SessionReport, SessionReportBuilder,
+    SocketLifecycleSummary,
 };
 pub use sequence::{SequenceError, SequenceGap, SequenceTracker};
 pub use sm4::{

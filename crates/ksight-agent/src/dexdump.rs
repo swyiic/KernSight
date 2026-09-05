@@ -1,6 +1,7 @@
 //! Dump in-memory DEX while the target process still holds decrypted pages.
 
 use std::{
+    collections::BTreeSet,
     fs::File,
     io::{Read as _, Seek as _, SeekFrom, Write as _},
     path::Path,
@@ -241,17 +242,24 @@ pub fn pids_for_package(package: &str) -> Vec<u32> {
     pids
 }
 
-const PLAINTEXT_NEEDLES: [&[u8]; 7] = [
+const PLAINTEXT_NEEDLES: [&[u8]; 13] = [
+    b"https://",
     b"HTTP/1.",
     b"POST /",
     b"GET /",
+    b"\"url\"",
+    b":path",
+    b":authority",
+    b":method",
     b"application/json",
     b"\"password\"",
     b"\"token\"",
     b"Authorization:",
+    b"http://",
 ];
 const PLAINTEXT_WINDOW: usize = 2048;
-const PLAINTEXT_CAP: usize = 32;
+const PLAINTEXT_CAP: usize = 64;
+const PLAINTEXT_PER_NEEDLE: usize = 12;
 
 fn dump_plaintext_windows(pid: u32, dest_dir: &Path, deadline: Instant) -> usize {
     let Ok(maps) = std::fs::read_to_string(format!("/proc/{pid}/maps")) else {
@@ -263,6 +271,7 @@ fn dump_plaintext_windows(pid: u32, dest_dir: &Path, deadline: Instant) -> usize
     let out_dir = dest_dir.join("plaintext");
     let _ = std::fs::create_dir_all(&out_dir);
     let mut dumped = 0_usize;
+    let mut seen = BTreeSet::new();
     for line in maps.lines() {
         if Instant::now() >= deadline || dumped >= PLAINTEXT_CAP {
             break;
@@ -295,7 +304,8 @@ fn dump_plaintext_windows(pid: u32, dest_dir: &Path, deadline: Instant) -> usize
         };
         for needle in PLAINTEXT_NEEDLES {
             let mut from = 0_usize;
-            while dumped < PLAINTEXT_CAP {
+            let mut needle_hits = 0_usize;
+            while dumped < PLAINTEXT_CAP && needle_hits < PLAINTEXT_PER_NEEDLE {
                 if Instant::now() >= deadline {
                     return dumped;
                 }
@@ -309,11 +319,17 @@ fn dump_plaintext_windows(pid: u32, dest_dir: &Path, deadline: Instant) -> usize
                     from = at.saturating_add(needle.len().max(1));
                     continue;
                 };
+                let fingerprint = plaintext_fingerprint(slice);
+                if !seen.insert(fingerprint) {
+                    from = at.saturating_add(needle.len().max(1));
+                    continue;
+                }
                 let name = format!("mem-{pid}-{start:x}+{at:x}.txt");
                 let dest = out_dir.join(&name);
                 if !dest.exists() {
                     let _ = std::fs::write(&dest, slice);
                     dumped = dumped.saturating_add(1);
+                    needle_hits = needle_hits.saturating_add(1);
                 }
                 from = at.saturating_add(needle.len().max(1));
             }
@@ -337,7 +353,7 @@ fn plaintext_window_begin(bytes: &[u8], at: usize, needle: &[u8]) -> usize {
         }
         return index;
     }
-    if needle == b"GET /" || needle == b"POST /" {
+    if needle == b"GET /" || needle == b"POST /" || needle == b"https://" || needle == b"http://" {
         return at;
     }
     at.saturating_sub(64)
@@ -358,7 +374,50 @@ fn keep_plaintext_window(slice: &[u8]) -> Option<&[u8]> {
         .iter()
         .filter(|byte| byte.is_ascii_graphic() || byte.is_ascii_whitespace())
         .count();
-    (printable.saturating_mul(4) >= trimmed.len().saturating_mul(3)).then_some(trimmed)
+    let has_url = trimmed.windows(8).any(|window| window == b"https://")
+        || trimmed.windows(7).any(|window| window == b"http://")
+        || trimmed.windows(7).any(|window| window == b":method")
+        || trimmed.windows(5).any(|window| window == b":path");
+    if pki_plaintext_window(trimmed) {
+        return None;
+    }
+    let enough = if has_url {
+        printable.saturating_mul(5) >= trimmed.len().saturating_mul(2)
+    } else {
+        printable.saturating_mul(4) >= trimmed.len().saturating_mul(3)
+    };
+    enough.then_some(trimmed)
+}
+
+fn pki_plaintext_window(trimmed: &[u8]) -> bool {
+    let pki = contains_ignore_ascii(trimmed, b"digicert")
+        || contains_ignore_ascii(trimmed, b"/ocsp")
+        || contains_ignore_ascii(trimmed, b".crl")
+        || contains_ignore_ascii(trimmed, b"cacerts");
+    if !pki {
+        return false;
+    }
+    let useful = trimmed.windows(8).any(|window| window == b"https://")
+        || trimmed.windows(7).any(|window| window == b":method")
+        || trimmed.windows(5).any(|window| window == b":path")
+        || trimmed.windows(5).any(|window| window == b"GET /")
+        || trimmed.windows(6).any(|window| window == b"POST /");
+    !useful
+}
+
+fn contains_ignore_ascii(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
+fn plaintext_fingerprint(slice: &[u8]) -> (u64, usize) {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in slice.iter().take(96) {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    (hash, slice.len())
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -2323,5 +2382,19 @@ mod tests {
         let mut sparse = vec![0_u8; 2048];
         sparse[10..17].copy_from_slice(b"HTTP/1.");
         assert!(keep_plaintext_window(&sparse).is_none());
+    }
+
+    #[test]
+    fn plaintext_window_keeps_https_and_h2_header_tokens() {
+        let https = b"https://api.example/v1/login extra";
+        assert_eq!(plaintext_window_begin(https, 0, b"https://"), 0);
+        let mut padded = b":method: GET\n:path: /v1/login\n:authority: api.example\n".to_vec();
+        padded.resize(2048, 0);
+        let kept = keep_plaintext_window(&padded).expect("h2 tokens");
+        assert!(kept.windows(5).any(|window| window == b":path"));
+        assert!(kept.windows(7).any(|window| window == b":method"));
+        let pki =
+            b"http://crl.digicert.cn/GeoTrustG2TLSCNRSA4096SHA2562022CA1.crl extra-bytes-here!!";
+        assert!(keep_plaintext_window(pki).is_none());
     }
 }

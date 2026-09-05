@@ -465,6 +465,7 @@ pub(crate) fn protocol_report(
 
     let mut report = builder.finish();
     merge_dump_reports(serial, &mut report);
+    merge_forensics_plaintext(&mut report, session_id);
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -512,6 +513,7 @@ pub(crate) fn protocol_graph(
     connection.close()?;
     let mut report = builder.finish();
     merge_dump_reports(serial, &mut report);
+    merge_forensics_plaintext(&mut report, session_id);
     let graph = report.graph.query(query);
     if json {
         println!("{}", serde_json::to_string_pretty(&graph)?);
@@ -535,6 +537,30 @@ struct PackageDumpFile {
     http_calls: Vec<ksight_core::HttpCallActivity>,
     #[serde(default)]
     http_code_refs: Vec<ksight_core::HttpCodeRef>,
+}
+
+fn merge_forensics_plaintext(report: &mut SessionReport, session_id: Uuid) {
+    let dir = std::path::Path::new("forensics")
+        .join(session_id.to_string())
+        .join("plaintext");
+    if !dir.is_dir() {
+        return;
+    }
+    let source = report
+        .processes
+        .first()
+        .map(|row| {
+            row.package
+                .clone()
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| row.label.clone())
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "heap".to_owned());
+    let calls = ksight_core::http_calls_from_plaintext_dir(&dir, &source);
+    if !calls.is_empty() {
+        report.ingest_dump_http_calls(calls);
+    }
 }
 
 fn merge_dump_reports(serial: Option<&str>, report: &mut SessionReport) {

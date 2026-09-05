@@ -1,8 +1,7 @@
-//! HTTP/1 (and HTTP/2 preface) parse of Inspect TLS plaintext previews.
+//! HTTP/1, JSON, embedded URLs, and HTTP/2 HPACK parse of Inspect/dump buffers.
 //!
-//! Values that look like tokens are replaced with `[REDACTED]`. HTTP/2 frames
-//! after the preface are not decoded. This is report-side analysis of existing
-//! Inspect buffers, not a new capture ABI.
+//! Values that look like tokens are replaced with `[REDACTED]`. This is
+//! report-side analysis of existing Inspect buffers, not a new capture ABI.
 
 const SENSITIVE_HEADER: &[&str] = &[
     "cookie",
@@ -67,10 +66,10 @@ const THIRD_PARTY_HOST: &[&str] = &[
     "taobao",
 ];
 
-/// One parsed HTTP/1 call or HTTP/2 preface from an Inspect preview.
+/// One parsed HTTP/1 call, HTTP/2 HEADERS row, JSON object, or embedded URL.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedHttpPlain {
-    /// `http1_request`, `http1_response`, `http2_preface`, or `json`.
+    /// `http1_request`, `http1_response`, `http2_request`, `http2_response`, `http2_preface`, `json`, or `url`.
     pub kind: &'static str,
     /// `GET` / `POST` / `HTTP` (response) / `PRI`.
     pub method: String,
@@ -109,18 +108,42 @@ pub fn parse_http_plain(preview: &str, content_class: &str) -> Option<ParsedHttp
 /// HTTP/1, JSON keys, and `http(s)://` URLs from one Inspect preview.
 ///
 /// Gzip/zlib hex previews are inflated first. Truncated JSON that does not start
-/// with `{` still yields URL hosts. HTTP/2 HPACK is not decoded.
+/// with `{` still yields URL hosts. HTTP/2 HEADERS are HPACK-decoded.
 #[must_use]
 pub fn parse_http_plain_all(preview: &str, content_class: &str) -> Vec<ParsedHttpPlain> {
     if content_class == "tls_record" {
         return Vec::new();
     }
     let (bytes, class) = normalize_preview_bytes(preview, content_class);
+    parse_http_plain_all_bytes(&bytes, &class)
+}
+
+/// Same as `parse_http_plain_all` on raw bytes (dump windows, HTTP/2 frames).
+#[must_use]
+pub fn parse_http_plain_all_bytes(bytes: &[u8], content_class: &str) -> Vec<ParsedHttpPlain> {
+    if content_class == "tls_record" {
+        return Vec::new();
+    }
+    let inflated = crate::inflate_inspect_buffer(bytes);
+    let bytes = inflated.as_deref().unwrap_or(bytes);
     let mut out = Vec::new();
-    if let Some(parsed) = parse_http_plain_bytes(&bytes, &class) {
+    if let Some(parsed) = parse_http_plain_bytes(bytes, content_class) {
         out.push(parsed);
     }
-    for parsed in embedded_http_urls(&bytes) {
+    for parsed in crate::http2::parse_http2(bytes) {
+        if parsed.kind == "http2_preface" {
+            continue;
+        }
+        if !out.iter().any(|seen| {
+            seen.host == parsed.host && seen.path == parsed.path && seen.kind == parsed.kind
+        }) {
+            out.push(parsed);
+        }
+        if out.len() >= 16 {
+            break;
+        }
+    }
+    for parsed in embedded_http_urls(bytes) {
         if !out.iter().any(|seen| {
             seen.host == parsed.host && seen.path == parsed.path && seen.kind == parsed.kind
         }) {
@@ -448,7 +471,7 @@ fn parse_json_only(text: &str) -> Option<ParsedHttpPlain> {
     })
 }
 
-fn embedded_http_urls(bytes: &[u8]) -> Vec<ParsedHttpPlain> {
+pub(crate) fn embedded_http_urls(bytes: &[u8]) -> Vec<ParsedHttpPlain> {
     let mut out: Vec<ParsedHttpPlain> = Vec::new();
     let mut index = 0_usize;
     while index + 8 < bytes.len() && out.len() < 16 {
@@ -519,17 +542,45 @@ fn embedded_http_urls(bytes: &[u8]) -> Vec<ParsedHttpPlain> {
     out
 }
 
+pub(crate) fn parse_host_token(value: &str) -> Option<String> {
+    sanitize_host(value)
+}
+
+pub(crate) fn header_is_sensitive(name: &str) -> bool {
+    sensitive_header(name)
+}
+
 fn sanitize_host(value: &str) -> Option<String> {
-    let host = value.trim().trim_matches(|ch: char| ch == '[' || ch == ']');
-    if host.is_empty() || host.len() > 253 {
+    let host = value
+        .trim()
+        .trim_matches(|ch: char| ch == '[' || ch == ']')
+        .trim_end_matches('.');
+    if host.len() < 4 || host.len() > 253 || !host.contains('.') {
         return None;
     }
     if !host.bytes().all(|byte| {
-        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b':' | b'[' | b']')
+        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b':' | b'[' | b']')
     }) {
         return None;
     }
-    Some(host.to_ascii_lowercase())
+    let host_no_port = host.split(':').next().unwrap_or(host);
+    let tld = host_no_port.rsplit('.').next().unwrap_or("");
+    if tld.len() < 2 || tld.len() > 24 || !tld.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+        return None;
+    }
+    if matches!(tld, "invalid" | "local" | "localhost") {
+        return None;
+    }
+    let lower = host.to_ascii_lowercase();
+    if lower == "schemas.android.com"
+        || lower.ends_with(".w3.org")
+        || lower.starts_with("ns.google.")
+        || lower.starts_with("ns.adobe.")
+        || lower.contains("xmlsoap")
+    {
+        return None;
+    }
+    Some(lower)
 }
 
 fn sensitive_header(name: &str) -> bool {
@@ -549,7 +600,8 @@ fn sensitive_key(name: &str) -> bool {
 /// Reconstruct a URL with scheme. Image paths are dropped; `.txt` / `.json` / `.html` stay.
 #[must_use]
 pub fn format_inspect_url(scheme: Option<&str>, host: &str, path: &str) -> Option<String> {
-    if host.is_empty() {
+    let host = sanitize_host(host)?;
+    if path.chars().any(|ch| ch == '\u{FFFD}' || ch.is_control()) {
         return None;
     }
     let scheme = scheme.unwrap_or("https");
@@ -643,6 +695,20 @@ mod tests {
         assert!(parse_http_plain("TLS application_data", "tls_record").is_none());
         let parsed = parse_http_plain("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", "text").expect("h2");
         assert_eq!(parsed.kind, "http2_preface");
+        let mut frame = vec![0, 0, 20, 0x1, 0x04, 0, 0, 0, 1];
+        frame.extend_from_slice(&[
+            0x82, 0x86, 0x84, 0x41, 0x0f, 0x77, 0x77, 0x77, 0x2e, 0x65, 0x78, 0x61, 0x6d, 0x70,
+            0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d,
+        ]);
+        let parsed = parse_http_plain_all_bytes(&frame, "binary");
+        assert!(
+            parsed.iter().any(|row| {
+                row.kind == "http2_request"
+                    && row.host.as_deref() == Some("www.example.com")
+                    && row.path == "/"
+            }),
+            "{parsed:?}"
+        );
     }
 
     #[test]

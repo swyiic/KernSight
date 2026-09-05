@@ -62,7 +62,7 @@ pub enum TlsLibraryKind {
     ConscryptSystem,
     /// Conscrypt JNI helper, not the `SSL_write` boundary.
     ConscryptJni,
-    /// App-private `libssl.so` / `libboringssl.so`. Inspect attaches if `SSL_write` is exported.
+    /// App-private `libssl.so` / `libboringssl.so` / `libhssl`. Inspect attaches only if `SSL_write` is exported.
     AppLibssl,
     /// Chromium Cronet. Inspect attaches only if that ELF exports `SSL_write`.
     Cronet,
@@ -134,6 +134,9 @@ pub fn classify_tls_library_path(path: &str) -> Option<TlsLibraryKind> {
     }
     if basename == "libconscrypt_jni.so" || basename == "libjavacrypto.so" {
         return Some(TlsLibraryKind::ConscryptJni);
+    }
+    if basename.contains("hssl") {
+        return Some(TlsLibraryKind::AppLibssl);
     }
     if basename == "libssl.so" || basename == "libboringssl.so" || basename == "libcrypto.so" {
         if lower.contains("conscrypt")
@@ -281,6 +284,10 @@ mod tests {
         assert_eq!(
             classify_tls_library_path("/data/app/foo/lib/arm64/libflutter.so"),
             Some(TlsLibraryKind::FlutterEngine)
+        );
+        assert_eq!(
+            classify_tls_library_path("/data/app/foo/lib/arm64/libhssl-2.1.so"),
+            Some(TlsLibraryKind::AppLibssl)
         );
     }
 }

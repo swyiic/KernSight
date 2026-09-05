@@ -330,7 +330,7 @@ pub struct PackageDumpReport {
     /// Sensitive candidate files retained by explicit package-dump operation.
     #[serde(default)]
     pub sensitive_files: Vec<DumpEvidenceFile>,
-    /// HTTP/1 or JSON calls parsed from `runtime/plaintext` heap windows. Token values redacted.
+    /// HTTP/1, HTTP/2 HPACK, JSON, and URL rows parsed from `runtime/plaintext` heap windows. Token values redacted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub http_calls: Vec<ksight_core::HttpCallActivity>,
     /// DEX string/method names that match HTTP catalog paths. Correlated, not JNI execution.
@@ -763,7 +763,7 @@ fn default_dump_warnings() -> Vec<String> {
     vec![
         "plaintext_windows and key_slots are bounded candidate counts, not confirmed secrets"
             .to_owned(),
-        "dump http_calls are parsed from runtime/plaintext heap windows (HTTP/1 or JSON, NUL or CRLF); they are correlated heap facts, not Inspect SSL_write and not HTTP/2 HPACK. Responses have no URL path. Windows are a 2048-byte cut around a needle then trimmed of trailing NULs; mostly-zero slices are not written."
+        "dump http_calls are parsed from runtime/plaintext heap windows (HTTP/1, JSON, embedded URLs, or HTTP/2 HEADERS HPACK; NUL or CRLF). They are correlated heap facts, not Inspect SSL_write. Responses have no URL path. Windows are a 2048-byte cut around HTTP/1.1, GET/POST, https://, or :path/:authority then trimmed of trailing NULs; mostly-zero slices are not written."
             .to_owned(),
         "http_code_refs match HTTP host/path to DEX string-pool and class->method names. That is correlated identifier overlap, not an ART/JNI call stack. jni_exports lists dynsym Java_*/JNI_OnLoad; empty names mean the SO is stripped. Inspect --inspect-adapter jni_plaintext attaches JNINativeInterface GetStringUTFChars/NewStringUTF/GetByteArray* via exported GetFunctionTable and jni.h slots, not Java_* exports."
             .to_owned(),
@@ -962,61 +962,7 @@ fn catalog_sensitive_files(dest: &Path) -> Vec<DumpEvidenceFile> {
 }
 
 fn catalog_plaintext_http_calls(dest: &Path, package: &str) -> Vec<ksight_core::HttpCallActivity> {
-    let mut calls =
-        BTreeMap::<(u32, String, String, String, String), ksight_core::HttpCallActivity>::new();
-    visit_files(&dest.join("runtime/plaintext"), &mut |path| {
-        let Ok(bytes) = std::fs::read(path) else {
-            return;
-        };
-        if bytes.len() > 8 * 1024 {
-            return;
-        }
-        let Some(parsed) = ksight_core::parse_http_plain_bytes(&bytes, "text") else {
-            return;
-        };
-        let process_id = pid_from_plaintext_name(path);
-        let host = parsed.host.clone().unwrap_or_default();
-        let key = (
-            process_id,
-            parsed.kind.to_owned(),
-            parsed.method.clone(),
-            host,
-            parsed.path.clone(),
-        );
-        let activity = calls
-            .entry(key)
-            .or_insert_with(|| ksight_core::HttpCallActivity {
-                source: package.to_owned(),
-                process_id,
-                direction: "heap".to_owned(),
-                kind: parsed.kind.to_owned(),
-                method: parsed.method.clone(),
-                host: parsed.host.clone(),
-                path: parsed.path.clone(),
-                status: parsed.status,
-                query_keys: parsed.query_keys.clone(),
-                header_names: parsed.header_names.clone(),
-                redacted_headers: parsed.redacted_headers.clone(),
-                body_keys: parsed.body_keys.clone(),
-                redacted_body_keys: parsed.redacted_body_keys.clone(),
-                content_type: parsed.content_type.clone(),
-                third_party: parsed.third_party,
-                count: 0,
-                origin: "heap".to_owned(),
-            });
-        activity.count = activity.count.saturating_add(1);
-        activity.third_party |= parsed.third_party;
-    });
-    let mut out = calls.into_values().collect::<Vec<_>>();
-    out.sort_by(|left, right| {
-        right
-            .count
-            .cmp(&left.count)
-            .then_with(|| left.path.cmp(&right.path))
-            .then_with(|| left.method.cmp(&right.method))
-    });
-    out.truncate(128);
-    out
+    ksight_core::http_calls_from_plaintext_dir(&dest.join("runtime/plaintext"), package)
 }
 
 fn catalog_jni_exports(dest: &Path, artifacts: &[ksight_core::DumpArtifact]) -> Vec<DumpJniExport> {
@@ -1046,15 +992,6 @@ fn catalog_jni_exports(dest: &Path, artifacts: &[ksight_core::DumpArtifact]) -> 
         });
     }
     out
-}
-
-fn pid_from_plaintext_name(path: &Path) -> u32 {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .and_then(|name| name.strip_prefix("mem-"))
-        .and_then(|name| name.split(['-', '+']).next())
-        .and_then(|name| name.parse().ok())
-        .unwrap_or(0)
 }
 
 fn recount_static_trees(report: &mut PackageDumpReport, dest: &Path) {
@@ -2884,6 +2821,51 @@ mod tests {
         assert_eq!(calls[0].status, Some(200));
         assert!(calls[0].path.is_empty());
         assert_eq!(calls[0].content_type.as_deref(), Some("image/jpeg"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn catalog_parses_http2_hpack_and_https_needles() {
+        let dir = std::env::temp_dir().join(format!("ksight-h2-calls-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("runtime/plaintext")).expect("plaintext dir");
+        let block = [
+            0x82, 0x86, 0x84, 0x41, 0x0f, 0x77, 0x77, 0x77, 0x2e, 0x65, 0x78, 0x61, 0x6d, 0x70,
+            0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d,
+        ];
+        let mut frame = vec![
+            0,
+            0,
+            u8::try_from(block.len()).unwrap(),
+            0x1,
+            0x04,
+            0,
+            0,
+            0,
+            1,
+        ];
+        frame.extend_from_slice(&block);
+        std::fs::write(dir.join("runtime/plaintext/mem-99-1000+0.txt"), &frame).expect("h2");
+        std::fs::write(
+            dir.join("runtime/plaintext/mem-99-2000+0.txt"),
+            b"https://api.example/v1/login?token=x",
+        )
+        .expect("https");
+        let calls = catalog_plaintext_http_calls(&dir, "com.example");
+        assert!(
+            calls.iter().any(|call| {
+                call.kind == "http2_request"
+                    && call.host.as_deref() == Some("www.example.com")
+                    && call.path == "/"
+                    && call.origin == "heap"
+            }),
+            "{calls:?}"
+        );
+        assert!(
+            calls.iter().any(|call| {
+                call.host.as_deref() == Some("api.example") && call.path == "/v1/login"
+            }),
+            "{calls:?}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

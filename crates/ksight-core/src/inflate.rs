@@ -1,7 +1,7 @@
 //! Bounded gzip/zlib inflate of Inspect buffers.
 //!
 //! This is report/device-side analysis of bytes already copied at an authorized
-//! TLS/JNI boundary. It is not MITM and does not invent HTTP/2 HPACK.
+//! TLS/JNI boundary. It is not MITM. HTTP/2 HPACK lives in `http2`.
 
 use std::io::Read as _;
 
@@ -81,7 +81,7 @@ fn gzip_offset(bytes: &[u8]) -> Option<usize> {
 
 fn read_bounded<R: std::io::Read>(decoder: R) -> Option<Vec<u8>> {
     let mut out = Vec::new();
-    decoder.take(INFLATE_CAP).read_to_end(&mut out).ok()?;
+    let _ = decoder.take(INFLATE_CAP).read_to_end(&mut out);
     (!out.is_empty()).then_some(out)
 }
 
@@ -126,6 +126,19 @@ mod tests {
         let text = String::from_utf8_lossy(&inflated);
         assert!(text.contains("HTTP/1.1 200 OK"));
         assert!(text.contains("ebsnew.boc.cn"));
+    }
+
+    #[test]
+    fn inflates_truncated_gzip_prefix() {
+        let plain = br#"{"url":"https://s.thsi.cn/cd/acrossBar_v1.8.zip","more":"padding-padding-padding"}"#;
+        let gz = gzip_of(plain);
+        let cut = gz.len().saturating_sub(8).max(16);
+        let inflated = inflate_gzip_bounded(&gz[..cut]).expect("truncated gzip");
+        let text = String::from_utf8_lossy(&inflated);
+        assert!(
+            text.contains("s.thsi.cn") || text.contains("acrossBar"),
+            "{text:?}"
+        );
     }
 
     #[test]

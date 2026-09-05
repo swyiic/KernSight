@@ -616,7 +616,7 @@ pub struct SessionReport {
     /// Bounded TLS plaintext fragments from Inspect `SSL_write`.
     #[serde(default)]
     pub plaintext: Vec<PlaintextActivity>,
-    /// HTTP/1 (and JSON) calls parsed from those Inspect previews. Token values are redacted.
+    /// HTTP/1, HTTP/2 HPACK, JSON, and embedded URL rows parsed from Inspect previews. Token values are redacted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub http_calls: Vec<HttpCallActivity>,
     /// DEX strings/methods that name the same host or path. Correlated, not JNI execution.
@@ -680,7 +680,7 @@ pub struct PlaintextActivity {
     pub content_class: String,
 }
 
-/// One HTTP/1 or JSON call aggregated from Inspect TLS plaintext previews.
+/// One HTTP/1, HTTP/2 HPACK, JSON, or URL row aggregated from Inspect/heap plaintext.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HttpCallActivity {
     /// Process label.
@@ -689,7 +689,7 @@ pub struct HttpCallActivity {
     pub process_id: u32,
     /// `send` for `SSL_write`, `recv` for `SSL_read`.
     pub direction: String,
-    /// `http1_request`, `http1_response`, `http2_preface`, or `json`.
+    /// `http1_request`, `http1_response`, `http2_request`, `http2_response`, `json`, or `url`.
     pub kind: String,
     /// `GET` / `POST` / `HTTP` / `PRI` / `JSON`.
     pub method: String,
@@ -819,6 +819,7 @@ pub struct SessionReportBuilder {
     handshake_events: u64,
     handshake_names: Vec<HandshakeNameActivity>,
     handshake_by_fd: BTreeMap<(u32, i32), MutableHandshake>,
+    http2: BTreeMap<(u32, String), crate::http2::Http2Assembler>,
 }
 
 #[derive(Debug, Default)]
@@ -1122,7 +1123,40 @@ impl SessionReportBuilder {
                     );
                     inspect.last_detail.truncate(240);
                 }
+                let raw = inspect_preview_bytes(fragment);
+                let h2_key = (pid, fragment.direction.clone());
+                let continue_h2 = self.http2.contains_key(&h2_key);
+                if class != "tls_record"
+                    && !raw.is_empty()
+                    && (continue_h2 || class == "binary" || crate::http2::looks_like_http2(&raw))
+                {
+                    let parsed_h2 = self.http2.entry(h2_key).or_default().push(&raw);
+                    for parsed in parsed_h2 {
+                        if parsed.kind == "http2_preface" {
+                            continue;
+                        }
+                        if parsed.kind == "http2_request" {
+                            if let Some(url) = crate::format_inspect_url(
+                                parsed.scheme.or(Some("https")),
+                                parsed.host.as_deref().unwrap_or(""),
+                                &parsed.path,
+                            ) {
+                                if let Some(plain) = self.plaintext.get_mut(&(
+                                    pid,
+                                    fragment.adapter.clone(),
+                                    fragment.direction.clone(),
+                                )) {
+                                    extend_unique(&mut plain.urls, std::slice::from_ref(&url), 32);
+                                }
+                            }
+                        }
+                        self.record_http_call(pid, &fragment.direction, "inspect", parsed);
+                    }
+                }
                 for parsed in crate::parse_http_plain_all(&preview, &class) {
+                    if parsed.kind.starts_with("http2") {
+                        continue;
+                    }
                     if parsed.kind == "url"
                         && crate::format_inspect_url(
                             parsed.scheme,
@@ -2617,7 +2651,7 @@ fn http_call_key(row: &HttpCallActivity) -> String {
 
 fn http_call_label(row: &HttpCallActivity) -> String {
     let tracker = if row.third_party { " tracker" } else { "" };
-    if row.kind == "http1_response" {
+    if row.kind == "http1_response" || row.kind == "http2_response" {
         let status = row
             .status
             .map_or_else(|| "?".to_owned(), |value| value.to_string());
@@ -2690,12 +2724,16 @@ fn pair_http_replies(
 ) {
     let requests: Vec<&HttpCallActivity> = calls
         .iter()
-        .filter(|row| row.kind == "http1_request" && row.host.is_some())
+        .filter(|row| {
+            matches!(row.kind.as_str(), "http1_request" | "http2_request") && row.host.is_some()
+        })
         .take(64)
         .collect();
     let responses: Vec<&HttpCallActivity> = calls
         .iter()
-        .filter(|row| row.kind == "http1_response" && row.host.is_some())
+        .filter(|row| {
+            matches!(row.kind.as_str(), "http1_response" | "http2_response") && row.host.is_some()
+        })
         .take(64)
         .collect();
     let mut paired = 0_usize;
@@ -2720,6 +2758,91 @@ fn pair_http_replies(
             paired = paired.saturating_add(1);
         }
     }
+}
+
+/// Parse dump/forensics `plaintext/` windows into heap `http_calls`.
+#[must_use]
+pub fn http_calls_from_plaintext_dir(dir: &std::path::Path, source: &str) -> Vec<HttpCallActivity> {
+    let mut calls = BTreeMap::<(u32, String, String, String, String), HttpCallActivity>::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        if bytes.len() > 8 * 1024 {
+            continue;
+        }
+        let process_id = pid_from_plaintext_name(&path);
+        for parsed in crate::parse_http_plain_all_bytes(&bytes, "text") {
+            if parsed.kind == "http2_preface" {
+                continue;
+            }
+            if parsed.kind == "url"
+                && crate::format_inspect_url(
+                    parsed.scheme,
+                    parsed.host.as_deref().unwrap_or(""),
+                    &parsed.path,
+                )
+                .is_none()
+            {
+                continue;
+            }
+            let host = parsed.host.clone().unwrap_or_default();
+            let key = (
+                process_id,
+                parsed.kind.to_owned(),
+                parsed.method.clone(),
+                host,
+                parsed.path.clone(),
+            );
+            let activity = calls.entry(key).or_insert_with(|| HttpCallActivity {
+                source: source.to_owned(),
+                process_id,
+                direction: "heap".to_owned(),
+                kind: parsed.kind.to_owned(),
+                method: parsed.method.clone(),
+                host: parsed.host.clone(),
+                path: parsed.path.clone(),
+                status: parsed.status,
+                query_keys: parsed.query_keys.clone(),
+                header_names: parsed.header_names.clone(),
+                redacted_headers: parsed.redacted_headers.clone(),
+                body_keys: parsed.body_keys.clone(),
+                redacted_body_keys: parsed.redacted_body_keys.clone(),
+                content_type: parsed.content_type.clone(),
+                third_party: parsed.third_party,
+                count: 0,
+                origin: "heap".to_owned(),
+            });
+            activity.count = activity.count.saturating_add(1);
+            activity.third_party |= parsed.third_party;
+        }
+    }
+    let mut out = calls.into_values().collect::<Vec<_>>();
+    out.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| left.method.cmp(&right.method))
+    });
+    out.truncate(128);
+    out
+}
+
+fn pid_from_plaintext_name(path: &std::path::Path) -> u32 {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("mem-"))
+        .and_then(|name| name.split('-').next())
+        .and_then(|pid| pid.parse().ok())
+        .unwrap_or(0)
 }
 
 impl SessionReport {
@@ -2838,6 +2961,15 @@ fn decode_inspect_preview(fragment: &ksight_model::InspectPlaintext) -> (String,
     (fragment.preview.clone(), class)
 }
 
+fn inspect_preview_bytes(fragment: &ksight_model::InspectPlaintext) -> Vec<u8> {
+    if fragment.preview_encoding == "hex" || preview_is_hex(&fragment.preview) {
+        crate::decode_hex_bytes(&fragment.preview)
+            .unwrap_or_else(|| fragment.preview.as_bytes().to_vec())
+    } else {
+        fragment.preview.as_bytes().to_vec()
+    }
+}
+
 fn absorb_plaintext_preview(activity: &mut MutablePlaintext, preview: &str, class: &str) {
     if preview.is_empty() {
         return;
@@ -2870,9 +3002,12 @@ fn absorb_plaintext_preview(activity: &mut MutablePlaintext, preview: &str, clas
 fn preview_url_list(preview: &str) -> Vec<String> {
     crate::parse_http_plain_all(preview, "text")
         .into_iter()
-        .filter(|parsed| parsed.kind == "url")
         .filter_map(|parsed| {
-            crate::format_inspect_url(parsed.scheme, parsed.host.as_deref()?, &parsed.path)
+            if !matches!(parsed.kind, "url" | "http1_request" | "http2_request") {
+                return None;
+            }
+            let scheme = parsed.scheme.or(Some("https"));
+            crate::format_inspect_url(scheme, parsed.host.as_deref()?, &parsed.path)
         })
         .collect()
 }
@@ -3142,8 +3277,8 @@ fn report_limitations() -> Vec<String> {
     vec![
         "Binder driver submission-to-delivery latency is correlated by transaction ID. Two-way RPCs pair reply submit to the request debug_id (binder_reply / replies_to, confirmed). A 128-byte parcel prefix is copied at kprobe binder_transaction (every online CPU) for 32-bit and 64-bit clients (native UAPI after compat conversion) and parsed as writeInterfaceToken String16. Inspect transact joins that request by tid+code as correlated joined_transact and copies reply latency when the kernel pair exists. Inspect pairs writeInterfaceToken and bounded exported Parcel writers on the same TID on ELF64; this GKI rejects AArch32 uprobes. AIDL method names come from on-device AOSP Stub tables (aosp_stub) or that process's loaded DEX TRANSACTION_* (process_dex). Parcel C++ object fields and writeFloat/writeDouble (no FPSIMD in uprobe pt_regs) are not read.".to_owned(),
         "DEX, ELF, connlog, and packed-cache path candidates may include a SHA-256 when a regular file <= 1 MiB is opened; capture also copies those forensic files under the spool forensics directory because apps often delete packed DEX after load.".to_owned(),
-        "Connect/accept and FD baseline/dup/close evidence reconstruct descriptor lifetimes. Optional network-io counts byte-returning socket calls and reports sendmmsg/recvmmsg results as message counts. UDP/53 datagrams parse QNAME/A/AAAA and stamp later connect() as correlated resolved_name (same-process first, then any resolver that answered the IP). getaddrinfo uprobes and non-53 resolvers remain uncovered. TLS/QUIC plaintext is Inspect-only. Consecutive SSL_read/SSL_write text previews for one process are stitched up to 16 KiB. gzip/zlib magic in those buffers is inflated before HTTP/JSON/`http(s)://` URL parse. HTTP/1 request-line, Host, query keys, JSON/form keys, and embedded URLs go into http_calls; Cookie/Authorization/token values are redacted. HTTP responses have no URL path. Heap windows that start at HTTP/1.1 are in-memory header tables (NUL or CRLF), not socket bytes. Same-process same-host request/response pairs are correlated http_reply. HTTP/2 frames after the PRI preface, HPACK, Cronet without SSL_write, Flutter, and custom TLS are not decoded.".to_owned(),
-        "The L0 graph is queryable (`ksightctl device graph`). Process instances use `procinst:{boot_id:pid:start_time_ns}` when start time is known; otherwise `process:pkg:pid`. Confirmed edges are Binder, Binder `replies_to`/`binder_reply` (request debug_id), socket, Binder FD `transfers_fd`, loopback scans, sched wakeup identity, and mmap/remap `maps` edges. Dump VMA `overlaps_mmap` is correlated even on an exact address match. Inspect `inspect_hit` and TLS `tls_send`/`tls_recv` are selected-process facts, not Observe. JNIEnv UTF-8/`byte[]` Inspect previews graph as `jni_from_java`/`jni_to_java` (confirmed selected-process, not Observe). Inspect HTTP `http_call` edges are parsed from those TLS or JNI previews (HTTP/1 or JSON); dump heap `http_call` edges are correlated. Same-host `http_reply` is correlated, not a stream id. Binder userspace hits record handle/code and join L0 `binder:req` by tid+code as correlated `joined_transact`. The interface token and bounded scalars come from exported Parcel writers on the same TID. AIDL names come from on-device AOSP Stub tables or session process DEX; they are not hardcoded GMS/app names. Parcel C++ fields are not read. RegisterNatives copies JNINativeMethod name/signature/fnPtr from the JNINativeInterface slot; jclass fields and Java/native stacks remain unresolved. Cronet/QUIC and custom TLS remain unresolved. Time proximity is never a confirmed edge.".to_owned(),
+        "Connect/accept and FD baseline/dup/close evidence reconstruct descriptor lifetimes. Optional network-io counts byte-returning socket calls and reports sendmmsg/recvmmsg results as message counts. UDP/53 datagrams parse QNAME/A/AAAA and stamp later connect() as correlated resolved_name (same-process first, then any resolver that answered the IP). getaddrinfo uprobes and non-53 resolvers remain uncovered. TLS/QUIC plaintext is Inspect-only. Consecutive SSL_read/SSL_write text previews for one process are stitched up to 16 KiB. gzip/zlib magic in those buffers is inflated before HTTP/JSON/`http(s)://` URL parse. HTTP/1 request-line, Host, query keys, JSON/form keys, embedded URLs, and HTTP/2 HEADERS HPACK (`:method`/`:path`/`:authority`) go into http_calls; Cookie/Authorization/token values are redacted. HTTP responses have no URL path. Heap windows that start at HTTP/1.1, GET/POST, `https://`, or `:path`/`:authority` are 2048-byte cuts (NUL or CRLF), not socket bytes. Same-process same-host request/response pairs are correlated http_reply. HPACK is report-side analysis of already-copied Inspect/dump buffers, not MITM. QUIC/HTTP/3 bodies, Cronet without SSL_write, Flutter Dart TLS, and custom TLS are not decoded.".to_owned(),
+        "The L0 graph is queryable (`ksightctl device graph`). Process instances use `procinst:{boot_id:pid:start_time_ns}` when start time is known; otherwise `process:pkg:pid`. Confirmed edges are Binder, Binder `replies_to`/`binder_reply` (request debug_id), socket, Binder FD `transfers_fd`, loopback scans, sched wakeup identity, and mmap/remap `maps` edges. Dump VMA `overlaps_mmap` is correlated even on an exact address match. Inspect `inspect_hit` and TLS `tls_send`/`tls_recv` are selected-process facts, not Observe. JNIEnv UTF-8/`byte[]` Inspect previews graph as `jni_from_java`/`jni_to_java` (confirmed selected-process, not Observe). Inspect HTTP `http_call` edges are parsed from those TLS or JNI previews (HTTP/1, HTTP/2 HPACK, JSON, or embedded URLs); dump heap `http_call` edges are correlated. Same-host `http_reply` is correlated, not a stream id. Binder userspace hits record handle/code and join L0 `binder:req` by tid+code as correlated `joined_transact`. The interface token and bounded scalars come from exported Parcel writers on the same TID. AIDL names come from on-device AOSP Stub tables or session process DEX; they are not hardcoded GMS/app names. Parcel C++ fields are not read. RegisterNatives copies JNINativeMethod name/signature/fnPtr from the JNINativeInterface slot; jclass fields and Java/native stacks remain unresolved. Cronet/QUIC and custom TLS remain unresolved. Time proximity is never a confirmed edge.".to_owned(),
         "dup/close file-descriptor events are off unless --files-fd is set. WebView/Chromium dup storms previously overflowed the file ring and dropped millions of records.".to_owned(),
         "Sampling, truncation, source loss, compatibility failures, or target early exit can make application behavior incomplete.".to_owned(),
     ]
@@ -3960,6 +4095,160 @@ mod tests {
             "HTTP/2 hex must not hide zip URL JSON: {preview}"
         );
         assert!(!preview.starts_with("00000000"), "{preview}");
+    }
+
+    #[test]
+    fn http2_hpack_hex_preview_becomes_http_calls_and_urls() {
+        let session = Uuid::new_v4();
+        let block = [
+            0x82, 0x86, 0x84, 0x41, 0x8c, 0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab,
+            0x90, 0xf4, 0xff,
+        ];
+        let mut frame = vec![
+            0,
+            0,
+            u8::try_from(block.len()).unwrap(),
+            0x1,
+            0x04,
+            0,
+            0,
+            0,
+            1,
+        ];
+        frame.extend_from_slice(&block);
+        let mut hex = String::new();
+        for byte in &frame {
+            let _ = std::fmt::Write::write_fmt(&mut hex, format_args!("{byte:02x}"));
+        }
+        let mut builder = SessionReportBuilder::default();
+        builder.record(&Event {
+            header: header(session, 31, SensorKind::Integrity),
+            payload: EventPayload::InspectPlaintext(ksight_model::InspectPlaintext {
+                adapter: "tls_ssl_read".to_owned(),
+                direction: "recv".to_owned(),
+                library: "libssl.so".to_owned(),
+                build_id: None,
+                offset: None,
+                requested_bytes: u64::try_from(frame.len()).unwrap_or(0),
+                captured_bytes: u32::try_from(frame.len()).unwrap_or(u32::MAX),
+                truncated: false,
+                sha256: "hpack".to_owned(),
+                preview: hex,
+                preview_encoding: "hex".to_owned(),
+                content_class: "binary".to_owned(),
+            }),
+        });
+        let report = builder.finish();
+        assert!(
+            report.http_calls.iter().any(|call| {
+                call.kind == "http2_request"
+                    && call.method == "GET"
+                    && call.host.as_deref() == Some("www.example.com")
+                    && call.path == "/"
+            }),
+            "{:?}",
+            report.http_calls
+        );
+        assert!(
+            report.plaintext[0]
+                .urls
+                .iter()
+                .any(|url| url == "http://www.example.com/" || url == "https://www.example.com/"),
+            "{:?}",
+            report.plaintext[0].urls
+        );
+    }
+
+    #[test]
+    fn http2_hpack_dynamic_table_survives_split_ssl_reads() {
+        let session = Uuid::new_v4();
+        let first = [
+            0x82, 0x86, 0x84, 0x41, 0x8c, 0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab,
+            0x90, 0xf4, 0xff,
+        ];
+        let mut frame1 = vec![
+            0,
+            0,
+            u8::try_from(first.len()).unwrap(),
+            0x1,
+            0x04,
+            0,
+            0,
+            0,
+            1,
+        ];
+        frame1.extend_from_slice(&first);
+        let second = [
+            0x82, 0x86, 0x84, 0xbe, 0x58, 0x08, 0x6e, 0x6f, 0x2d, 0x63, 0x61, 0x63, 0x68, 0x65,
+        ];
+        let mut frame2 = vec![
+            0,
+            0,
+            u8::try_from(second.len()).unwrap(),
+            0x1,
+            0x04,
+            0,
+            0,
+            0,
+            3,
+        ];
+        frame2.extend_from_slice(&second);
+        let mut hex1 = String::new();
+        for byte in &frame1 {
+            let _ = std::fmt::Write::write_fmt(&mut hex1, format_args!("{byte:02x}"));
+        }
+        let mut hex2 = String::new();
+        for byte in &frame2 {
+            let _ = std::fmt::Write::write_fmt(&mut hex2, format_args!("{byte:02x}"));
+        }
+        let mut builder = SessionReportBuilder::default();
+        builder.record(&Event {
+            header: header(session, 31, SensorKind::Integrity),
+            payload: EventPayload::InspectPlaintext(ksight_model::InspectPlaintext {
+                adapter: "tls_ssl_read".to_owned(),
+                direction: "recv".to_owned(),
+                library: "libssl.so".to_owned(),
+                build_id: None,
+                offset: None,
+                requested_bytes: u64::try_from(frame1.len()).unwrap_or(0),
+                captured_bytes: u32::try_from(frame1.len()).unwrap_or(u32::MAX),
+                truncated: false,
+                sha256: "h1".to_owned(),
+                preview: hex1,
+                preview_encoding: "hex".to_owned(),
+                content_class: "binary".to_owned(),
+            }),
+        });
+        builder.record(&Event {
+            header: header(session, 31, SensorKind::Integrity),
+            payload: EventPayload::InspectPlaintext(ksight_model::InspectPlaintext {
+                adapter: "tls_ssl_read".to_owned(),
+                direction: "recv".to_owned(),
+                library: "libssl.so".to_owned(),
+                build_id: None,
+                offset: None,
+                requested_bytes: u64::try_from(frame2.len()).unwrap_or(0),
+                captured_bytes: u32::try_from(frame2.len()).unwrap_or(u32::MAX),
+                truncated: false,
+                sha256: "h2".to_owned(),
+                preview: hex2,
+                preview_encoding: "hex".to_owned(),
+                content_class: "binary".to_owned(),
+            }),
+        });
+        let report = builder.finish();
+        let call = report
+            .http_calls
+            .iter()
+            .find(|call| {
+                call.kind == "http2_request" && call.host.as_deref() == Some("www.example.com")
+            })
+            .expect("h2 request");
+        assert!(
+            call.count >= 2 && call.header_names.iter().any(|name| name == "cache-control"),
+            "dynamic :authority must survive the second SSL_read: {:?}",
+            report.http_calls
+        );
     }
 
     #[test]
