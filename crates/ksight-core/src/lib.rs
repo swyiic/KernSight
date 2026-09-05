@@ -54,13 +54,13 @@ pub use provenance::{
     DexArtifactSet, DexClassConflict, DumpArtifact, PackageDexIndex, ProvenanceClass,
 };
 pub use report::{
-    correlate_http_calls_to_dex, http_calls_from_plaintext_dir, rank_observed_mappings,
-    ArtifactActivity, BinderFdTransfer, BinderLifecycleSummary, BinderRelation, BinderReplyPair,
-    DnsNameActivity, FdLifecycleSummary, HandshakeNameActivity, HttpCallActivity, HttpCodeRef,
-    InspectHitActivity, LoopbackScanActivity, MappingSource, MemoryLifecycleSummary, MergedDumpRef,
-    NetworkPeerActivity, ObservedMapping, PlaintextActivity, ProcessActivity, ProcessInstanceRef,
-    QualitySummary, SchedWakeupActivity, SessionReport, SessionReportBuilder,
-    SocketLifecycleSummary,
+    correlate_http_calls_to_dex, http_calls_from_plaintext_dir, http_calls_from_private_dir,
+    rank_observed_mappings, ArtifactActivity, BinderFdTransfer, BinderLifecycleSummary,
+    BinderRelation, BinderReplyPair, DnsNameActivity, FdLifecycleSummary, HandshakeNameActivity,
+    HttpCallActivity, HttpCodeRef, InspectHitActivity, LoopbackScanActivity, MappingSource,
+    MemoryLifecycleSummary, MergedDumpRef, NetworkPeerActivity, ObservedMapping, PlaintextActivity,
+    ProcessActivity, ProcessInstanceRef, QualitySummary, SchedWakeupActivity, SessionReport,
+    SessionReportBuilder, SocketLifecycleSummary,
 };
 pub use sequence::{SequenceError, SequenceGap, SequenceTracker};
 pub use sm4::{

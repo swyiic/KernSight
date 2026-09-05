@@ -705,6 +705,20 @@ fn finalize_catalog(report: &mut PackageDumpReport, dest: &Path) -> Result<()> {
     report.native_framework_matches = ksight_core::classify_native_frameworks(&report.artifacts);
     report.sensitive_files = catalog_sensitive_files(dest);
     report.http_calls = catalog_plaintext_http_calls(dest, &report.package);
+    report
+        .http_calls
+        .extend(ksight_core::http_calls_from_private_dir(
+            &dest.join("data-private"),
+            &report.package,
+        ));
+    report.http_calls.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| left.origin.cmp(&right.origin))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    report.http_calls.truncate(128);
     report.http_code_refs =
         ksight_core::correlate_http_calls_to_dex(&report.http_calls, &report.dex_sets);
     report.jni_exports = catalog_jni_exports(dest, &report.artifacts);
@@ -763,7 +777,7 @@ fn default_dump_warnings() -> Vec<String> {
     vec![
         "plaintext_windows and key_slots are bounded candidate counts, not confirmed secrets"
             .to_owned(),
-        "dump http_calls are parsed from runtime/plaintext heap windows (HTTP/1, JSON, embedded URLs, or HTTP/2 HEADERS HPACK; NUL or CRLF). They are correlated heap facts, not Inspect SSL_write. Responses have no URL path. Windows are a 2048-byte cut around HTTP/1.1, GET/POST, https://, or :path/:authority then trimmed of trailing NULs; mostly-zero slices are not written."
+        "dump http_calls are parsed from runtime/plaintext heap windows and data-private CE/DE copies (HTTP/1, JSON, embedded URLs, or HTTP/2 HEADERS HPACK; NUL or CRLF). Heap rows are correlated, not Inspect SSL_write. Responses have no URL path. Windows are a 4096-byte cut around HTTP/1.1, GET/POST, https://, \"url\", /api/, or :path/:authority then trimmed of trailing NULs; mostly-zero slices are not written."
             .to_owned(),
         "http_code_refs match HTTP host/path to DEX string-pool and class->method names. That is correlated identifier overlap, not an ART/JNI call stack. jni_exports lists dynsym Java_*/JNI_OnLoad; empty names mean the SO is stripped. Inspect --inspect-adapter jni_plaintext attaches JNINativeInterface GetStringUTFChars/NewStringUTF/GetByteArray* via exported GetFunctionTable and jni.h slots, not Java_* exports."
             .to_owned(),
@@ -785,7 +799,7 @@ fn default_dump_warnings() -> Vec<String> {
             .to_owned(),
         "hide-debug only clears adb_enabled/developer options; it does not hide root or an unlocked bootloader".to_owned(),
         "denylist is Magisk DenyList add/remove for this dump window when Magisk is present; it is not a root-hide claim".to_owned(),
-        "data-private is a bounded copy of CE shared_prefs/databases/files/no_backup after live harvest; not a full /data/data image".to_owned(),
+        "data-private is a bounded copy of CE/DE shared_prefs/databases/files/no_backup (≤512 files, ≤8 MiB each), not a full /data/data image. http(s):// hosts in those XML/JSON/SQLite copies are cataloged as origin=private http_calls; token values are not copied as secrets.".to_owned(),
         "tls_stacks is mapped/dumped ELF classification; --inspect-tls attaches exported SSL_write on libssl.so and libcronet.so only. Cronet/Flutter/mbedTLS without that export stay uncovered".to_owned(),
     ]
 }
@@ -2864,6 +2878,37 @@ mod tests {
             calls.iter().any(|call| {
                 call.host.as_deref() == Some("api.example") && call.path == "/v1/login"
             }),
+            "{calls:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn catalog_parses_private_sqlite_https_urls() {
+        let dir = std::env::temp_dir().join(format!("ksight-private-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("data-private/ce/databases")).expect("db dir");
+        let mut bytes = vec![0_u8; 64];
+        bytes.extend_from_slice(b"https://mbas.mbs.boc.cn/WeiBankFront/supportUNI/8");
+        bytes.extend_from_slice(&[0, 0, 0]);
+        bytes.extend_from_slice(b"https://wap.boc.cn/cs/fd5/index_2220.html");
+        std::fs::write(
+            dir.join("data-private/ce/databases/boc_mobile_database.db"),
+            &bytes,
+        )
+        .expect("db");
+        let calls = ksight_core::http_calls_from_private_dir(&dir.join("data-private"), "com.boc");
+        assert!(
+            calls.iter().any(|call| {
+                call.origin == "private"
+                    && call.host.as_deref() == Some("mbas.mbs.boc.cn")
+                    && call.path.starts_with("/WeiBankFront/")
+            }),
+            "{calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.host.as_deref() == Some("wap.boc.cn")),
             "{calls:?}"
         );
         let _ = std::fs::remove_dir_all(dir);

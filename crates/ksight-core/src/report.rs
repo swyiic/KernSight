@@ -819,7 +819,7 @@ pub struct SessionReportBuilder {
     handshake_events: u64,
     handshake_names: Vec<HandshakeNameActivity>,
     handshake_by_fd: BTreeMap<(u32, i32), MutableHandshake>,
-    http2: BTreeMap<(u32, String), crate::http2::Http2Assembler>,
+    http2: BTreeMap<(u32, String, String), crate::http2::Http2Assembler>,
 }
 
 #[derive(Debug, Default)]
@@ -1124,13 +1124,14 @@ impl SessionReportBuilder {
                     inspect.last_detail.truncate(240);
                 }
                 let raw = inspect_preview_bytes(fragment);
-                let h2_key = (pid, fragment.direction.clone());
+                let inflated = crate::inflate_inspect_buffer(&raw).unwrap_or(raw);
+                let h2_key = (pid, fragment.adapter.clone(), fragment.direction.clone());
                 let continue_h2 = self.http2.contains_key(&h2_key);
                 if class != "tls_record"
-                    && !raw.is_empty()
-                    && (continue_h2 || class == "binary" || crate::http2::looks_like_http2(&raw))
+                    && !inflated.is_empty()
+                    && (continue_h2 || crate::http2::looks_like_http2(&inflated))
                 {
-                    let parsed_h2 = self.http2.entry(h2_key).or_default().push(&raw);
+                    let parsed_h2 = self.http2.entry(h2_key).or_default().push(&inflated);
                     for parsed in parsed_h2 {
                         if parsed.kind == "http2_preface" {
                             continue;
@@ -2763,19 +2764,34 @@ fn pair_http_replies(
 /// Parse dump/forensics `plaintext/` windows into heap `http_calls`.
 #[must_use]
 pub fn http_calls_from_plaintext_dir(dir: &std::path::Path, source: &str) -> Vec<HttpCallActivity> {
+    http_calls_from_store(dir, source, "heap", 8 * 1024, false)
+}
+
+/// Parse already-copied CE/DE prefs/databases/files for `http(s)://` interface rows.
+#[must_use]
+pub fn http_calls_from_private_dir(dir: &std::path::Path, source: &str) -> Vec<HttpCallActivity> {
+    http_calls_from_store(dir, source, "private", 512 * 1024, true)
+}
+
+fn http_calls_from_store(
+    dir: &std::path::Path,
+    source: &str,
+    origin: &str,
+    max_bytes: usize,
+    recursive: bool,
+) -> Vec<HttpCallActivity> {
+    let mut files = Vec::new();
+    let mut remaining = 256_usize;
+    collect_store_files(dir, recursive, &mut files, &mut remaining);
     let mut calls = BTreeMap::<(u32, String, String, String, String), HttpCallActivity>::new();
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let Ok(bytes) = std::fs::read(&path) else {
+    for path in files {
+        let Ok(mut bytes) = std::fs::read(&path) else {
             continue;
         };
-        if bytes.len() > 8 * 1024 {
+        if bytes.len() > max_bytes {
+            bytes.truncate(max_bytes);
+        }
+        if bytes.is_empty() {
             continue;
         }
         let process_id = pid_from_plaintext_name(&path);
@@ -2804,7 +2820,7 @@ pub fn http_calls_from_plaintext_dir(dir: &std::path::Path, source: &str) -> Vec
             let activity = calls.entry(key).or_insert_with(|| HttpCallActivity {
                 source: source.to_owned(),
                 process_id,
-                direction: "heap".to_owned(),
+                direction: origin.to_owned(),
                 kind: parsed.kind.to_owned(),
                 method: parsed.method.clone(),
                 host: parsed.host.clone(),
@@ -2818,7 +2834,7 @@ pub fn http_calls_from_plaintext_dir(dir: &std::path::Path, source: &str) -> Vec
                 content_type: parsed.content_type.clone(),
                 third_party: parsed.third_party,
                 count: 0,
-                origin: "heap".to_owned(),
+                origin: origin.to_owned(),
             });
             activity.count = activity.count.saturating_add(1);
             activity.third_party |= parsed.third_party;
@@ -2834,6 +2850,57 @@ pub fn http_calls_from_plaintext_dir(dir: &std::path::Path, source: &str) -> Vec
     });
     out.truncate(128);
     out
+}
+
+fn collect_store_files(
+    dir: &std::path::Path,
+    recursive: bool,
+    out: &mut Vec<std::path::PathBuf>,
+    remaining: &mut usize,
+) {
+    if *remaining == 0 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if *remaining == 0 {
+            return;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            if recursive {
+                collect_store_files(&path, true, out, remaining);
+            }
+            continue;
+        }
+        if !keep_store_file(&path) {
+            continue;
+        }
+        out.push(path);
+        *remaining = remaining.saturating_sub(1);
+    }
+}
+
+fn keep_store_file(path: &std::path::Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if name.ends_with("-wal") || name.ends_with("-shm") || name.ends_with("-journal") {
+        return false;
+    }
+    let ext = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(
+        ext.as_str(),
+        "xml" | "json" | "txt" | "html" | "db" | "sqlite" | "sqlite3" | ""
+    ) || name.starts_with("mem-")
 }
 
 fn pid_from_plaintext_name(path: &std::path::Path) -> u32 {
@@ -3277,7 +3344,7 @@ fn report_limitations() -> Vec<String> {
     vec![
         "Binder driver submission-to-delivery latency is correlated by transaction ID. Two-way RPCs pair reply submit to the request debug_id (binder_reply / replies_to, confirmed). A 128-byte parcel prefix is copied at kprobe binder_transaction (every online CPU) for 32-bit and 64-bit clients (native UAPI after compat conversion) and parsed as writeInterfaceToken String16. Inspect transact joins that request by tid+code as correlated joined_transact and copies reply latency when the kernel pair exists. Inspect pairs writeInterfaceToken and bounded exported Parcel writers on the same TID on ELF64; this GKI rejects AArch32 uprobes. AIDL method names come from on-device AOSP Stub tables (aosp_stub) or that process's loaded DEX TRANSACTION_* (process_dex). Parcel C++ object fields and writeFloat/writeDouble (no FPSIMD in uprobe pt_regs) are not read.".to_owned(),
         "DEX, ELF, connlog, and packed-cache path candidates may include a SHA-256 when a regular file <= 1 MiB is opened; capture also copies those forensic files under the spool forensics directory because apps often delete packed DEX after load.".to_owned(),
-        "Connect/accept and FD baseline/dup/close evidence reconstruct descriptor lifetimes. Optional network-io counts byte-returning socket calls and reports sendmmsg/recvmmsg results as message counts. UDP/53 datagrams parse QNAME/A/AAAA and stamp later connect() as correlated resolved_name (same-process first, then any resolver that answered the IP). getaddrinfo uprobes and non-53 resolvers remain uncovered. TLS/QUIC plaintext is Inspect-only. Consecutive SSL_read/SSL_write text previews for one process are stitched up to 16 KiB. gzip/zlib magic in those buffers is inflated before HTTP/JSON/`http(s)://` URL parse. HTTP/1 request-line, Host, query keys, JSON/form keys, embedded URLs, and HTTP/2 HEADERS HPACK (`:method`/`:path`/`:authority`) go into http_calls; Cookie/Authorization/token values are redacted. HTTP responses have no URL path. Heap windows that start at HTTP/1.1, GET/POST, `https://`, or `:path`/`:authority` are 2048-byte cuts (NUL or CRLF), not socket bytes. Same-process same-host request/response pairs are correlated http_reply. HPACK is report-side analysis of already-copied Inspect/dump buffers, not MITM. QUIC/HTTP/3 bodies, Cronet without SSL_write, Flutter Dart TLS, and custom TLS are not decoded.".to_owned(),
+        "Connect/accept and FD baseline/dup/close evidence reconstruct descriptor lifetimes. Optional network-io counts byte-returning socket calls and reports sendmmsg/recvmmsg results as message counts. UDP/53 datagrams parse QNAME/A/AAAA and stamp later connect() as correlated resolved_name (same-process first, then any resolver that answered the IP). getaddrinfo uprobes and non-53 resolvers remain uncovered. TLS/QUIC plaintext is Inspect-only. Consecutive SSL_read/SSL_write text previews for one process are stitched up to 16 KiB. gzip/zlib magic in those buffers is inflated before HTTP/JSON/`http(s)://` URL parse. HTTP/1 request-line, Host, query keys, JSON/form keys, embedded URLs, and HTTP/2 HEADERS HPACK (`:method`/`:path`/`:authority`) go into http_calls; Cookie/Authorization/token values are redacted. HTTP responses have no URL path. Heap windows that start at HTTP/1.1, GET/POST, `https://`, `\"url\"`, `/api/`, or `:path`/`:authority` are 4096-byte cuts (NUL or CRLF), not a full memory image. CE/DE shared_prefs/SQLite copies contribute origin=private URL rows. Same-process same-host request/response pairs are correlated http_reply. HPACK is report-side analysis of already-copied Inspect/dump buffers, not MITM. QUIC/HTTP/3 bodies, Cronet without SSL_write, Flutter Dart TLS, WebView/Chromium, and custom TLS without that export are not decoded.".to_owned(),
         "The L0 graph is queryable (`ksightctl device graph`). Process instances use `procinst:{boot_id:pid:start_time_ns}` when start time is known; otherwise `process:pkg:pid`. Confirmed edges are Binder, Binder `replies_to`/`binder_reply` (request debug_id), socket, Binder FD `transfers_fd`, loopback scans, sched wakeup identity, and mmap/remap `maps` edges. Dump VMA `overlaps_mmap` is correlated even on an exact address match. Inspect `inspect_hit` and TLS `tls_send`/`tls_recv` are selected-process facts, not Observe. JNIEnv UTF-8/`byte[]` Inspect previews graph as `jni_from_java`/`jni_to_java` (confirmed selected-process, not Observe). Inspect HTTP `http_call` edges are parsed from those TLS or JNI previews (HTTP/1, HTTP/2 HPACK, JSON, or embedded URLs); dump heap `http_call` edges are correlated. Same-host `http_reply` is correlated, not a stream id. Binder userspace hits record handle/code and join L0 `binder:req` by tid+code as correlated `joined_transact`. The interface token and bounded scalars come from exported Parcel writers on the same TID. AIDL names come from on-device AOSP Stub tables or session process DEX; they are not hardcoded GMS/app names. Parcel C++ fields are not read. RegisterNatives copies JNINativeMethod name/signature/fnPtr from the JNINativeInterface slot; jclass fields and Java/native stacks remain unresolved. Cronet/QUIC and custom TLS remain unresolved. Time proximity is never a confirmed edge.".to_owned(),
         "dup/close file-descriptor events are off unless --files-fd is set. WebView/Chromium dup storms previously overflowed the file ring and dropped millions of records.".to_owned(),
         "Sampling, truncation, source loss, compatibility failures, or target early exit can make application behavior incomplete.".to_owned(),
@@ -4249,6 +4316,36 @@ mod tests {
             "dynamic :authority must survive the second SSL_read: {:?}",
             report.http_calls
         );
+    }
+
+    #[test]
+    fn private_store_sqlite_bytes_become_http_calls() {
+        let dir = std::env::temp_dir().join(format!("ksight-ce-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("ce/databases")).expect("db dir");
+        let mut bytes = b"COL".to_vec();
+        bytes.extend_from_slice(b"https://ebsnew.boc.cn/api/login");
+        bytes.push(0);
+        bytes.extend_from_slice(b"https://mbs.boc.cn/phone/");
+        std::fs::write(dir.join("ce/databases/boc_mobile_database.db"), &bytes).expect("db");
+        std::fs::write(
+            dir.join("ce/shared_prefs.xml"),
+            br#"<?xml version='1.0'?><map><string name="host">https://wap.boc.cn/cs/fd5/index.html</string></map>"#,
+        )
+        .expect("xml");
+        let calls = http_calls_from_private_dir(&dir, "com.chinamworld.bocmbci");
+        assert!(
+            calls.iter().any(|call| {
+                call.origin == "private" && call.host.as_deref() == Some("ebsnew.boc.cn")
+            }),
+            "{calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.host.as_deref() == Some("wap.boc.cn")),
+            "{calls:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

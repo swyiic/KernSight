@@ -433,11 +433,11 @@ dependencies = [
 
 [[package]]
 name = "ksight-abi"
-version = "0.2.4"
+version = "0.2.5"
 
 [[package]]
 name = "ksight-agent"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "aya",
@@ -460,7 +460,7 @@ dependencies = [
 
 [[package]]
 name = "ksight-cli"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -474,7 +474,7 @@ dependencies = [
 
 [[package]]
 name = "ksight-core"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "flate2",
  "ksight-model",
@@ -488,7 +488,7 @@ dependencies = [
 
 [[package]]
 name = "ksight-hwbp"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "aya",
@@ -498,7 +498,7 @@ dependencies = [
 
 [[package]]
 name = "ksight-model"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "serde",
  "uuid",
@@ -506,7 +506,7 @@ dependencies = [
 
 [[package]]
 name = "ksight-protocol"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "ksight-model",
  "serde",
@@ -868,7 +868,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "clap",

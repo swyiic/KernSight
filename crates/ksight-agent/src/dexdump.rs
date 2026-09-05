@@ -242,12 +242,15 @@ pub fn pids_for_package(package: &str) -> Vec<u32> {
     pids
 }
 
-const PLAINTEXT_NEEDLES: [&[u8]; 13] = [
+const PLAINTEXT_NEEDLES: [&[u8]; 16] = [
     b"https://",
     b"HTTP/1.",
     b"POST /",
     b"GET /",
     b"\"url\"",
+    b"\"host\"",
+    b"\"path\"",
+    b"/api/",
     b":path",
     b":authority",
     b":method",
@@ -257,7 +260,7 @@ const PLAINTEXT_NEEDLES: [&[u8]; 13] = [
     b"Authorization:",
     b"http://",
 ];
-const PLAINTEXT_WINDOW: usize = 2048;
+const PLAINTEXT_WINDOW: usize = 4096;
 const PLAINTEXT_CAP: usize = 64;
 const PLAINTEXT_PER_NEEDLE: usize = 12;
 
@@ -359,7 +362,7 @@ fn plaintext_window_begin(bytes: &[u8], at: usize, needle: &[u8]) -> usize {
     at.saturating_sub(64)
 }
 
-/// Heap windows are a fixed 2048-byte cut around a needle, not a URL extractor.
+/// Heap windows are a fixed 4096-byte cut around a needle, not a URL extractor.
 /// Drop trailing NULs (allocator padding) and skip slices that are mostly binary.
 fn keep_plaintext_window(slice: &[u8]) -> Option<&[u8]> {
     let end = slice

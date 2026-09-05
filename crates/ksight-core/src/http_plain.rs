@@ -130,17 +130,19 @@ pub fn parse_http_plain_all_bytes(bytes: &[u8], content_class: &str) -> Vec<Pars
     if let Some(parsed) = parse_http_plain_bytes(bytes, content_class) {
         out.push(parsed);
     }
-    for parsed in crate::http2::parse_http2(bytes) {
-        if parsed.kind == "http2_preface" {
-            continue;
-        }
-        if !out.iter().any(|seen| {
-            seen.host == parsed.host && seen.path == parsed.path && seen.kind == parsed.kind
-        }) {
-            out.push(parsed);
-        }
-        if out.len() >= 16 {
-            break;
+    if bytes.len() <= 16 * 1024 {
+        for parsed in crate::http2::parse_http2(bytes) {
+            if parsed.kind == "http2_preface" {
+                continue;
+            }
+            if !out.iter().any(|seen| {
+                seen.host == parsed.host && seen.path == parsed.path && seen.kind == parsed.kind
+            }) {
+                out.push(parsed);
+            }
+            if out.len() >= 48 {
+                break;
+            }
         }
     }
     for parsed in embedded_http_urls(bytes) {
@@ -149,7 +151,7 @@ pub fn parse_http_plain_all_bytes(bytes: &[u8], content_class: &str) -> Vec<Pars
         }) {
             out.push(parsed);
         }
-        if out.len() >= 16 {
+        if out.len() >= 48 {
             break;
         }
     }
@@ -474,7 +476,7 @@ fn parse_json_only(text: &str) -> Option<ParsedHttpPlain> {
 pub(crate) fn embedded_http_urls(bytes: &[u8]) -> Vec<ParsedHttpPlain> {
     let mut out: Vec<ParsedHttpPlain> = Vec::new();
     let mut index = 0_usize;
-    while index + 8 < bytes.len() && out.len() < 16 {
+    while index + 8 < bytes.len() && out.len() < 48 {
         let rest = &bytes[index..];
         let scheme = if rest.starts_with(b"https://") {
             8_usize
@@ -486,7 +488,8 @@ pub(crate) fn embedded_http_urls(bytes: &[u8]) -> Vec<ParsedHttpPlain> {
         };
         if index > 0 {
             let previous = bytes[index - 1];
-            if previous.is_ascii_alphanumeric() {
+            // SQLite/XML packs `https://` after letters. Only skip if this is a path continuation.
+            if previous == b'/' || previous == b':' || previous == b'.' {
                 index += 1;
                 continue;
             }
