@@ -680,9 +680,12 @@ const WAIT_WALL: i32 = 0x4000_0000;
 
 fn attach_main(pid: i32) -> Result<Vec<i32>, String> {
     unsafe {
-        let seized = libc::ptrace(PTRACE_SEIZE, pid, 0, 0) == 0;
+        // libc exposes the ptrace request as c_uint on glibc and c_int on
+        // Android/musl. Let the call-site infer the target-specific integer
+        // type instead of baking either ABI into this portable constant.
+        let seized = libc::ptrace(PTRACE_SEIZE as _, pid, 0, 0) == 0;
         if seized {
-            let _ = libc::ptrace(PTRACE_INTERRUPT, pid, 0, 0);
+            let _ = libc::ptrace(PTRACE_INTERRUPT as _, pid, 0, 0);
         } else if libc::ptrace(libc::PTRACE_ATTACH, pid, 0, 0) != 0 {
             return Err(format!(
                 "ptrace attach: {}",
