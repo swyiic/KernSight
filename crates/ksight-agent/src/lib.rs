@@ -8,6 +8,17 @@ pub mod baseline;
 pub mod binder_aidl;
 /// Session-scoped Binder method names from a process's loaded DEX.
 pub mod binder_dex;
+/// Reconstruct Inspect HTTP/WS copies and feed a Burp HTTP proxy.
+pub mod burp_mirror;
+/// Per-UID iptables DNAT to Burp.
+#[cfg(any(target_os = "android", target_os = "linux"))]
+pub mod mitm_redirect;
+/// Live heap scan for AES/SM4 material while capturing.
+#[cfg(any(target_os = "android", target_os = "linux"))]
+pub mod crypto_watch;
+/// Late `dlopen` of `libksight_tls.so` after packer init.
+#[cfg(any(target_os = "android", target_os = "linux"))]
+pub mod tls_inject;
 /// Read-only platform capability discovery.
 pub mod capabilities;
 /// Foreground multi-sensor capture orchestration.

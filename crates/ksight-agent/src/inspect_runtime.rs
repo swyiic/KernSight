@@ -16,7 +16,7 @@ use ksight_model::{InspectObservation, InspectPlaintext, ProcessIdentity, Proces
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
-use crate::elf::{inspect_elf, matching_symbols, symbol_match};
+use crate::elf::{inspect_elf, matching_symbols, matching_symbols_exact, symbol_match};
 
 const LINKER_NAMES: [&str; 3] = ["__loader_dlopen", "do_dlopen", "android_dlopen_ext"];
 const LINKER_PATHS: [&str; 4] = [
@@ -76,6 +76,10 @@ const ART_JNI_PATHS: [&str; 2] = [
     "/apex/com.android.art/lib/libart.so",
 ];
 const ART_OPEN_ATTACH_CAP: usize = 12;
+/// DexHelper/Bangcle-style packers suicide if `libart` JNI uprobes exist during
+/// the first few seconds of process start. Attach after this age instead.
+#[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
+const PACKER_ATTACH_GRACE: Duration = Duration::from_secs(6);
 const JNI_ENV_ATTACH_CAP: usize = 64;
 const CODE_PATH_MARKERS: [&str; 8] = [
     ".apk", ".dex", ".jar", ".vdex", ".zip", ".oat", ".art", "memfd:",
@@ -419,7 +423,10 @@ impl InspectAdapterKind {
     /// Adapters recorded as audited stubs when another adapter is selected.
     pub const fn audited_stubs(self) -> &'static [Self] {
         match self {
-            Self::TlsSslWrite | Self::TlsSslRead | Self::LinkerSoLoad => &[
+            Self::TlsSslWrite | Self::TlsSslRead => {
+                &[Self::ArtDexLoad, Self::ArtDexMemory, Self::BinderUserspace]
+            }
+            Self::LinkerSoLoad => &[
                 Self::ArtDexLoad,
                 Self::ArtDexMemory,
                 Self::JniRegistration,
@@ -567,6 +574,35 @@ impl InspectPlan {
             && Path::new(&self.uprobe_object).is_file()
     }
 
+    /// Attach every exact exported TLS write/read name on each mapped library.
+    fn evaluate_tls_exports(
+        policy: InspectPolicy,
+        adapter: InspectAdapterKind,
+        uprobe_object: PathBuf,
+    ) -> Vec<Self> {
+        let libraries = resolve_libraries(&policy, adapter);
+        if libraries.is_empty() {
+            return Self::evaluate(policy, adapter, uprobe_object);
+        }
+        let mut plans = Vec::new();
+        for library in libraries {
+            match evaluate_tls_symbol_exports(&policy, adapter, &uprobe_object, &library) {
+                Some(mut found) => plans.append(&mut found),
+                None => plans.push(evaluate_one(
+                    policy.clone(),
+                    adapter,
+                    uprobe_object.clone(),
+                    Some(library),
+                )),
+            }
+        }
+        if plans.is_empty() {
+            Self::evaluate(policy, adapter, uprobe_object)
+        } else {
+            plans
+        }
+    }
+
     /// Attach every exported Open* that matches this ART adapter's prefixes.
     fn evaluate_art_exports(
         policy: InspectPolicy,
@@ -642,6 +678,8 @@ pub enum InspectOutput {
         tid: u32,
         /// Copied fragment.
         fragment: InspectPlaintext,
+        /// Original copied bytes for Burp (preview may be lossy).
+        raw: Vec<u8>,
     },
 }
 
@@ -673,6 +711,8 @@ pub struct InspectRuntime {
     binder_dex_cache: crate::binder_dex::ProcessDexAidlCache,
     #[cfg(any(target_os = "android", target_os = "linux"))]
     scoped_tgids: Vec<u32>,
+    #[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
+    delay_notice_emitted: bool,
 }
 
 #[derive(Debug, Default)]
@@ -733,6 +773,9 @@ struct PendingSslRead {
     buf: u64,
     #[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
     requested: i32,
+    /// `SSL_read_ex` writes the byte count through x3; `SSL_read` uses x0.
+    #[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
+    written_ptr: Option<u64>,
 }
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
@@ -753,6 +796,7 @@ impl InspectRuntime {
     }
 
     /// Evaluate every selected adapter (for example TLS plus Binder) in one session.
+    #[allow(clippy::too_many_lines)]
     pub fn prepare_all(
         policy: &InspectPolicy,
         adapters: &[InspectAdapterKind],
@@ -807,6 +851,12 @@ impl InspectRuntime {
                     *adapter,
                     uprobe_object.clone(),
                 ));
+            } else if adapter.is_tls() {
+                plans.extend(InspectPlan::evaluate_tls_exports(
+                    policy.clone(),
+                    *adapter,
+                    uprobe_object.clone(),
+                ));
             } else {
                 plans.extend(InspectPlan::evaluate(
                     policy.clone(),
@@ -815,11 +865,19 @@ impl InspectRuntime {
                 ));
             }
             for companion in adapter.companions() {
-                plans.extend(InspectPlan::evaluate(
-                    policy.clone(),
-                    *companion,
-                    uprobe_object.clone(),
-                ));
+                if companion.is_tls() {
+                    plans.extend(InspectPlan::evaluate_tls_exports(
+                        policy.clone(),
+                        *companion,
+                        uprobe_object.clone(),
+                    ));
+                } else {
+                    plans.extend(InspectPlan::evaluate(
+                        policy.clone(),
+                        *companion,
+                        uprobe_object.clone(),
+                    ));
+                }
             }
             for stub in adapter.audited_stubs() {
                 if selected_adapters.contains(stub) {
@@ -853,6 +911,7 @@ impl InspectRuntime {
             binder_dex_cache: crate::binder_dex::ProcessDexAidlCache::default(),
             #[cfg(any(target_os = "android", target_os = "linux"))]
             scoped_tgids: Vec::new(),
+            delay_notice_emitted: false,
         }
     }
 
@@ -869,11 +928,43 @@ impl InspectRuntime {
         attach_all(self)
     }
 
+    /// Attach after a package-scoped process has survived packer init.
+    ///
+    /// ICBC `libDexHelper` SIGSEGVs at ~2s if `libart` JNI uprobes are already
+    /// patched on cold start. Wait until a matching TGID is at least
+    /// [`PACKER_ATTACH_GRACE`] old, then attach. Already-running apps attach
+    /// immediately. Whole-device inspect is unchanged.
+    pub fn attach_when_safe(&mut self) -> Vec<InspectObservation> {
+        #[cfg(any(target_os = "android", target_os = "linux"))]
+        {
+            if self.expired || !self.sessions.is_empty() {
+                return Vec::new();
+            }
+            if !inspect_target_survived_packer(&self.plans) {
+                if !self.delay_notice_emitted {
+                    self.delay_notice_emitted = true;
+                    eprintln!(
+                        "inspect waiting for package process to stay up >= {}s (packer init)",
+                        PACKER_ATTACH_GRACE.as_secs()
+                    );
+                }
+                return Vec::new();
+            }
+            attach_all(self)
+        }
+        #[cfg(not(any(target_os = "android", target_os = "linux")))]
+        {
+            Vec::new()
+        }
+    }
+
     /// Poll authorized hits.
     pub fn poll(&mut self) -> Vec<InspectOutput> {
         if self.expired {
             return Vec::new();
         }
+        #[cfg(any(target_os = "android", target_os = "linux"))]
+        refresh_package_tgids(self);
         poll_all(self)
     }
 
@@ -1075,6 +1166,66 @@ fn evaluate_one(
             )
         }
     }
+}
+
+fn tls_exact_names(adapter: InspectAdapterKind) -> Vec<&'static str> {
+    adapter.symbols().to_vec()
+}
+
+fn evaluate_tls_symbol_exports(
+    policy: &InspectPolicy,
+    adapter: InspectAdapterKind,
+    uprobe_object: &Path,
+    elf_path: &str,
+) -> Option<Vec<InspectPlan>> {
+    let elf = inspect_elf(elf_path).ok()?;
+    if let Some(required) = policy.build_id.as_deref() {
+        match elf.build_id.as_deref() {
+            Some(actual) if actual == required => {}
+            _ => return None,
+        }
+    }
+    let names = tls_exact_names(adapter);
+    let matched = matching_symbols_exact(&elf, &names);
+    if matched.is_empty() {
+        return None;
+    }
+    Some(
+        matched
+            .into_iter()
+            .take(8)
+            .map(|(name, offset)| {
+                let mut observation = InspectObservation {
+                    adapter: adapter.as_str().to_owned(),
+                    library: elf_path.to_owned(),
+                    build_id: elf.build_id.clone(),
+                    offset: Some(offset),
+                    detectability_notice: policy.detectability_notice.clone(),
+                    ..InspectObservation::default()
+                };
+                if Path::new(uprobe_object).is_file() {
+                    observation.detail = format!(
+                        "ready to attach {} uprobe symbol={name} offset={offset:#x}",
+                        adapter.as_str()
+                    );
+                } else {
+                    observation.detail =
+                        format!("uprobe object missing: {}", uprobe_object.display());
+                }
+                InspectPlan {
+                    policy: policy.clone(),
+                    adapter,
+                    uprobe_object: uprobe_object.to_path_buf(),
+                    elf_path: Some(elf_path.to_owned()),
+                    offset: Some(offset),
+                    build_id: elf.build_id.clone(),
+                    symbol: Some(name.to_owned()),
+                    pointer_width: (elf.bits / 8).max(4),
+                    observation,
+                }
+            })
+            .collect(),
+    )
 }
 
 fn evaluate_art_open_exports(
@@ -1630,6 +1781,88 @@ fn inspect_budget_exhausted(runtime: &InspectRuntime) -> bool {
     }
 }
 
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn inspect_target_survived_packer(plans: &[InspectPlan]) -> bool {
+    let Some(policy) = plans.first().map(|plan| &plan.policy) else {
+        return true;
+    };
+    if policy.whole_device {
+        return true;
+    }
+    if let Some(pid) = policy.pid.filter(|pid| *pid > 0) {
+        return process_age(pid).is_some_and(|age| age >= PACKER_ATTACH_GRACE);
+    }
+    let Some(package) = policy.package.as_deref().filter(|name| !name.is_empty()) else {
+        return false;
+    };
+    crate::dexdump::pids_for_package(package)
+        .into_iter()
+        .filter(|pid| process_cmdline_is_main(*pid, package))
+        .any(|pid| process_age(pid).is_some_and(|age| age >= PACKER_ATTACH_GRACE))
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn process_cmdline_is_main(pid: u32, package: &str) -> bool {
+    let Ok(bytes) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    let cmd = bytes.split(|byte| *byte == 0).next().unwrap_or(&[]);
+    std::str::from_utf8(cmd).ok() == Some(package)
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn process_age(pid: u32) -> Option<Duration> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let start_ticks = parse_stat_start_ticks(&stat)?;
+    let uptime = std::fs::read_to_string("/proc/uptime").ok()?;
+    let uptime_secs: f64 = uptime.split_whitespace().next()?.parse().ok()?;
+    let start_secs = start_ticks as f64 / 100.0;
+    let age = uptime_secs - start_secs;
+    if age.is_finite() && age >= 0.0 {
+        Some(Duration::from_secs_f64(age.min(86_400.0 * 30.0)))
+    } else {
+        None
+    }
+}
+
+#[cfg_attr(
+    not(any(test, target_os = "android", target_os = "linux")),
+    allow(dead_code)
+)]
+fn parse_stat_start_ticks(stat: &str) -> Option<u64> {
+    let after_comm = stat.rsplit_once(')')?.1;
+    after_comm.split_whitespace().nth(19)?.parse().ok()
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn refresh_package_tgids(runtime: &mut InspectRuntime) {
+    let Some(package) = runtime
+        .plans
+        .first()
+        .and_then(|plan| plan.policy.package.clone())
+        .filter(|name| !name.is_empty())
+    else {
+        return;
+    };
+    let mut pids = crate::dexdump::pids_for_package(&package);
+    pids.sort_unstable();
+    pids.dedup();
+    if pids == runtime.scoped_tgids {
+        return;
+    }
+    eprintln!(
+        "inspect tgid_filter refresh {} -> {}",
+        join_tgids(&runtime.scoped_tgids),
+        join_tgids(&pids)
+    );
+    runtime.scoped_tgids.clone_from(&pids);
+    for live in &mut runtime.sessions {
+        if let Err(error) = live.session.apply_tgid_filter(Some(&pids)) {
+            eprintln!("inspect tgid_filter update failed: {error:#}");
+        }
+    }
+}
+
 fn take_attached_sessions(runtime: &mut InspectRuntime) -> bool {
     #[cfg(any(target_os = "android", target_os = "linux"))]
     {
@@ -1760,6 +1993,7 @@ fn attach_all(runtime: &mut InspectRuntime) -> Vec<InspectObservation> {
                         plan.adapter.as_str(),
                         runtime.max_hits
                     );
+                    eprintln!("{}", observation.detail);
                     runtime.sessions.push(LiveProbe {
                         plan: plan.clone(),
                         session,
@@ -1877,15 +2111,12 @@ fn decode_hit(
             i32::try_from(hit.regs[2] as i64).unwrap_or(0),
             max_payload,
             "send",
+            tls_write_snapshot(hit),
         ),
         InspectAdapterKind::TlsSslRead => {
             if retprobe {
                 let pending = ssl_read_pending.remove(&hit.tid)?;
-                let retval = i64::from(hit.regs[0] as i32);
-                if retval <= 0 {
-                    return None;
-                }
-                let captured = i32::try_from(retval).unwrap_or(0).min(pending.requested);
+                let captured = ssl_read_captured(&pending, hit)?;
                 decode_tls_plaintext(
                     plan,
                     pending.pid,
@@ -1894,16 +2125,22 @@ fn decode_hit(
                     captured,
                     max_payload,
                     "recv",
+                    &[],
                 )
             } else {
                 let requested = i32::try_from(hit.regs[2] as i64).unwrap_or(0);
                 if requested > 0 && ssl_read_pending.len() < 4096 {
+                    let read_ex = plan
+                        .symbol
+                        .as_deref()
+                        .is_some_and(|name| name.ends_with("_ex") || name.ends_with("Ex"));
                     ssl_read_pending.insert(
                         hit.tid,
                         PendingSslRead {
                             pid,
                             buf: hit.regs[1],
                             requested,
+                            written_ptr: read_ex.then_some(hit.regs[3]),
                         },
                     );
                 }
@@ -2127,6 +2364,7 @@ fn decode_hit(
                     pending.requested,
                     max_payload,
                     "java_to_native",
+                    &[],
                 )
             } else {
                 let requested =
@@ -2139,6 +2377,7 @@ fn decode_hit(
                             pid,
                             buf,
                             requested,
+                            written_ptr: None,
                         },
                     );
                 }
@@ -2162,7 +2401,16 @@ fn decode_hit(
         InspectAdapterKind::JniSetByteArrayRegion => {
             let len = i32::try_from(hit.regs.get(3).copied().unwrap_or(0) as i64).unwrap_or(0);
             let buf = hit.regs.get(4).copied().unwrap_or(0);
-            decode_tls_plaintext(plan, pid, hit.tid, buf, len, max_payload, "native_to_java")
+            decode_tls_plaintext(
+                plan,
+                pid,
+                hit.tid,
+                buf,
+                len,
+                max_payload,
+                "native_to_java",
+                &[],
+            )
         }
         InspectAdapterKind::JniGetByteArrayElements => {
             if retprobe {
@@ -2196,6 +2444,7 @@ fn decode_hit(
                     pending.requested,
                     max_payload,
                     "java_to_native",
+                    &[],
                 )
             } else {
                 let requested =
@@ -2208,6 +2457,7 @@ fn decode_hit(
                             pid,
                             buf,
                             requested,
+                            written_ptr: None,
                         },
                     );
                 }
@@ -2282,6 +2532,7 @@ fn decode_hit(
                             pid,
                             buf,
                             requested,
+                            written_ptr: None,
                         },
                     );
                 }
@@ -2344,6 +2595,7 @@ fn decode_hit(
                             pid,
                             buf,
                             requested,
+                            written_ptr: None,
                         },
                     );
                 }
@@ -2452,6 +2704,7 @@ fn decode_jni_bytes_with_len(
             preview_encoding,
             content_class: content_class.to_owned(),
         },
+        raw: bytes,
     })
 }
 
@@ -2489,6 +2742,7 @@ fn decode_jni_cstring(
             preview_encoding,
             content_class: content_class.to_owned(),
         },
+        raw: bytes,
     })
 }
 
@@ -2516,6 +2770,7 @@ fn decode_jni_utf16_units(
     let truncated = usize::try_from(units).unwrap_or(0) > count;
     let content_class = classify_buffer(text.as_bytes());
     let (preview, preview_encoding) = preview_bytes(text.as_bytes());
+    let raw = text.as_bytes().to_vec();
     Some(InspectOutput::Plaintext {
         pid,
         tid,
@@ -2533,6 +2788,7 @@ fn decode_jni_utf16_units(
             preview_encoding,
             content_class: content_class.to_owned(),
         },
+        raw,
     })
 }
 
@@ -2797,15 +3053,21 @@ fn decode_tls_plaintext(
     requested: i32,
     max_payload: usize,
     direction: &str,
+    snapshot: &[u8],
 ) -> Option<InspectOutput> {
-    if requested <= 0 {
+    if requested <= 0 && snapshot.is_empty() {
         return None;
     }
-    let requested_bytes = u64::try_from(requested).unwrap_or(0);
+    let requested_bytes = u64::try_from(requested.max(0)).unwrap_or(0);
     let want = usize::try_from(requested_bytes)
         .unwrap_or(0)
         .min(max_payload);
-    let mut bytes = read_remote_bytes(pid, buf, want).unwrap_or_default();
+    let remote = if want == 0 {
+        Vec::new()
+    } else {
+        read_remote_bytes(pid, buf, want).unwrap_or_default()
+    };
+    let mut bytes = prefer_probe_snapshot(&remote, snapshot);
     let truncated = requested_bytes > u64::try_from(bytes.len()).unwrap_or(0);
     let captured_bytes = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
     let digest = hex_sha256(&bytes);
@@ -2844,7 +3106,68 @@ fn decode_tls_plaintext(
             preview_encoding,
             content_class: content_class.to_owned(),
         },
+        raw: bytes,
     })
+}
+
+#[cfg_attr(
+    not(any(test, target_os = "android", target_os = "linux")),
+    allow(dead_code)
+)]
+fn snapshot_looks_like_http(bytes: &[u8]) -> bool {
+    http1_prefix(bytes) || ksight_core::looks_like_http2(bytes)
+}
+
+#[cfg_attr(
+    not(any(test, target_os = "android", target_os = "linux")),
+    allow(dead_code)
+)]
+fn prefer_probe_snapshot(remote: &[u8], snapshot: &[u8]) -> Vec<u8> {
+    if snapshot_looks_like_http(snapshot)
+        && (remote.is_empty()
+            || classify_buffer(remote) == "tls_record"
+            || !snapshot_looks_like_http(remote))
+    {
+        return snapshot.to_vec();
+    }
+    if !remote.is_empty() {
+        return remote.to_vec();
+    }
+    snapshot.to_vec()
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn tls_write_snapshot(hit: &ksight_hwbp::RegisterContext) -> &[u8] {
+    let n = usize::try_from(hit.aux_bytes)
+        .unwrap_or(0)
+        .min(hit.aux.len());
+    if snapshot_looks_like_http(&hit.aux) {
+        let end = hit
+            .aux
+            .iter()
+            .rposition(|byte| *byte != 0)
+            .map_or(n, |index| index.saturating_add(1).min(hit.aux.len()));
+        return &hit.aux[..end.max(n)];
+    }
+    &hit.aux[..n]
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn ssl_read_captured(pending: &PendingSslRead, hit: &ksight_hwbp::RegisterContext) -> Option<i32> {
+    if let Some(ptr) = pending.written_ptr.filter(|ptr| *ptr >= 0x1000) {
+        if hit.regs[0] == 0 {
+            return None;
+        }
+        let raw = read_remote_bytes(pending.pid, ptr, 8)?;
+        let n = u64::from_le_bytes(raw.get(..8)?.try_into().ok()?);
+        let n = i32::try_from(n).unwrap_or(0);
+        return (n > 0).then_some(n.min(pending.requested));
+    }
+    let retval = i64::from(hit.regs[0] as i32);
+    if retval <= 0 {
+        return None;
+    }
+    Some(i32::try_from(retval).unwrap_or(0).min(pending.requested))
 }
 
 #[allow(dead_code)]
@@ -2957,6 +3280,12 @@ fn keep_jni_plaintext(bytes: &[u8]) -> bool {
     allow(dead_code)
 )]
 fn classify_buffer(bytes: &[u8]) -> &'static str {
+    if http1_prefix(bytes) {
+        return "text";
+    }
+    if ksight_core::looks_like_http2(bytes) {
+        return "binary";
+    }
     if bytes.len() >= 3 {
         let record = bytes[0];
         let version = u16::from_be_bytes([bytes[1], bytes[2]]);
@@ -2973,6 +3302,26 @@ fn classify_buffer(bytes: &[u8]) -> &'static str {
     } else {
         "binary"
     }
+}
+
+#[cfg_attr(
+    not(any(test, target_os = "android", target_os = "linux")),
+    allow(dead_code)
+)]
+fn http1_prefix(bytes: &[u8]) -> bool {
+    const STARTS: [&[u8]; 10] = [
+        b"GET ",
+        b"POST ",
+        b"HEAD ",
+        b"PUT ",
+        b"DELETE ",
+        b"PATCH ",
+        b"OPTIONS ",
+        b"CONNECT ",
+        b"HTTP/1.0",
+        b"HTTP/1.1",
+    ];
+    STARTS.iter().any(|needle| bytes.starts_with(needle))
 }
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
@@ -3575,6 +3924,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parse_stat_start_ticks_skips_comm_in_parentheses() {
+        let mut fields = vec!["S".to_owned()];
+        fields.extend(std::iter::repeat_n("0".to_owned(), 18));
+        fields.push("99999".to_owned());
+        let stat = format!("21428 (icbc helper) {}", fields.join(" "));
+        assert_eq!(parse_stat_start_ticks(&stat), Some(99999));
+    }
+
+    #[test]
     fn pid_and_memory_size_parse_from_art_open_fields() {
         assert_eq!(pid_from_detail("ART DEX Open hit pid=24056 path=/x"), 24056);
         assert_eq!(parse_open_size("memory:0x1000+4096"), Some(4096));
@@ -3714,15 +4072,17 @@ mod tests {
         assert!(InspectAdapterKind::TlsSslRead
             .symbols()
             .contains(&"wolfSSL_read"));
-        assert!(InspectAdapterKind::TlsSslRead.symbols().contains(&"sslRead"));
+        assert!(InspectAdapterKind::TlsSslRead
+            .symbols()
+            .contains(&"sslRead"));
+        assert!(tls_exact_names(InspectAdapterKind::TlsSslWrite).contains(&"sslWriteEx"));
+        assert!(!tls_exact_names(InspectAdapterKind::TlsSslRead).contains(&"sslReadEx"));
+        assert!(tls_exact_names(InspectAdapterKind::TlsSslRead).contains(&"sslRead"));
         assert!(mapping_path_matches(
             "/data/app/foo/lib/arm64/libhssl-2.1.so",
             "hssl"
         ));
-        assert_eq!(
-            tls_attach_rank("/data/app/foo/lib/arm64/libhssl-2.1.so"),
-            0
-        );
+        assert_eq!(tls_attach_rank("/data/app/foo/lib/arm64/libhssl-2.1.so"), 0);
         assert!(
             tls_attach_rank("/data/app/foo/lib/arm64/libhssl-2.1.so")
                 < tls_attach_rank("/apex/com.android.conscrypt/lib64/libssl.so")
@@ -4270,6 +4630,41 @@ mod tests {
         assert!(adapters.contains("art_dex_memory"));
         assert!(adapters.contains("jni_registration"));
         assert!(adapters.contains("binder_userspace"));
+    }
+
+    #[test]
+    fn prefer_probe_snapshot_keeps_http_when_remote_is_tls_record() {
+        let http = b"POST /v1/login HTTP/1.1\r\nHost: api.bank.com\r\n\r\n";
+        let mut record = vec![0x17, 0x03, 0x03, 0x00, 0x10];
+        record.extend_from_slice(&[9; 16]);
+        let chosen = prefer_probe_snapshot(&record, http);
+        assert!(chosen.starts_with(b"POST /v1/login"), "{chosen:?}");
+        let full = prefer_probe_snapshot(http, b"POST /");
+        assert_eq!(full, http);
+    }
+
+    #[test]
+    fn tls_only_session_does_not_plan_libart_jni() {
+        let policy = InspectPolicy {
+            enabled: true,
+            package: Some("com.icbc".to_owned()),
+            ..InspectPolicy::default()
+        };
+        let runtime = InspectRuntime::prepare(
+            &policy,
+            InspectAdapterKind::TlsSslWrite,
+            Path::new("/nonexistent"),
+        );
+        let adapters = runtime
+            .initial_observations()
+            .into_iter()
+            .map(|observation| observation.adapter)
+            .collect::<BTreeSet<_>>();
+        assert!(adapters.contains("tls_ssl_write"));
+        assert!(adapters.contains("tls_ssl_read"));
+        assert!(!adapters.contains("jni_registration"));
+        assert!(!adapters.contains("jni_new_string_utf"));
+        assert!(!adapters.contains("jni_get_string_region"));
     }
 
     #[test]

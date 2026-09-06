@@ -59,13 +59,32 @@ build/bpf/uprobe_regs.bpf.o: bpf/programs/uprobe/regs.bpf.c $(BPF_HEADERS)
 device-target:
 	rustup target add $(DEVICE_TARGET)
 
-device: bpf device-target
+NATIVE_CC ?= $(firstword $(wildcard /opt/homebrew/opt/llvm/bin/clang) $(shell command -v clang))
+NATIVE_LLD ?= $(RUST_LLD)
+
+build/native/libksight_tls.so: native/tls_hook.c
+	@mkdir -p $(dir $@)
+	$(NATIVE_CC) -target aarch64-linux-android21 -c -fPIC -nostdlib -ffreestanding -fno-builtin -fno-stack-protector -fomit-frame-pointer -fno-asynchronous-unwind-tables -fvisibility=hidden -Os $< -o build/native/tls_hook.o
+	$(NATIVE_LLD) -flavor gnu -shared --soname=libpac.so -z now -z noexecstack -o $@ build/native/tls_hook.o
+	$(firstword $(wildcard /opt/homebrew/opt/llvm/bin/llvm-strip) $(shell command -v llvm-strip) $(shell command -v strip)) -x $@ 2>/dev/null || true
+
+build/native/libksight_tls32.so: native/tls_hook.c
+	@mkdir -p $(dir $@)
+	$(NATIVE_CC) -target armv7-linux-androideabi21 -c -fPIC -nostdlib -ffreestanding -fno-builtin -fno-stack-protector -fomit-frame-pointer -fno-asynchronous-unwind-tables -fvisibility=hidden -Os $< -o build/native/tls_hook32.o
+	$(NATIVE_LLD) -flavor gnu -shared --soname=libpac.so -z now -z noexecstack -o $@ build/native/tls_hook32.o
+	$(firstword $(wildcard /opt/homebrew/opt/llvm/bin/llvm-strip) $(shell command -v llvm-strip) $(shell command -v strip)) -x $@ 2>/dev/null || true
+
+device: bpf device-target build/native/libksight_tls.so build/native/libksight_tls32.so
 	RUSTFLAGS="-C linker=$(RUST_LLD)" cargo build --release --target $(DEVICE_TARGET) -p ksight-agent --bin ksightd --features embedded-assets
+	RUSTFLAGS="-C linker=$(RUST_LLD)" cargo build --release --target $(DEVICE_TARGET) -p ksight-inject
 
 deploy: device
 	$(ADB) shell 'rm -rf $(DEVICE_STAGE) && mkdir -p $(DEVICE_STAGE)'
 	$(ADB) push target/$(DEVICE_TARGET)/release/ksightd $(DEVICE_STAGE)/ksightd
-	$(ADB) shell 'su -c "mkdir -p $(DEVICE_DIR) && cp $(DEVICE_STAGE)/ksightd $(DEVICE_DIR)/ksightd.new && chown root:root $(DEVICE_DIR) $(DEVICE_DIR)/ksightd.new && chmod 0755 $(DEVICE_DIR) $(DEVICE_DIR)/ksightd.new && mv -f $(DEVICE_DIR)/ksightd.new $(DEVICE_DIR)/ksightd && $(DEVICE_DIR)/ksightd run --dry-run"'
+	$(ADB) push target/$(DEVICE_TARGET)/release/ksight-inject $(DEVICE_STAGE)/ksight-inject
+	$(ADB) push build/native/libksight_tls.so $(DEVICE_STAGE)/libksight_tls.so
+	$(ADB) push build/native/libksight_tls32.so $(DEVICE_STAGE)/libksight_tls32.so
+	$(ADB) shell 'su -c "mkdir -p $(DEVICE_DIR) && cp $(DEVICE_STAGE)/ksightd $(DEVICE_DIR)/ksightd.new && cp $(DEVICE_STAGE)/ksight-inject $(DEVICE_DIR)/ksight-inject && cp $(DEVICE_STAGE)/libksight_tls.so $(DEVICE_DIR)/libksight_tls.so && cp $(DEVICE_STAGE)/libksight_tls32.so $(DEVICE_DIR)/libksight_tls32.so && chown root:root $(DEVICE_DIR) $(DEVICE_DIR)/ksightd.new $(DEVICE_DIR)/ksight-inject $(DEVICE_DIR)/libksight_tls.so $(DEVICE_DIR)/libksight_tls32.so && chmod 0755 $(DEVICE_DIR) $(DEVICE_DIR)/ksightd.new $(DEVICE_DIR)/ksight-inject && chmod 0644 $(DEVICE_DIR)/libksight_tls.so $(DEVICE_DIR)/libksight_tls32.so && mv -f $(DEVICE_DIR)/ksightd.new $(DEVICE_DIR)/ksightd && $(DEVICE_DIR)/ksightd run --dry-run"'
 	$(ADB) shell 'rm -rf $(DEVICE_STAGE)'
 
 probe: deploy

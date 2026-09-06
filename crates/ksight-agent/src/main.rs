@@ -282,6 +282,12 @@ struct CaptureArgs {
     /// Compiled uprobe object used by Inspect adapters.
     #[arg(long, default_value = "/data/local/tmp/ksight/uprobe_regs.bpf.o")]
     uprobe_object: PathBuf,
+    /// Burp HTTP proxy `host:port`. Copies TLS HTTP/WS to that listener; app TLS is unchanged.
+    #[arg(long, value_name = "HOST:PORT")]
+    mirror_burp: Option<String>,
+    /// Transparent UID REDIRECT of 80/443 to Burp (CONNECT uses SNI). Pinning still applies.
+    #[arg(long)]
+    mitm_burp: bool,
 }
 
 fn main() -> Result<()> {
@@ -473,12 +479,36 @@ fn print_dump_report(
 }
 
 #[allow(clippy::too_many_lines)]
-fn run_capture(args: CaptureArgs) -> Result<()> {
+fn run_capture(mut args: CaptureArgs) -> Result<()> {
     if args.sample_one_in == 0 {
         bail!("sampling rate must be greater than zero");
     }
     let inspect_adapter_set = args.inspect_adapter.is_some();
     let mut inspect_adapters = Vec::new();
+    if let Some(endpoint) = args.mirror_burp.as_deref() {
+        if let Err(error) = ksight_core::parse_mirror_endpoint(endpoint) {
+            bail!("{error}");
+        }
+        args.inspect_tls = true;
+        args.network = true;
+        if args.inspect_max_hits == 0 {
+            args.inspect_max_hits = 1_000_000;
+        }
+        args.inspect_max_secs = 0;
+        if !args.inspect_jni {
+            eprintln!(
+                "mirror tls-only: Conscrypt/Cronet uprobe copy after packer grace; no dlopen, libart JNI off"
+            );
+        }
+    }
+    if args.mitm_burp {
+        if args.mirror_burp.is_none() || args.package.is_none() {
+            bail!("--mitm-burp requires --mirror-burp HOST:PORT and --package");
+        }
+        eprintln!(
+            "mitm-burp: UID REDIRECT every TCP port; non-DNS UDP rejected (QUIC cannot skip); Intercept off; Proxy HTTP history; Burp upstream 127.0.0.1:18888; pinning still applies on bank apps"
+        );
+    }
     if args.inspect_tls {
         inspect_adapters.push(ksight_agent::inspect_runtime::InspectAdapterKind::TlsSslWrite);
     }
@@ -592,6 +622,8 @@ fn run_capture(args: CaptureArgs) -> Result<()> {
         inspect,
         inspect_adapters,
         uprobe_object: args.uprobe_object,
+        mirror_burp: args.mirror_burp,
+        mitm_burp: args.mitm_burp,
     })
 }
 

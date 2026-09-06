@@ -94,6 +94,17 @@ const THIRD_PARTY_HOST: &[&str] = &[
     "volces.com",
     "cdn-static",
     "xiaojukeji",
+    "parastorage",
+    "squarespace",
+    "tawk.to",
+    "iubenda",
+    "id5-sync",
+    "tealium",
+    "wsimg.com",
+    "e.189.cn",
+    "21cn.com",
+    "pandpdf.com",
+    "lytics.io",
 ];
 
 /// One parsed HTTP/1 call, HTTP/2 HEADERS row, JSON object, or embedded URL.
@@ -593,14 +604,7 @@ pub(crate) fn embedded_http_urls(bytes: &[u8]) -> Vec<ParsedHttpPlain> {
 /// Packed Chromium `host_key` values (`mywap2.icbc.com.cnCK_...`) without `https://`.
 pub(crate) fn embedded_cookie_hosts(bytes: &[u8]) -> Vec<ParsedHttpPlain> {
     const TLDS: [&[u8]; 8] = [
-        b".com.cn",
-        b".com.hk",
-        b".co.uk",
-        b".com",
-        b".net",
-        b".org",
-        b".cn",
-        b".hk",
+        b".com.cn", b".com.hk", b".co.uk", b".com", b".net", b".org", b".cn", b".hk",
     ];
     let mut out = Vec::new();
     let lower: Vec<u8> = bytes.iter().map(u8::to_ascii_lowercase).collect();
@@ -666,10 +670,7 @@ pub(crate) fn embedded_cookie_hosts(bytes: &[u8]) -> Vec<ParsedHttpPlain> {
 }
 
 fn drop_prefixed_cookie_hosts(out: &mut Vec<ParsedHttpPlain>) {
-    let hosts: Vec<String> = out
-        .iter()
-        .filter_map(|row| row.host.clone())
-        .collect();
+    let hosts: Vec<String> = out.iter().filter_map(|row| row.host.clone()).collect();
     out.retain(|row| {
         let Some(host) = row.host.as_deref() else {
             return true;
@@ -709,9 +710,10 @@ fn drop_truncated_hosts(out: &mut Vec<ParsedHttpPlain>) {
 pub(crate) fn is_truncated_host(host: &str, other: &str) -> bool {
     other.len() > host.len()
         && other.starts_with(host)
-        && other.as_bytes().get(host.len()).is_some_and(|byte| {
-            byte.is_ascii_alphanumeric() || *byte == b'.'
-        })
+        && other
+            .as_bytes()
+            .get(host.len())
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'.')
 }
 
 pub(crate) fn parse_host_token(value: &str) -> Option<String> {
@@ -756,9 +758,7 @@ fn sanitize_host(value: &str) -> Option<String> {
     if labels
         .get(labels.len().saturating_sub(2))
         .copied()
-        .is_some_and(|label| {
-            matches!(label, "constructor" | "prototype" | "vuemodel" | "jquery")
-        })
+        .is_some_and(|label| matches!(label, "constructor" | "prototype" | "vuemodel" | "jquery"))
     {
         return None;
     }
@@ -849,6 +849,7 @@ pub fn is_kept_inspect_url(url: &str) -> bool {
     if path.contains("digicert")
         || path.contains("/ocsp")
         || path.contains("pki.goog")
+        || path.contains("swisssign")
         || path.contains("amazontrust")
         || path.contains(".crl")
         || path.contains("/crl")
@@ -1005,7 +1006,9 @@ mod tests {
                 .any(|row| row.host.as_deref() == Some("b2c.icbc.com.cn")),
             "{parsed:?}"
         );
-        assert!(!parsed.iter().any(|row| row.host.as_deref() == Some("com.cn")));
+        assert!(!parsed
+            .iter()
+            .any(|row| row.host.as_deref() == Some("com.cn")));
         assert!(!parsed
             .iter()
             .any(|row| row.host.as_deref() == Some("cmywap2.icbc.com.cn")));

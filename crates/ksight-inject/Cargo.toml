@@ -1,0 +1,23 @@
+[package]
+name = "ksight-inject"
+description = "Brief PTRACE_ATTACH helper to dlopen libksight_tls.so"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ksight-inject"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+
+[lints.rust]
+unsafe_code = "allow"
+missing_docs = "allow"
+unexpected_cfgs = "allow"
+
+[lints.clippy]
+all = "allow"

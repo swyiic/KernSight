@@ -89,15 +89,15 @@ static __always_inline int ksight_emit_user_regs(struct ksight_user_regs *ctx)
 
         if (src1 >= 0x10000ULL) {
             ksight_u64 n = len2;
-            if (n == 0 || n > 192)
-                n = 192;
+            if (n == 0 || n > 2048)
+                n = 2048;
             ksight_bpf_probe_read_user(out->aux, sizeof(out->aux),
                                        (const void *)src1);
             out->aux_bytes = (ksight_u32)n;
         } else if (src2 >= 0x10000ULL && len1 > 0 && len1 <= 4096) {
             ksight_u64 n = len1;
-            if (n > 192)
-                n = 192;
+            if (n > 2048)
+                n = 2048;
             ksight_bpf_probe_read_user(out->aux, sizeof(out->aux),
                                        (const void *)src2);
             out->aux_bytes = (ksight_u32)n;

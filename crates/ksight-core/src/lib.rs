@@ -6,6 +6,7 @@ mod dns;
 mod graph;
 mod handshake;
 mod http2;
+mod http_mirror;
 mod http_plain;
 mod identity;
 mod inflate;
@@ -34,6 +35,11 @@ pub use graph::{
     ranges_overlap, EdgeStrength, GraphEdge, GraphEntity, GraphEntityKind, GraphQuery, SessionGraph,
 };
 pub use handshake::{parse_handshake, HandshakeMeta};
+pub use http2::looks_like_http2;
+pub use http_mirror::{
+    fragment_bytes, parse_mirror_endpoint, request_from_http_url, requests_from_embedded_http_urls,
+    MirroredMessage, StreamReassembler, BURP_PLAYBACK_PORT, BURP_UPSTREAM_PORT,
+};
 pub use http_plain::{
     format_inspect_url, is_kept_inspect_url, is_third_party_host, parse_http_plain,
     parse_http_plain_all, parse_http_plain_all_bytes, parse_http_plain_bytes, ParsedHttpPlain,
@@ -56,12 +62,11 @@ pub use provenance::{
 pub use report::{
     correlate_http_calls_to_dex, http_calls_from_plaintext_dir, http_calls_from_private_dir,
     rank_observed_mappings, sort_http_catalog, ArtifactActivity, BinderFdTransfer,
-    BinderLifecycleSummary,
-    BinderRelation, BinderReplyPair, DnsNameActivity, FdLifecycleSummary, HandshakeNameActivity,
-    HttpCallActivity, HttpCodeRef, InspectHitActivity, LoopbackScanActivity, MappingSource,
-    MemoryLifecycleSummary, MergedDumpRef, NetworkPeerActivity, ObservedMapping, PlaintextActivity,
-    ProcessActivity, ProcessInstanceRef, QualitySummary, SchedWakeupActivity, SessionReport,
-    SessionReportBuilder, SocketLifecycleSummary,
+    BinderLifecycleSummary, BinderRelation, BinderReplyPair, DnsNameActivity, FdLifecycleSummary,
+    HandshakeNameActivity, HttpCallActivity, HttpCodeRef, InspectHitActivity, LoopbackScanActivity,
+    MappingSource, MemoryLifecycleSummary, MergedDumpRef, NetworkPeerActivity, ObservedMapping,
+    PlaintextActivity, ProcessActivity, ProcessInstanceRef, QualitySummary, SchedWakeupActivity,
+    SessionReport, SessionReportBuilder, SocketLifecycleSummary,
 };
 pub use sequence::{SequenceError, SequenceGap, SequenceTracker};
 pub use sm4::{

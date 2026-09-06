@@ -274,6 +274,9 @@ pub struct NetworkHandshake {
     /// HTTP `Host` header.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_host: Option<String>,
+    /// First-write HTTP bytes (≤512), when this socket started with cleartext HTTP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_prefix: Option<String>,
     /// QUIC version as `0x` plus eight hex digits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quic_version: Option<String>,

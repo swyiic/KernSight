@@ -186,6 +186,10 @@ pub struct CaptureRequest {
     pub inspect_adapters: Vec<crate::inspect_runtime::InspectAdapterKind>,
     /// Compiled uprobe object used by Inspect adapters.
     pub uprobe_object: PathBuf,
+    /// Optional Burp HTTP proxy `host:port`. Device feeds reconstructed HTTP/WS there.
+    pub mirror_burp: Option<String>,
+    /// Transparent per-UID REDIRECT of 80/443 through a CONNECT forwarder to Burp.
+    pub mitm_burp: bool,
 }
 
 /// Run a foreground capture session.
@@ -477,8 +481,73 @@ fn stream_events(
             pipeline.normalizer.session_id().to_string(),
         );
     }
+    let mut tls_inject: Option<crate::tls_inject::TlsInject> = None;
+    if request.mitm_burp {
+        match crate::tls_inject::TlsInject::start(request.package.as_deref()) {
+            Ok(inject) => {
+                eprintln!("tls-inject on with --mitm-burp only");
+                tls_inject = Some(inject);
+            }
+            Err(error) => eprintln!("tls-inject skipped: {error}"),
+        }
+    } else if request.mirror_burp.is_some() {
+        eprintln!("tls-inject off (no ptrace); inspect-tls uprobe only; app TLS unchanged");
+    }
+    let _mitm = if request.mitm_burp {
+        match (
+            request.package.as_deref(),
+            request.mirror_burp.as_deref(),
+        ) {
+            (Some(package), Some(endpoint)) => {
+                match (
+                    crate::mitm_redirect::uid_for_package(package),
+                    ksight_core::parse_mirror_endpoint(endpoint),
+                ) {
+                    (Some(uid), Ok(addr)) => match crate::mitm_redirect::MitmRedirect::install(uid, addr)
+                    {
+                        Ok(mitm) => {
+                            eprintln!(
+                                "mitm-burp uid={uid} package={package} -> {endpoint}; Burp Network→Connections→Upstream proxy = 127.0.0.1:18888 (adb forward); Proxy HTTP history, not Logger"
+                            );
+                            Some(mitm)
+                        }
+                        Err(error) => {
+                            eprintln!("mitm-burp skipped: {error}");
+                            None
+                        }
+                    },
+                    _ => {
+                        eprintln!("mitm-burp skipped: need package uid and Burp host:port");
+                        None
+                    }
+                }
+            }
+            _ => {
+                eprintln!("mitm-burp requires --package and --mirror-burp host:port");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    pipeline.burp_mirror = match request.mirror_burp.as_deref() {
+        Some(endpoint) => match crate::burp_mirror::BurpMirror::start(endpoint) {
+            Ok(mirror) => {
+                eprintln!(
+                    "burp-mirror {endpoint} playback=:{} (original HTTP request+response; Intercept off)",
+                    ksight_core::BURP_PLAYBACK_PORT
+                );
+                Some(mirror)
+            }
+            Err(error) => {
+                eprintln!("burp-mirror disabled: {error}");
+                None
+            }
+        },
+        None => None,
+    };
     eprintln!(
-        "ksightd {} session={} files={} files-fd={} network={:?} binder={} inspect={} package={}",
+        "ksightd {} session={} files={} files-fd={} network={:?} binder={} inspect={} package={} mirror={}",
         env!("CARGO_PKG_VERSION"),
         pipeline.normalizer.session_id(),
         request.sensors.files,
@@ -486,7 +555,8 @@ fn stream_events(
         request.sensors.network,
         request.sensors.binder,
         request.inspect.enabled,
-        request.package.as_deref().unwrap_or("-")
+        request.package.as_deref().unwrap_or("-"),
+        request.mirror_burp.as_deref().unwrap_or("-")
     );
     if request.sensors.files && !request.sensors.file_descriptors {
         eprintln!("file sensor: openat only; dup/close is off unless --files-fd");
@@ -513,13 +583,11 @@ fn stream_events(
         for observation in inspect.initial_observations() {
             pipeline.emit_inspect(observation)?;
         }
-        for observation in inspect.attach() {
-            pipeline.emit_inspect(observation)?;
-        }
     }
 
     publish_service_health(request, &pipeline, &sensors)?;
     let mut next_heartbeat = Instant::now() + Duration::from_secs(1);
+    let mut next_crypto = Instant::now() + Duration::from_secs(3);
     let environment_check_interval = match request.collector_mode {
         ksight_model::CollectorMode::ForegroundAdb => Duration::from_secs(1),
         ksight_model::CollectorMode::DetachedDaemon => Duration::from_secs(30),
@@ -569,12 +637,68 @@ fn stream_events(
             }
         }
         if request.inspect.enabled {
+            for observation in inspect.attach_when_safe() {
+                pipeline.emit_inspect(observation)?;
+            }
+            if let (Some(inject), Some(package)) =
+                (tls_inject.as_mut(), request.package.as_deref())
+            {
+                if let Some(pid) = crate::tls_inject::TlsInject::main_pid(package) {
+                    inject.inject(pid);
+                    let items = inject.poll();
+                    if !items.is_empty() {
+                        eprintln!(
+                            "tls-inject plaintext {} chunks first={}B",
+                            items.len(),
+                            items[0].bytes.len()
+                        );
+                    }
+                    if let Some(mirror) = pipeline.burp_mirror.as_mut() {
+                        for item in items {
+                            let adapter = if item.direction == "send" {
+                                "tls_ssl_write"
+                            } else {
+                                "tls_ssl_read"
+                            };
+                            mirror.observe_bytes(pid, 0, adapter, item.direction, &item.bytes);
+                        }
+                    }
+                }
+            }
             for output in inspect.poll() {
+                if let Some(mirror) = pipeline.burp_mirror.as_mut() {
+                    if let crate::inspect_runtime::InspectOutput::Plaintext {
+                        pid,
+                        tid,
+                        fragment,
+                        raw,
+                    } = &output
+                    {
+                        mirror.observe_bytes(
+                            *pid,
+                            *tid,
+                            &fragment.adapter,
+                            &fragment.direction,
+                            raw,
+                        );
+                    }
+                }
                 pipeline.emit_inspect_output(output)?;
             }
             if let Some(observation) = inspect.expire_if_needed() {
                 pipeline.emit_inspect(observation)?;
             }
+        }
+        if Instant::now() >= next_crypto {
+            if let Some(package) = request.package.as_deref() {
+                if let Some(pid) = crate::tls_inject::TlsInject::main_pid(package) {
+                    let found = crate::crypto_watch::scan_pid(pid, package);
+                    if found > 0 {
+                        eprintln!("crypto-watch pid={pid} new={found} log=/data/local/tmp/ksight/crypto-watch.log");
+                    }
+                }
+            }
+            next_crypto = Instant::now() + Duration::from_secs(5);
         }
         if !consumed_any {
             std::thread::sleep(Duration::from_millis(10));
@@ -895,6 +1019,7 @@ struct EventPipeline {
     collector_pid: u32,
     last_event_monotonic_ns: Option<u64>,
     stats: CaptureStats,
+    burp_mirror: Option<crate::burp_mirror::BurpMirror>,
 }
 
 #[cfg(any(test, target_os = "android", target_os = "linux"))]
@@ -958,6 +1083,7 @@ impl EventPipeline {
             collector_pid: std::process::id(),
             last_event_monotonic_ns: None,
             stats: CaptureStats::default(),
+            burp_mirror: None,
         }
     }
 
@@ -1022,12 +1148,16 @@ impl EventPipeline {
                 Some(tid).filter(|tid| *tid > 0),
                 ksight_model::EventPayload::InspectObservation(observation),
             ),
-            crate::inspect_runtime::InspectOutput::Plaintext { pid, tid, fragment } => self
-                .emit_inspect_payload(
-                    Some(pid),
-                    Some(tid),
-                    ksight_model::EventPayload::InspectPlaintext(fragment),
-                ),
+            crate::inspect_runtime::InspectOutput::Plaintext {
+                pid,
+                tid,
+                fragment,
+                raw: _,
+            } => self.emit_inspect_payload(
+                Some(pid),
+                Some(tid),
+                ksight_model::EventPayload::InspectPlaintext(fragment),
+            ),
         }
     }
 
@@ -1089,6 +1219,23 @@ impl EventPipeline {
         }
         self.fd_lineage.correlate(event);
         self.dns_lineage.correlate(event);
+        if let (Some(mirror), EventPayload::NetworkHandshake(handshake)) =
+            (self.burp_mirror.as_mut(), &event.payload)
+        {
+            let pid = event.header.process.key.pid;
+            if let Some(host) = handshake_mirror_host(handshake) {
+                mirror.observe_peer(pid, host);
+            }
+            if let Some(prefix) = handshake.request_prefix.as_deref() {
+                mirror.observe_bytes(
+                    pid,
+                    event.header.process.tid,
+                    "handshake_http",
+                    "send",
+                    prefix.as_bytes(),
+                );
+            }
+        }
         if !self.output.include_threads
             && event.header.sensor == SensorKind::Process
             && event.header.process.tid != event.header.process.tgid
@@ -1388,6 +1535,35 @@ fn current_credentials() -> (u32, u32) {
             .unwrap_or(0)
     };
     (parse("Uid:"), parse("Gid:"))
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn handshake_mirror_host(handshake: &ksight_model::NetworkHandshake) -> Option<String> {
+    if let Some(host) = handshake
+        .http_host
+        .as_deref()
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+    {
+        return Some(host.to_owned());
+    }
+    if let Some(sni) = handshake
+        .sni
+        .as_deref()
+        .map(str::trim)
+        .filter(|sni| !sni.is_empty())
+    {
+        return Some(sni.to_owned());
+    }
+    let address = handshake
+        .peer_address
+        .as_deref()
+        .filter(|addr| !addr.is_empty())?;
+    if handshake.peer_port > 0 {
+        Some(format!("{address}:{}", handshake.peer_port))
+    } else {
+        Some(address.to_owned())
+    }
 }
 
 #[cfg(any(target_os = "android", target_os = "linux"))]

@@ -18,10 +18,10 @@ struct ksight_hwbp_context {
     ksight_u64 time_ns;
     ksight_u32 aux_bytes;
     ksight_u32 aux_pad;
-    ksight_u8 aux[384];
+    ksight_u8 aux[2048];
 };
 
-_Static_assert(sizeof(struct ksight_hwbp_context) == 680,
+_Static_assert(sizeof(struct ksight_hwbp_context) == 2344,
                "ksight hwbp context ABI changed");
 
 #endif /* KSIGHT_HWBP_H */

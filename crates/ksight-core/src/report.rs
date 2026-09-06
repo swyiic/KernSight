@@ -1780,29 +1780,31 @@ impl SessionReportBuilder {
         let mut inspect_hits = self
             .inspect_hits
             .into_iter()
-            .map(|((process_id, adapter, library), activity)| InspectHitActivity {
-                adapter,
-                library,
-                process_id,
-                process_instance_id: activity.process_instance_id,
-                attached: activity.attached,
-                hits: activity.hits,
-                last_detail: activity.last_detail,
-                binder_handle: activity.binder_handle,
-                binder_code: activity.binder_code,
-                binder_interface: activity.binder_interface,
-                binder_method: activity.binder_method,
-                binder_method_source: activity.binder_method_source,
-                binder_strings: activity.binder_strings,
-                binder_ints: activity.binder_ints,
-                binder_int64s: activity.binder_int64s,
-                binder_bools: activity.binder_bools,
-                binder_fds: activity.binder_fds,
-                binder_blobs: activity.binder_blobs,
-                binder_binders: activity.binder_binders,
-                binder_transaction_id: activity.binder_transaction_id,
-                reply_latency_ns: activity.reply_latency_ns,
-            })
+            .map(
+                |((process_id, adapter, library), activity)| InspectHitActivity {
+                    adapter,
+                    library,
+                    process_id,
+                    process_instance_id: activity.process_instance_id,
+                    attached: activity.attached,
+                    hits: activity.hits,
+                    last_detail: activity.last_detail,
+                    binder_handle: activity.binder_handle,
+                    binder_code: activity.binder_code,
+                    binder_interface: activity.binder_interface,
+                    binder_method: activity.binder_method,
+                    binder_method_source: activity.binder_method_source,
+                    binder_strings: activity.binder_strings,
+                    binder_ints: activity.binder_ints,
+                    binder_int64s: activity.binder_int64s,
+                    binder_bools: activity.binder_bools,
+                    binder_fds: activity.binder_fds,
+                    binder_blobs: activity.binder_blobs,
+                    binder_binders: activity.binder_binders,
+                    binder_transaction_id: activity.binder_transaction_id,
+                    reply_latency_ns: activity.reply_latency_ns,
+                },
+            )
             .collect::<Vec<_>>();
         inspect_hits.sort_by(|left, right| {
             right
@@ -2789,7 +2791,7 @@ fn http_calls_from_store(
     let mut files = Vec::new();
     let mut remaining = 256_usize;
     collect_store_files(dir, recursive, &mut files, &mut remaining);
-    let mut calls = BTreeMap::<(u32, String, String, String, String), HttpCallActivity>::new();
+    let mut calls = BTreeMap::<(String, String, String, String), HttpCallActivity>::new();
     for path in files {
         let Ok(mut bytes) = std::fs::read(&path) else {
             continue;
@@ -2816,7 +2818,6 @@ fn http_calls_from_store(
                 continue;
             }
             let key = (
-                process_id,
                 parsed.kind.to_owned(),
                 parsed.method.clone(),
                 host.clone(),
@@ -2855,6 +2856,7 @@ pub fn sort_http_catalog(calls: &mut Vec<HttpCallActivity>) {
     calls.retain(keep_catalog_row);
     drop_truncated_catalog_hosts(calls);
     drop_truncated_catalog_paths(calls);
+    collapse_catalog_families(calls);
     for row in calls.iter_mut() {
         if let Some(host) = row.host.as_deref() {
             row.third_party |= crate::is_third_party_host(host);
@@ -2914,9 +2916,11 @@ fn stamp_empty_hosts_from_sni(
 }
 
 fn keep_catalog_row(row: &HttpCallActivity) -> bool {
-    if row.host.as_deref().is_some_and(|host| {
-        crate::format_inspect_url(Some("https"), host, &row.path).is_some()
-    }) {
+    if row
+        .host
+        .as_deref()
+        .is_some_and(|host| crate::format_inspect_url(Some("https"), host, &row.path).is_some())
+    {
         return true;
     }
     row.status.is_some() && row.kind.contains("response")
@@ -2934,6 +2938,48 @@ fn drop_truncated_catalog_hosts(calls: &mut Vec<HttpCallActivity>) {
     });
 }
 
+/// Keep a few representatives per host+path-prefix so CMS variants cannot fill the 256 cap.
+fn collapse_catalog_families(calls: &mut Vec<HttpCallActivity>) {
+    const PER_FAMILY: usize = 3;
+    let mut families: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (index, row) in calls.iter().enumerate() {
+        families
+            .entry(catalog_family_key(row))
+            .or_default()
+            .push(index);
+    }
+    let mut keep = vec![false; calls.len()];
+    for indexes in families.values() {
+        let mut ranked = indexes.clone();
+        ranked.sort_by(|&left, &right| {
+            catalog_weight(&calls[right])
+                .cmp(&catalog_weight(&calls[left]))
+                .then_with(|| calls[right].count.cmp(&calls[left].count))
+                .then_with(|| calls[right].path.len().cmp(&calls[left].path.len()))
+        });
+        for index in ranked.into_iter().take(PER_FAMILY) {
+            keep[index] = true;
+        }
+    }
+    let mut cursor = 0_usize;
+    calls.retain(|_| {
+        let kept = keep[cursor];
+        cursor = cursor.saturating_add(1);
+        kept
+    });
+}
+
+fn catalog_family_key(row: &HttpCallActivity) -> String {
+    let host = row.host.as_deref().unwrap_or("");
+    let prefix: Vec<&str> = row
+        .path
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .take(4)
+        .collect();
+    format!("{host}|{}", prefix.join("/"))
+}
+
 fn drop_truncated_catalog_paths(calls: &mut Vec<HttpCallActivity>) {
     let keys: Vec<(String, String)> = calls
         .iter()
@@ -2949,9 +2995,10 @@ fn drop_truncated_catalog_paths(calls: &mut Vec<HttpCallActivity>) {
             other_host == &host
                 && other_path.len() > path.len()
                 && other_path.starts_with(path)
-                && other_path.as_bytes().get(path.len()).is_some_and(|byte| {
-                    *byte == b'/' || byte.is_ascii_alphanumeric()
-                })
+                && other_path
+                    .as_bytes()
+                    .get(path.len())
+                    .is_some_and(|byte| *byte == b'/' || byte.is_ascii_alphanumeric())
         })
     });
 }
@@ -2973,14 +3020,15 @@ fn catalog_weight(row: &HttpCallActivity) -> u8 {
         || path.contains("/img/")
         || path.contains("/huamei_")
         || path.contains("/www/js/")
-        || path.contains("/file/download/");
+        || path.contains("/file/download/")
+        || path.starts_with("/cd/")
+        || path.contains("/content/dam/");
     let ext = std::path::Path::new(&path)
         .extension()
         .and_then(|value| value.to_str())
         .unwrap_or("");
-    let static_like = static_like
-        || ext.eq_ignore_ascii_case("js")
-        || ext.eq_ignore_ascii_case("css");
+    let static_like =
+        static_like || ext.eq_ignore_ascii_case("js") || ext.eq_ignore_ascii_case("css");
     let api_like = path.contains("/api")
         || path.contains("/mbfront")
         || path.contains("/login")
@@ -3063,9 +3111,10 @@ fn collect_store_files(
             }
             continue;
         }
-        if path.components().any(|part| {
-            skip_store_dir_name(&part.as_os_str().to_string_lossy())
-        }) {
+        if path
+            .components()
+            .any(|part| skip_store_dir_name(&part.as_os_str().to_string_lossy()))
+        {
             continue;
         }
         if !keep_store_file(&path) {
@@ -4128,6 +4177,7 @@ mod tests {
                 http_method: None,
                 http_path: None,
                 http_host: None,
+                request_prefix: None,
                 quic_version: None,
                 quic_packet: None,
             }),
@@ -4657,6 +4707,65 @@ mod tests {
     }
 
     #[test]
+    fn catalog_keeps_few_rows_per_path_family() {
+        let mut calls = (0..12)
+            .map(|index| HttpCallActivity {
+                source: "us.hsbc.hsbcus".to_owned(),
+                process_id: 1,
+                direction: "heap".to_owned(),
+                kind: "url".to_owned(),
+                method: "URL".to_owned(),
+                host: Some("www.us.hsbc.com".to_owned()),
+                path: format!(
+                    "/api/wpb-dsvc-zz-content-entity-prod-proxy/v1/entities/us/page{index}"
+                ),
+                status: None,
+                query_keys: Vec::new(),
+                header_names: Vec::new(),
+                redacted_headers: Vec::new(),
+                body_keys: Vec::new(),
+                redacted_body_keys: Vec::new(),
+                content_type: None,
+                third_party: false,
+                count: 10,
+                origin: "heap".to_owned(),
+            })
+            .collect::<Vec<_>>();
+        calls.push(HttpCallActivity {
+            source: "us.hsbc.hsbcus".to_owned(),
+            process_id: 1,
+            direction: "heap".to_owned(),
+            kind: "url".to_owned(),
+            method: "URL".to_owned(),
+            host: Some("www.us.hsbc.com".to_owned()),
+            path: "/api/login".to_owned(),
+            status: None,
+            query_keys: Vec::new(),
+            header_names: Vec::new(),
+            redacted_headers: Vec::new(),
+            body_keys: Vec::new(),
+            redacted_body_keys: Vec::new(),
+            content_type: None,
+            third_party: false,
+            count: 2,
+            origin: "heap".to_owned(),
+        });
+        sort_http_catalog(&mut calls);
+        let cms = calls
+            .iter()
+            .filter(|row| {
+                row.path
+                    .contains("/api/wpb-dsvc-zz-content-entity-prod-proxy/v1")
+            })
+            .count();
+        assert!(cms <= 3, "{calls:?}");
+        assert!(
+            calls.iter().any(|row| row.path == "/api/login"),
+            "{calls:?}"
+        );
+    }
+
+    #[test]
     fn catalog_drops_empty_host_and_truncated_prefix() {
         let mut calls = vec![
             HttpCallActivity {
@@ -4763,8 +4872,7 @@ mod tests {
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or("");
-            let mut calls =
-                http_calls_from_plaintext_dir(&dest.join("runtime/plaintext"), package);
+            let mut calls = http_calls_from_plaintext_dir(&dest.join("runtime/plaintext"), package);
             calls.extend(http_calls_from_private_dir(
                 &dest.join("data-private"),
                 package,
@@ -4780,38 +4888,44 @@ mod tests {
             .expect("write dump");
             eprintln!("dump {package} http_calls={}", calls.len());
         }
-        for entry in std::fs::read_dir(root).expect("reports") {
-            let path = entry.expect("entry").path();
-            let name = path
-                .file_name()
-                .and_then(|value| value.to_str())
-                .unwrap_or("");
-            if !name.ends_with("-report.json") {
-                continue;
+        let mut session_dirs = vec![root.to_path_buf()];
+        let review = root.join("review-final");
+        if review.is_dir() {
+            session_dirs.push(review);
+        }
+        for dir in session_dirs {
+            for entry in std::fs::read_dir(&dir).expect("reports") {
+                let path = entry.expect("entry").path();
+                let name = path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("");
+                if !name.ends_with("-report.json") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).expect("read session");
+                let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                    continue;
+                };
+                let Some(arr) = value.get("http_calls").cloned() else {
+                    continue;
+                };
+                let Ok(mut calls) = serde_json::from_value::<Vec<HttpCallActivity>>(arr) else {
+                    continue;
+                };
+                sort_http_catalog(&mut calls);
+                value["http_calls"] = serde_json::to_value(&calls).expect("ser");
+                std::fs::write(&path, serde_json::to_vec_pretty(&value).expect("bytes"))
+                    .expect("write session");
+                eprintln!("session {name} http_calls={}", calls.len());
             }
-            let text = std::fs::read_to_string(&path).expect("read session");
-            let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&text) else {
-                continue;
-            };
-            let Some(arr) = value.get("http_calls").cloned() else {
-                continue;
-            };
-            let Ok(mut calls) = serde_json::from_value::<Vec<HttpCallActivity>>(arr) else {
-                continue;
-            };
-            sort_http_catalog(&mut calls);
-            value["http_calls"] = serde_json::to_value(&calls).expect("ser");
-            std::fs::write(&path, serde_json::to_vec_pretty(&value).expect("bytes"))
-                .expect("write session");
-            eprintln!("session {name} http_calls={}", calls.len());
         }
     }
 
     #[test]
     fn icbc_private_store_on_disk_if_present() {
-        let dir = std::path::Path::new(
-            "/Users/swyiic/Desktop/KernSight-reports/com.icbc/data-private",
-        );
+        let dir =
+            std::path::Path::new("/Users/swyiic/Desktop/KernSight-reports/com.icbc/data-private");
         if !dir.is_dir() {
             return;
         }

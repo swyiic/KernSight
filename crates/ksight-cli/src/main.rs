@@ -11,12 +11,14 @@ use uuid::Uuid;
 
 use crate::{
     device::{
-        cleanup_package, daemon_start, daemon_status, daemon_stop, deploy_agent,
-        protocol_acknowledge, protocol_graph, protocol_replay, protocol_report, protocol_sessions,
-        pull_forensics, pull_package, pull_snapshot, read_last_session, recatalog_package,
-        run_device, run_device_tee, run_hide_debug_capture, validate_package, DEVICE_AGENT,
-        DEVICE_BINDER_OBJECT, DEVICE_FILE_OBJECT, DEVICE_MEMORY_OBJECT, DEVICE_NETWORK_OBJECT,
-        DEVICE_PROCESS_OBJECT, DEVICE_SCHED_OBJECT, DEVICE_SPOOL_ROOT, DEVICE_UPROBE_OBJECT,
+        adb_forward_burp_playback, adb_forward_burp_upstream, cleanup_package, daemon_start,
+        daemon_status, daemon_stop,
+        deploy_agent, protocol_acknowledge, protocol_graph, protocol_replay, protocol_report,
+        protocol_sessions, pull_forensics, pull_package, pull_snapshot, read_last_session,
+        recatalog_package, run_device, run_device_tee, run_hide_debug_capture, validate_package,
+        DEVICE_AGENT, DEVICE_BINDER_OBJECT, DEVICE_FILE_OBJECT, DEVICE_MEMORY_OBJECT,
+        DEVICE_NETWORK_OBJECT, DEVICE_PROCESS_OBJECT, DEVICE_SCHED_OBJECT, DEVICE_SPOOL_ROOT,
+        DEVICE_UPROBE_OBJECT,
     },
     display::{print_capabilities, print_keypoints},
 };
@@ -312,6 +314,12 @@ struct CaptureOptions {
     /// Detach capture, hide USB debugging and developer options for the duration, restore them, then pull forensics. Does not hide root or an unlocked bootloader.
     #[arg(long)]
     hide_debug: bool,
+    /// Burp HTTP proxy `host:port` on the computer. Enables `--inspect-tls`. Phone feeds HTTP/WS; app TLS is unchanged.
+    #[arg(long, value_name = "HOST:PORT")]
+    mirror_burp: Option<String>,
+    /// Transparent UID REDIRECT of 80/443 to Burp. Requires `--mirror-burp` and `--package`. Pinning still applies.
+    #[arg(long)]
+    mitm_burp: bool,
 }
 
 fn main() -> Result<()> {
@@ -437,13 +445,13 @@ fn run_device_command(serial: Option<&str>, command: DeviceCommand) -> Result<()
                 json,
             )?;
         }
-        DeviceCommand::Capture(options) => run_capture(serial, &options)?,
+        DeviceCommand::Capture(options) => run_capture(serial, options)?,
     }
     Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
-fn run_capture(serial: Option<&str>, options: &CaptureOptions) -> Result<()> {
+fn run_capture(serial: Option<&str>, mut options: CaptureOptions) -> Result<()> {
     let json_flag = if options.json { " --json" } else { "" };
     let quiet_flag = if options.quiet { " --quiet" } else { "" };
     let threads_flag = if options.include_threads {
@@ -495,6 +503,21 @@ fn run_capture(serial: Option<&str>, options: &CaptureOptions) -> Result<()> {
     } else {
         String::new()
     };
+    if let Some(endpoint) = options.mirror_burp.as_deref() {
+        if let Err(error) = ksight_core::parse_mirror_endpoint(endpoint) {
+            bail!("{error}");
+        }
+        options.inspect_tls = true;
+        options.network = true;
+        if options.package.is_none() && options.pid.is_none() && options.uid.is_none() {
+            bail!("--mirror-burp requires --package, --pid, or --uid");
+        }
+    }
+    if options.mitm_burp {
+        if options.mirror_burp.is_none() || options.package.is_none() {
+            bail!("--mitm-burp requires --mirror-burp HOST:PORT and --package");
+        }
+    }
     if options.inspect_linker
         && (options.inspect_tls
             || options.inspect_jni
@@ -562,8 +585,17 @@ fn run_capture(serial: Option<&str>, options: &CaptureOptions) -> Result<()> {
         .inspect_offset
         .map_or_else(String::new, |value| format!(" --inspect-offset {value}"));
     let inspect_max_flag = format!(" --inspect-max-secs {}", options.inspect_max_secs);
+    let mirror_burp_flag = options
+        .mirror_burp
+        .as_deref()
+        .map_or_else(String::new, |value| format!(" --mirror-burp {value}"));
+    let mitm_burp_flag = if options.mitm_burp {
+        " --mitm-burp"
+    } else {
+        ""
+    };
     let command = format!(
-        "{DEVICE_AGENT} capture --object {DEVICE_PROCESS_OBJECT} --file-object {DEVICE_FILE_OBJECT} --network-object {DEVICE_NETWORK_OBJECT} --memory-object {DEVICE_MEMORY_OBJECT} --binder-object {DEVICE_BINDER_OBJECT} --sched-object {DEVICE_SCHED_OBJECT} --uprobe-object {DEVICE_UPROBE_OBJECT} --count {} --duration-seconds {}{json_flag}{quiet_flag}{threads_flag}{files_flag}{files_fd_flag}{network_flag}{network_io_flag}{memory_flag}{memory_all_flag}{binder_flag}{sched_flag}{all_flag}{pid_flag}{uid_flag}{package_flag}{spool_flag}{sampling_flag}{inspect_linker_flag}{inspect_tls_flag}{inspect_jni_flag}{inspect_all_apps_flag}{inspect_adapter_flag}{inspect_build_id_flag}{inspect_elf_flag}{inspect_offset_flag}{inspect_max_flag}{inspect_max_bytes_flag}{inspect_max_hits_flag}",
+        "{DEVICE_AGENT} capture --object {DEVICE_PROCESS_OBJECT} --file-object {DEVICE_FILE_OBJECT} --network-object {DEVICE_NETWORK_OBJECT} --memory-object {DEVICE_MEMORY_OBJECT} --binder-object {DEVICE_BINDER_OBJECT} --sched-object {DEVICE_SCHED_OBJECT} --uprobe-object {DEVICE_UPROBE_OBJECT} --count {} --duration-seconds {}{json_flag}{quiet_flag}{threads_flag}{files_flag}{files_fd_flag}{network_flag}{network_io_flag}{memory_flag}{memory_all_flag}{binder_flag}{sched_flag}{all_flag}{pid_flag}{uid_flag}{package_flag}{spool_flag}{sampling_flag}{inspect_linker_flag}{inspect_tls_flag}{inspect_jni_flag}{inspect_all_apps_flag}{inspect_adapter_flag}{inspect_build_id_flag}{inspect_elf_flag}{inspect_offset_flag}{inspect_max_flag}{inspect_max_bytes_flag}{inspect_max_hits_flag}{mirror_burp_flag}{mitm_burp_flag}",
         options.count, options.duration_seconds
     );
     eprintln!(
@@ -576,6 +608,23 @@ fn run_capture(serial: Option<&str>, options: &CaptureOptions) -> Result<()> {
     );
     if options.files && !options.files_fd {
         eprintln!("file sensor: openat only (dup/close off). Do not add --files-fd unless chasing FD leaks.");
+    }
+    if options.mirror_burp.is_some() {
+        adb_forward_burp_playback(serial)?;
+        eprintln!(
+            "adb forward tcp:{} tcp:{} (Burp fetches original SSL_read on 127.0.0.1)",
+            ksight_core::BURP_PLAYBACK_PORT,
+            ksight_core::BURP_PLAYBACK_PORT
+        );
+    }
+    if options.mitm_burp {
+        adb_forward_burp_upstream(serial)?;
+        eprintln!(
+            "adb forward tcp:{} tcp:{} — Burp Settings → Network → Connections → Upstream proxy = 127.0.0.1:{}; Intercept off; use Proxy HTTP history, not Logger",
+            ksight_core::BURP_UPSTREAM_PORT,
+            ksight_core::BURP_UPSTREAM_PORT,
+            ksight_core::BURP_UPSTREAM_PORT
+        );
     }
     if options.hide_debug {
         if !options.spool {

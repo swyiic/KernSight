@@ -234,12 +234,21 @@ pub fn symbol_match<'a>(elf: &'a ElfIdentity, names: &[&str]) -> Option<(&'a str
 
 /// First exact dynsym name in `names` order. Avoids `sslRead` matching `sslReadEx`.
 pub fn symbol_match_exact<'a>(elf: &'a ElfIdentity, names: &[&str]) -> Option<(&'a str, u64)> {
+    matching_symbols_exact(elf, names).into_iter().next()
+}
+
+/// Every exact dynsym name in `names` order. Unique by file offset.
+pub fn matching_symbols_exact<'a>(elf: &'a ElfIdentity, names: &[&str]) -> Vec<(&'a str, u64)> {
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
     for wanted in names {
         if let Some((name, offset)) = elf.symbols.iter().find(|(name, _)| name == wanted) {
-            return Some((name.as_str(), *offset));
+            if seen.insert(*offset) {
+                out.push((name.as_str(), *offset));
+            }
         }
     }
-    None
+    out
 }
 
 /// Every exported symbol whose name equals or starts with one of `names`.

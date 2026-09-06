@@ -1,8 +1,8 @@
 //! uprobe 命中时的用户态寄存器上下文。
 
 /// ABI 尺寸：与 `bpf/include/ksight_hwbp.h` 的 `ksight_hwbp_context` 对齐。
-pub const HWBP_CONTEXT_SIZE: usize = 680;
-const AUX_LEN: usize = 384;
+pub const HWBP_CONTEXT_SIZE: usize = 2344;
+const AUX_LEN: usize = 2048;
 
 /// ARM64 用户态寄存器现场（x0-x30、SP、PC、PSTATE）。
 #[derive(Debug, Clone, Copy)]
@@ -46,7 +46,7 @@ impl Default for RegisterContext {
 impl RegisterContext {
     /// 从事件字节流解码寄存器现场。
     ///
-    /// Layout: `pid`/`tid`, `regs[31]`, `sp`/`pc`/`pstate`, `time_ns`, `aux_bytes`, pad, `aux[384]`.
+    /// Layout: `pid`/`tid`, `regs[31]`, `sp`/`pc`/`pstate`, `time_ns`, `aux_bytes`, pad, `aux[2048]`.
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         if bytes.len() < HWBP_CONTEXT_SIZE {
             return None;
@@ -115,7 +115,7 @@ mod tests {
         assert_eq!(ctx.pc, 0x1234_5678_9abc);
         assert_eq!(RegisterContext::pid(&bytes), 42);
         assert_eq!(RegisterContext::tid(&bytes), 43);
-        assert_eq!(HWBP_CONTEXT_SIZE, 680);
+        assert_eq!(HWBP_CONTEXT_SIZE, 2344);
     }
 
     #[test]

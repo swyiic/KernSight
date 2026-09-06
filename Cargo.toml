@@ -8,6 +8,7 @@ members = [
     "crates/ksight-agent",
     "crates/ksight-hwbp",
     "crates/ksight-cli",
+    "crates/ksight-inject",
     "xtask",
 ]
 default-members = [
@@ -20,7 +21,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.2.8"
+version = "0.2.9"
 edition = "2021"
 rust-version = "1.85"
 authors = ["KernSight Contributors"]

@@ -2,6 +2,8 @@
 //!
 //! This is report-side analysis of Inspect/dump bytes, not MITM and not QUIC.
 
+use std::collections::HashMap;
+
 use crate::http_plain::ParsedHttpPlain;
 
 const STATIC_TABLE: [(&str, &str); 61] = [
@@ -341,7 +343,7 @@ pub fn parse_http2(bytes: &[u8]) -> Vec<ParsedHttpPlain> {
 
 /// True when a buffer starts like an HTTP/2 preface or a well-formed frame header.
 #[must_use]
-pub(crate) fn looks_like_http2(bytes: &[u8]) -> bool {
+pub fn looks_like_http2(bytes: &[u8]) -> bool {
     if bytes.is_empty() {
         return false;
     }
@@ -349,6 +351,21 @@ pub(crate) fn looks_like_http2(bytes: &[u8]) -> bool {
         return true;
     }
     bytes.len() >= 9 && frame_header_ok(bytes, 0).is_some()
+}
+
+/// One completed HTTP/2 request or response after HEADERS+DATA.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct H2Message {
+    /// Decoded HPACK name/value pairs, including pseudo-headers.
+    pub headers: Vec<(String, String)>,
+    /// DATA payload, inflated when the bytes were gzip/zlib.
+    pub body: Vec<u8>,
+}
+
+#[derive(Debug, Default)]
+struct PartialH2 {
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
 }
 
 /// Reassemble HTTP/2 frames and HPACK state across TLS/JNI copy fragments.
@@ -359,6 +376,9 @@ pub(crate) struct Http2Assembler {
     pending: Vec<u8>,
     in_headers: bool,
     aligned: bool,
+    headers_stream: u32,
+    streams: HashMap<u32, PartialH2>,
+    h2_messages: Vec<H2Message>,
 }
 
 impl Http2Assembler {
@@ -378,6 +398,25 @@ impl Http2Assembler {
         self.drain()
     }
 
+    /// Completed HTTP/2 messages with full header values, for Burp reconstruction.
+    pub(crate) fn take_h2_messages(&mut self) -> Vec<H2Message> {
+        std::mem::take(&mut self.h2_messages)
+    }
+
+    fn finish_stream(&mut self, stream: u32) {
+        let Some(partial) = self.streams.remove(&stream) else {
+            return;
+        };
+        if partial.headers.is_empty() {
+            return;
+        }
+        let body = crate::inflate_inspect_buffer(&partial.body).unwrap_or(partial.body);
+        self.h2_messages.push(H2Message {
+            headers: partial.headers,
+            body,
+        });
+    }
+
     fn drain(&mut self) -> Vec<ParsedHttpPlain> {
         let mut out = Vec::new();
         let mut index = 0_usize;
@@ -390,7 +429,8 @@ impl Http2Assembler {
             return out;
         }
         while index + 9 <= self.buf.len() && out.len() < 16 {
-            let Some((frame_end, frame_ty, flags, header_end)) = frame_header_ok(&self.buf, index)
+            let Some((frame_end, frame_ty, flags, header_end, stream)) =
+                frame_header_ok(&self.buf, index)
             else {
                 if self.aligned {
                     self.aligned = false;
@@ -410,6 +450,7 @@ impl Http2Assembler {
                     if frame_ty == 0x1 {
                         self.pending.clear();
                         self.in_headers = true;
+                        self.headers_stream = stream;
                         if flags & 0x08 != 0 {
                             let pad = usize::from(payload.first().copied().unwrap_or(0));
                             payload = payload
@@ -431,9 +472,28 @@ impl Http2Assembler {
                         if let Some(parsed) = headers_to_parsed(&headers) {
                             out.push(parsed);
                         }
+                        let entry = self.streams.entry(self.headers_stream).or_default();
+                        entry.headers.clone_from(&headers);
+                        if flags & 0x01 != 0 {
+                            self.finish_stream(self.headers_stream);
+                        }
                     }
                 }
-                0x0 => out.extend(data_to_parsed(payload, flags)),
+                0x0 => {
+                    out.extend(data_to_parsed(payload, flags));
+                    let mut body = payload;
+                    if flags & 0x08 != 0 {
+                        let pad = usize::from(body.first().copied().unwrap_or(0));
+                        body = body.get(1..body.len().saturating_sub(pad)).unwrap_or(&[]);
+                    }
+                    let entry = self.streams.entry(stream).or_default();
+                    if entry.body.len().saturating_add(body.len()) <= 64 * 1024 {
+                        entry.body.extend_from_slice(body);
+                    }
+                    if flags & 0x01 != 0 {
+                        self.finish_stream(stream);
+                    }
+                }
                 _ => {}
             }
             index = frame_end;
@@ -463,7 +523,7 @@ fn preface_row() -> ParsedHttpPlain {
     }
 }
 
-fn frame_header_ok(bytes: &[u8], index: usize) -> Option<(usize, u8, u8, usize)> {
+fn frame_header_ok(bytes: &[u8], index: usize) -> Option<(usize, u8, u8, usize, u32)> {
     let len = u32::from_be_bytes([0, bytes[index], bytes[index + 1], bytes[index + 2]]) as usize;
     let frame_ty = bytes[index + 3];
     let flags = bytes[index + 4];
@@ -484,7 +544,13 @@ fn frame_header_ok(bytes: &[u8], index: usize) -> Option<(usize, u8, u8, usize)>
         return None;
     }
     let header_end = index.saturating_add(9);
-    Some((header_end.saturating_add(len), frame_ty, flags, header_end))
+    Some((
+        header_end.saturating_add(len),
+        frame_ty,
+        flags,
+        header_end,
+        stream,
+    ))
 }
 
 fn data_to_parsed(payload: &[u8], flags: u8) -> Vec<ParsedHttpPlain> {

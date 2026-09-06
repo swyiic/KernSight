@@ -672,6 +672,13 @@ impl EventNormalizer {
                 http_method: parsed.as_ref().and_then(|meta| meta.http_method.clone()),
                 http_path: parsed.as_ref().and_then(|meta| meta.http_path.clone()),
                 http_host: parsed.as_ref().and_then(|meta| meta.http_host.clone()),
+                request_prefix: parsed
+                    .as_ref()
+                    .filter(|meta| meta.kind == "http")
+                    .and_then(|_| {
+                        let text = String::from_utf8_lossy(&payload);
+                        (!text.is_empty()).then(|| text.into_owned())
+                    }),
                 quic_version: parsed.as_ref().and_then(|meta| meta.quic_version.clone()),
                 quic_packet: parsed.as_ref().and_then(|meta| meta.quic_packet.clone()),
             }),

@@ -845,6 +845,29 @@ fn run_device_output(serial: Option<&str>, device_command: &str) -> Result<Strin
     String::from_utf8(output.stdout).context("device command returned non-UTF-8 output")
 }
 
+/// Forward computer `BURP_PLAYBACK_PORT` to the device so Burp can fetch original responses.
+pub(crate) fn adb_forward_burp_playback(serial: Option<&str>) -> Result<()> {
+    adb_forward_tcp(serial, ksight_core::BURP_PLAYBACK_PORT)
+        .context("adb forward for Burp playback")
+}
+
+/// Forward computer `BURP_UPSTREAM_PORT` to the phone CONNECT proxy so Burp
+/// origin fetches use the device network.
+pub(crate) fn adb_forward_burp_upstream(serial: Option<&str>) -> Result<()> {
+    adb_forward_tcp(serial, ksight_core::BURP_UPSTREAM_PORT)
+        .context("adb forward for Burp upstream")
+}
+
+fn adb_forward_tcp(serial: Option<&str>, port: u16) -> Result<()> {
+    let spec = format!("tcp:{port}");
+    let mut adb = adb_command(serial)?;
+    let status = adb
+        .args(["forward", &spec, &spec])
+        .status()
+        .context("adb forward")?;
+    ensure_success(status)
+}
+
 fn adb_command(serial: Option<&str>) -> Result<ProcessCommand> {
     let mut adb = ProcessCommand::new("adb");
     if let Some(serial) = serial {
