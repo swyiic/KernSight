@@ -49,7 +49,7 @@ impl Default for RegisterContext {
 impl RegisterContext {
     /// 从事件字节流解码寄存器现场。
     ///
-    /// Layout: `pid`/`tid`, `regs[31]`, `sp`/`pc`/`pstate`, `time_ns`, `aux_bytes`, pad, `aux[2048]`.
+    /// Layout: `pid`/`tid`, `regs[31]`, `sp`/`pc`/`pstate`, `time_ns`, `aux_bytes`, pad, `aux[4096]`.
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         if bytes.len() < HWBP_CONTEXT_SIZE {
             return None;
@@ -119,7 +119,7 @@ mod tests {
         assert_eq!(ctx.pc, 0x1234_5678_9abc);
         assert_eq!(RegisterContext::pid(&bytes), 42);
         assert_eq!(RegisterContext::tid(&bytes), 43);
-        assert_eq!(HWBP_CONTEXT_SIZE, 2344);
+        assert_eq!(HWBP_CONTEXT_SIZE, 4392);
     }
 
     #[test]
