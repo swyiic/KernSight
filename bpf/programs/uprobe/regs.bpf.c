@@ -48,7 +48,17 @@ struct {
     __type(value, ksight_u32);
 } tgid_allow SEC(".maps");
 
-static __always_inline int ksight_emit_user_regs(struct ksight_user_regs *ctx)
+/* Entry-time x1 (first user pointer) per tid, so the return probe can snapshot
+ * an output buffer (SSL_read) at the exact moment the bytes exist. */
+struct {
+    __uint(type, KSIGHT_BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 8192);
+    __type(key, ksight_u32);
+    __type(value, ksight_u64);
+} entry_ptr SEC(".maps");
+
+static __always_inline int ksight_emit_user_regs(struct ksight_user_regs *ctx,
+                                                 ksight_u32 at_return)
 {
     ksight_u32 zero = 0;
     struct ksight_hwbp_context *out = ksight_bpf_map_lookup_elem(&hwbp_ctx, &zero);
@@ -79,8 +89,32 @@ static __always_inline int ksight_emit_user_regs(struct ksight_user_regs *ctx)
     out->time_ns = ksight_bpf_ktime_get_ns();
     out->aux_bytes = 0;
     out->aux_pad = 0;
-    /* x1 is a user pointer for Parcel UTF-16 / TLS buffers; transact x1 is a handle.
-     * Strip ARM TBI/MTE tags so probe_read_user can follow ART heap pointers. */
+    if (at_return) {
+        /* Return probe: argument registers are gone. The entry program saved
+         * x1 (the buffer pointer); x0 is the returned byte count, so snapshot
+         * the buffer NOW while the bytes are still in place. */
+        ksight_u32 tid = (ksight_u32)pid_tgid;
+        ksight_u64 *saved = ksight_bpf_map_lookup_elem(&entry_ptr, &tid);
+        ksight_u64 count = out->regs[0];
+        if (saved && *saved >= 0x10000ULL && count > 0) {
+            ksight_u64 src = *saved & 0x00ffffffffffffffULL;
+            ksight_bpf_probe_read_user(out->aux, sizeof(out->aux),
+                                       (const void *)src);
+            out->aux_bytes = count > sizeof(out->aux)
+                                 ? (ksight_u32)sizeof(out->aux)
+                                 : (ksight_u32)count;
+            out->aux_pad = 1; /* snapshot taken at return time */
+        }
+        ksight_bpf_perf_event_output(ctx, &hwbp_events, 0, out, sizeof(*out));
+        return 0;
+    }
+    /* Entry probe: x1 is a user pointer for Parcel UTF-16 / TLS buffers;
+     * transact x1 is a handle. Strip ARM TBI/MTE tags so probe_read_user can
+     * follow ART heap pointers. */
+    ksight_u32 tid = (ksight_u32)pid_tgid;
+    ksight_u64 x1 = out->regs[1] & 0x00ffffffffffffffULL;
+    if (x1 >= 0x10000ULL)
+        ksight_bpf_map_update_elem(&entry_ptr, &tid, &out->regs[1], 0);
     {
         ksight_u64 src1 = out->regs[1] & 0x00ffffffffffffffULL;
         ksight_u64 src2 = out->regs[2] & 0x00ffffffffffffffULL;
@@ -89,15 +123,15 @@ static __always_inline int ksight_emit_user_regs(struct ksight_user_regs *ctx)
 
         if (src1 >= 0x10000ULL) {
             ksight_u64 n = len2;
-            if (n == 0 || n > 2048)
-                n = 2048;
+            if (n == 0 || n > 4096)
+                n = 4096;
             ksight_bpf_probe_read_user(out->aux, sizeof(out->aux),
                                        (const void *)src1);
             out->aux_bytes = (ksight_u32)n;
         } else if (src2 >= 0x10000ULL && len1 > 0 && len1 <= 4096) {
             ksight_u64 n = len1;
-            if (n > 2048)
-                n = 2048;
+            if (n > 4096)
+                n = 4096;
             ksight_bpf_probe_read_user(out->aux, sizeof(out->aux),
                                        (const void *)src2);
             out->aux_bytes = (ksight_u32)n;
@@ -111,14 +145,14 @@ static __always_inline int ksight_emit_user_regs(struct ksight_user_regs *ctx)
 SEC("uprobe/ksight_regs")
 int ksight_uprobe_regs(struct ksight_user_regs *ctx)
 {
-    return ksight_emit_user_regs(ctx);
+    return ksight_emit_user_regs(ctx, 0);
 }
 
 /* Return probe: ARM64 x0 is the function result; argument registers are not preserved. */
 SEC("uretprobe/ksight_ret")
 int ksight_uretprobe_regs(struct ksight_user_regs *ctx)
 {
-    return ksight_emit_user_regs(ctx);
+    return ksight_emit_user_regs(ctx, 1);
 }
 
 char LICENSE[] SEC("license") = "GPL";

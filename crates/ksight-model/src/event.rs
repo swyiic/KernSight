@@ -252,7 +252,8 @@ pub struct NetworkHandshake {
     pub peer_port: u16,
     /// Presentation form of the peer address when decoded.
     pub peer_address: Option<String>,
-    /// True when the kernel copy truncated the payload at 512 bytes.
+    /// True when the kernel copy truncated the payload at the capture cap.
+    #[serde(default)]
     pub truncated: bool,
     /// `tls`, `http`, or `quic`.
     pub kind: String,
@@ -283,6 +284,9 @@ pub struct NetworkHandshake {
     /// QUIC long-header packet type.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quic_packet: Option<String>,
+    /// Destination connection ID (hex) when the RFC 9001 `Initial` decryption recovered one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quic_dcid: Option<String>,
 }
 
 /// Completed `accept` or `accept4` attempt.

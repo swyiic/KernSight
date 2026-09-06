@@ -50,7 +50,7 @@ fn parse_tls_client_hello(payload: &[u8]) -> Option<HandshakeMeta> {
     None
 }
 
-fn parse_client_hello_body(handshake: &[u8]) -> Option<HandshakeMeta> {
+pub(crate) fn parse_client_hello_body(handshake: &[u8]) -> Option<HandshakeMeta> {
     if handshake.len() < 4 || handshake[0] != 0x01 {
         return None;
     }

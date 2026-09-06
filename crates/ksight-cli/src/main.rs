@@ -12,13 +12,12 @@ use uuid::Uuid;
 use crate::{
     device::{
         adb_forward_burp_playback, adb_forward_burp_upstream, cleanup_package, daemon_start,
-        daemon_status, daemon_stop,
-        deploy_agent, protocol_acknowledge, protocol_graph, protocol_replay, protocol_report,
-        protocol_sessions, pull_forensics, pull_package, pull_snapshot, read_last_session,
-        recatalog_package, run_device, run_device_tee, run_hide_debug_capture, validate_package,
-        DEVICE_AGENT, DEVICE_BINDER_OBJECT, DEVICE_FILE_OBJECT, DEVICE_MEMORY_OBJECT,
-        DEVICE_NETWORK_OBJECT, DEVICE_PROCESS_OBJECT, DEVICE_SCHED_OBJECT, DEVICE_SPOOL_ROOT,
-        DEVICE_UPROBE_OBJECT,
+        daemon_status, daemon_stop, deploy_agent, kill_stale_agents, protocol_acknowledge,
+        protocol_graph, protocol_replay, protocol_report, protocol_sessions, pull_forensics,
+        pull_package, pull_snapshot, read_last_session, recatalog_package, run_device,
+        run_device_tee, run_hide_debug_capture, validate_package, DEVICE_AGENT,
+        DEVICE_BINDER_OBJECT, DEVICE_FILE_OBJECT, DEVICE_MEMORY_OBJECT, DEVICE_NETWORK_OBJECT,
+        DEVICE_PROCESS_OBJECT, DEVICE_SCHED_OBJECT, DEVICE_SPOOL_ROOT, DEVICE_UPROBE_OBJECT,
     },
     display::{print_capabilities, print_keypoints},
 };
@@ -133,6 +132,14 @@ enum DeviceCommand {
         /// Host directory that receives the files.
         #[arg(long, default_value = ".")]
         dest: std::path::PathBuf,
+    },
+    /// Decrypt a session's pcap with its keylog and export HTTP objects.
+    Decrypt {
+        /// Capture session UUID.
+        session: Uuid,
+        /// Output directory for the decrypted exports.
+        #[arg(long, default_value = "decrypted")]
+        out: std::path::PathBuf,
     },
     /// Copy one installed package's APK, native libraries, repaired DEX, and live images.
     PullPackage {
@@ -284,7 +291,7 @@ struct CaptureOptions {
     /// Inspect every app mapping the adapter ELF. Noisy; prefer `--package`.
     #[arg(long)]
     inspect_all_apps: bool,
-    /// Maximum `SSL_write`/`SSL_read` bytes copied per hit (hard cap 4096).
+    /// Maximum plaintext bytes reconstructed per hit (hard cap 64 KiB).
     #[arg(long, default_value_t = 4096)]
     inspect_max_bytes: u32,
     /// Maximum Inspect hits; 0 uses the adapter default.
@@ -351,6 +358,9 @@ fn run_device_command(serial: Option<&str>, command: DeviceCommand) -> Result<()
         DeviceCommand::Probe => run_device(serial, &format!("{DEVICE_AGENT} probe --json"))?,
         DeviceCommand::Deploy => deploy_agent(serial)?,
         DeviceCommand::PullForensics { session, dest } => pull_forensics(serial, session, &dest)?,
+        DeviceCommand::Decrypt { session, out } => {
+            crate::device::decrypt_session(serial, &session.to_string(), &out)?;
+        }
         DeviceCommand::PullPackage {
             package,
             dest,
@@ -513,10 +523,8 @@ fn run_capture(serial: Option<&str>, mut options: CaptureOptions) -> Result<()> 
             bail!("--mirror-burp requires --package, --pid, or --uid");
         }
     }
-    if options.mitm_burp {
-        if options.mirror_burp.is_none() || options.package.is_none() {
-            bail!("--mitm-burp requires --mirror-burp HOST:PORT and --package");
-        }
+    if options.mitm_burp && (options.mirror_burp.is_none() || options.package.is_none()) {
+        bail!("--mitm-burp requires --mirror-burp HOST:PORT and --package");
     }
     if options.inspect_linker
         && (options.inspect_tls
@@ -626,6 +634,7 @@ fn run_capture(serial: Option<&str>, mut options: CaptureOptions) -> Result<()> 
             ksight_core::BURP_UPSTREAM_PORT
         );
     }
+    kill_stale_agents(serial)?;
     if options.hide_debug {
         if !options.spool {
             bail!("--hide-debug requires --spool so the session can be pulled after ADB returns");

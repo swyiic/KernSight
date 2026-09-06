@@ -332,7 +332,8 @@ const HUFFMAN: [(u32, u8); 256] = [
 ];
 
 const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-const ASSEMBLER_CAP: usize = 32 * 1024;
+const ASSEMBLER_CAP: usize = 1024 * 1024;
+const STREAM_BODY_CAP: usize = 1024 * 1024;
 
 /// Walk HTTP/2 frames and emit request/response rows plus URLs from DATA.
 #[must_use]
@@ -473,7 +474,19 @@ impl Http2Assembler {
                             out.push(parsed);
                         }
                         let entry = self.streams.entry(self.headers_stream).or_default();
-                        entry.headers.clone_from(&headers);
+                        if entry.headers.is_empty() {
+                            entry.headers.clone_from(&headers);
+                        } else {
+                            // A later HEADERS block is a trailer. Preserve the
+                            // request/response pseudo-headers needed to identify
+                            // the message and append only normal trailer fields.
+                            entry.headers.extend(
+                                headers
+                                    .iter()
+                                    .filter(|(name, _)| !name.starts_with(':'))
+                                    .cloned(),
+                            );
+                        }
                         if flags & 0x01 != 0 {
                             self.finish_stream(self.headers_stream);
                         }
@@ -487,12 +500,22 @@ impl Http2Assembler {
                         body = body.get(1..body.len().saturating_sub(pad)).unwrap_or(&[]);
                     }
                     let entry = self.streams.entry(stream).or_default();
-                    if entry.body.len().saturating_add(body.len()) <= 64 * 1024 {
-                        entry.body.extend_from_slice(body);
-                    }
+                    let remaining = STREAM_BODY_CAP.saturating_sub(entry.body.len());
+                    entry
+                        .body
+                        .extend_from_slice(&body[..body.len().min(remaining)]);
                     if flags & 0x01 != 0 {
                         self.finish_stream(stream);
                     }
+                }
+                0x3 => {
+                    // RST_STREAM makes the partial message unusable and bounds
+                    // state retained for abruptly closed app connections.
+                    self.streams.remove(&stream);
+                }
+                0x7 => {
+                    // GOAWAY ends the connection-level stream namespace.
+                    self.streams.clear();
                 }
                 _ => {}
             }

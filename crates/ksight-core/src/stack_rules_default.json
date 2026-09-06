@@ -1,0 +1,194 @@
+{
+  "schema_version": "1.1",
+  "device_profiles": {
+    "pixel6a-gki-6.1": {
+      "kernel": "6.1.124-android14",
+      "sdk": 36,
+      "capabilities": {
+        "aarch32_uprobe": false,
+        "bpf_loop": true,
+        "kallsyms_ksu_visible": true,
+        "tcpdump_sll2": true,
+        "uprobe_read_cap_4096": true
+      },
+      "notes": "Pixel 6a (bluejay) GKI; AArch32 uprobes return ENOTSUP so 32-bit apps (国网) cannot be symbol-probed on this device; KernelSU kernel symbols visible in kallsyms (bank-grade RASP detects; needs SUSFS). tcpdump -i any emits LINKTYPE_LINUX_SLL2 (276)."
+    }
+  },
+  "stacks": [
+    {
+      "id": "conscrypt_system",
+      "class": "generic",
+      "tier": 1,
+      "match_rules": { "path_contains": ["conscrypt"], "basename": "libssl.so" },
+      "symbols": {
+        "write": ["SSL_write", "SSL_write_ex"],
+        "read": ["SSL_read", "SSL_read_ex"],
+        "keylog": ["SSL_CTX_set_keylog_callback"]
+      },
+      "coverage": { "plaintext_copy": true, "keylog": true, "boundary_dump": false },
+      "notes": "System/Apex Conscrypt. Primary mirror path for OkHttp/Java apps (zcfwnew native layer, alipay partial). SSL_write apex offset 0x723f0 / system 0x59990 on pixel6a-gki-6.1 build 20a7471e/5bb7c9f8."
+    },
+    {
+      "id": "app_libssl_generic",
+      "class": "vendor-fork",
+      "tier": 2,
+      "match_rules": { "basename": "libssl.so" },
+      "symbols": {
+        "write": ["SSL_write", "SSL_write_ex"],
+        "read": ["SSL_read", "SSL_read_ex"],
+        "keylog": ["SSL_CTX_set_keylog_callback"]
+      },
+      "coverage": { "plaintext_copy": true, "keylog": true, "boundary_dump": false },
+      "notes": "App-private OpenSSL/BoringSSL with standard exports (bankabc libssl.so = OpenSSL 3.x with SSL_new_domain/SSL_read_ex)."
+    },
+    {
+      "id": "libhssl",
+      "class": "vendor-fork",
+      "tier": 2,
+      "match_rules": { "basename_contains": ["hssl"] },
+      "symbols": {
+        "write": ["sslWrite", "sslWriteEx"],
+        "read": ["sslRead", "sslReadEx"]
+      },
+      "coverage": { "plaintext_copy": true, "keylog": false, "boundary_dump": false },
+      "notes": "同花顺/恒生 HSSL: lowercase sslWrite/sslRead exports (v0.2.8 path). pazq/hexin carry libhssl-2.1.so sslWrite@0x1248c."
+    },
+    {
+      "id": "ttboringssl",
+      "class": "vendor-fork",
+      "tier": 2,
+      "match_rules": { "basename_contains": ["ttboringssl"], "size": 369256 },
+      "symbols": {
+        "write": ["SSL_write"],
+        "read": ["SSL_read"],
+        "keylog": ["SSL_CTX_set_keylog_callback"]
+      },
+      "keylog": {
+        "offset": 359252,
+        "lib_name": "libttboringssl.so",
+        "size": 369256,
+        "anchors": ["CLIENT_HANDSHAKE_TRAFFIC_SECRET", "CLIENT_RANDOM"],
+        "note": "ssl_log_secret entry via label-xref (0x57b54); ELF has NO GNU build-id — match by basename+size; client_random offset not yet derived."
+      },
+      "coverage": { "plaintext_copy": true, "keylog": true, "boundary_dump": false },
+      "notes": "字节系 vendor boringssl (pazq). QUIC API exports present (SSL_set_quic_method). Loads lazily — video/live SDK activation required."
+    },
+    {
+      "id": "cronet",
+      "class": "vendor-fork",
+      "tier": 2,
+      "match_rules": { "basename_contains": ["cronet"] },
+      "symbols": {
+        "write": ["SSL_write"],
+        "read": ["SSL_read"]
+      },
+      "coverage": { "plaintext_copy": true, "keylog": false, "boundary_dump": false },
+      "notes": "Attach only when SSL_write is exported (stable_cronet_libssl.so works; Google cronet builds are stripped)."
+    },
+    {
+      "id": "xquic",
+      "class": "vendor-fork",
+      "tier": 2,
+      "match_rules": { "basename_contains": ["xquic"], "build_id": "030b5b5657a9aba1b8b4602ad200e489f7088a51" },
+      "symbols": { "write": [], "read": [] },
+      "keylog": {
+        "offset": 305616,
+        "build_id": "030b5b5657a9aba1b8b4602ad200e489f7088a51",
+        "anchors": ["CLIENT_TRAFFIC_SECRET_0", "CLIENT_HANDSHAKE_TRAFFIC_SECRET", "CLIENT_RANDOM", "EXPORTER_SECRET"],
+        "note": "ssl_log_secret entry 0x4a9d0; validated attached on wandoujia libxquic. client_random struct offset pending (decryptor trial-matches instead)."
+      },
+      "coverage": { "plaintext_copy": false, "keylog": true, "boundary_dump": false },
+      "notes": "阿里 XQUIC (QUIC/HTTP3). No SSL_write surface — keylog probe is the only content path. Fires when the app actually uses QUIC."
+    },
+    {
+      "id": "flutter",
+      "class": "framework",
+      "tier": 3,
+      "match_rules": { "basename": "libflutter.so" },
+      "symbols": { "write": [], "read": [] },
+      "keylog": {
+        "anchors": ["CLIENT_TRAFFIC_SECRET_0", "CLIENT_RANDOM"],
+        "note": "Labels present in embedded boringssl but referenced via interned table (static init), not direct call sites. Runtime writer needs dynamic anchoring — pending. Offset tables from online engine versions are forbidden (frozen constraint); per-ELF on-device derivation only."
+      },
+      "coverage": { "plaintext_copy": false, "keylog": false, "boundary_dump": false },
+      "notes": "Dart TLS via statically-linked stripped boringssl. pazq/hexin engines carry full keylog labels — anchor path exists once runtime writer is pinned."
+    },
+    {
+      "id": "webview_chromium",
+      "class": "framework",
+      "tier": 3,
+      "match_rules": { "path_contains": ["webview"] },
+      "symbols": { "write": [], "read": [] },
+      "coverage": { "plaintext_copy": false, "keylog": false, "boundary_dump": false },
+      "notes": "Chromium network service inside webview.apk (H5 hybrid apps: zcfwnew captcha, GeeTest slider). No exported symbols; content path = WebView debugging or SUSFS-era approaches."
+    },
+    {
+      "id": "infosec_mssl",
+      "class": "framework-vendor",
+      "tier": 2,
+      "match_rules": { "basename_contains": ["infosecmssl"] },
+      "symbols": { "write": [], "read": [] },
+      "boundary": {
+        "write": ["Java_InfosecTcp_writeSSLDataNative", "Java_InfosecTcp_writeSSLData"],
+        "read": ["Java_InfosecTcp_readSSLDataNative", "Java_InfosecTcp_readSSLData"],
+        "layout": "empirical"
+      },
+      "coverage": { "plaintext_copy": false, "keylog": false, "boundary_dump": true },
+      "notes": "恒生 Infosec GMSSL (国密) — pazq login/captcha channel. JNI boundary exported; register layout empirical pending one probe run. infosec_probe dumps x0-x7 + candidate pointer memory."
+    },
+    {
+      "id": "tnet_slightssl",
+      "class": "framework-vendor",
+      "tier": 3,
+      "match_rules": { "basename_contains": ["libtnet"] },
+      "symbols": { "write": [], "read": [] },
+      "boundary": {
+        "write": ["NAL_session_SendHead", "NAL_session_SendData", "NAL_session_SubmitRequest"],
+        "read": [],
+        "layout": "empirical"
+      },
+      "coverage": { "plaintext_copy": false, "keylog": false, "boundary_dump": true },
+      "notes": "阿里 TNET: keylog label strings stripped entirely (slightssl custom TLS) — keylog probe impossible; only JNI/NAI boundary capture (B-route). Wandoujia main API (w-api.pp.cn) rides this."
+    },
+    {
+      "id": "mbedtls",
+      "class": "vendor-fork",
+      "tier": 2,
+      "match_rules": { "basename_contains": ["mbedtls"] },
+      "symbols": { "write": ["mbedtls_ssl_write"], "read": ["mbedtls_ssl_read"] },
+      "coverage": { "plaintext_copy": true, "keylog": false, "boundary_dump": false },
+      "notes": "mbed TLS with standard exports."
+    },
+    {
+      "id": "wolfssl",
+      "class": "vendor-fork",
+      "tier": 2,
+      "match_rules": { "basename_contains": ["wolfssl"] },
+      "symbols": { "write": ["wolfSSL_write"], "read": ["wolfSSL_read"] },
+      "coverage": { "plaintext_copy": true, "keylog": false, "boundary_dump": false },
+      "notes": "wolfSSL with standard exports."
+    },
+    {
+      "id": "gmssl_tassl",
+      "class": "vendor-fork",
+      "tier": 2,
+      "match_rules": { "basename_contains": ["gmssl", "tassl", "smcrypto"] },
+      "symbols": { "write": ["SSL_write"], "read": ["SSL_read"] },
+      "coverage": { "plaintext_copy": true, "keylog": false, "boundary_dump": false },
+      "notes": "国密 TASSL/GmSSL forks keeping standard symbol names; content is SM-ciphered — plaintext copy yields SM4 records the standard decryptor cannot open."
+    },
+    {
+      "id": "quic_generic",
+      "class": "generic",
+      "tier": 3,
+      "match_rules": { "basename_contains": ["quic"] },
+      "symbols": { "write": [], "read": [] },
+      "keylog": {
+        "anchors": ["CLIENT_HANDSHAKE_TRAFFIC_SECRET"],
+        "note": "Generic QUIC stacks: keylog probe by anchor-xref where labels survive (xquic proved the procedure)."
+      },
+      "coverage": { "plaintext_copy": false, "keylog": false, "boundary_dump": false },
+      "notes": "Placeholder for ttquic/other QUIC engines; keylog anchors presence varies per vendor."
+    }
+  ]
+}

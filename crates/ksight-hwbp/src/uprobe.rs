@@ -27,6 +27,10 @@ pub struct UprobeSession {
     hit_once: bool,
     finished: bool,
     tgid_keys: Vec<u32>,
+    /// Total valid records drained from the perf buffers.
+    pub drained_total: u64,
+    /// Total records the kernel reports as lost (ring overflow).
+    pub lost_total: u64,
 }
 
 impl UprobeSession {
@@ -98,6 +102,8 @@ impl UprobeSession {
             hit_once,
             finished: false,
             tgid_keys: Vec::new(),
+            drained_total: 0,
+            lost_total: 0,
         })
     }
 
@@ -147,13 +153,17 @@ impl UprobeSession {
         }
         let mut hits = Vec::new();
         for buffer in &mut self.buffers {
-            for raw in drain(buffer) {
-                if let Some(hit) = RegisterContext::decode(&raw) {
-                    hits.push(hit);
-                }
-                if self.hit_once {
-                    self.detach();
-                    return Ok(hits);
+            for (raw, lost) in drain(buffer) {
+                self.lost_total += lost;
+                self.drained_total += u64::try_from(raw.len()).unwrap_or(u64::MAX);
+                for record in raw {
+                    if let Some(hit) = RegisterContext::decode(&record) {
+                        hits.push(hit);
+                    }
+                    if self.hit_once {
+                        self.detach();
+                        return Ok(hits);
+                    }
                 }
             }
         }
@@ -196,18 +206,18 @@ impl Drop for UprobeSession {
     }
 }
 
-fn drain(buffer: &mut aya::maps::perf::PerfEventArrayBuffer<MapData>) -> Vec<Vec<u8>> {
+fn drain(buffer: &mut aya::maps::perf::PerfEventArrayBuffer<MapData>) -> Vec<(Vec<Vec<u8>>, u64)> {
     let mut out = Vec::new();
     loop {
         let mut slots = [
-            bytes::BytesMut::with_capacity(1024),
-            bytes::BytesMut::with_capacity(1024),
-            bytes::BytesMut::with_capacity(1024),
-            bytes::BytesMut::with_capacity(1024),
-            bytes::BytesMut::with_capacity(1024),
-            bytes::BytesMut::with_capacity(1024),
-            bytes::BytesMut::with_capacity(1024),
-            bytes::BytesMut::with_capacity(1024),
+            bytes::BytesMut::with_capacity(8192),
+            bytes::BytesMut::with_capacity(8192),
+            bytes::BytesMut::with_capacity(8192),
+            bytes::BytesMut::with_capacity(8192),
+            bytes::BytesMut::with_capacity(8192),
+            bytes::BytesMut::with_capacity(8192),
+            bytes::BytesMut::with_capacity(8192),
+            bytes::BytesMut::with_capacity(8192),
         ];
         let Ok(read) = buffer.read_events(&mut slots) else {
             break;
@@ -215,14 +225,14 @@ fn drain(buffer: &mut aya::maps::perf::PerfEventArrayBuffer<MapData>) -> Vec<Vec
         if read.read == 0 {
             break;
         }
-        for slot in slots.into_iter().take(read.read) {
-            if !slot.is_empty() {
-                out.push(slot.to_vec());
-            }
-        }
-        if read.lost > 0 {
-            break;
-        }
+        let records: Vec<Vec<u8>> = slots
+            .into_iter()
+            .take(read.read)
+            .filter(|slot| !slot.is_empty())
+            .map(|slot| slot.to_vec())
+            .collect();
+        let lost = u64::try_from(read.lost).unwrap_or(u64::MAX);
+        out.push((records, lost));
     }
     out
 }

@@ -12,11 +12,14 @@ mod identity;
 mod inflate;
 mod inspect;
 mod native_rules;
+mod pcap_decrypt;
 mod policy;
 mod provenance;
+mod quic_initial;
 mod report;
 mod sequence;
 mod sm4;
+mod stack_rules;
 
 pub use capability::{
     current_capabilities, semantic_keypoints, CapabilityArea, CapabilityStage, ObservationTier,
@@ -54,11 +57,13 @@ pub use native_rules::{
     classify_native_frameworks, classify_tls_library_path, native_framework_rule_version,
     NativeFrameworkEvidence, NativeFrameworkMatch, TlsLibraryKind,
 };
+pub use pcap_decrypt::{decrypt_flows, parse_keylog, parse_pcap_tcp_flows, DecryptedFlow};
 pub use policy::{validate_policy, PolicyError};
 pub use provenance::{
     anonymous_executable, hashed_file, path_candidate, CodeArtifact, DexArtifactObservation,
     DexArtifactSet, DexClassConflict, DumpArtifact, PackageDexIndex, ProvenanceClass,
 };
+pub use quic_initial::{decrypt_initial, QuicInitialHello, QuicInitialTable};
 pub use report::{
     correlate_http_calls_to_dex, http_calls_from_plaintext_dir, http_calls_from_private_dir,
     rank_observed_mappings, sort_http_catalog, ArtifactActivity, BinderFdTransfer,
@@ -72,4 +77,8 @@ pub use sequence::{SequenceError, SequenceGap, SequenceTracker};
 pub use sm4::{
     decrypt_block as sm4_decrypt_block, decrypt_ecb as sm4_decrypt_ecb,
     encrypt_ecb as sm4_encrypt_ecb,
+};
+pub use stack_rules::{
+    boundary_rule_for_symbol, boundary_symbols, keylog_entries, load as load_stack_rules,
+    stack_for_path, tls_symbol_names,
 };

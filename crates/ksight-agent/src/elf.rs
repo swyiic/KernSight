@@ -92,9 +92,13 @@ fn inspect_elf64(path: &Path, bytes: &[u8]) -> Result<ElfIdentity, String> {
         let len = usize::try_from(sym_size).unwrap_or(0);
         let str_start = usize::try_from(str_off).unwrap_or(0);
         let str_len = usize::try_from(str_size).unwrap_or(0);
-        if start + len <= bytes.len() && str_start + str_len <= bytes.len() {
-            let strings = &bytes[str_start..str_start + str_len];
-            for entry in bytes[start..start + len].chunks(24) {
+        let sym_end = start.checked_add(len).filter(|end| *end <= bytes.len());
+        let str_end = str_start
+            .checked_add(str_len)
+            .filter(|end| *end <= bytes.len());
+        if let (Some(sym_end), Some(str_end)) = (sym_end, str_end) {
+            let strings = &bytes[str_start..str_end];
+            for entry in bytes[start..sym_end].chunks(24) {
                 if entry.len() < 24 {
                     break;
                 }
@@ -182,9 +186,13 @@ fn inspect_elf32(path: &Path, bytes: &[u8]) -> Result<ElfIdentity, String> {
         let len = usize::try_from(sym_size).unwrap_or(0);
         let str_start = usize::try_from(str_off).unwrap_or(0);
         let str_len = usize::try_from(str_size).unwrap_or(0);
-        if start + len <= bytes.len() && str_start + str_len <= bytes.len() {
-            let strings = &bytes[str_start..str_start + str_len];
-            for entry in bytes[start..start + len].chunks(16) {
+        let sym_end = start.checked_add(len).filter(|end| *end <= bytes.len());
+        let str_end = str_start
+            .checked_add(str_len)
+            .filter(|end| *end <= bytes.len());
+        if let (Some(sym_end), Some(str_end)) = (sym_end, str_end) {
+            let strings = &bytes[str_start..str_end];
+            for entry in bytes[start..sym_end].chunks(16) {
                 if entry.len() < 16 {
                     break;
                 }
@@ -333,6 +341,29 @@ fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, String> {
             .try_into()
             .map_err(|_| "truncated")?,
     ))
+}
+
+/// Cheap pre-filter before reading a mapped file as an ELF: size cap plus
+/// extension and magic checks. Target processes map huge non-ELF blobs
+/// (`base.apk`, webview APKs, OAT/ART images) that must not be read whole.
+#[must_use]
+pub fn plausible_elf_file(path: &str) -> bool {
+    const MAX_SCAN_BYTES: u64 = 256 * 1024 * 1024;
+    const SKIP_SUFFIXES: [&str; 6] = [".apk", ".jar", ".oat", ".art", ".odex", ".vdex"];
+    if SKIP_SUFFIXES.iter().any(|suffix| path.ends_with(suffix)) {
+        return false;
+    }
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if meta.len() == 0 || meta.len() > MAX_SCAN_BYTES {
+        return false;
+    }
+    std::fs::File::open(path).is_ok_and(|mut file| {
+        let mut magic = [0_u8; 4];
+        std::io::Read::read_exact(&mut file, &mut magic).is_ok()
+            && magic == [0x7f, b'E', b'L', b'F']
+    })
 }
 
 #[cfg(test)]

@@ -307,7 +307,9 @@ impl MitmRedirect {
                 Ok(status) if status.success() || insert_or_delete == "-D" => {}
                 Ok(_) if binary == "ip6tables" => {}
                 Ok(_) => {
-                    return Err(format!("{binary} {insert_or_delete} INPUT {UPSTREAM_PORT} failed"));
+                    return Err(format!(
+                        "{binary} {insert_or_delete} INPUT {UPSTREAM_PORT} failed"
+                    ));
                 }
                 Err(_) if binary == "ip6tables" => {}
                 Err(error) => return Err(error.to_string()),

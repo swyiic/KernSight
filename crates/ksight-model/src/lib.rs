@@ -22,5 +22,5 @@ pub use quality::{Confidence, DataQuality};
 /// Current normalized event schema.
 pub const CURRENT_SCHEMA: SchemaVersion = SchemaVersion {
     major: 1,
-    minor: 28,
+    minor: 29,
 };

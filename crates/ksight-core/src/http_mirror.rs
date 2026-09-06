@@ -15,7 +15,9 @@ pub const BURP_PLAYBACK_PORT: u16 = 18_081;
 /// device network (`adb forward tcp:18888 tcp:18888` → `127.0.0.1:18888`).
 pub const BURP_UPSTREAM_PORT: u16 = 18_888;
 
-const ASSEMBLER_CAP: usize = 256 * 1024;
+/// Bound one reconstructed HTTP/1 message while still allowing ordinary
+/// avatar/photo multipart uploads to survive 64 KiB boundary fragments.
+const ASSEMBLER_CAP: usize = 8 * 1024 * 1024;
 const HOP_BY_HOP: &[&str] = &[
     "proxy-connection",
     "proxy-authenticate",
@@ -71,6 +73,26 @@ impl MirroredMessage {
         };
         let target = format!("http://{callback_host}:{playback_port}{path}");
         self.write_http1(self.method.as_str(), &target, Some(&self.host))
+    }
+
+    /// Playback request tagged with an opaque ID so concurrent Burp fetches
+    /// can retrieve the response paired with this exact reconstructed request.
+    #[must_use]
+    pub fn to_proxy_playback_with_id(
+        &self,
+        callback_host: &str,
+        playback_port: u16,
+        playback_id: &str,
+    ) -> Vec<u8> {
+        let mut wire = self.to_proxy_playback(callback_host, playback_port);
+        if playback_id.is_empty() {
+            return wire;
+        }
+        if let Some(position) = wire.windows(4).position(|window| window == b"\r\n\r\n") {
+            let header = format!("\r\nX-KernSight-Playback-ID: {playback_id}");
+            wire.splice(position..position, header.bytes());
+        }
+        wire
     }
 
     /// Origin-form HTTP/1.1 response for the playback listener to return to Burp.
@@ -268,8 +290,8 @@ impl StreamReassembler {
 
     /// Emit a truncated HTTP/1 message still sitting in the assembler.
     ///
-    /// Inspect copies are capped at 4096 bytes, so ICBC `Transfer-Encoding:
-    /// chunked` HTML often never sees the terminating `0` chunk. Flushing lets
+    /// A capture can end before `Transfer-Encoding: chunked` sees its terminal
+    /// `0` chunk. Flushing lets
     /// Burp store the headers and partial body instead of waiting forever.
     pub fn flush(&mut self) -> Vec<MirroredMessage> {
         match self.mode {
@@ -722,7 +744,7 @@ fn host_from_response_headers(headers: &[(String, String)]) -> Option<String> {
         if lower == "x-cache" {
             if let Some(host) = value.split_whitespace().last() {
                 let host = host_from_token(host);
-                if host.contains('.') {
+                if usable_host(&host) {
                     return Some(host);
                 }
             }
@@ -730,7 +752,7 @@ fn host_from_response_headers(headers: &[(String, String)]) -> Option<String> {
         if lower == "via" {
             for token in value.split([' ', ',', '(', ')']) {
                 let host = host_from_token(token);
-                if host.contains('.')
+                if usable_host(&host)
                     && host.bytes().any(|byte| byte.is_ascii_alphabetic())
                     && !host.eq_ignore_ascii_case("http")
                     && !host.eq_ignore_ascii_case("https")
@@ -862,14 +884,27 @@ fn skip_embedded_host(host: &str) -> bool {
 }
 
 fn host_from_token(value: &str) -> String {
-    value
+    let host = value
         .trim()
         .trim_matches(|ch: char| ch == '[' || ch == ']')
         .split('/')
         .next()
         .unwrap_or(value)
         .trim()
-        .to_owned()
+        .to_owned();
+    if usable_host(&host) {
+        host
+    } else {
+        String::new()
+    }
+}
+
+fn usable_host(host: &str) -> bool {
+    !host.is_empty()
+        && !host.contains('*')
+        && !host.ends_with('+')
+        && !host.contains("empty-sockaddr")
+        && (host.contains('.') || host.contains(':'))
 }
 
 fn reason_phrase(status: u16) -> &'static str {
@@ -923,9 +958,17 @@ pub fn fragment_bytes(preview: &str, preview_encoding: &str, content_class: &str
 #[cfg(test)]
 mod tests {
     use super::{
-        fragment_bytes, parse_mirror_endpoint, request_from_http_url,
+        fragment_bytes, host_from_token, parse_mirror_endpoint, request_from_http_url,
         requests_from_embedded_http_urls, StreamReassembler, BURP_PLAYBACK_PORT,
     };
+
+    #[test]
+    fn malformed_discovery_hosts_are_not_promoted_to_http_hosts() {
+        assert!(host_from_token("*.example.test").is_empty());
+        assert!(host_from_token("api.example.test+").is_empty());
+        assert!(host_from_token("empty-sockaddr").is_empty());
+        assert_eq!(host_from_token("api.example.test"), "api.example.test");
+    }
 
     #[test]
     fn post_headers_and_body_round_trip_to_burp_absolute_form() {
@@ -953,6 +996,13 @@ mod tests {
         let playback_text = String::from_utf8_lossy(&playback);
         assert!(playback_text.starts_with("POST http://192.168.3.20:18081/v1/login HTTP/1.1"));
         assert!(playback_text.contains("Host: api.bank.com\r\n"));
+        let tagged = message.to_proxy_playback_with_id(
+            "127.0.0.1",
+            BURP_PLAYBACK_PORT,
+            "session-connection-request",
+        );
+        let tagged = String::from_utf8_lossy(&tagged);
+        assert!(tagged.contains("X-KernSight-Playback-ID: session-connection-request\r\n"));
     }
 
     #[test]
@@ -1104,6 +1154,30 @@ mod tests {
         let wire = messages[0].to_proxy_playback("127.0.0.1", BURP_PLAYBACK_PORT);
         assert!(wire.windows(3).any(|w| w == [0xff, 0xd8, 0xff]));
         assert!(String::from_utf8_lossy(&wire).contains("multipart/form-data"));
+    }
+
+    #[test]
+    fn multipart_upload_waits_for_every_boundary_fragment() {
+        let image = vec![0x5a; 384 * 1024];
+        let mut body = b"--ksight\r\nContent-Disposition: form-data; name=\"avatar\"; filename=\"avatar.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n\xff\xd8\xff"
+            .to_vec();
+        body.extend_from_slice(&image);
+        body.extend_from_slice(b"\r\n--ksight--\r\n");
+        let mut raw = format!(
+            "POST /profile/avatar HTTP/1.1\r\nHost: upload.example.test\r\nContent-Type: multipart/form-data; boundary=ksight\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        raw.extend_from_slice(&body);
+
+        let mut stream = StreamReassembler::default();
+        let mut messages = Vec::new();
+        for fragment in raw.chunks(32 * 1024) {
+            messages.extend(stream.push(fragment));
+        }
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].path, "/profile/avatar");
+        assert_eq!(messages[0].body, body);
     }
 
     #[test]

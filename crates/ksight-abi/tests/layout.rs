@@ -25,7 +25,7 @@ fn raw_header_layout_is_stable() {
     assert_eq!(RAW_NETWORK_EVENT_SIZE, 240);
     assert_eq!(RAW_NETWORK_IO_EVENT_SIZE, 128);
     assert_eq!(RAW_DNS_EVENT_SIZE, 640);
-    assert_eq!(RAW_HANDSHAKE_EVENT_SIZE, 640);
+    assert_eq!(RAW_HANDSHAKE_EVENT_SIZE, 2176);
     assert_eq!(RawEventType::NetworkDns as u16, 0x0405);
     assert_eq!(RawEventType::NetworkHandshake as u16, 0x0406);
     assert_eq!(RAW_BINDER_EVENT_SIZE, 128);

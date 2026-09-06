@@ -1,8 +1,8 @@
 //! uprobe 命中时的用户态寄存器上下文。
 
 /// ABI 尺寸：与 `bpf/include/ksight_hwbp.h` 的 `ksight_hwbp_context` 对齐。
-pub const HWBP_CONTEXT_SIZE: usize = 2344;
-const AUX_LEN: usize = 2048;
+pub const HWBP_CONTEXT_SIZE: usize = 4392;
+const AUX_LEN: usize = 4096;
 
 /// ARM64 用户态寄存器现场（x0-x30、SP、PC、PSTATE）。
 #[derive(Debug, Clone, Copy)]
@@ -23,6 +23,8 @@ pub struct RegisterContext {
     pub time_ns: u64,
     /// Bytes valid in `aux`, from x2 units capped at 192 UTF-16 units.
     pub aux_bytes: u32,
+    /// True when aux was snapshotted at probe return (`SSL_read` output buffer).
+    pub snapshot_at_return: bool,
     /// x1 user-buffer snapshot at hit time. Empty when x1 is not a pointer.
     pub aux: [u8; AUX_LEN],
 }
@@ -38,6 +40,7 @@ impl Default for RegisterContext {
             pstate: 0,
             time_ns: 0,
             aux_bytes: 0,
+            snapshot_at_return: false,
             aux: [0; AUX_LEN],
         }
     }
@@ -64,6 +67,7 @@ impl RegisterContext {
         ctx.pstate = read_u64(bytes, 8 + 33 * 8);
         ctx.time_ns = read_u64(bytes, 8 + 34 * 8);
         ctx.aux_bytes = read_u32(bytes, 8 + 35 * 8);
+        ctx.snapshot_at_return = read_u32(bytes, 8 + 35 * 8 + 4) != 0;
         let aux_off = 8 + 35 * 8 + 8;
         ctx.aux
             .copy_from_slice(bytes.get(aux_off..aux_off + AUX_LEN)?);

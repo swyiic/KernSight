@@ -258,7 +258,7 @@ struct CaptureArgs {
     /// Inspect every app mapping the adapter ELF. Noisy; prefer `--package`.
     #[arg(long)]
     inspect_all_apps: bool,
-    /// Maximum `SSL_write`/`SSL_read` bytes copied per hit (hard cap 4096).
+    /// Maximum plaintext bytes reconstructed per hit (hard cap 64 KiB).
     #[arg(long, default_value_t = 4096)]
     inspect_max_bytes: u32,
     /// Maximum Inspect hits; 0 uses the adapter default.
@@ -560,7 +560,7 @@ fn run_capture(mut args: CaptureArgs) -> Result<()> {
         max_hits: args.inspect_max_hits,
         max_duration_secs: args.inspect_max_secs,
         whole_device: args.inspect_all_apps,
-        max_payload_bytes: args.inspect_max_bytes.clamp(1, 4096),
+        max_payload_bytes: args.inspect_max_bytes.clamp(1, 64 * 1024),
         ..ksight_core::InspectPolicy::default()
     };
     ksight_agent::capture::run(CaptureRequest {

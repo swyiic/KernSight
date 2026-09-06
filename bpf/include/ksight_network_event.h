@@ -48,13 +48,13 @@ struct ksight_dns_event {
 _Static_assert(sizeof(struct ksight_dns_event) == 640,
                "ksight DNS event ABI changed");
 
-#define KSIGHT_HANDSHAKE_PAYLOAD_LEN 512
+#define KSIGHT_HANDSHAKE_PAYLOAD_LEN 2048
 #define KSIGHT_HANDSHAKE_KIND_TLS 1
 #define KSIGHT_HANDSHAKE_KIND_HTTP 2
 #define KSIGHT_HANDSHAKE_KIND_QUIC 3
 
 /*
- * Same 640-byte layout as ksight_dns_event. `direction` carries the protocol
+ * Fixed 96+32+2048-byte layout. `direction` carries the protocol
  * kind (KSIGHT_HANDSHAKE_KIND_*) rather than DNS query/response.
  */
 struct ksight_handshake_event {
@@ -70,7 +70,7 @@ struct ksight_handshake_event {
     ksight_u8 payload[KSIGHT_HANDSHAKE_PAYLOAD_LEN];
 };
 
-_Static_assert(sizeof(struct ksight_handshake_event) == 640,
+_Static_assert(sizeof(struct ksight_handshake_event) == 2176,
                "ksight handshake event ABI changed");
 
 #endif /* KSIGHT_NETWORK_EVENT_H */

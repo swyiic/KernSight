@@ -10,15 +10,6 @@ pub mod binder_aidl;
 pub mod binder_dex;
 /// Reconstruct Inspect HTTP/WS copies and feed a Burp HTTP proxy.
 pub mod burp_mirror;
-/// Per-UID iptables DNAT to Burp.
-#[cfg(any(target_os = "android", target_os = "linux"))]
-pub mod mitm_redirect;
-/// Live heap scan for AES/SM4 material while capturing.
-#[cfg(any(target_os = "android", target_os = "linux"))]
-pub mod crypto_watch;
-/// Late `dlopen` of `libksight_tls.so` after packer init.
-#[cfg(any(target_os = "android", target_os = "linux"))]
-pub mod tls_inject;
 /// Read-only platform capability discovery.
 pub mod capabilities;
 /// Foreground multi-sensor capture orchestration.
@@ -27,6 +18,9 @@ pub mod capture;
 pub mod collector;
 /// Negotiated durable-session control protocol.
 pub mod control;
+/// Live heap scan for AES/SM4 material while capturing.
+#[cfg(any(target_os = "android", target_os = "linux"))]
+pub mod crypto_watch;
 /// Dump decrypted DEX from live process mappings.
 pub mod dexdump;
 /// Join DNS answers to later socket connects.
@@ -44,16 +38,21 @@ pub mod fd_lineage;
 /// Best-effort file path semantic enrichment.
 pub mod file;
 pub mod identity;
+pub mod infosec_probe;
 /// Inspect adapter evaluation and selected-process attachment.
 pub mod inspect_runtime;
 /// Capture and deployment integrity reporting.
 pub mod integrity;
 /// `JNIEnv` plaintext functions from exported `GetFunctionTable` + `jni.h` slots.
 pub mod jni_env;
+pub mod keylog_probe;
 /// Sensor loading and attachment lifecycle.
 pub mod loader;
 /// Best-effort virtual-memory semantic enrichment.
 pub mod memory;
+/// Per-UID iptables DNAT to Burp.
+#[cfg(any(target_os = "android", target_os = "linux"))]
+pub mod mitm_redirect;
 /// Raw ABI normalization.
 pub mod normalize;
 /// Validated capture policy state.
@@ -70,6 +69,9 @@ pub mod service;
 pub mod snapshot;
 /// Durable disconnected-session buffering.
 pub mod spool;
+/// Late `dlopen` of `libksight_tls.so` after packer init.
+#[cfg(any(target_os = "android", target_os = "linux"))]
+pub mod tls_inject;
 /// Runtime tracepoint-format compatibility checks.
 pub mod tracepoint;
 /// Authenticated local transport boundary.

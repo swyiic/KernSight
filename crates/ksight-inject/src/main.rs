@@ -139,13 +139,7 @@ fn original_dst(stream: &TcpStream) -> Option<SocketAddr> {
         let fd = stream.as_raw_fd();
         let mut addr: libc::sockaddr_in = std::mem::zeroed();
         let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-        if libc::getsockopt(
-            fd,
-            libc::SOL_IP,
-            80,
-            (&raw mut addr).cast(),
-            &raw mut len,
-        ) == 0
+        if libc::getsockopt(fd, libc::SOL_IP, 80, (&raw mut addr).cast(), &raw mut len) == 0
             && addr.sin_family as i32 == libc::AF_INET
         {
             let ip = u32::from_be(addr.sin_addr.s_addr);
@@ -206,9 +200,10 @@ fn proxy_one(
         || peek.starts_with(b"OPTIONS");
     // Custom API ports (SGCC 28083 / Aliyun 28630) are TLS, not 443.
     if tls || orig_port == 443 || orig_port == 8443 || !looks_http {
-        let host = sni.clone().or(http_host.clone()).unwrap_or_else(|| {
-            orig.map(socket_ip_string).unwrap_or_default()
-        });
+        let host = sni
+            .clone()
+            .or(http_host.clone())
+            .unwrap_or_else(|| orig.map(socket_ip_string).unwrap_or_default());
         if host.is_empty() {
             return Err("no SNI/Host for CONNECT".into());
         }
@@ -306,10 +301,7 @@ fn upstream_one(mut client: TcpStream, burp: Option<SocketAddr>) -> Result<(), S
     let extra = buf[header_end..].to_vec();
     let text = String::from_utf8_lossy(&headers);
     let Some((host, port)) = parse_connect_target(&text) else {
-        return Err(format!(
-            "not CONNECT {}",
-            text.lines().next().unwrap_or("")
-        ));
+        return Err(format!("not CONNECT {}", text.lines().next().unwrap_or("")));
     };
     if port == 18443 || port == 18888 || port == 0 {
         return Err(format!("refusing upstream port {port}"));
@@ -387,9 +379,7 @@ fn splice_origin(
     let mut origin = TcpStream::connect_timeout(&dest, Duration::from_secs(12))
         .map_err(|error| format!("passthrough {dest}: {error}"))?;
     let _ = origin.set_nodelay(true);
-    origin
-        .write_all(peek)
-        .map_err(|error| error.to_string())?;
+    origin.write_all(peek).map_err(|error| error.to_string())?;
     let _ = client.set_read_timeout(None);
     let _ = origin.set_read_timeout(None);
     let mut client_up = client.try_clone().map_err(|error| error.to_string())?;
@@ -467,12 +457,7 @@ fn resolve_via_ping(host: &str) -> Option<IpAddr> {
 
 fn dns_servers() -> Vec<SocketAddr> {
     let mut out = Vec::new();
-    for key in [
-        "net.dns1",
-        "net.dns2",
-        "dhcp.wlan0.dns1",
-        "dhcp.wlan0.dns2",
-    ] {
+    for key in ["net.dns1", "net.dns2", "dhcp.wlan0.dns1", "dhcp.wlan0.dns2"] {
         let Ok(output) = Command::new("getprop").arg(key).output() else {
             continue;
         };
@@ -562,9 +547,7 @@ fn skip_dns_name(msg: &[u8], mut i: usize) -> Result<usize, String> {
         if len == 0 {
             return i.checked_add(1).ok_or_else(|| "dns name".into());
         }
-        i = i
-            .checked_add(1 + usize::from(len))
-            .ok_or("dns name")?;
+        i = i.checked_add(1 + usize::from(len)).ok_or("dns name")?;
         hops += 1;
     }
 }
@@ -673,14 +656,7 @@ fn inject(pid: i32, lib: &str) -> Result<u64, String> {
     }
     let attached = attach_main(pid)?;
     let result = if process_is_32(pid) {
-        inject_attached32(
-            pid,
-            &so,
-            &lib,
-            dlopen_ext,
-            dlopen,
-            caller,
-        )
+        inject_attached32(pid, &so, &lib, dlopen_ext, dlopen, caller)
     } else {
         inject_attached(
             pid,
@@ -708,7 +684,10 @@ fn attach_main(pid: i32) -> Result<Vec<i32>, String> {
         if seized {
             let _ = libc::ptrace(PTRACE_INTERRUPT, pid, 0, 0);
         } else if libc::ptrace(libc::PTRACE_ATTACH, pid, 0, 0) != 0 {
-            return Err(format!("ptrace attach: {}", std::io::Error::last_os_error()));
+            return Err(format!(
+                "ptrace attach: {}",
+                std::io::Error::last_os_error()
+            ));
         }
     }
     if !wait_stop(pid, Duration::from_secs(5)) {
@@ -1077,7 +1056,9 @@ fn clear_same_uid_tracer(pid: i32) {
 fn process_is_32(pid: i32) -> bool {
     fs::read_to_string(format!("/proc/{pid}/maps"))
         .ok()
-        .is_some_and(|maps| maps.contains("/lib/bionic/libc.so") && !maps.contains("/lib64/bionic/libc.so"))
+        .is_some_and(|maps| {
+            maps.contains("/lib/bionic/libc.so") && !maps.contains("/lib64/bionic/libc.so")
+        })
 }
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
@@ -1213,9 +1194,7 @@ fn read_regs32(pid: i32) -> Result<Arm32Regs, String> {
 fn write_regs32(pid: i32, regs: &Arm32Regs) -> Result<(), String> {
     unsafe {
         let mut iov = libc::iovec {
-            iov_base: (regs as *const Arm32Regs)
-                .cast::<libc::c_void>()
-                .cast_mut(),
+            iov_base: (regs as *const Arm32Regs).cast::<libc::c_void>().cast_mut(),
             iov_len: std::mem::size_of::<Arm32Regs>(),
         };
         if libc::ptrace(libc::PTRACE_SETREGSET, pid, NT_PRSTATUS, &raw mut iov) != 0 {
@@ -1322,7 +1301,10 @@ fn peek_word(pid: i32, addr: u64) -> Result<i64, String> {
             if process_vm_rw(pid, addr, &mut buf, false).is_ok() {
                 return Ok(i64::from_le_bytes(buf));
             }
-            return Err(format!("peek {addr:#x}: {}", std::io::Error::last_os_error()));
+            return Err(format!(
+                "peek {addr:#x}: {}",
+                std::io::Error::last_os_error()
+            ));
         }
         Ok(word)
     }
@@ -1336,7 +1318,10 @@ fn poke_word(pid: i32, addr: u64, word: u64) -> Result<(), String> {
     }
     unsafe {
         if libc::ptrace(libc::PTRACE_POKEDATA, pid, addr, word as libc::c_long) != 0 {
-            return Err(format!("poke {addr:#x}: {}", std::io::Error::last_os_error()));
+            return Err(format!(
+                "poke {addr:#x}: {}",
+                std::io::Error::last_os_error()
+            ));
         }
     }
     Ok(())
@@ -1416,7 +1401,10 @@ type Regs = Aarch64Regs;
 
 const NT_PRSTATUS: i64 = 1;
 
-#[cfg(all(any(target_os = "android", target_os = "linux"), target_arch = "aarch64"))]
+#[cfg(all(
+    any(target_os = "android", target_os = "linux"),
+    target_arch = "aarch64"
+))]
 fn read_regs(pid: i32) -> Result<Regs, String> {
     unsafe {
         let mut regs = std::mem::zeroed::<Aarch64Regs>();
@@ -1431,7 +1419,10 @@ fn read_regs(pid: i32) -> Result<Regs, String> {
     }
 }
 
-#[cfg(all(any(target_os = "android", target_os = "linux"), target_arch = "aarch64"))]
+#[cfg(all(
+    any(target_os = "android", target_os = "linux"),
+    target_arch = "aarch64"
+))]
 fn write_regs(pid: i32, regs: &Regs) -> Result<(), String> {
     unsafe {
         let mut iov = libc::iovec {
@@ -1464,19 +1455,30 @@ mod tests {
 
     #[test]
     fn parse_connect_host_port() {
-        let got = parse_connect_target("CONNECT map.sgcc.com.cn:443 HTTP/1.1\r\nHost: map.sgcc.com.cn:443\r\n\r\n");
+        let got = parse_connect_target(
+            "CONNECT map.sgcc.com.cn:443 HTTP/1.1\r\nHost: map.sgcc.com.cn:443\r\n\r\n",
+        );
         assert_eq!(got, Some(("map.sgcc.com.cn".into(), 443)));
-        assert_eq!(split_host_port("[2001:db8::1]:8443"), Some(("2001:db8::1".into(), 8443)));
+        assert_eq!(
+            split_host_port("[2001:db8::1]:8443"),
+            Some(("2001:db8::1".into(), 8443))
+        );
         assert!(parse_connect_target("GET / HTTP/1.1\r\n\r\n").is_none());
     }
 
     #[test]
     fn parse_dns_a_record() {
         // id=0x1234, qd=1, an=1, question example.com, answer 93.184.216.34
-        let mut msg = vec![0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00];
-        msg.extend_from_slice(&[7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0]);
+        let mut msg = vec![
+            0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        ];
+        msg.extend_from_slice(&[
+            7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
+        ]);
         msg.extend_from_slice(&[0, 1, 0, 1]);
-        msg.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04]);
+        msg.extend_from_slice(&[
+            0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04,
+        ]);
         msg.extend_from_slice(&[93, 184, 216, 34]);
         assert_eq!(
             parse_dns_a(&msg).unwrap(),

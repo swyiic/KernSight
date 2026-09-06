@@ -2,9 +2,9 @@ use std::fmt::Write as _;
 
 use ksight_abi::{
     RawEventHeader, RawEventType, RawSensorId, EVENT_FLAG_IDENTITY_PARTIAL, EVENT_FLAG_TRUNCATED,
-    FILE_PATH_LEN, PROCESS_FILENAME_LEN, RAW_BINDER_EVENT_SIZE, RAW_BINDER_FD_EVENT_SIZE,
-    RAW_BINDER_PARCEL_EVENT_SIZE, RAW_DNS_EVENT_SIZE, RAW_FD_EVENT_SIZE, RAW_FILE_EVENT_SIZE,
-    RAW_HANDSHAKE_EVENT_SIZE, RAW_MEMORY_EVENT_SIZE, RAW_NETWORK_EVENT_SIZE,
+    FILE_PATH_LEN, HANDSHAKE_PAYLOAD_LEN, PROCESS_FILENAME_LEN, RAW_BINDER_EVENT_SIZE,
+    RAW_BINDER_FD_EVENT_SIZE, RAW_BINDER_PARCEL_EVENT_SIZE, RAW_DNS_EVENT_SIZE, RAW_FD_EVENT_SIZE,
+    RAW_FILE_EVENT_SIZE, RAW_HANDSHAKE_EVENT_SIZE, RAW_MEMORY_EVENT_SIZE, RAW_NETWORK_EVENT_SIZE,
     RAW_NETWORK_IO_EVENT_SIZE, RAW_PROCESS_EVENT_SIZE, RAW_SCHED_EVENT_SIZE, SOCKET_ADDRESS_LEN,
 };
 use ksight_model::{
@@ -39,6 +39,7 @@ pub trait Normalizer {
 pub struct EventNormalizer {
     boot_id: Uuid,
     session_id: Uuid,
+    quic_initials: ksight_core::QuicInitialTable,
 }
 
 impl EventNormalizer {
@@ -47,6 +48,7 @@ impl EventNormalizer {
         Self {
             boot_id,
             session_id,
+            quic_initials: ksight_core::QuicInitialTable::default_table(),
         }
     }
 
@@ -412,7 +414,7 @@ impl EventNormalizer {
     }
 
     fn normalize_network(
-        &self,
+        &mut self,
         bytes: &[u8],
         raw: &RawEventHeader,
     ) -> Result<Event, NormalizeError> {
@@ -588,15 +590,40 @@ impl EventNormalizer {
         })
     }
 
+    /// Combine parsed first-write metadata with RFC 9001 `Initial` decryption.
+    ///
+    /// QUIC client hellos split across datagrams are reassembled in
+    /// `quic_initials`; the recovered SNI/ALPN fill the same fields a TLS
+    /// `ClientHello` would, plus the destination connection ID.
+    fn recover_handshake_names(
+        &mut self,
+        bpf_kind: u8,
+        payload: &[u8],
+        parsed: Option<&ksight_core::HandshakeMeta>,
+    ) -> (Option<String>, Option<String>, Option<String>) {
+        let mut sni = parsed.and_then(|meta| meta.sni.clone());
+        let mut alpn = parsed.and_then(|meta| meta.alpn.clone());
+        let mut quic_dcid = None;
+        if bpf_kind == 3 && payload.len() >= 64 {
+            // User-space Initial decryption: no hook, no process change.
+            if let Some(hello) = self.quic_initials.feed(payload) {
+                sni = hello.sni;
+                alpn = hello.alpn;
+                quic_dcid = Some(hello.dcid_hex);
+            }
+        }
+        (sni, alpn, quic_dcid)
+    }
+
     fn normalize_handshake(
-        &self,
+        &mut self,
         bytes: &[u8],
         raw: &RawEventHeader,
     ) -> Result<Event, NormalizeError> {
         if bytes.len() != RAW_HANDSHAKE_EVENT_SIZE {
             return Err(NormalizeError::InvalidNetworkRecordSize(bytes.len()));
         }
-        let captured = usize::from(read_u16(bytes, 108)).min(512);
+        let captured = usize::from(read_u16(bytes, 108)).min(HANDSHAKE_PAYLOAD_LEN);
         let payload_start = 128_usize;
         let payload_end = payload_start.saturating_add(captured);
         let payload = bytes
@@ -604,6 +631,8 @@ impl EventNormalizer {
             .unwrap_or(&[])
             .to_vec();
         let parsed = ksight_core::parse_handshake(&payload);
+        let (sni, alpn, quic_dcid) =
+            self.recover_handshake_names(bytes[110], &payload, parsed.as_ref());
         let family = read_u16(bytes, 104);
         let address = &bytes[112..128];
         let peer_address = match family {
@@ -666,8 +695,8 @@ impl EventNormalizer {
                 kind: parsed
                     .as_ref()
                     .map_or_else(|| bpf_kind.to_owned(), |meta| meta.kind.to_owned()),
-                sni: parsed.as_ref().and_then(|meta| meta.sni.clone()),
-                alpn: parsed.as_ref().and_then(|meta| meta.alpn.clone()),
+                sni,
+                alpn,
                 ech: parsed.as_ref().is_some_and(|meta| meta.ech),
                 http_method: parsed.as_ref().and_then(|meta| meta.http_method.clone()),
                 http_path: parsed.as_ref().and_then(|meta| meta.http_path.clone()),
@@ -681,6 +710,7 @@ impl EventNormalizer {
                     }),
                 quic_version: parsed.as_ref().and_then(|meta| meta.quic_version.clone()),
                 quic_packet: parsed.as_ref().and_then(|meta| meta.quic_packet.clone()),
+                quic_dcid,
             }),
         })
     }

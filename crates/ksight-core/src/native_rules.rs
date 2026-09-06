@@ -135,7 +135,13 @@ pub fn classify_tls_library_path(path: &str) -> Option<TlsLibraryKind> {
     if basename == "libconscrypt_jni.so" || basename == "libjavacrypto.so" {
         return Some(TlsLibraryKind::ConscryptJni);
     }
-    if basename.contains("hssl") {
+    if basename.contains("mssl") || basename.contains("infosec") {
+        // 恒生 Infosec GMSSL stacks: JNI-boundary TLS (writeSSLDataNative).
+        return Some(TlsLibraryKind::AppLibssl);
+    }
+    if basename.contains("hssl") || basename.contains("boringssl") {
+        // `libhssl*` (Tonghuashun) and vendor boringssl forks such as
+        // `libttboringssl.so` export standard `SSL_write` symbols.
         return Some(TlsLibraryKind::AppLibssl);
     }
     if basename == "libssl.so" || basename == "libboringssl.so" || basename == "libcrypto.so" {
@@ -287,6 +293,12 @@ mod tests {
         );
         assert_eq!(
             classify_tls_library_path("/data/app/foo/lib/arm64/libhssl-2.1.so"),
+            Some(TlsLibraryKind::AppLibssl)
+        );
+        assert_eq!(
+            classify_tls_library_path(
+                "/data/app/~~x==/com.hundsun.winner.pazq-y==/lib/arm64/libttboringssl.so"
+            ),
             Some(TlsLibraryKind::AppLibssl)
         );
     }

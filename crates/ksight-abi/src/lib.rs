@@ -30,8 +30,10 @@ pub const RAW_NETWORK_EVENT_SIZE: usize = RAW_EVENT_HEADER_SIZE + 16 + SOCKET_AD
 pub const RAW_NETWORK_IO_EVENT_SIZE: usize = RAW_EVENT_HEADER_SIZE + 32;
 /// Fixed bounded DNS datagram record size.
 pub const RAW_DNS_EVENT_SIZE: usize = RAW_EVENT_HEADER_SIZE + 32 + 512;
-/// Fixed bounded first-write handshake record size (same layout as DNS).
-pub const RAW_HANDSHAKE_EVENT_SIZE: usize = RAW_DNS_EVENT_SIZE;
+/// Bounded first-write handshake payload bytes (QUIC Initial needs \u22651250).
+pub const HANDSHAKE_PAYLOAD_LEN: usize = 2048;
+/// Fixed bounded first-write handshake record size (same field layout as DNS).
+pub const RAW_HANDSHAKE_EVENT_SIZE: usize = RAW_EVENT_HEADER_SIZE + 32 + HANDSHAKE_PAYLOAD_LEN;
 /// Fixed Binder transaction record size.
 pub const RAW_BINDER_EVENT_SIZE: usize = RAW_EVENT_HEADER_SIZE + 32;
 /// Fixed Binder file-descriptor transfer record size.

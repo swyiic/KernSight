@@ -50,7 +50,9 @@ pub fn scan_pid(pid: u32, package: &str) -> usize {
         if !perms.contains('r') || perms.contains('x') {
             continue;
         }
-        if path.starts_with("/system/") || path.starts_with("/apex/") || path.starts_with("/vendor/")
+        if path.starts_with("/system/")
+            || path.starts_with("/apex/")
+            || path.starts_with("/vendor/")
         {
             continue;
         }
@@ -71,7 +73,10 @@ pub fn scan_pid(pid: u32, package: &str) -> usize {
         for needle in NEEDLES {
             let mut from = 0;
             while added < CAP {
-                let Some(rel) = bytes[from..].windows(needle.len()).position(|w| w == needle) else {
+                let Some(rel) = bytes[from..]
+                    .windows(needle.len())
+                    .position(|w| w == needle)
+                else {
                     break;
                 };
                 let at = from + rel;
@@ -92,7 +97,11 @@ pub fn scan_pid(pid: u32, package: &str) -> usize {
                     "pid={pid} pkg={package} needle={} va={:#x} {}",
                     String::from_utf8_lossy(needle),
                     start + at as u64,
-                    printable.replace('\n', " ").chars().take(240).collect::<String>()
+                    printable
+                        .replace('\n', " ")
+                        .chars()
+                        .take(240)
+                        .collect::<String>()
                 );
                 if seen.insert(line.clone()) {
                     append_log(&line);

@@ -198,12 +198,17 @@ int ksight_handshake_exit(struct ksight_raw_sys_exit *context)
     kind = ksight_handshake_classify(preview, preview_len);
     if (kind == 0)
         goto out;
-    {
-        ksight_u8 bit = kind == KSIGHT_HANDSHAKE_KIND_QUIC ? 4 : kind;
-
-        seen = ksight_bpf_map_lookup_elem(&handshake_seen, &sock_key);
-        if (seen)
-            flags = *seen;
+    seen = ksight_bpf_map_lookup_elem(&handshake_seen, &sock_key);
+    if (kind == KSIGHT_HANDSHAKE_KIND_QUIC) {
+        /* One QUIC datagram per socket per high-nibble tick (up to 8) so a
+         * client hello split across Initial datagrams is still captured. */
+        ksight_u8 count = seen ? ((*seen >> 4) & 0x0f) : 0;
+        if (count >= 8)
+            goto out;
+        flags = (seen ? (*seen & 0x0f) : 0) | ((count + 1) << 4);
+    } else {
+        ksight_u8 bit = kind;
+        flags = seen ? *seen : 0;
         if (flags & bit)
             goto out;
         flags |= bit;
@@ -219,7 +224,10 @@ int ksight_handshake_exit(struct ksight_raw_sys_exit *context)
         ksight_record_drop();
         goto out;
     }
-    __builtin_memset(event, 0, sizeof(*event));
+    /* The ringbuf consumer reads assigned fields and `captured_len` payload
+     * bytes only, so zero just the peer address tail and padding-sensitive
+     * fields; a 2176-byte memset is beyond the BPF builtin expansion limit. */
+    __builtin_memset(event->address, 0, sizeof(event->address));
     uid_gid = ksight_bpf_get_current_uid_gid();
     event->header.abi_version = KSIGHT_RAW_ABI_VERSION;
     event->header.header_size = sizeof(event->header);
@@ -250,8 +258,7 @@ int ksight_handshake_exit(struct ksight_raw_sys_exit *context)
         __builtin_memcpy(event->address, sockaddr + 4, 4);
     else if (family == KSIGHT_AF_INET6)
         __builtin_memcpy(event->address, sockaddr + 8, 16);
-    ksight_bpf_probe_read_user(event->payload, KSIGHT_HANDSHAKE_PAYLOAD_LEN,
-                               (const void *)buf);
+    ksight_bpf_probe_read_user(event->payload, copy_len, (const void *)buf);
     ksight_bpf_ringbuf_submit(event, 0);
     if (ksight_bpf_map_update_elem(&handshake_seen, &sock_key, &flags, 0) != 0)
         ksight_record_drop();

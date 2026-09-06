@@ -717,6 +717,23 @@ pub(crate) fn protocol_acknowledge(
     connection.close()
 }
 
+/// Kill leftover on-device `ksightd` instances so the new capture owns the
+/// Burp playback port and no stale collector keeps filtering events.
+pub(crate) fn kill_stale_agents(serial: Option<&str>) -> Result<()> {
+    let mut adb = adb_command(serial)?;
+    let status = adb
+        .args(["shell", "su -c 'pkill -f ksightd; sleep 1'"])
+        .status()
+        .context("adb shell pkill ksightd")?;
+    // pkill exits nonzero when nothing matched; that is fine.
+    let _ = ensure_success_soft(status);
+    Ok(())
+}
+
+fn ensure_success_soft(status: std::process::ExitStatus) -> bool {
+    status.success()
+}
+
 pub(crate) fn run_device(serial: Option<&str>, device_command: &str) -> Result<()> {
     let mut adb = adb_command(serial)?;
     let remote = format!("su -c \"{device_command}\"");
@@ -1005,6 +1022,158 @@ fn write_json_line(value: &impl serde::Serialize) -> Result<bool> {
         Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(false),
         Err(error) => Err(error.into()),
     }
+}
+
+/// Pull a session's pcap + keylog and export decrypted HTTP objects via tshark.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn decrypt_session(
+    serial: Option<&str>,
+    session: &str,
+    out: &std::path::Path,
+) -> Result<()> {
+    std::fs::create_dir_all(out).context("create output directory")?;
+    let work = out.join("raw");
+    std::fs::create_dir_all(&work).context("create raw work directory")?;
+    let pcap = work.join("traffic.pcap");
+    let keylog = work.join("sslkeylog.txt");
+    let pcap_remote = format!("/data/local/tmp/ksight/spool/forensics/{session}/traffic.pcap");
+    let keylog_remote = format!("/data/local/tmp/ksight/spool/forensics/{session}/sslkeylog.txt");
+    adb_pull_file(serial, &pcap_remote, &pcap)?;
+    match adb_pull_file(serial, &keylog_remote, &keylog) {
+        Ok(()) => {}
+        Err(error) => eprintln!("no keylog file pulled: {error}"),
+    }
+    if !pcap.is_file() {
+        bail!("traffic.pcap missing for session {session}");
+    }
+    // Native decryption first: AES-GCM TLS 1.3 via keylog trial-matching.
+    let native_flows = std::fs::read(&pcap)
+        .ok()
+        .map(|pcap_bytes| {
+            let keylog_text = std::fs::read_to_string(&keylog).unwrap_or_default();
+            let flows = ksight_core::parse_pcap_tcp_flows(&pcap_bytes);
+            let secrets = ksight_core::parse_keylog(&keylog_text);
+            ksight_core::decrypt_flows(&flows, &secrets)
+        })
+        .unwrap_or_default();
+    let mut standard_keylog = String::new();
+    for (index, flow) in native_flows.iter().enumerate() {
+        let flow_dir = out.join("flows").join(format!("{index:03}"));
+        std::fs::create_dir_all(&flow_dir).ok();
+        std::fs::write(flow_dir.join("client.bin"), &flow.client_plain).ok();
+        std::fs::write(flow_dir.join("server.bin"), &flow.server_plain).ok();
+        std::fs::write(
+            flow_dir.join("meta.txt"),
+            format!(
+                "client={} server={} cipher=0x{:04x} client_random={}\n",
+                flow.client, flow.server, flow.cipher, flow.client_random
+            ),
+        )
+        .ok();
+        for line in &flow.keylog_lines {
+            standard_keylog.push_str(line);
+            standard_keylog.push('\n');
+        }
+        let client_text = String::from_utf8_lossy(&flow.client_plain);
+        let server_text = String::from_utf8_lossy(&flow.server_plain);
+        eprintln!(
+            "decrypted flow {index}: {} <-> {} client={}B server={}B http={}",
+            flow.client,
+            flow.server,
+            flow.client_plain.len(),
+            flow.server_plain.len(),
+            client_text.contains("HTTP/1.") || server_text.contains("HTTP/1.")
+        );
+    }
+    if !standard_keylog.is_empty() {
+        std::fs::write(out.join("keylog.standard.txt"), &standard_keylog).ok();
+        eprintln!(
+            "standard keylog written ({} lines) for Wireshark/tshark",
+            standard_keylog.lines().count()
+        );
+    }
+    if native_flows.is_empty() {
+        eprintln!("native decryption found no AES-GCM TLS 1.3 flow matching the keylog");
+    }
+    let Some(tshark) = find_tshark() else {
+        println!("decrypt done (native only); output under {}", out.display());
+        return Ok(());
+    };
+    let standard_lines = if keylog.is_file() {
+        std::fs::read_to_string(&keylog).map_or(0, |text| {
+            text.lines()
+                .filter(|line| !line.trim_start().starts_with('#') && !line.trim().is_empty())
+                .count()
+        })
+    } else {
+        0
+    };
+    eprintln!("keylog standard lines: {standard_lines}");
+    if standard_lines == 0 {
+        eprintln!(
+            "no standard keylog lines; only the raw pcap was pulled to {}",
+            pcap.display()
+        );
+    } else {
+        let keylog_std = work.join("sslkeylog.standard.txt");
+        if let Ok(text) = std::fs::read_to_string(&keylog) {
+            let filtered: Vec<&str> = text
+                .lines()
+                .filter(|line| !line.trim_start().starts_with('#') && !line.trim().is_empty())
+                .collect();
+            std::fs::write(&keylog_std, filtered.join("\n")).ok();
+        }
+        for profile in ["http", "http2", "dicom"] {
+            let export_dir = out.join(profile);
+            std::fs::create_dir_all(&export_dir).ok();
+            let spec = format!("{profile},{}", export_dir.display());
+            let status = std::process::Command::new(&tshark)
+                .args([
+                    "-r",
+                    pcap.to_string_lossy().as_ref(),
+                    "-o",
+                    &format!("tls.keylog_file:{}", keylog_std.display()),
+                    "--export-objects",
+                    &spec,
+                    "-q",
+                ])
+                .status()
+                .context("run tshark")?;
+            let exported = std::fs::read_dir(&export_dir).map_or(0, std::iter::Iterator::count);
+            eprintln!(
+                "tshark export {profile}: status={} objects={exported}",
+                status.success()
+            );
+        }
+    }
+    println!("decrypt done; output under {}", out.display());
+    Ok(())
+}
+
+fn adb_pull_file(serial: Option<&str>, remote: &str, local: &std::path::Path) -> Result<()> {
+    let mut adb = adb_command(serial)?;
+    let status = adb
+        .args(["pull", remote, local.to_string_lossy().as_ref()])
+        .status()
+        .context("adb pull")?;
+    ensure_success(status)
+}
+
+fn find_tshark() -> Option<std::path::PathBuf> {
+    let in_path = std::process::Command::new("tshark")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok();
+    if in_path {
+        return Some(std::path::PathBuf::from("tshark"));
+    }
+    let bundled = Path::new("/Applications/Wireshark.app/Contents/MacOS/tshark");
+    if bundled.is_file() {
+        return Some(bundled.to_path_buf());
+    }
+    None
 }
 
 #[cfg(test)]

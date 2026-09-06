@@ -89,7 +89,10 @@ impl TlsInject {
                     self.injected_pid = Some(pid);
                     log_maps_hint(pid);
                 } else {
-                    eprintln!("tls-inject failed pid={pid} attempt={} {err}", self.attempts);
+                    eprintln!(
+                        "tls-inject failed pid={pid} attempt={} {err}",
+                        self.attempts
+                    );
                     if self.attempts >= 3 {
                         self.injected_pid = Some(pid);
                     }
@@ -159,7 +162,9 @@ fn log_maps_hint(pid: u32) {
     let hits: Vec<&str> = maps
         .lines()
         .filter(|line| {
-            line.contains("memfd:jit-cache") || line.contains("libpac.so") || line.contains("libksight")
+            line.contains("memfd:jit-cache")
+                || line.contains("libpac.so")
+                || line.contains("libksight")
         })
         .collect();
     if hits.is_empty() {
@@ -204,7 +209,8 @@ fn listen_loop(sock: UdpSocket, cache: Option<String>, tx: Sender<InjectedPlaint
             }
             Ok(_) => {}
             Err(error)
-                if error.kind() == ErrorKind::WouldBlock || error.kind() == ErrorKind::TimedOut => {}
+                if error.kind() == ErrorKind::WouldBlock || error.kind() == ErrorKind::TimedOut => {
+            }
             Err(_) => thread::sleep(Duration::from_millis(50)),
         }
         if let Some(path) = cache.as_deref() {

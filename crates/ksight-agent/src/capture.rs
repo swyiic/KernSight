@@ -494,28 +494,26 @@ fn stream_events(
         eprintln!("tls-inject off (no ptrace); inspect-tls uprobe only; app TLS unchanged");
     }
     let _mitm = if request.mitm_burp {
-        match (
-            request.package.as_deref(),
-            request.mirror_burp.as_deref(),
-        ) {
+        match (request.package.as_deref(), request.mirror_burp.as_deref()) {
             (Some(package), Some(endpoint)) => {
                 match (
                     crate::mitm_redirect::uid_for_package(package),
                     ksight_core::parse_mirror_endpoint(endpoint),
                 ) {
-                    (Some(uid), Ok(addr)) => match crate::mitm_redirect::MitmRedirect::install(uid, addr)
-                    {
-                        Ok(mitm) => {
-                            eprintln!(
+                    (Some(uid), Ok(addr)) => {
+                        match crate::mitm_redirect::MitmRedirect::install(uid, addr) {
+                            Ok(mitm) => {
+                                eprintln!(
                                 "mitm-burp uid={uid} package={package} -> {endpoint}; Burp Network→Connections→Upstream proxy = 127.0.0.1:18888 (adb forward); Proxy HTTP history, not Logger"
                             );
-                            Some(mitm)
+                                Some(mitm)
+                            }
+                            Err(error) => {
+                                eprintln!("mitm-burp skipped: {error}");
+                                None
+                            }
                         }
-                        Err(error) => {
-                            eprintln!("mitm-burp skipped: {error}");
-                            None
-                        }
-                    },
+                    }
                     _ => {
                         eprintln!("mitm-burp skipped: need package uid and Burp host:port");
                         None
@@ -531,7 +529,10 @@ fn stream_events(
         None
     };
     pipeline.burp_mirror = match request.mirror_burp.as_deref() {
-        Some(endpoint) => match crate::burp_mirror::BurpMirror::start(endpoint) {
+        Some(endpoint) => match crate::burp_mirror::BurpMirror::start_for_session(
+            endpoint,
+            Some(&pipeline.normalizer.session_id().to_string()),
+        ) {
             Ok(mirror) => {
                 eprintln!(
                     "burp-mirror {endpoint} playback=:{} (original HTTP request+response; Intercept off)",
@@ -588,6 +589,7 @@ fn stream_events(
     publish_service_health(request, &pipeline, &sensors)?;
     let mut next_heartbeat = Instant::now() + Duration::from_secs(1);
     let mut next_crypto = Instant::now() + Duration::from_secs(3);
+    let mut next_inspect_stats = Instant::now() + Duration::from_secs(10);
     let environment_check_interval = match request.collector_mode {
         ksight_model::CollectorMode::ForegroundAdb => Duration::from_secs(1),
         ksight_model::CollectorMode::DetachedDaemon => Duration::from_secs(30),
@@ -599,6 +601,58 @@ fn stream_events(
     }
     for event in baseline_events {
         pipeline.emit_event(event)?;
+    }
+
+    // Passive on-wire capture for the mirror workflow: the pcap plus a keylog
+    // file (when a keylog probe is configured) decrypt offline to the full
+    // traffic picture that symbol probes cannot reach on stripped stacks.
+    let mut pcap_child: Option<std::process::Child> = None;
+    let pcap_dest = request.storage.spool_root.as_ref().map(|root| {
+        let dir = root
+            .join("forensics")
+            .join(pipeline.normalizer.session_id().to_string());
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join("traffic.pcap")
+    });
+    let mut keylog_probe: Option<crate::keylog_probe::KeylogProbe> = None;
+    let mut keylog_attached = false;
+    let mut next_keylog_try = Instant::now();
+    let mut infosec_probe: Option<crate::infosec_probe::InfosecProbe> = None;
+    let mut next_infosec_try = Instant::now();
+    let keylog_file = pcap_dest
+        .as_ref()
+        .map(|pcap| pcap.with_file_name("sslkeylog.txt"));
+
+    if request.mirror_burp.is_some() {
+        if let Some(dest) = pcap_dest.as_ref() {
+            let filter = "tcp port 443 or udp port 443";
+            for iface in ["any", "wlan0", "rmnet_data0"] {
+                match std::process::Command::new("tcpdump")
+                    .args([
+                        "-i",
+                        iface,
+                        "-s",
+                        "0",
+                        "-U",
+                        "-w",
+                        dest.to_string_lossy().as_ref(),
+                        filter,
+                    ])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                {
+                    Ok(child) => {
+                        eprintln!("pcap capture started iface={iface} dest={}", dest.display());
+                        pcap_child = Some(child);
+                        break;
+                    }
+                    Err(error) => {
+                        eprintln!("pcap spawn iface={iface} failed: {error}");
+                    }
+                }
+            }
+        }
     }
 
     while running.load(Ordering::SeqCst)
@@ -640,8 +694,7 @@ fn stream_events(
             for observation in inspect.attach_when_safe() {
                 pipeline.emit_inspect(observation)?;
             }
-            if let (Some(inject), Some(package)) =
-                (tls_inject.as_mut(), request.package.as_deref())
+            if let (Some(inject), Some(package)) = (tls_inject.as_mut(), request.package.as_deref())
             {
                 if let Some(pid) = crate::tls_inject::TlsInject::main_pid(package) {
                     inject.inject(pid);
@@ -670,13 +723,15 @@ fn stream_events(
                     if let crate::inspect_runtime::InspectOutput::Plaintext {
                         pid,
                         tid,
+                        connection_id,
                         fragment,
                         raw,
                     } = &output
                     {
-                        mirror.observe_bytes(
+                        mirror.observe_bytes_for_connection(
                             *pid,
                             *tid,
+                            *connection_id,
                             &fragment.adapter,
                             &fragment.direction,
                             raw,
@@ -688,6 +743,145 @@ fn stream_events(
             if let Some(observation) = inspect.expire_if_needed() {
                 pipeline.emit_inspect(observation)?;
             }
+            if request.mirror_burp.is_some() && Instant::now() >= next_keylog_try {
+                if !keylog_attached {
+                    eprintln!(
+                        "keylog attempt: mirror={} pids={:?} table={}",
+                        request.mirror_burp.is_some(),
+                        request
+                            .package
+                            .as_deref()
+                            .map(crate::dexdump::pids_for_package)
+                            .unwrap_or_default(),
+                        crate::keylog_probe::table_path().display()
+                    );
+                }
+                let pids = request
+                    .package
+                    .as_deref()
+                    .map(crate::dexdump::pids_for_package)
+                    .unwrap_or_default();
+                if !pids.is_empty() {
+                    let (probe, status) = if keylog_attached {
+                        (
+                            None,
+                            keylog_probe.as_mut().map_or_else(Vec::new, |probe| {
+                                probe.retry_attach(&request.uprobe_object, &pids)
+                            }),
+                        )
+                    } else {
+                        let (probe, status) = crate::keylog_probe::KeylogProbe::attach_for_pids(
+                            &request.uprobe_object,
+                            &pids,
+                        );
+                        keylog_attached = true;
+                        (Some(probe), status)
+                    };
+                    for line in &status {
+                        eprintln!("{line}");
+                    }
+                    if let Some(probe) = probe {
+                        keylog_probe = Some(probe);
+                    }
+                }
+                next_keylog_try = Instant::now() + Duration::from_secs(5);
+                if !infosec_probe.as_ref().is_some_and(|probe| probe.is_armed())
+                    && Instant::now() >= next_infosec_try
+                {
+                    let pids = request
+                        .package
+                        .as_deref()
+                        .map(crate::dexdump::pids_for_package)
+                        .unwrap_or_default();
+                    if !pids.is_empty() {
+                        let (probe, status) = crate::infosec_probe::InfosecProbe::attach_for_pids(
+                            &request.uprobe_object,
+                            &pids,
+                        );
+                        for line in &status {
+                            eprintln!("{line}");
+                        }
+                        infosec_probe = Some(probe);
+                        next_infosec_try = Instant::now() + Duration::from_secs(15);
+                    }
+                }
+            }
+            if let Some(probe) = keylog_probe.as_mut() {
+                let lines = probe.poll();
+                if !lines.is_empty() {
+                    if let Some(dest) = keylog_file.as_ref() {
+                        if let Ok(mut file) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(dest)
+                        {
+                            use std::io::Write as _;
+                            for line in &lines {
+                                let _ = writeln!(file, "{line}");
+                            }
+                        }
+                    }
+                    eprintln!("keylog lines captured: {}", lines.len());
+                }
+            }
+            if let Some(probe) = infosec_probe.as_mut() {
+                for capture in probe.poll_captures() {
+                    let output = crate::inspect_runtime::external_plaintext(capture);
+                    if let Some(mirror) = pipeline.burp_mirror.as_mut() {
+                        if let crate::inspect_runtime::InspectOutput::Plaintext {
+                            pid,
+                            tid,
+                            connection_id,
+                            fragment,
+                            raw,
+                        } = &output
+                        {
+                            mirror.observe_bytes_for_connection(
+                                *pid,
+                                *tid,
+                                *connection_id,
+                                &fragment.adapter,
+                                &fragment.direction,
+                                raw,
+                            );
+                        }
+                    }
+                    pipeline.emit_inspect_output(output)?;
+                }
+                for line in probe.poll(
+                    request
+                        .package
+                        .as_deref()
+                        .map(crate::dexdump::pids_for_package)
+                        .unwrap_or_default()
+                        .as_slice(),
+                ) {
+                    eprintln!("{line}");
+                }
+            }
+        }
+        if Instant::now() >= next_inspect_stats {
+            let (raw, decoded, lost) = inspect.drain_totals();
+            let mirror_diagnostics = pipeline
+                .burp_mirror
+                .as_ref()
+                .map(crate::burp_mirror::BurpMirror::diagnostic_detail);
+            eprintln!(
+                "inspect layers: raw_uprobe={raw} decoded={decoded} perf_lost={lost} {}",
+                mirror_diagnostics.as_deref().unwrap_or("mirror=disabled")
+            );
+            if let Some(detail) = mirror_diagnostics {
+                pipeline.emit_inspect(ksight_model::InspectObservation {
+                    adapter: "burp_mirror_diagnostics".to_owned(),
+                    attached: true,
+                    hit: true,
+                    detail,
+                    detectability_notice:
+                        "diagnostic counters only; no additional probe was attached".to_owned(),
+                    ..ksight_model::InspectObservation::default()
+                })?;
+            }
+            next_inspect_stats = Instant::now() + Duration::from_secs(10);
         }
         if Instant::now() >= next_crypto {
             if let Some(package) = request.package.as_deref() {
@@ -730,6 +924,25 @@ fn stream_events(
             "duration {}s elapsed, sealing capture",
             request.duration_seconds
         );
+    }
+    if request.inspect.enabled {
+        let (raw, decoded, lost) = inspect.drain_totals();
+        eprintln!(
+            "inspect final: raw_uprobe={raw} decoded={decoded} perf_lost={lost} mirror_deliveries={}",
+            pipeline
+                .burp_mirror
+                .as_ref()
+                .map_or(0, |mirror| mirror.delivery_count())
+        );
+    }
+    if let Some(mut child) = pcap_child.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+        if let Some(dest) = pcap_dest.as_ref() {
+            if let Ok(meta) = std::fs::metadata(dest) {
+                eprintln!("pcap captured {} bytes at {}", meta.len(), dest.display());
+            }
+        }
     }
     if let Some(root) = request.storage.spool_root.as_ref() {
         let dest = root
@@ -1151,6 +1364,7 @@ impl EventPipeline {
             crate::inspect_runtime::InspectOutput::Plaintext {
                 pid,
                 tid,
+                connection_id: _,
                 fragment,
                 raw: _,
             } => self.emit_inspect_payload(

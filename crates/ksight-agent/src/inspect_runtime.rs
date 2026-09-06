@@ -128,7 +128,7 @@ const BINDER_PENDING_TIDS: usize = 4096;
 #[cfg(any(target_os = "android", target_os = "linux"))]
 const REMOTE_PATH_BYTES: usize = 256;
 #[cfg(any(target_os = "android", target_os = "linux"))]
-const MAX_PAYLOAD_BYTES: usize = 4096;
+const MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 
 /// Named Inspect adapter.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -676,11 +676,43 @@ pub enum InspectOutput {
         pid: u32,
         /// Thread that executed `SSL_write`.
         tid: u32,
+        /// Stable connection/object pointer when the boundary exposes one.
+        connection_id: Option<u64>,
         /// Copied fragment.
         fragment: InspectPlaintext,
         /// Original copied bytes for Burp (preview may be lossy).
         raw: Vec<u8>,
     },
+}
+
+/// Convert a decoded external/vendor boundary hit into the same durable event
+/// used by built-in TLS/JNI adapters.
+#[cfg(any(target_os = "android", target_os = "linux"))]
+pub(crate) fn external_plaintext(capture: crate::infosec_probe::BoundaryCapture) -> InspectOutput {
+    let captured_bytes = u32::try_from(capture.bytes.len()).unwrap_or(u32::MAX);
+    let truncated = capture.requested > u64::from(captured_bytes);
+    let content_class = classify_buffer(&capture.bytes).to_owned();
+    let (preview, preview_encoding) = preview_bytes(&capture.bytes);
+    InspectOutput::Plaintext {
+        pid: capture.pid,
+        tid: capture.tid,
+        connection_id: capture.connection_id,
+        fragment: InspectPlaintext {
+            adapter: capture.adapter,
+            direction: capture.direction.to_owned(),
+            library: capture.library,
+            build_id: None,
+            offset: Some(capture.offset),
+            requested_bytes: capture.requested,
+            captured_bytes,
+            truncated,
+            sha256: hex_sha256(&capture.bytes),
+            preview,
+            preview_encoding,
+            content_class,
+        },
+        raw: capture.bytes,
+    }
 }
 
 /// Live Inspect session: evaluate, optionally attach, poll, and expire.
@@ -692,6 +724,18 @@ pub struct InspectRuntime {
     max_duration: Duration,
     max_hits: u32,
     hits: u32,
+    /// Raw uprobe records drained from perf buffers, before decode.
+    raw_drained: u64,
+    /// Records the kernel reported lost to ring-buffer overflow.
+    perf_lost: u64,
+    /// Hits `decode_hit` turned into outputs.
+    decoded_hits: u64,
+    /// Last lazy-TLS-exporter rescan time.
+    #[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
+    last_tls_rescan: Option<Instant>,
+    /// Completed TLS exporter rescans.
+    #[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
+    tls_rescans: u32,
     #[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
     hits_by_adapter: HashMap<String, u32>,
     #[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
@@ -776,6 +820,7 @@ struct PendingSslRead {
     /// `SSL_read_ex` writes the byte count through x3; `SSL_read` uses x0.
     #[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
     written_ptr: Option<u64>,
+    connection_id: Option<u64>,
 }
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
@@ -899,6 +944,11 @@ impl InspectRuntime {
             max_duration,
             max_hits,
             hits: 0,
+            raw_drained: 0,
+            perf_lost: 0,
+            decoded_hits: 0,
+            last_tls_rescan: None,
+            tls_rescans: 0,
             hits_by_adapter: HashMap::new(),
             per_adapter_budget,
             expired: false,
@@ -928,6 +978,101 @@ impl InspectRuntime {
         attach_all(self)
     }
 
+    /// Attach TLS exporters that mapped after the first attach pass.
+    ///
+    /// Vendor stacks are dlopened lazily (ttboringssl appears only when the
+    /// SDK initializes), so the once-at-start sweep misses them. Re-evaluate
+    /// the TLS plans on a throttle and attach unseen (library, offset) pairs.
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    fn rescan_tls_exports_maybe(&mut self) -> Vec<InspectObservation> {
+        if self.sessions.is_empty()
+            || !self
+                .selected_adapters
+                .iter()
+                .any(|adapter| adapter.is_tls())
+            || self.tls_rescans >= 40
+        {
+            return Vec::new();
+        }
+        if self
+            .last_tls_rescan
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(15))
+        {
+            return Vec::new();
+        }
+        self.last_tls_rescan = Some(Instant::now());
+        self.tls_rescans = self.tls_rescans.saturating_add(1);
+        let Some(first) = self.plans.first() else {
+            return Vec::new();
+        };
+        let policy = first.policy.clone();
+        let uprobe_object = first.uprobe_object.clone();
+        let known: std::collections::BTreeSet<(String, u64, String)> = self
+            .plans
+            .iter()
+            .filter_map(|plan| {
+                Some((
+                    plan.elf_path.clone()?,
+                    plan.offset?,
+                    plan.symbol.clone().unwrap_or_default(),
+                ))
+            })
+            .collect();
+        let mut fresh = Vec::new();
+        let mut observations = Vec::new();
+        for adapter in &self.selected_adapters {
+            if !adapter.is_tls() {
+                continue;
+            }
+            for plan in
+                InspectPlan::evaluate_tls_exports(policy.clone(), *adapter, uprobe_object.clone())
+            {
+                if plan.offset.is_none() {
+                    continue;
+                }
+                let key = (
+                    plan.elf_path.clone().unwrap_or_default(),
+                    plan.offset.expect("checked above"),
+                    plan.symbol.clone().unwrap_or_default(),
+                );
+                if known.contains(&key)
+                    || fresh.iter().any(|item: &InspectPlan| {
+                        (
+                            item.elf_path.clone().unwrap_or_default(),
+                            item.offset.expect("checked"),
+                            item.symbol.clone().unwrap_or_default(),
+                        ) == key
+                    })
+                {
+                    continue;
+                }
+                fresh.push(plan);
+            }
+        }
+        if fresh.is_empty() {
+            return Vec::new();
+        }
+        for plan in &fresh {
+            let mut observation = plan.observation.clone();
+            observation.attached = true;
+            observation.detail = format!(
+                "lazy-mapped exporter attached on rescan {}: {}",
+                plan.elf_path.clone().unwrap_or_default(),
+                plan.observation.detail
+            );
+            observations.push(observation);
+        }
+        self.plans.extend(fresh);
+        observations.extend(attach_all(self));
+        observations
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "linux")))]
+    #[allow(dead_code, unused_variables, clippy::unused_self)]
+    fn rescan_tls_exports_maybe(&mut self) -> Vec<InspectObservation> {
+        Vec::new()
+    }
+
     /// Attach after a package-scoped process has survived packer init.
     ///
     /// ICBC `libDexHelper` SIGSEGVs at ~2s if `libart` JNI uprobes are already
@@ -937,10 +1082,35 @@ impl InspectRuntime {
     pub fn attach_when_safe(&mut self) -> Vec<InspectObservation> {
         #[cfg(any(target_os = "android", target_os = "linux"))]
         {
-            if self.expired || !self.sessions.is_empty() {
+            if self.expired {
                 return Vec::new();
             }
-            if !inspect_target_survived_packer(&self.plans) {
+            if !self.sessions.is_empty() {
+                let out = self.rescan_tls_exports_maybe();
+                return out.into_iter().collect::<Vec<_>>();
+            }
+            // Audited stub plans (classification-only) do not patch ART; the
+            // grace is only required when an ART-patching probe is selected.
+            let art_patching_selected = self.selected_adapters.iter().any(|adapter| {
+                matches!(
+                    adapter,
+                    InspectAdapterKind::JniPlaintext
+                        | InspectAdapterKind::JniNewString
+                        | InspectAdapterKind::JniGetStringUtfChars
+                        | InspectAdapterKind::JniGetStringUtfLength
+                        | InspectAdapterKind::JniGetStringUtfRegion
+                        | InspectAdapterKind::JniGetArrayLength
+                        | InspectAdapterKind::JniGetByteArrayElements
+                        | InspectAdapterKind::JniGetByteArrayRegion
+                        | InspectAdapterKind::JniSetByteArrayRegion
+                        | InspectAdapterKind::JniRegistration
+                )
+            });
+            if art_patching_selected && !inspect_target_survived_packer(&self.plans) {
+                // The packer grace protects ART-patching probes (JNI) from
+                // packed-process init crashes. TLS uprobes live on libssl and
+                // never touch ART, so they attach immediately — the launch
+                // burst is exactly the traffic a mirror session must not miss.
                 if !self.delay_notice_emitted {
                     self.delay_notice_emitted = true;
                     eprintln!(
@@ -966,6 +1136,11 @@ impl InspectRuntime {
         #[cfg(any(target_os = "android", target_os = "linux"))]
         refresh_package_tgids(self);
         poll_all(self)
+    }
+
+    /// Layered counters for loss analysis: (raw drained, decoded, perf lost).
+    pub fn drain_totals(&self) -> (u64, u64, u64) {
+        (self.raw_drained, self.decoded_hits, self.perf_lost)
     }
 
     /// Revoke unused probes after the authorized window or hit budget.
@@ -1564,13 +1739,23 @@ fn resolve_libraries(policy: &InspectPolicy, adapter: InspectAdapterKind) -> Vec
         discover_mapped_libraries(needles)
     };
     found.extend(mapped);
+    // Name needles miss vendor forks that export the standard symbols under
+    // arbitrary basenames (ttboringssl, slightssl builds, game SDKs). Sweep
+    // every mapped ELF of the target once and keep real exporters.
+    if adapter.is_tls() {
+        if let Some(pids) = active_tgid_filter(policy) {
+            for path in discover_mapped_libraries_by_tls_symbol(&pids, adapter) {
+                found.insert(path);
+            }
+        }
+    }
     let mut libs: Vec<String> = found.into_iter().collect();
     libs.sort_by(|left, right| {
         tls_attach_rank(left)
             .cmp(&tls_attach_rank(right))
             .then_with(|| left.cmp(right))
     });
-    libs.truncate(16);
+    libs.truncate(24);
     libs
 }
 
@@ -1632,6 +1817,61 @@ fn discover_mapped_libraries(needles: &[&str]) -> Vec<String> {
         .filter_map(|entry| entry.file_name().to_string_lossy().parse().ok())
         .collect();
     discover_mapped_libraries_in(&pids, needles)
+}
+
+#[cfg(not(any(target_os = "android", target_os = "linux")))]
+fn discover_mapped_libraries_by_tls_symbol(
+    _pids: &[u32],
+    _adapter: InspectAdapterKind,
+) -> Vec<String> {
+    Vec::new()
+}
+
+/// Sweep every file-backed mapping of the target processes and keep ELFs that
+/// export the adapter's exact TLS symbols, whatever their basename is.
+#[cfg(any(target_os = "android", target_os = "linux"))]
+#[allow(clippy::too_many_lines)]
+fn discover_mapped_libraries_by_tls_symbol(
+    pids: &[u32],
+    adapter: InspectAdapterKind,
+) -> Vec<String> {
+    let names = tls_exact_names(adapter);
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut exporters: Vec<String> = Vec::new();
+    for pid in pids.iter().copied().take(8) {
+        let Ok(maps) = std::fs::read_to_string(format!("/proc/{pid}/maps")) else {
+            continue;
+        };
+        for line in maps.lines() {
+            let Some(path) = line.split_whitespace().last() else {
+                continue;
+            };
+            if !path.starts_with('/') || path.contains(" (deleted)") {
+                continue;
+            }
+            if !seen.insert(path.to_owned()) {
+                continue;
+            }
+            if !crate::elf::plausible_elf_file(path) {
+                continue;
+            }
+            if seen.len() > 128 || exporters.len() >= 12 {
+                return exporters;
+            }
+            // Hardened/obfuscated ELFs carry hostile section tables; parsing
+            // must never take the whole agent down.
+            let scanned = std::panic::catch_unwind(|| {
+                crate::elf::inspect_elf(path)
+                    .ok()
+                    .filter(|elf| !matching_symbols_exact(elf, &names).is_empty())
+            });
+            if let Ok(Some(elf)) = scanned {
+                exporters.push(path.to_owned());
+                drop(elf);
+            }
+        }
+    }
+    exporters
 }
 
 fn discover_mapped_libraries_in(pids: &[u32], needles: &[&str]) -> Vec<String> {
@@ -2039,9 +2279,13 @@ fn poll_all(runtime: &mut InspectRuntime) -> Vec<InspectOutput> {
     .min(MAX_PAYLOAD_BYTES);
     let mut batch = Vec::new();
     for probe in &mut runtime.sessions {
+        let before_drained = probe.session.drained_total;
+        let before_lost = probe.session.lost_total;
         let Ok(hits) = probe.session.poll_hits() else {
             continue;
         };
+        runtime.raw_drained += probe.session.drained_total.saturating_sub(before_drained);
+        runtime.perf_lost += probe.session.lost_total.saturating_sub(before_lost);
         for hit in hits {
             batch.push((probe.plan.clone(), probe.retprobe, hit));
         }
@@ -2070,6 +2314,7 @@ fn poll_all(runtime: &mut InspectRuntime) -> Vec<InspectOutput> {
                 .entry(plan.adapter.as_str().to_owned())
                 .or_default() += 1;
             runtime.hits = runtime.hits.saturating_add(1);
+            runtime.decoded_hits = runtime.decoded_hits.saturating_add(1);
             out.push(output);
         }
     }
@@ -2112,11 +2357,21 @@ fn decode_hit(
             max_payload,
             "send",
             tls_write_snapshot(hit),
+            true,
+            Some(hit.regs[0]),
         ),
         InspectAdapterKind::TlsSslRead => {
             if retprobe {
                 let pending = ssl_read_pending.remove(&hit.tid)?;
                 let captured = ssl_read_captured(&pending, hit)?;
+                let return_snapshot: &[u8] = if hit.snapshot_at_return {
+                    let n = usize::try_from(hit.aux_bytes)
+                        .unwrap_or(0)
+                        .min(hit.aux.len());
+                    &hit.aux[..n]
+                } else {
+                    &[]
+                };
                 decode_tls_plaintext(
                     plan,
                     pending.pid,
@@ -2125,7 +2380,9 @@ fn decode_hit(
                     captured,
                     max_payload,
                     "recv",
-                    &[],
+                    return_snapshot,
+                    hit.snapshot_at_return,
+                    pending.connection_id,
                 )
             } else {
                 let requested = i32::try_from(hit.regs[2] as i64).unwrap_or(0);
@@ -2141,6 +2398,7 @@ fn decode_hit(
                             buf: hit.regs[1],
                             requested,
                             written_ptr: read_ex.then_some(hit.regs[3]),
+                            connection_id: Some(hit.regs[0]),
                         },
                     );
                 }
@@ -2365,6 +2623,8 @@ fn decode_hit(
                     max_payload,
                     "java_to_native",
                     &[],
+                    false,
+                    None,
                 )
             } else {
                 let requested =
@@ -2378,6 +2638,7 @@ fn decode_hit(
                             buf,
                             requested,
                             written_ptr: None,
+                            connection_id: None,
                         },
                     );
                 }
@@ -2410,6 +2671,8 @@ fn decode_hit(
                 max_payload,
                 "native_to_java",
                 &[],
+                false,
+                None,
             )
         }
         InspectAdapterKind::JniGetByteArrayElements => {
@@ -2445,6 +2708,8 @@ fn decode_hit(
                     max_payload,
                     "java_to_native",
                     &[],
+                    false,
+                    None,
                 )
             } else {
                 let requested =
@@ -2458,6 +2723,7 @@ fn decode_hit(
                             buf,
                             requested,
                             written_ptr: None,
+                            connection_id: None,
                         },
                     );
                 }
@@ -2533,6 +2799,7 @@ fn decode_hit(
                             buf,
                             requested,
                             written_ptr: None,
+                            connection_id: None,
                         },
                     );
                 }
@@ -2596,6 +2863,7 @@ fn decode_hit(
                             buf,
                             requested,
                             written_ptr: None,
+                            connection_id: None,
                         },
                     );
                 }
@@ -2690,6 +2958,7 @@ fn decode_jni_bytes_with_len(
     Some(InspectOutput::Plaintext {
         pid,
         tid,
+        connection_id: None,
         fragment: InspectPlaintext {
             adapter: plan.adapter.as_str().to_owned(),
             direction: direction.to_owned(),
@@ -2728,6 +2997,7 @@ fn decode_jni_cstring(
     Some(InspectOutput::Plaintext {
         pid,
         tid,
+        connection_id: None,
         fragment: InspectPlaintext {
             adapter: plan.adapter.as_str().to_owned(),
             direction: direction.to_owned(),
@@ -2774,6 +3044,7 @@ fn decode_jni_utf16_units(
     Some(InspectOutput::Plaintext {
         pid,
         tid,
+        connection_id: None,
         fragment: InspectPlaintext {
             adapter: plan.adapter.as_str().to_owned(),
             direction: direction.to_owned(),
@@ -3054,6 +3325,8 @@ fn decode_tls_plaintext(
     max_payload: usize,
     direction: &str,
     snapshot: &[u8],
+    snapshot_exact: bool,
+    connection_id: Option<u64>,
 ) -> Option<InspectOutput> {
     if requested <= 0 && snapshot.is_empty() {
         return None;
@@ -3062,12 +3335,27 @@ fn decode_tls_plaintext(
     let want = usize::try_from(requested_bytes)
         .unwrap_or(0)
         .min(max_payload);
-    let remote = if want == 0 {
-        Vec::new()
+    // A BPF-time snapshot is the truth for the bytes it covers: the caller's
+    // buffer may already be reused by the time this userspace decode runs.
+    // Remote reads only extend past the snapshot cap, never replace it.
+    let mut bytes = if snapshot_exact && !snapshot.is_empty() {
+        let mut exact = snapshot.to_vec();
+        let have = exact.len();
+        if requested_bytes as usize > have && have < want {
+            let tail_want = want - have;
+            if let Some(tail) = read_remote_bytes(pid, buf.saturating_add(have as u64), tail_want) {
+                exact.extend_from_slice(&tail);
+            }
+        }
+        exact
     } else {
-        read_remote_bytes(pid, buf, want).unwrap_or_default()
+        let remote = if want == 0 {
+            Vec::new()
+        } else {
+            read_remote_bytes(pid, buf, want).unwrap_or_default()
+        };
+        prefer_probe_snapshot(&remote, snapshot)
     };
-    let mut bytes = prefer_probe_snapshot(&remote, snapshot);
     let truncated = requested_bytes > u64::try_from(bytes.len()).unwrap_or(0);
     let captured_bytes = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
     let digest = hex_sha256(&bytes);
@@ -3092,6 +3380,7 @@ fn decode_tls_plaintext(
     Some(InspectOutput::Plaintext {
         pid,
         tid,
+        connection_id: connection_id.filter(|value| *value >= 0x1000),
         fragment: InspectPlaintext {
             adapter: plan.adapter.as_str().to_owned(),
             direction: direction.to_owned(),
@@ -3141,14 +3430,6 @@ fn tls_write_snapshot(hit: &ksight_hwbp::RegisterContext) -> &[u8] {
     let n = usize::try_from(hit.aux_bytes)
         .unwrap_or(0)
         .min(hit.aux.len());
-    if snapshot_looks_like_http(&hit.aux) {
-        let end = hit
-            .aux
-            .iter()
-            .rposition(|byte| *byte != 0)
-            .map_or(n, |index| index.saturating_add(1).min(hit.aux.len()));
-        return &hit.aux[..end.max(n)];
-    }
     &hit.aux[..n]
 }
 
@@ -4076,7 +4357,7 @@ mod tests {
             .symbols()
             .contains(&"sslRead"));
         assert!(tls_exact_names(InspectAdapterKind::TlsSslWrite).contains(&"sslWriteEx"));
-        assert!(!tls_exact_names(InspectAdapterKind::TlsSslRead).contains(&"sslReadEx"));
+        assert!(tls_exact_names(InspectAdapterKind::TlsSslRead).contains(&"sslReadEx"));
         assert!(tls_exact_names(InspectAdapterKind::TlsSslRead).contains(&"sslRead"));
         assert!(mapping_path_matches(
             "/data/app/foo/lib/arm64/libhssl-2.1.so",
