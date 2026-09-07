@@ -434,6 +434,67 @@ fn with_sampling(
 }
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
+fn spawn_pcap_watchdog(
+    interface: &str,
+    destination: &std::path::Path,
+    filter: &str,
+) -> std::io::Result<std::process::Child> {
+    // The shell watches ksightd's PID and owns tcpdump. If ksightd is killed
+    // before Rust cleanup runs, the watchdog still terminates and reaps the
+    // packet-capture child instead of leaving it reparented to PID 1.
+    const SCRIPT: &str = r#"
+parent=$1
+interface=$2
+destination=$3
+filter=$4
+tcpdump -i "$interface" -s 0 -U -w "$destination" "$filter" >/dev/null 2>&1 &
+worker=$!
+cleanup() {
+  trap - EXIT INT TERM HUP
+  kill "$worker" 2>/dev/null || true
+  wait "$worker" 2>/dev/null || true
+}
+trap 'cleanup; exit 0' EXIT INT TERM HUP
+while kill -0 "$parent" 2>/dev/null; do sleep 1; done
+cleanup
+"#;
+    std::process::Command::new("sh")
+        .args([
+            "-c",
+            SCRIPT,
+            "ksight-pcap-watchdog",
+            &std::process::id().to_string(),
+            interface,
+            destination.to_string_lossy().as_ref(),
+            filter,
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn stop_pcap_watchdog(child: &mut std::process::Child) {
+    let Ok(pid) = i32::try_from(child.id()) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return;
+    };
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid),
+        nix::sys::signal::Signal::SIGTERM,
+    );
+    for _ in 0..40 {
+        if child.try_wait().ok().flatten().is_some() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
 #[allow(clippy::too_many_lines)]
 fn stream_events(
     mut sensors: Vec<ActiveSensor>,
@@ -627,21 +688,7 @@ fn stream_events(
         if let Some(dest) = pcap_dest.as_ref() {
             let filter = "tcp port 443 or udp port 443";
             for iface in ["any", "wlan0", "rmnet_data0"] {
-                match std::process::Command::new("tcpdump")
-                    .args([
-                        "-i",
-                        iface,
-                        "-s",
-                        "0",
-                        "-U",
-                        "-w",
-                        dest.to_string_lossy().as_ref(),
-                        filter,
-                    ])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn()
-                {
+                match spawn_pcap_watchdog(iface, dest, filter) {
                     Ok(child) => {
                         eprintln!("pcap capture started iface={iface} dest={}", dest.display());
                         pcap_child = Some(child);
@@ -797,6 +844,10 @@ fn stream_events(
                         let (probe, status) = crate::infosec_probe::InfosecProbe::attach_for_pids(
                             &request.uprobe_object,
                             &pids,
+                            request
+                                .inspect_adapters
+                                .iter()
+                                .any(|adapter| adapter.is_jni()),
                         );
                         for line in &status {
                             eprintln!("{line}");
@@ -866,6 +917,11 @@ fn stream_events(
                 .burp_mirror
                 .as_ref()
                 .map(crate::burp_mirror::BurpMirror::diagnostic_detail);
+            let mirror_metrics = pipeline
+                .burp_mirror
+                .as_ref()
+                .map(crate::burp_mirror::BurpMirror::diagnostic_metrics)
+                .unwrap_or_default();
             eprintln!(
                 "inspect layers: raw_uprobe={raw} decoded={decoded} perf_lost={lost} {}",
                 mirror_diagnostics.as_deref().unwrap_or("mirror=disabled")
@@ -876,6 +932,7 @@ fn stream_events(
                     attached: true,
                     hit: true,
                     detail,
+                    metrics: mirror_metrics,
                     detectability_notice:
                         "diagnostic counters only; no additional probe was attached".to_owned(),
                     ..ksight_model::InspectObservation::default()
@@ -936,8 +993,7 @@ fn stream_events(
         );
     }
     if let Some(mut child) = pcap_child.take() {
-        let _ = child.kill();
-        let _ = child.wait();
+        stop_pcap_watchdog(&mut child);
         if let Some(dest) = pcap_dest.as_ref() {
             if let Ok(meta) = std::fs::metadata(dest) {
                 eprintln!("pcap captured {} bytes at {}", meta.len(), dest.display());

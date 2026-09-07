@@ -104,6 +104,34 @@ impl MatchRules {
         }
         true
     }
+
+    /// Rank matching rules so an exact build-specific rule always wins over
+    /// a generic basename fallback, regardless of JSON declaration order.
+    #[must_use]
+    pub fn specificity(&self) -> u32 {
+        u32::from(self.build_id.is_some())
+            .saturating_mul(1_000)
+            .saturating_add(u32::from(self.size.is_some()).saturating_mul(200))
+            .saturating_add(u32::from(self.basename.is_some()).saturating_mul(100))
+            .saturating_add(
+                u32::try_from(self.path_contains.len())
+                    .unwrap_or(u32::MAX)
+                    .saturating_mul(20),
+            )
+            .saturating_add(
+                u32::try_from(self.basename_contains.len())
+                    .unwrap_or(u32::MAX)
+                    .saturating_mul(10),
+            )
+    }
+
+    fn is_empty(&self) -> bool {
+        self.basename.is_none()
+            && self.basename_contains.is_empty()
+            && self.path_contains.is_empty()
+            && self.size.is_none()
+            && self.build_id.is_none()
+    }
 }
 
 /// Exported-symbol sets the sweeps and probes should target.
@@ -225,10 +253,22 @@ pub fn load() -> &'static StackRulesFile {
     LOADED.get_or_init(|| {
         if let Ok(text) = std::fs::read_to_string(DEVICE_TABLE_PATH) {
             if let Ok(parsed) = serde_json::from_str::<StackRulesFile>(&text) {
-                return parsed;
+                let issues = validation_issues(&parsed);
+                if issues.is_empty() {
+                    return parsed;
+                }
+                eprintln!(
+                    "ignoring invalid TLS stack override {}: {}",
+                    DEVICE_TABLE_PATH,
+                    issues.join("; ")
+                );
             }
         }
-        serde_json::from_str::<StackRulesFile>(EMBEDDED_RULES).unwrap_or_default()
+        let embedded = serde_json::from_str::<StackRulesFile>(EMBEDDED_RULES).unwrap_or_default();
+        for issue in validation_issues(&embedded) {
+            eprintln!("embedded TLS stack rule issue: {issue}");
+        }
+        embedded
     })
 }
 
@@ -240,10 +280,77 @@ pub fn stack_for_path(
     file_size: Option<u64>,
     actual_build_id: Option<&str>,
 ) -> Option<&'static StackRule> {
-    load()
+    matching_stacks(path, file_size, actual_build_id)
+        .into_iter()
+        .next()
+}
+
+/// Every matching stack in deterministic precedence order. Exact build/file
+/// rules win, then lower attach tier, then id. Callers can retain the complete
+/// candidate list for coverage diagnostics instead of losing it to first-match.
+#[must_use]
+pub fn matching_stacks(
+    path: &str,
+    file_size: Option<u64>,
+    actual_build_id: Option<&str>,
+) -> Vec<&'static StackRule> {
+    let mut matches = load()
         .stacks
         .iter()
-        .find(|stack| stack.matches(path, file_size, actual_build_id))
+        .filter(|stack| stack.matches(path, file_size, actual_build_id))
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| {
+        right
+            .match_rules
+            .specificity()
+            .cmp(&left.match_rules.specificity())
+            .then_with(|| left.tier.cmp(&right.tier))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    matches
+}
+
+/// Validate an override before operators rely on it. Invalid entries remain
+/// visible as diagnostics; they must never silently broaden to every ELF.
+#[must_use]
+pub fn validation_issues(rules: &StackRulesFile) -> Vec<String> {
+    let mut issues = Vec::new();
+    if rules.schema_version.trim().is_empty() {
+        issues.push("stack rules schema_version is empty".to_owned());
+    } else if !rules.schema_version.starts_with("1.") {
+        issues.push(format!(
+            "unsupported stack rules schema_version={}",
+            rules.schema_version
+        ));
+    }
+    let mut ids = std::collections::HashSet::new();
+    for stack in &rules.stacks {
+        if stack.id.trim().is_empty() {
+            issues.push("stack rule has an empty id".to_owned());
+        } else if !ids.insert(stack.id.as_str()) {
+            issues.push(format!("duplicate stack rule id={}", stack.id));
+        }
+        if stack.match_rules.is_empty() {
+            issues.push(format!(
+                "stack rule id={} has no match constraints",
+                stack.id
+            ));
+        }
+        if let Some(keylog) = &stack.keylog {
+            if keylog.offset.is_some()
+                && keylog.build_id.is_none()
+                && keylog.lib_name.is_none()
+                && stack.match_rules.build_id.is_none()
+                && stack.match_rules.size.is_none()
+            {
+                issues.push(format!(
+                    "stack rule id={} has an unpinned keylog offset",
+                    stack.id
+                ));
+            }
+        }
+    }
+    issues
 }
 
 /// Union of exported write/read symbol names across all stacks.
@@ -351,5 +458,20 @@ mod tests {
             stack_for_path("/data/app/x/lib/arm64/libttboringssl.so", Some(999), None)
                 .is_none_or(|stack| stack.match_rules.size.is_none())
         );
+    }
+
+    #[test]
+    fn exact_path_rule_beats_generic_basename() {
+        let matches = matching_stacks("/apex/com.android.conscrypt/lib64/libssl.so", None, None);
+        assert_eq!(
+            matches.first().map(|item| item.id.as_str()),
+            Some("conscrypt_system")
+        );
+        assert!(matches.iter().any(|item| item.id == "app_libssl_generic"));
+    }
+
+    #[test]
+    fn embedded_rules_are_structurally_valid() {
+        assert_eq!(validation_issues(load()), Vec::<String>::new());
     }
 }

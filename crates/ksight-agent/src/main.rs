@@ -143,6 +143,8 @@ enum Command {
 enum SpoolCommand {
     /// List durable capture sessions and their unacknowledged ranges.
     List,
+    /// Mark stale running sessions as interrupted after their collector has exited.
+    Repair,
     /// Emit unacknowledged batches as protocol JSON Lines without deleting them.
     Replay {
         /// Capture session to replay.
@@ -497,7 +499,7 @@ fn run_capture(mut args: CaptureArgs) -> Result<()> {
         args.inspect_max_secs = 0;
         if !args.inspect_jni {
             eprintln!(
-                "mirror tls-only: Conscrypt/Cronet uprobe copy after packer grace; no dlopen, libart JNI off"
+                "mirror auto-discovery: package-scoped TLS exporters, embedded stack rules, lazy library rescans, and pinned vendor boundaries; experimental ART/JNI probes remain off"
             );
         }
     }
@@ -741,6 +743,16 @@ fn manage_spool(root: &std::path::Path, command: &SpoolCommand) -> Result<()> {
     match command {
         SpoolCommand::List => {
             println!("{}", serde_json::to_string_pretty(&inspect_root(root)?)?);
+        }
+        SpoolCommand::Repair => {
+            let _lease = ksight_agent::retention::SpoolLease::acquire(root)?;
+            let repaired = ksight_agent::retention::SpoolRetention {
+                root: root.to_path_buf(),
+                max_total_bytes: 0,
+                keep_completed: u32::MAX,
+            }
+            .repair_interrupted()?;
+            println!("repaired_interrupted_sessions={repaired}");
         }
         SpoolCommand::Replay { session } => {
             ksight_agent::spool::visit_batches(

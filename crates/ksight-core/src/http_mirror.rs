@@ -18,6 +18,10 @@ pub const BURP_UPSTREAM_PORT: u16 = 18_888;
 /// Bound one reconstructed HTTP/1 message while still allowing ordinary
 /// avatar/photo multipart uploads to survive 64 KiB boundary fragments.
 const ASSEMBLER_CAP: usize = 8 * 1024 * 1024;
+/// Keep a small prefix while the first TLS/JNI copies are too short to
+/// identify the application protocol. Native boundaries may split `POST`,
+/// `HTTP/1.1`, or the HTTP/2 preface across consecutive probe hits.
+const PROTOCOL_PROBE_CAP: usize = 64 * 1024;
 const HOP_BY_HOP: &[&str] = &[
     "proxy-connection",
     "proxy-authenticate",
@@ -253,6 +257,7 @@ impl MirroredMessage {
 #[derive(Debug, Default)]
 pub struct StreamReassembler {
     mode: StreamMode,
+    protocol_probe: Vec<u8>,
     http1: Http1Assembler,
     http2: Http2Assembler,
 }
@@ -266,6 +271,28 @@ enum StreamMode {
 }
 
 impl StreamReassembler {
+    /// Current protocol classification for diagnostics. `unknown` means the
+    /// accepted boundary bytes have not exposed an HTTP/1 start line or an
+    /// HTTP/2 preface/frame boundary yet.
+    #[must_use]
+    pub const fn protocol(&self) -> &'static str {
+        match self.mode {
+            StreamMode::Unknown => "unknown",
+            StreamMode::Http1 => "http1",
+            StreamMode::Http2 => "http2",
+        }
+    }
+
+    /// Bytes retained while waiting for a complete message.
+    #[must_use]
+    pub fn buffered_bytes(&self) -> usize {
+        match self.mode {
+            StreamMode::Unknown => self.protocol_probe.len(),
+            StreamMode::Http1 => self.http1.buf.len(),
+            StreamMode::Http2 => self.http2.buffered_bytes(),
+        }
+    }
+
     /// Push one Inspect copy. Complete messages are returned in order.
     pub fn push(&mut self, bytes: &[u8]) -> Vec<MirroredMessage> {
         if bytes.is_empty() {
@@ -273,12 +300,19 @@ impl StreamReassembler {
         }
         match self.mode {
             StreamMode::Unknown => {
-                if looks_like_http1(bytes) {
+                self.protocol_probe.extend_from_slice(bytes);
+                if self.protocol_probe.len() > PROTOCOL_PROBE_CAP {
+                    let discard = self.protocol_probe.len().saturating_sub(PROTOCOL_PROBE_CAP);
+                    self.protocol_probe.drain(..discard);
+                }
+                if looks_like_http1(&self.protocol_probe) {
                     self.mode = StreamMode::Http1;
-                    self.http1.push(bytes)
-                } else if looks_like_http2(bytes) {
+                    let buffered = std::mem::take(&mut self.protocol_probe);
+                    self.http1.push(&buffered)
+                } else if looks_like_http2(&self.protocol_probe) {
                     self.mode = StreamMode::Http2;
-                    self.push_h2(bytes)
+                    let buffered = std::mem::take(&mut self.protocol_probe);
+                    self.push_h2(&buffered)
                 } else {
                     Vec::new()
                 }
@@ -297,7 +331,10 @@ impl StreamReassembler {
         match self.mode {
             StreamMode::Http1 => self.http1.flush(),
             StreamMode::Http2 => self.push_h2(&[]),
-            StreamMode::Unknown => Vec::new(),
+            StreamMode::Unknown => {
+                self.protocol_probe.clear();
+                Vec::new()
+            }
         }
     }
 
@@ -1015,6 +1052,19 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].path, "/pay");
         assert_eq!(messages[0].body, b"ABCD");
+    }
+
+    #[test]
+    fn protocol_detection_survives_a_split_start_line() {
+        let mut stream = StreamReassembler::default();
+        assert!(stream.push(b"PO").is_empty());
+        assert_eq!(stream.buffered_bytes(), 2);
+        let messages = stream
+            .push(b"ST /submit HTTP/1.1\r\nHost: api.example.test\r\nContent-Length: 2\r\n\r\n{}");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].method, "POST");
+        assert_eq!(messages[0].path, "/submit");
+        assert_eq!(stream.protocol(), "http1");
     }
 
     #[test]

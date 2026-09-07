@@ -383,6 +383,26 @@ pub(crate) struct Http2Assembler {
 }
 
 impl Http2Assembler {
+    pub(crate) fn buffered_bytes(&self) -> usize {
+        self.buf
+            .len()
+            .saturating_add(self.pending.len())
+            .saturating_add(
+                self.streams
+                    .values()
+                    .map(|stream| {
+                        stream.body.len().saturating_add(
+                            stream
+                                .headers
+                                .iter()
+                                .map(|(name, value)| name.len().saturating_add(value.len()))
+                                .sum::<usize>(),
+                        )
+                    })
+                    .sum::<usize>(),
+            )
+    }
+
     pub(crate) fn push(&mut self, bytes: &[u8]) -> Vec<ParsedHttpPlain> {
         if bytes.is_empty() {
             return Vec::new();

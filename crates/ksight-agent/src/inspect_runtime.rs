@@ -76,6 +76,15 @@ const ART_JNI_PATHS: [&str; 2] = [
     "/apex/com.android.art/lib/libart.so",
 ];
 const ART_OPEN_ATTACH_CAP: usize = 12;
+const TLS_LIBRARY_CANDIDATE_CAP: usize = 48;
+#[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
+const TLS_EXPORTER_CAP: usize = 24;
+#[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
+const TLS_BURST_RESCAN_INTERVAL: Duration = Duration::from_secs(3);
+#[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
+const TLS_STEADY_RESCAN_INTERVAL: Duration = Duration::from_secs(15);
+#[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
+const TLS_BURST_RESCANS: u32 = 4;
 /// DexHelper/Bangcle-style packers suicide if `libart` JNI uprobes exist during
 /// the first few seconds of process start. Attach after this age instead.
 #[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
@@ -356,7 +365,7 @@ impl InspectAdapterKind {
         matches!(self, Self::TlsSslWrite | Self::TlsSslRead)
     }
 
-    const fn is_jni(self) -> bool {
+    pub(crate) const fn is_jni(self) -> bool {
         matches!(
             self,
             Self::JniRegistration
@@ -743,6 +752,10 @@ pub struct InspectRuntime {
     expired: bool,
     #[cfg(any(target_os = "android", target_os = "linux"))]
     sessions: Vec<LiveProbe>,
+    /// Last attach attempt per concrete adapter/library/program. Permanent ABI
+    /// failures are throttled while transient failures can still recover.
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    attach_attempts: HashMap<String, Instant>,
     #[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
     ssl_read_pending: HashMap<u32, PendingSslRead>,
     #[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
@@ -820,6 +833,7 @@ struct PendingSslRead {
     /// `SSL_read_ex` writes the byte count through x3; `SSL_read` uses x0.
     #[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
     written_ptr: Option<u64>,
+    #[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
     connection_id: Option<u64>,
 }
 
@@ -954,6 +968,8 @@ impl InspectRuntime {
             expired: false,
             #[cfg(any(target_os = "android", target_os = "linux"))]
             sessions: Vec::new(),
+            #[cfg(any(target_os = "android", target_os = "linux"))]
+            attach_attempts: HashMap::new(),
             ssl_read_pending: HashMap::new(),
             jni_region_pending: HashMap::new(),
             jni_pair: JniPairPending::default(),
@@ -985,18 +1001,21 @@ impl InspectRuntime {
     /// the TLS plans on a throttle and attach unseen (library, offset) pairs.
     #[cfg(any(target_os = "android", target_os = "linux"))]
     fn rescan_tls_exports_maybe(&mut self) -> Vec<InspectObservation> {
-        if self.sessions.is_empty()
-            || !self
-                .selected_adapters
-                .iter()
-                .any(|adapter| adapter.is_tls())
-            || self.tls_rescans >= 40
+        if !self
+            .selected_adapters
+            .iter()
+            .any(|adapter| adapter.is_tls())
         {
             return Vec::new();
         }
+        let interval = if self.tls_rescans < TLS_BURST_RESCANS {
+            TLS_BURST_RESCAN_INTERVAL
+        } else {
+            TLS_STEADY_RESCAN_INTERVAL
+        };
         if self
             .last_tls_rescan
-            .is_some_and(|at| at.elapsed() < Duration::from_secs(15))
+            .is_some_and(|at| at.elapsed() < interval)
         {
             return Vec::new();
         }
@@ -1007,15 +1026,16 @@ impl InspectRuntime {
         };
         let policy = first.policy.clone();
         let uprobe_object = first.uprobe_object.clone();
-        let known: std::collections::BTreeSet<(String, u64, String)> = self
+        let known: std::collections::BTreeSet<(String, String, Option<u64>, String)> = self
             .plans
             .iter()
-            .filter_map(|plan| {
-                Some((
-                    plan.elf_path.clone()?,
-                    plan.offset?,
+            .map(|plan| {
+                (
+                    plan.adapter.as_str().to_owned(),
+                    plan.elf_path.clone().unwrap_or_default(),
+                    plan.offset,
                     plan.symbol.clone().unwrap_or_default(),
-                ))
+                )
             })
             .collect();
         let mut fresh = Vec::new();
@@ -1027,19 +1047,18 @@ impl InspectRuntime {
             for plan in
                 InspectPlan::evaluate_tls_exports(policy.clone(), *adapter, uprobe_object.clone())
             {
-                if plan.offset.is_none() {
-                    continue;
-                }
                 let key = (
+                    plan.adapter.as_str().to_owned(),
                     plan.elf_path.clone().unwrap_or_default(),
-                    plan.offset.expect("checked above"),
+                    plan.offset,
                     plan.symbol.clone().unwrap_or_default(),
                 );
                 if known.contains(&key)
                     || fresh.iter().any(|item: &InspectPlan| {
                         (
+                            item.adapter.as_str().to_owned(),
                             item.elf_path.clone().unwrap_or_default(),
-                            item.offset.expect("checked"),
+                            item.offset,
                             item.symbol.clone().unwrap_or_default(),
                         ) == key
                     })
@@ -1052,13 +1071,12 @@ impl InspectRuntime {
         if fresh.is_empty() {
             return Vec::new();
         }
+        prune_redundant_elf32_tls(&mut fresh);
         for plan in &fresh {
             let mut observation = plan.observation.clone();
-            observation.attached = true;
             observation.detail = format!(
-                "lazy-mapped exporter attached on rescan {}: {}",
-                plan.elf_path.clone().unwrap_or_default(),
-                plan.observation.detail
+                "lazy-mapped TLS candidate discovered on rescan {}: {}",
+                self.tls_rescans, plan.observation.detail
             );
             observations.push(observation);
         }
@@ -1085,9 +1103,13 @@ impl InspectRuntime {
             if self.expired {
                 return Vec::new();
             }
+            let mut observations = self.rescan_tls_exports_maybe();
             if !self.sessions.is_empty() {
-                let out = self.rescan_tls_exports_maybe();
-                return out.into_iter().collect::<Vec<_>>();
+                // Successful probes are skipped by identity; failed probes are
+                // retried on their throttle so one live Conscrypt probe does
+                // not permanently suppress a later vendor-stack recovery.
+                observations.extend(attach_all(self));
+                return observations;
             }
             // Audited stub plans (classification-only) do not patch ART; the
             // grace is only required when an ART-patching probe is selected.
@@ -1120,7 +1142,8 @@ impl InspectRuntime {
                 }
                 return Vec::new();
             }
-            attach_all(self)
+            observations.extend(attach_all(self));
+            observations
         }
         #[cfg(not(any(target_os = "android", target_os = "linux")))]
         {
@@ -1755,7 +1778,7 @@ fn resolve_libraries(policy: &InspectPolicy, adapter: InspectAdapterKind) -> Vec
             .cmp(&tls_attach_rank(right))
             .then_with(|| left.cmp(right))
     });
-    libs.truncate(24);
+    libs.truncate(TLS_LIBRARY_CANDIDATE_CAP);
     libs
 }
 
@@ -1855,7 +1878,7 @@ fn discover_mapped_libraries_by_tls_symbol(
             if !crate::elf::plausible_elf_file(path) {
                 continue;
             }
-            if seen.len() > 128 || exporters.len() >= 12 {
+            if seen.len() > 256 || exporters.len() >= TLS_EXPORTER_CAP {
                 return exporters;
             }
             // Hardened/obfuscated ELFs carry hostile section tables; parsing
@@ -2190,6 +2213,32 @@ fn attach_all(runtime: &mut InspectRuntime) -> Vec<InspectObservation> {
         let programs: &[&str] = adapter_probe_programs(plan.adapter);
         for program in programs {
             let retprobe = *program == "ksight_uretprobe_regs";
+            let already_live = runtime.sessions.iter().any(|live| {
+                live.retprobe == retprobe
+                    && live.plan.adapter == plan.adapter
+                    && live.plan.elf_path == plan.elf_path
+                    && live.plan.offset == plan.offset
+                    && live.plan.symbol == plan.symbol
+            });
+            if already_live {
+                continue;
+            }
+            let attempt_key = format!(
+                "{}|{}|{}|{}|{program}",
+                plan.adapter.as_str(),
+                plan.elf_path.as_deref().unwrap_or_default(),
+                plan.offset.unwrap_or_default(),
+                plan.symbol.as_deref().unwrap_or_default()
+            );
+            let now = Instant::now();
+            if runtime
+                .attach_attempts
+                .get(&attempt_key)
+                .is_some_and(|attempted| attempted.elapsed() < Duration::from_secs(15))
+            {
+                continue;
+            }
+            runtime.attach_attempts.insert(attempt_key, now);
             match start_uprobe_session(
                 &plan.uprobe_object,
                 program,

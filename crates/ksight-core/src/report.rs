@@ -79,6 +79,9 @@ pub struct InspectHitActivity {
     pub hits: u64,
     /// Last adapter detail string.
     pub last_detail: String,
+    /// Latest payload-free diagnostic counters emitted by this adapter.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metrics: BTreeMap<String, u64>,
     /// Binder handle from `IPCThreadState::transact` x1, when the adapter recorded it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binder_handle: Option<u32>,
@@ -830,6 +833,7 @@ struct MutableInspectHit {
     attached: bool,
     hits: u64,
     last_detail: String,
+    metrics: BTreeMap<String, u64>,
     process_instance_id: Option<String>,
     binder_handle: Option<u32>,
     binder_code: Option<u32>,
@@ -1190,6 +1194,9 @@ impl SessionReportBuilder {
                     }
                     if !observation.detail.is_empty() {
                         activity.last_detail.clone_from(&observation.detail);
+                    }
+                    if !observation.metrics.is_empty() {
+                        activity.metrics.clone_from(&observation.metrics);
                     }
                     activity.process_instance_id = Some(format!(
                         "{}:{pid}:{}",
@@ -1789,6 +1796,7 @@ impl SessionReportBuilder {
                     attached: activity.attached,
                     hits: activity.hits,
                     last_detail: activity.last_detail,
+                    metrics: activity.metrics,
                     binder_handle: activity.binder_handle,
                     binder_code: activity.binder_code,
                     binder_interface: activity.binder_interface,

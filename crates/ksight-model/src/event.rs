@@ -712,6 +712,10 @@ pub struct InspectObservation {
     pub detail: String,
     /// Operator-visible detectability statement.
     pub detectability_notice: String,
+    /// Payload-free diagnostic counters. Names are stable within the adapter;
+    /// values may be rendered directly without parsing `detail` text.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metrics: BTreeMap<String, u64>,
     /// Binder handle from `IPCThreadState::transact` x1 when the adapter recorded it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binder_handle: Option<u32>,

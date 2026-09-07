@@ -51,14 +51,23 @@ pub struct InfosecProbe {
     handles: Vec<InfosecHandle>,
 }
 
+fn automatic_boundary_allowed(layout: &str, allow_empirical: bool) -> bool {
+    allow_empirical || layout.eq_ignore_ascii_case("pinned")
+}
+
 impl InfosecProbe {
     /// Attach to every target symbol exported by the process's mapped ELFs.
     ///
     /// Returns the probe plus status lines for the capture log.
-    pub fn attach_for_pids(uprobe_object: &Path, pids: &[u32]) -> (Self, Vec<String>) {
+    pub fn attach_for_pids(
+        uprobe_object: &Path,
+        pids: &[u32],
+        allow_empirical: bool,
+    ) -> (Self, Vec<String>) {
         let mut status = Vec::new();
         let mut handles = Vec::new();
         let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut deferred_empirical = std::collections::BTreeSet::new();
         for pid in pids.iter().copied().take(8) {
             let Ok(maps) = std::fs::read_to_string(format!("/proc/{pid}/maps")) else {
                 continue;
@@ -100,6 +109,10 @@ impl InfosecProbe {
                     else {
                         continue;
                     };
+                    if !automatic_boundary_allowed(&boundary.layout, allow_empirical) {
+                        deferred_empirical.insert(format!("{}:{name}", stack.id));
+                        continue;
+                    }
                     if handles.iter().any(|handle: &InfosecHandle| {
                         handle.symbol == name && handle.library == path
                     }) {
@@ -146,6 +159,12 @@ impl InfosecProbe {
         }
         if handles.is_empty() {
             status.push("infosec probe: no vendor TLS boundary symbols found".to_owned());
+        }
+        if !deferred_empirical.is_empty() {
+            status.push(format!(
+                "auto-discovery deferred {} empirical vendor boundary candidate(s); only pinned ABI rules attach automatically",
+                deferred_empirical.len()
+            ));
         }
         (Self { handles }, status)
     }
@@ -336,7 +355,14 @@ fn boundary_sample_score(bytes: &[u8]) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::boundary_sample_score;
+    use super::{automatic_boundary_allowed, boundary_sample_score};
+
+    #[test]
+    fn automatic_mode_only_arms_pinned_boundaries() {
+        assert!(automatic_boundary_allowed("pinned", false));
+        assert!(!automatic_boundary_allowed("empirical", false));
+        assert!(automatic_boundary_allowed("empirical", true));
+    }
 
     #[test]
     fn boundary_learning_prefers_protocol_and_upload_prefixes() {

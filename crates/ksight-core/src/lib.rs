@@ -80,5 +80,5 @@ pub use sm4::{
 };
 pub use stack_rules::{
     boundary_rule_for_symbol, boundary_symbols, keylog_entries, load as load_stack_rules,
-    stack_for_path, tls_symbol_names,
+    matching_stacks, stack_for_path, tls_symbol_names, validation_issues,
 };

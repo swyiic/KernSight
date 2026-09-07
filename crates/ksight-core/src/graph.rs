@@ -1224,6 +1224,7 @@ mod tests {
             attached: true,
             hits: 2,
             last_detail: "handle=3 code=0x1".to_owned(),
+            metrics: BTreeMap::new(),
             binder_handle: Some(3),
             binder_code: Some(1),
             binder_interface: Some("android.os.IServiceManager".to_owned()),

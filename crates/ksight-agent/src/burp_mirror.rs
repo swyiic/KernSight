@@ -7,7 +7,7 @@
 //! If playback is unreachable, the request is sent as `https://host/path` so Burp
 //! still records a response. No VPN, iptables, or app proxy settings are touched.
 
-use std::collections::{hash_map::DefaultHasher, HashMap, HashSet, VecDeque};
+use std::collections::{hash_map::DefaultHasher, BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::OpenOptions;
 use std::hash::{Hash as _, Hasher as _};
 use std::io::{Read as _, Write as _};
@@ -26,17 +26,32 @@ use ksight_model::InspectPlaintext;
 /// Live Burp feed for one capture session.
 pub struct BurpMirror {
     tx: Sender<MirrorJob>,
-    deliveries: Arc<AtomicU64>,
-    delivery_failures: Arc<AtomicU64>,
+    delivery_metrics: Arc<DeliveryMetrics>,
     observed_fragments: u64,
     observed_bytes: u64,
     reconstructed_messages: u64,
+    reconstructed_requests: u64,
+    reconstructed_responses: u64,
     rejected_fragments: u64,
+    duplicate_fragments: u64,
+    fragment_pushes_without_message: u64,
+    evicted_streams: u64,
+    hostless_requests: u64,
+    queue_failures: u64,
     streams: HashMap<(u32, u64), DirectionStreams>,
     peer_hosts: HashMap<u32, HashSet<String>>,
     last_url: HashMap<(u32, u64), (String, String)>,
     recent_fragments: HashMap<(u32, u64, bool, u64), Instant>,
     stop: Arc<AtomicBool>,
+}
+
+#[derive(Default)]
+struct DeliveryMetrics {
+    delivered: AtomicU64,
+    attempt_failed: AtomicU64,
+    retry_pending: AtomicU64,
+    retry_delivered: AtomicU64,
+    retry_exhausted: AtomicU64,
 }
 
 struct DirectionStreams {
@@ -86,7 +101,16 @@ const PAIRING_GRACE: Duration = Duration::from_secs(2);
 /// Maximum requests held per process before the oldest flushes unpaired.
 const PENDING_CAP: usize = 32;
 const STREAM_CAP: usize = 256;
+const RETRY_CAP: usize = 128;
+const MAX_DELIVERY_ATTEMPTS: u8 = 6;
 static NEXT_PLAYBACK_ID: AtomicU64 = AtomicU64::new(1);
+
+struct RetryDelivery {
+    request: MirroredMessage,
+    response: Option<MirroredMessage>,
+    attempts: u8,
+    next_attempt: Instant,
+}
 
 impl BurpMirror {
     /// Bind playback and start the worker that talks to `host:port`.
@@ -99,6 +123,10 @@ impl BurpMirror {
     }
 
     /// Start a mirror whose durable log rows are tagged with the capture session.
+    ///
+    /// # Errors
+    ///
+    /// Returns when the endpoint cannot be parsed.
     pub fn start_for_session(endpoint: &str, session_id: Option<&str>) -> Result<Self, String> {
         let endpoint = parse_mirror_endpoint(endpoint)?;
         let session_id = session_id.unwrap_or("-").to_owned();
@@ -115,10 +143,8 @@ impl BurpMirror {
         }
         let (tx, rx) = mpsc::channel();
         let worker_queue = Arc::clone(&queue);
-        let deliveries = Arc::new(AtomicU64::new(0));
-        let worker_deliveries = Arc::clone(&deliveries);
-        let delivery_failures = Arc::new(AtomicU64::new(0));
-        let worker_failures = Arc::clone(&delivery_failures);
+        let delivery_metrics = Arc::new(DeliveryMetrics::default());
+        let worker_metrics = Arc::clone(&delivery_metrics);
         let worker_session_id = session_id.clone();
         let _ = std::thread::Builder::new()
             .name("ksight-burp-mirror".to_owned())
@@ -127,8 +153,7 @@ impl BurpMirror {
                     endpoint,
                     &rx,
                     &worker_queue,
-                    &worker_deliveries,
-                    &worker_failures,
+                    &worker_metrics,
                     &worker_session_id,
                 );
             });
@@ -138,12 +163,18 @@ impl BurpMirror {
         );
         Ok(Self {
             tx,
-            deliveries,
-            delivery_failures,
+            delivery_metrics,
             observed_fragments: 0,
             observed_bytes: 0,
             reconstructed_messages: 0,
+            reconstructed_requests: 0,
+            reconstructed_responses: 0,
             rejected_fragments: 0,
+            duplicate_fragments: 0,
+            fragment_pushes_without_message: 0,
+            evicted_streams: 0,
+            hostless_requests: 0,
+            queue_failures: 0,
             streams: HashMap::new(),
             peer_hosts: HashMap::new(),
             last_url: HashMap::new(),
@@ -155,22 +186,93 @@ impl BurpMirror {
     /// Successful deliveries to the Burp listener so far.
     #[must_use]
     pub fn delivery_count(&self) -> u64 {
-        self.deliveries.load(Ordering::Relaxed)
+        self.delivery_metrics.delivered.load(Ordering::Relaxed)
     }
 
     /// Machine-readable-enough counters persisted as an Inspect observation.
     #[must_use]
     pub fn diagnostic_detail(&self) -> String {
-        format!(
-            "fragments={} bytes={} reconstructed={} delivered={} delivery_failed={} rejected={} active_streams={}",
-            self.observed_fragments,
-            self.observed_bytes,
+        self.diagnostic_metrics()
+            .into_iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Structured counters carried by the normalized Inspect observation and
+    /// consumed directly by `MobileE`. No payload, URL, header, or field name is
+    /// included in this map.
+    #[must_use]
+    pub fn diagnostic_metrics(&self) -> BTreeMap<String, u64> {
+        let mut metrics = BTreeMap::new();
+        let mut unknown_streams = 0_u64;
+        let mut http1_streams = 0_u64;
+        let mut http2_streams = 0_u64;
+        let mut buffered_bytes = 0_u64;
+        for streams in self.streams.values() {
+            for assembler in [&streams.send, &streams.recv] {
+                match assembler.protocol() {
+                    "http1" => http1_streams = http1_streams.saturating_add(1),
+                    "http2" => http2_streams = http2_streams.saturating_add(1),
+                    _ => unknown_streams = unknown_streams.saturating_add(1),
+                }
+                buffered_bytes = buffered_bytes
+                    .saturating_add(u64::try_from(assembler.buffered_bytes()).unwrap_or(u64::MAX));
+            }
+        }
+        metrics.insert("observed_fragments".to_owned(), self.observed_fragments);
+        metrics.insert("observed_bytes".to_owned(), self.observed_bytes);
+        metrics.insert(
+            "reconstructed_messages".to_owned(),
             self.reconstructed_messages,
-            self.delivery_count(),
-            self.delivery_failures.load(Ordering::Relaxed),
-            self.rejected_fragments,
-            self.streams.len()
-        )
+        );
+        metrics.insert(
+            "reconstructed_requests".to_owned(),
+            self.reconstructed_requests,
+        );
+        metrics.insert(
+            "reconstructed_responses".to_owned(),
+            self.reconstructed_responses,
+        );
+        metrics.insert("delivered".to_owned(), self.delivery_count());
+        metrics.insert(
+            "delivery_attempt_failed".to_owned(),
+            self.delivery_metrics.attempt_failed.load(Ordering::Relaxed),
+        );
+        metrics.insert(
+            "retry_pending".to_owned(),
+            self.delivery_metrics.retry_pending.load(Ordering::Relaxed),
+        );
+        metrics.insert(
+            "retry_delivered".to_owned(),
+            self.delivery_metrics
+                .retry_delivered
+                .load(Ordering::Relaxed),
+        );
+        metrics.insert(
+            "delivery_failed".to_owned(),
+            self.delivery_metrics
+                .retry_exhausted
+                .load(Ordering::Relaxed),
+        );
+        metrics.insert("rejected_fragments".to_owned(), self.rejected_fragments);
+        metrics.insert("duplicate_fragments".to_owned(), self.duplicate_fragments);
+        metrics.insert(
+            "fragment_pushes_without_message".to_owned(),
+            self.fragment_pushes_without_message,
+        );
+        metrics.insert("evicted_streams".to_owned(), self.evicted_streams);
+        metrics.insert("hostless_requests".to_owned(), self.hostless_requests);
+        metrics.insert("queue_failures".to_owned(), self.queue_failures);
+        metrics.insert(
+            "active_streams".to_owned(),
+            u64::try_from(self.streams.len()).unwrap_or(u64::MAX),
+        );
+        metrics.insert("unknown_directions".to_owned(), unknown_streams);
+        metrics.insert("http1_directions".to_owned(), http1_streams);
+        metrics.insert("http2_directions".to_owned(), http2_streams);
+        metrics.insert("buffered_bytes".to_owned(), buffered_bytes);
+        metrics
     }
 
     /// Remember SNI / HTTP Host / `ip:port` from L0 first-write for this process.
@@ -234,16 +336,21 @@ impl BurpMirror {
             .filter(|value| *value >= 0x1000)
             .unwrap_or(0x8000_0000_0000_0000 | u64::from(tid));
         if let Some(request) = request_from_http_url(bytes) {
+            self.reconstructed_messages = self.reconstructed_messages.saturating_add(1);
+            self.reconstructed_requests = self.reconstructed_requests.saturating_add(1);
             self.emit_request(pid, stream_key, request);
             return;
         }
         if adapter.starts_with("jni_") {
             for request in requests_from_embedded_http_urls(bytes) {
+                self.reconstructed_messages = self.reconstructed_messages.saturating_add(1);
+                self.reconstructed_requests = self.reconstructed_requests.saturating_add(1);
                 self.emit_request(pid, stream_key, request);
             }
         }
         let outbound = outbound_copy(adapter, direction, bytes);
         if self.is_duplicate_fragment(pid, stream_key, outbound, bytes) {
+            self.duplicate_fragments = self.duplicate_fragments.saturating_add(1);
             return;
         }
         if !self.streams.contains_key(&(pid, stream_key)) && self.streams.len() >= STREAM_CAP {
@@ -254,6 +361,7 @@ impl BurpMirror {
                 .map(|(key, _)| *key)
             {
                 self.streams.remove(&oldest);
+                self.evicted_streams = self.evicted_streams.saturating_add(1);
             }
         }
         let stream = self
@@ -273,7 +381,16 @@ impl BurpMirror {
         self.reconstructed_messages = self
             .reconstructed_messages
             .saturating_add(u64::try_from(messages.len()).unwrap_or(u64::MAX));
+        if messages.is_empty() {
+            self.fragment_pushes_without_message =
+                self.fragment_pushes_without_message.saturating_add(1);
+        }
         for message in messages {
+            if message.is_request {
+                self.reconstructed_requests = self.reconstructed_requests.saturating_add(1);
+            } else {
+                self.reconstructed_responses = self.reconstructed_responses.saturating_add(1);
+            }
             self.handle_message(pid, stream_key, message);
         }
     }
@@ -309,39 +426,50 @@ impl BurpMirror {
         // Pairing happens on the worker thread; the fallback GET keeps an
         // SSL_read-only response visible when no request is in flight.
         let fallback = self.synthesize_request(pid, stream_id, &message);
-        let _ = self.tx.send(MirrorJob::Response {
-            response: Box::new(message),
-            fallback: fallback.map(Box::new),
-            pid,
-            stream_id,
-        });
+        if self
+            .tx
+            .send(MirrorJob::Response {
+                response: Box::new(message),
+                fallback: fallback.map(Box::new),
+                pid,
+                stream_id,
+            })
+            .is_err()
+        {
+            self.queue_failures = self.queue_failures.saturating_add(1);
+        }
     }
 
     fn emit_request(&mut self, pid: u32, stream_id: u64, mut request: MirroredMessage) {
         self.finish_request(pid, stream_id, &mut request);
         if !looks_like_mirror_host(&request.host) {
+            self.hostless_requests = self.hostless_requests.saturating_add(1);
             return;
         }
         // Repeated requests to the same endpoint are meaningful (login,
         // captcha refresh, OTP retry). Fragment-level debounce above removes
         // duplicate probes without suppressing those requests.
-        let _ = self
+        if self
             .tx
-            .send(MirrorJob::Request(Box::new(request), pid, stream_id));
+            .send(MirrorJob::Request(Box::new(request), pid, stream_id))
+            .is_err()
+        {
+            self.queue_failures = self.queue_failures.saturating_add(1);
+        }
     }
 
     fn finish_request(&mut self, pid: u32, stream_id: u64, request: &mut MirroredMessage) {
         if request.host.is_empty() {
             if let Some((host, path)) = self.last_url.get(&(pid, stream_id)) {
-                request.host = host.to_owned();
+                host.clone_into(&mut request.host);
                 if request.path == "/" {
-                    request.path = path.to_owned();
+                    path.clone_into(&mut request.path);
                 }
             }
         }
         if request.host.is_empty() {
             if let Some(host) = self.unique_peer_host(pid) {
-                request.host = host.to_owned();
+                host.clone_into(&mut request.host);
             }
         }
         if !request.host.is_empty() {
@@ -372,15 +500,15 @@ impl BurpMirror {
             }
         } else if let Some((host, path)) = self.unique_url_for_pid(pid) {
             if request.host.is_empty() || same_site(&request.host, host) {
-                request.host = host.to_owned();
+                host.clone_into(&mut request.host);
                 if request.path == "/" {
-                    request.path = path.to_owned();
+                    path.clone_into(&mut request.path);
                 }
             }
         }
         if request.host.is_empty() {
             if let Some(host) = self.unique_peer_host(pid) {
-                request.host = host.to_owned();
+                host.clone_into(&mut request.host);
             }
         }
         if request.host.is_empty() {
@@ -512,22 +640,32 @@ fn worker_loop(
     endpoint: SocketAddr,
     rx: &mpsc::Receiver<MirrorJob>,
     queue: &Arc<Mutex<PlaybackStore>>,
-    deliveries: &AtomicU64,
-    failures: &AtomicU64,
+    metrics: &DeliveryMetrics,
     session_id: &str,
 ) {
+    let runtime = DeliveryRuntime {
+        endpoint,
+        queue,
+        metrics,
+        session_id,
+    };
     let mut pending: HashMap<(u32, u64), VecDeque<(MirroredMessage, Instant)>> = HashMap::new();
+    let mut retries = VecDeque::new();
     loop {
-        match rx.recv_timeout(Duration::from_millis(500)) {
+        match rx.recv_timeout(Duration::from_millis(250)) {
             Ok(MirrorJob::Stop) => {
-                flush_pending(
-                    &mut pending,
-                    endpoint,
-                    queue,
-                    deliveries,
-                    failures,
-                    session_id,
-                );
+                flush_pending(&mut pending, &mut retries, &runtime);
+                let abandoned = u64::try_from(retries.len()).unwrap_or(u64::MAX);
+                metrics
+                    .retry_exhausted
+                    .fetch_add(abandoned, Ordering::Relaxed);
+                metrics.retry_pending.store(0, Ordering::Relaxed);
+                if abandoned > 0 {
+                    log_mirror(
+                        session_id,
+                        &format!("burp-mirror stop abandoned_retries={abandoned}"),
+                    );
+                }
                 log_mirror(session_id, "burp-mirror session-stop");
                 break;
             }
@@ -536,9 +674,7 @@ fn worker_loop(
                 while slot.len() >= PENDING_CAP {
                     match slot.pop_front() {
                         Some((stale, _)) => {
-                            deliver_or_log(
-                                endpoint, &stale, None, queue, deliveries, failures, session_id,
-                            );
+                            enqueue_delivery(&runtime, &mut retries, stale, None);
                         }
                         None => break,
                     }
@@ -557,40 +693,142 @@ fn worker_loop(
                     .map(|(request, _)| request)
                     .or_else(|| fallback.map(|fallback| *fallback));
                 if let Some(request) = request {
-                    deliver_or_log(
-                        endpoint,
-                        &request,
-                        Some(&response),
-                        queue,
-                        deliveries,
-                        failures,
-                        session_id,
-                    );
+                    enqueue_delivery(&runtime, &mut retries, request, Some(*response));
                 }
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                sweep_expired(
-                    &mut pending,
-                    endpoint,
-                    queue,
-                    deliveries,
-                    failures,
-                    session_id,
-                );
-            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
+        sweep_expired(&mut pending, &mut retries, &runtime);
+        sweep_retries(&runtime, &mut retries);
     }
+}
+
+struct DeliveryRuntime<'a> {
+    endpoint: SocketAddr,
+    queue: &'a Mutex<PlaybackStore>,
+    metrics: &'a DeliveryMetrics,
+    session_id: &'a str,
+}
+
+fn enqueue_delivery(
+    runtime: &DeliveryRuntime<'_>,
+    retries: &mut VecDeque<RetryDelivery>,
+    request: MirroredMessage,
+    response: Option<MirroredMessage>,
+) {
+    match deliver(
+        runtime.endpoint,
+        &request,
+        response.as_ref(),
+        runtime.queue,
+        runtime.session_id,
+    ) {
+        Ok(()) => {
+            runtime.metrics.delivered.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(error) => {
+            runtime
+                .metrics
+                .attempt_failed
+                .fetch_add(1, Ordering::Relaxed);
+            while retries.len() >= RETRY_CAP {
+                retries.pop_front();
+                runtime
+                    .metrics
+                    .retry_exhausted
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            retries.push_back(RetryDelivery {
+                request,
+                response,
+                attempts: 1,
+                next_attempt: Instant::now() + retry_delay(1),
+            });
+            runtime.metrics.retry_pending.store(
+                u64::try_from(retries.len()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            log_mirror(
+                runtime.session_id,
+                &format!("burp-mirror deliver queued retry=1/{MAX_DELIVERY_ATTEMPTS}: {error}"),
+            );
+        }
+    }
+}
+
+fn sweep_retries(runtime: &DeliveryRuntime<'_>, retries: &mut VecDeque<RetryDelivery>) {
+    let now = Instant::now();
+    let queued = retries.len();
+    for _ in 0..queued {
+        let Some(mut item) = retries.pop_front() else {
+            break;
+        };
+        if item.next_attempt > now {
+            retries.push_back(item);
+            continue;
+        }
+        match deliver(
+            runtime.endpoint,
+            &item.request,
+            item.response.as_ref(),
+            runtime.queue,
+            runtime.session_id,
+        ) {
+            Ok(()) => {
+                runtime.metrics.delivered.fetch_add(1, Ordering::Relaxed);
+                runtime
+                    .metrics
+                    .retry_delivered
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Err(error) => {
+                runtime
+                    .metrics
+                    .attempt_failed
+                    .fetch_add(1, Ordering::Relaxed);
+                item.attempts = item.attempts.saturating_add(1);
+                if item.attempts >= MAX_DELIVERY_ATTEMPTS {
+                    runtime
+                        .metrics
+                        .retry_exhausted
+                        .fetch_add(1, Ordering::Relaxed);
+                    log_mirror(
+                        runtime.session_id,
+                        &format!(
+                            "burp-mirror deliver exhausted attempts={}: {error}",
+                            item.attempts
+                        ),
+                    );
+                } else {
+                    item.next_attempt = Instant::now() + retry_delay(item.attempts);
+                    log_mirror(
+                        runtime.session_id,
+                        &format!(
+                            "burp-mirror deliver retry={}/{} failed: {error}",
+                            item.attempts, MAX_DELIVERY_ATTEMPTS
+                        ),
+                    );
+                    retries.push_back(item);
+                }
+            }
+        }
+    }
+    runtime.metrics.retry_pending.store(
+        u64::try_from(retries.len()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
+}
+
+fn retry_delay(attempt: u8) -> Duration {
+    Duration::from_secs(1_u64 << u32::from(attempt.saturating_sub(1).min(5)))
 }
 
 /// Deliver requests whose pairing grace elapsed without a response copy.
 fn sweep_expired(
     pending: &mut HashMap<(u32, u64), VecDeque<(MirroredMessage, Instant)>>,
-    endpoint: SocketAddr,
-    queue: &Arc<Mutex<PlaybackStore>>,
-    deliveries: &AtomicU64,
-    failures: &AtomicU64,
-    session_id: &str,
+    retries: &mut VecDeque<RetryDelivery>,
+    runtime: &DeliveryRuntime<'_>,
 ) {
     let now = Instant::now();
     for slot in pending.values_mut() {
@@ -599,9 +837,7 @@ fn sweep_expired(
                 break;
             }
             let (request, _) = slot.pop_front().expect("front checked");
-            deliver_or_log(
-                endpoint, &request, None, queue, deliveries, failures, session_id,
-            );
+            enqueue_delivery(runtime, retries, request, None);
         }
     }
     pending.retain(|_, slot| !slot.is_empty());
@@ -610,40 +846,15 @@ fn sweep_expired(
 /// Deliver every still-pending request unpaired; used when the session ends.
 fn flush_pending(
     pending: &mut HashMap<(u32, u64), VecDeque<(MirroredMessage, Instant)>>,
-    endpoint: SocketAddr,
-    queue: &Arc<Mutex<PlaybackStore>>,
-    deliveries: &AtomicU64,
-    failures: &AtomicU64,
-    session_id: &str,
+    retries: &mut VecDeque<RetryDelivery>,
+    runtime: &DeliveryRuntime<'_>,
 ) {
     for slot in pending.values_mut() {
         while let Some((request, _)) = slot.pop_front() {
-            deliver_or_log(
-                endpoint, &request, None, queue, deliveries, failures, session_id,
-            );
+            enqueue_delivery(runtime, retries, request, None);
         }
     }
     pending.clear();
-}
-
-fn deliver_or_log(
-    endpoint: SocketAddr,
-    request: &MirroredMessage,
-    response: Option<&MirroredMessage>,
-    queue: &Arc<Mutex<PlaybackStore>>,
-    deliveries: &AtomicU64,
-    failures: &AtomicU64,
-    session_id: &str,
-) {
-    match deliver(endpoint, request, response, queue, session_id) {
-        Ok(()) => {
-            deliveries.fetch_add(1, Ordering::Relaxed);
-        }
-        Err(error) => {
-            failures.fetch_add(1, Ordering::Relaxed);
-            log_mirror(session_id, &format!("burp-mirror deliver failed: {error}"));
-        }
-    }
 }
 
 fn deliver(
@@ -952,6 +1163,49 @@ mod tests {
     }
 
     #[test]
+    fn delivery_retries_after_listener_becomes_available() {
+        let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = reservation.local_addr().unwrap();
+        drop(reservation);
+
+        let mut mirror = BurpMirror::start(&addr.to_string()).expect("mirror");
+        mirror.observe_bytes_for_connection(
+            22,
+            201,
+            Some(0x2222),
+            "tls_ssl_write",
+            "send",
+            b"GET /retry HTTP/1.1\r\nHost: api.example.test\r\n\r\n",
+        );
+        thread::sleep(Duration::from_millis(2_500));
+
+        let listener = TcpListener::bind(addr).unwrap();
+        let received = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_message(&mut stream, 4096);
+            let _ = stream.write_all(
+                b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+            request
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(4);
+        while std::time::Instant::now() < deadline
+            && mirror
+                .diagnostic_metrics()
+                .get("retry_delivered")
+                .copied()
+                .unwrap_or(0)
+                == 0
+        {
+            thread::sleep(Duration::from_millis(50));
+        }
+        let metrics = mirror.diagnostic_metrics();
+        assert_eq!(metrics.get("retry_delivered"), Some(&1));
+        assert_eq!(metrics.get("delivery_failed"), Some(&0));
+        assert!(received.join().unwrap().starts_with(b"GET "));
+    }
+
+    #[test]
     fn exact_duplicate_probe_fragment_is_debounced() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -981,6 +1235,12 @@ mod tests {
         let raw = b"POST /once HTTP/1.1\r\nHost: api.example.test\r\nContent-Length: 2\r\n\r\n{}";
         mirror.observe_bytes_for_connection(22, 201, Some(0x2222), "tls_ssl_write", "send", raw);
         mirror.observe_bytes_for_connection(22, 201, Some(0x2222), "tls_ssl_write", "send", raw);
+        let metrics = mirror.diagnostic_metrics();
+        assert_eq!(metrics.get("observed_fragments"), Some(&2));
+        assert_eq!(metrics.get("duplicate_fragments"), Some(&1));
+        assert_eq!(metrics.get("reconstructed_requests"), Some(&1));
+        assert_eq!(metrics.get("reconstructed_responses"), Some(&0));
+        assert_eq!(metrics.get("queue_failures"), Some(&0));
         drop(mirror);
         assert_eq!(received.join().unwrap(), 1);
     }
