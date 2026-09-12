@@ -342,16 +342,58 @@ pub fn parse_http2(bytes: &[u8]) -> Vec<ParsedHttpPlain> {
     assembler.push(bytes)
 }
 
+/// Bytes to scan when the first TLS/JNI copy is mid-frame (Alipay warm attach).
+const HTTP2_RESYNC_SCAN: usize = 256;
+
+/// Offset of the first HTTP/2 preface or plausible frame header in `bytes`.
+///
+/// Mid-stream attach often misses the connection preface; the first readable
+/// copy may start a few bytes into a prior frame. Prefer offset 0 when valid,
+/// otherwise require a strong frame type (DATA/HEADERS/SETTINGS/CONTINUATION)
+/// and either a following frame header or a complete HEADERS/SETTINGS frame.
+#[must_use]
+pub fn http2_sync_offset(bytes: &[u8]) -> Option<usize> {
+    if bytes.is_empty() {
+        return None;
+    }
+    if bytes.starts_with(PREFACE) || PREFACE.starts_with(bytes) {
+        return Some(0);
+    }
+    if bytes.len() < 9 {
+        return None;
+    }
+    let last = bytes.len().saturating_sub(9).min(HTTP2_RESYNC_SCAN);
+    for i in 0..=last {
+        let Some((frame_end, frame_ty, _, _, _)) = frame_header_ok(bytes, i, 16 * 1024) else {
+            continue;
+        };
+        if i == 0 {
+            return Some(0);
+        }
+        // Mid-buffer: only lock onto common request/control frames to limit
+        // false positives in binary app payloads.
+        if !matches!(frame_ty, 0x0 | 0x1 | 0x4 | 0x9) {
+            continue;
+        }
+        if frame_end + 9 <= bytes.len() && frame_header_ok(bytes, frame_end, 16 * 1024).is_some() {
+            return Some(i);
+        }
+        if matches!(frame_ty, 0x1 | 0x4) && frame_end <= bytes.len() && frame_end > i + 9 {
+            return Some(i);
+        }
+        if matches!(frame_ty, 0x1 | 0x4) && frame_end > bytes.len() {
+            // Incomplete but typed HEADERS/SETTINGS — still sync so the
+            // assembler can wait for the rest instead of staying Unknown.
+            return Some(i);
+        }
+    }
+    None
+}
+
 /// True when a buffer starts like an HTTP/2 preface or a well-formed frame header.
 #[must_use]
 pub fn looks_like_http2(bytes: &[u8]) -> bool {
-    if bytes.is_empty() {
-        return false;
-    }
-    if bytes.starts_with(PREFACE) || PREFACE.starts_with(bytes) {
-        return true;
-    }
-    bytes.len() >= 9 && frame_header_ok(bytes, 0).is_some()
+    http2_sync_offset(bytes).is_some()
 }
 
 /// One completed HTTP/2 request or response after HEADERS+DATA.
@@ -361,6 +403,8 @@ pub(crate) struct H2Message {
     pub headers: Vec<(String, String)>,
     /// DATA payload, inflated when the bytes were gzip/zlib.
     pub body: Vec<u8>,
+    /// HTTP/2 stream identifier.
+    pub stream_id: u32,
 }
 
 #[derive(Debug, Default)]
@@ -370,7 +414,7 @@ struct PartialH2 {
 }
 
 /// Reassemble HTTP/2 frames and HPACK state across TLS/JNI copy fragments.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Http2Assembler {
     buf: Vec<u8>,
     decoder: HpackDecoder,
@@ -378,8 +422,37 @@ pub(crate) struct Http2Assembler {
     in_headers: bool,
     aligned: bool,
     headers_stream: u32,
+    /// END_STREAM seen on the initial HEADERS frame of the current block.
+    /// CONTINUATION must honor this when END_HEADERS finally arrives.
+    headers_end_stream: bool,
+    /// SETTINGS_MAX_FRAME_SIZE (default 16384).
+    max_frame_size: usize,
     streams: HashMap<u32, PartialH2>,
     h2_messages: Vec<H2Message>,
+    /// Last :authority/Host seen on this TLS connection. Later multiplexed
+    /// streams often omit it (HPACK index / inspect attached mid-session).
+    last_authority: Option<String>,
+}
+
+impl Default for Http2Assembler {
+    fn default() -> Self {
+        Self {
+            buf: Vec::new(),
+            decoder: HpackDecoder::default(),
+            pending: Vec::new(),
+            in_headers: false,
+            aligned: false,
+            headers_stream: 0,
+            headers_end_stream: false,
+            // Inspect often attaches after SETTINGS. RFC initial 16KiB
+            // rejected CCB/Alipay 64KiB DATA (cycle-002655 buffered=64332
+            // orig=0). Cap at inspect copy size; SETTINGS may still raise.
+            max_frame_size: 256 * 1024,
+            streams: HashMap::new(),
+            h2_messages: Vec::new(),
+            last_authority: None,
+        }
+    }
 }
 
 impl Http2Assembler {
@@ -403,6 +476,21 @@ impl Http2Assembler {
             )
     }
 
+    pub(crate) fn ends_with(&self, bytes: &[u8]) -> bool {
+        !bytes.is_empty() && self.buf.ends_with(bytes)
+    }
+
+    /// Unparsed frame bytes + pending HPACK after seal_finish. Used so
+    /// incomplete large DATA still becomes an orphan response.
+    pub(crate) fn take_remainder(&mut self) -> Vec<u8> {
+        let mut out = std::mem::take(&mut self.buf);
+        out.extend(std::mem::take(&mut self.pending));
+        for (_, partial) in self.streams.drain() {
+            out.extend(partial.body);
+        }
+        out
+    }
+
     pub(crate) fn push(&mut self, bytes: &[u8]) -> Vec<ParsedHttpPlain> {
         if bytes.is_empty() {
             return Vec::new();
@@ -413,6 +501,7 @@ impl Http2Assembler {
             self.buf.drain(..drop);
             self.aligned = false;
             self.in_headers = false;
+            self.headers_end_stream = false;
             self.pending.clear();
             self.decoder = HpackDecoder::default();
         }
@@ -425,17 +514,79 @@ impl Http2Assembler {
     }
 
     fn finish_stream(&mut self, stream: u32) {
-        let Some(partial) = self.streams.remove(&stream) else {
+        let Some(mut partial) = self.streams.remove(&stream) else {
             return;
         };
         if partial.headers.is_empty() {
+            if partial.body.is_empty() {
+                return;
+            }
+            // DATA-only copy (inspect attached after HEADERS). Salvage as a
+            // response so SSL_read plaintext still pairs instead of orig=0.
+            self.h2_messages.push(H2Message {
+                headers: vec![(":status".to_owned(), "200".to_owned())],
+                body: crate::inflate_inspect_buffer(&partial.body).unwrap_or(partial.body),
+                stream_id: stream,
+            });
             return;
         }
-        let body = crate::inflate_inspect_buffer(&partial.body).unwrap_or(partial.body);
+        let has_authority = partial.headers.iter().any(|(name, value)| {
+            (name.eq_ignore_ascii_case(":authority") || name.eq_ignore_ascii_case("host"))
+                && !value.is_empty()
+        });
+        if let Some((_, value)) = partial.headers.iter().find(|(name, value)| {
+            (name.eq_ignore_ascii_case(":authority") || name.eq_ignore_ascii_case("host"))
+                && !value.is_empty()
+        }) {
+            if let Some(host) = crate::http_plain::parse_host_token(value) {
+                self.last_authority = Some(host);
+            }
+        } else if !has_authority {
+            if let Some(authority) = self.last_authority.clone() {
+                partial.headers.push((":authority".to_owned(), authority));
+            }
+        }
+        let grpc = partial.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("content-type") && value.to_ascii_lowercase().contains("grpc")
+        });
+        let body = if grpc {
+            unwrap_grpc_length_prefixed(&partial.body)
+        } else {
+            crate::inflate_inspect_buffer(&partial.body).unwrap_or(partial.body)
+        };
         self.h2_messages.push(H2Message {
             headers: partial.headers,
             body,
+            stream_id: stream,
         });
+    }
+
+    /// Promote open streams that already decoded HEADERS but never saw
+    /// END_STREAM (common when the final DATA copy is missed / idle soft-flush).
+    pub(crate) fn soft_finish_open_streams(&mut self) {
+        let open: Vec<u32> = self
+            .streams
+            .iter()
+            .filter(|(_, partial)| !partial.headers.is_empty())
+            .map(|(id, _)| *id)
+            .collect();
+        for stream in open {
+            self.finish_stream(stream);
+        }
+    }
+
+    /// Session-end: also emit DATA-only streams that never saw HEADERS.
+    pub(crate) fn seal_finish_open_streams(&mut self) {
+        self.soft_finish_open_streams();
+        let data_only: Vec<u32> = self
+            .streams
+            .iter()
+            .filter(|(_, partial)| !partial.body.is_empty())
+            .map(|(id, _)| *id)
+            .collect();
+        for stream in data_only {
+            self.finish_stream(stream);
+        }
     }
 
     fn drain(&mut self) -> Vec<ParsedHttpPlain> {
@@ -451,11 +602,12 @@ impl Http2Assembler {
         }
         while index + 9 <= self.buf.len() && out.len() < 16 {
             let Some((frame_end, frame_ty, flags, header_end, stream)) =
-                frame_header_ok(&self.buf, index)
+                frame_header_ok(&self.buf, index, self.max_frame_size)
             else {
                 if self.aligned {
                     self.aligned = false;
                     self.in_headers = false;
+                    self.headers_end_stream = false;
                     self.pending.clear();
                 }
                 index = index.saturating_add(1);
@@ -472,6 +624,9 @@ impl Http2Assembler {
                         self.pending.clear();
                         self.in_headers = true;
                         self.headers_stream = stream;
+                        // Remember END_STREAM from the initial HEADERS; CONTINUATION
+                        // carries END_HEADERS but must not clear this bit.
+                        self.headers_end_stream = flags & 0x01 != 0;
                         if flags & 0x08 != 0 {
                             let pad = usize::from(payload.first().copied().unwrap_or(0));
                             payload = payload
@@ -490,6 +645,8 @@ impl Http2Assembler {
                         let headers = self.decoder.decode_block(&self.pending);
                         self.pending.clear();
                         self.in_headers = false;
+                        let end_stream = self.headers_end_stream || (flags & 0x01 != 0);
+                        self.headers_end_stream = false;
                         if let Some(parsed) = headers_to_parsed(&headers) {
                             out.push(parsed);
                         }
@@ -507,10 +664,14 @@ impl Http2Assembler {
                                     .cloned(),
                             );
                         }
-                        if flags & 0x01 != 0 {
+                        if end_stream {
                             self.finish_stream(self.headers_stream);
                         }
                     }
+                }
+                0x4 => {
+                    // SETTINGS — honor SETTINGS_MAX_FRAME_SIZE (0x5).
+                    apply_settings(payload, flags, &mut self.max_frame_size);
                 }
                 0x0 => {
                     out.extend(data_to_parsed(payload, flags));
@@ -566,7 +727,36 @@ fn preface_row() -> ParsedHttpPlain {
     }
 }
 
-fn frame_header_ok(bytes: &[u8], index: usize) -> Option<(usize, u8, u8, usize, u32)> {
+fn apply_settings(payload: &[u8], flags: u8, max_frame_size: &mut usize) {
+    if flags & 0x01 != 0 {
+        // ACK — no payload.
+        return;
+    }
+    let mut index = 0_usize;
+    while index + 6 <= payload.len() {
+        let id = u16::from_be_bytes([payload[index], payload[index + 1]]);
+        let value = u32::from_be_bytes([
+            payload[index + 2],
+            payload[index + 3],
+            payload[index + 4],
+            payload[index + 5],
+        ]);
+        if id == 0x5 {
+            // SETTINGS_MAX_FRAME_SIZE: initial 16384, max 2^24-1.
+            let size = value as usize;
+            if (16 * 1024..=16 * 1024 * 1024 - 1).contains(&size) {
+                *max_frame_size = size;
+            }
+        }
+        index += 6;
+    }
+}
+
+fn frame_header_ok(
+    bytes: &[u8],
+    index: usize,
+    max_frame_size: usize,
+) -> Option<(usize, u8, u8, usize, u32)> {
     let len = u32::from_be_bytes([0, bytes[index], bytes[index + 1], bytes[index + 2]]) as usize;
     let frame_ty = bytes[index + 3];
     let flags = bytes[index + 4];
@@ -583,7 +773,8 @@ fn frame_header_ok(bytes: &[u8], index: usize) -> Option<(usize, u8, u8, usize, 
         0x2 | 0x3 | 0x5 | 0x8 => true,
         _ => false,
     };
-    if !known || !stream_ok || len > 16 * 1024 {
+    let max_frame = max_frame_size.max(16 * 1024).min(16 * 1024 * 1024);
+    if !known || !stream_ok || len > max_frame {
         return None;
     }
     let header_end = index.saturating_add(9);
@@ -664,12 +855,16 @@ fn headers_to_parsed(headers: &[(String, String)]) -> Option<ParsedHttpPlain> {
     let (query_path, query_keys) = split_query(&path);
     let host = authority;
     let third_party = host.as_deref().is_some_and(crate::is_third_party_host);
+    let grpc = content_type
+        .as_deref()
+        .is_some_and(|value: &str| value.to_ascii_lowercase().contains("grpc"));
     let kind = if status.is_some() {
         "http2_response"
-    } else if matches!(
+    } else if (matches!(
         method.as_str(),
         "GET" | "POST" | "HEAD" | "PUT" | "DELETE" | "PATCH" | "OPTIONS"
-    ) && host.is_some()
+    ) && (host.is_some() || grpc))
+        || (grpc && !path.is_empty())
     {
         "http2_request"
     } else {
@@ -698,6 +893,53 @@ fn headers_to_parsed(headers: &[(String, String)]) -> Option<ParsedHttpPlain> {
         content_type,
         third_party,
     })
+}
+
+/// Strip gRPC length-prefixed DATA frames (`compressed` byte + big-endian length).
+///
+/// Uncompressed messages are concatenated. Compressed messages are inflated
+/// when the payload looks like gzip/zlib. Incomplete or non-gRPC buffers are
+/// returned unchanged so Burp still sees the copied bytes.
+#[must_use]
+pub fn unwrap_grpc_length_prefixed(bytes: &[u8]) -> Vec<u8> {
+    if bytes.len() < 5 {
+        return bytes.to_vec();
+    }
+    let mut offset = 0_usize;
+    let mut out = Vec::new();
+    let mut saw_frame = false;
+    while offset + 5 <= bytes.len() {
+        let compressed = bytes[offset];
+        if compressed > 1 {
+            return bytes.to_vec();
+        }
+        let len = u32::from_be_bytes([
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+            bytes[offset + 4],
+        ]) as usize;
+        offset += 5;
+        if len > STREAM_BODY_CAP || offset.saturating_add(len) > bytes.len() {
+            return bytes.to_vec();
+        }
+        let payload = &bytes[offset..offset + len];
+        offset += len;
+        saw_frame = true;
+        if compressed == 1 {
+            match crate::inflate_inspect_buffer(payload) {
+                Some(plain) => out.extend_from_slice(&plain),
+                None => out.extend_from_slice(payload),
+            }
+        } else {
+            out.extend_from_slice(payload);
+        }
+    }
+    if saw_frame && offset == bytes.len() {
+        out
+    } else {
+        bytes.to_vec()
+    }
 }
 
 fn split_query(target: &str) -> (String, Vec<String>) {
@@ -986,9 +1228,9 @@ mod tests {
             "{parsed:?}"
         );
         let query_block = [
-            0x82, 0x87, 0x04, 0x15, b'/', b'v', b'1', b'/', b'l', b'o', b'g', b'i', b'n', b'?',
-            b't', b'o', b'k', b'e', b'n', b'=', b'x', b'&', b'q', b'=', b'1', 0x41, 0x0b, b'a',
-            b'p', b'i', b'.', b'e', b'x', b'a', b'm', b'p', b'l', b'e',
+            0x82, 0x87, 0x04, 0x17, b'/', b'v', b'1', b'/', b's', b'e', b's', b's', b'i', b'o',
+            b'n', b'?', b't', b'o', b'k', b'e', b'n', b'=', b'x', b'&', b'q', b'=', b'1', 0x41,
+            0x0b, b'a', b'p', b'i', b'.', b'e', b'x', b'a', b'm', b'p', b'l', b'e',
         ];
         let mut query_frame = vec![
             0,
@@ -1007,11 +1249,40 @@ mod tests {
             parsed.iter().any(|row| {
                 row.kind == "http2_request"
                     && row.host.as_deref() == Some("api.example")
-                    && row.path == "/v1/login"
+                    && row.path == "/v1/session"
                     && row.query_keys.iter().any(|key| key == "token")
                     && row.scheme == Some("https")
             }),
             "{parsed:?}"
+        );
+    }
+
+    #[test]
+    fn http2_sync_offset_skips_mid_frame_preamble() {
+        let block = [
+            0x82, 0x86, 0x84, 0x41, 0x8c, 0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab,
+            0x90, 0xf4, 0xff,
+        ];
+        let mut frame = vec![
+            0,
+            0,
+            u8::try_from(block.len()).unwrap(),
+            0x1,
+            0x05,
+            0,
+            0,
+            0,
+            1,
+        ];
+        frame.extend_from_slice(&block);
+        let mut junk = vec![0xab, 0xcd, 0xef, 0x01, 0x02];
+        junk.extend_from_slice(&frame);
+        assert_eq!(super::http2_sync_offset(&junk), Some(5));
+        assert!(super::looks_like_http2(&junk));
+        // Random noise alone should not sync.
+        assert_eq!(
+            super::http2_sync_offset(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99]),
+            None
         );
     }
 
@@ -1076,7 +1347,7 @@ mod tests {
     #[test]
     fn data_frame_inflates_gzip_json_url() {
         use std::io::Write as _;
-        let plain = br#"{"url":"https://ebsnew.boc.cn/api/login"}"#;
+        let plain = br#"{"url":"https://ebs.app.example/api/session"}"#;
         let mut gz = Vec::new();
         {
             let mut encoder =
@@ -1101,9 +1372,108 @@ mod tests {
         assert!(
             parsed
                 .iter()
-                .any(|row| row.host.as_deref() == Some("ebsnew.boc.cn")
-                    && row.path == "/api/login"),
+                .any(|row| row.host.as_deref() == Some("ebs.app.example")
+                    && row.path == "/api/session"),
             "{parsed:?}"
         );
+    }
+
+    #[test]
+    fn grpc_length_prefix_unwraps_uncompressed_messages() {
+        let msg = b"\x0a\x05hello";
+        let mut framed = vec![0, 0, 0, 0, u8::try_from(msg.len()).unwrap()];
+        framed.extend_from_slice(msg);
+        assert_eq!(super::unwrap_grpc_length_prefixed(&framed), msg);
+        assert_eq!(super::unwrap_grpc_length_prefixed(b"not-grpc"), b"not-grpc");
+    }
+
+    #[test]
+    fn continuation_preserves_headers_end_stream() {
+        // HEADERS with END_STREAM but without END_HEADERS, then CONTINUATION+END_HEADERS.
+        let block = [
+            0x82, 0x86, 0x84, 0x41, 0x0f, 0x77, 0x77, 0x77, 0x2e, 0x65, 0x78, 0x61, 0x6d, 0x70,
+            0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d,
+        ];
+        let mid = 8_usize;
+        let mut headers = vec![
+            0,
+            0,
+            u8::try_from(mid).unwrap(),
+            0x1,
+            0x01, // END_STREAM only
+            0,
+            0,
+            0,
+            5,
+        ];
+        headers.extend_from_slice(&block[..mid]);
+        let rest = &block[mid..];
+        let mut cont = vec![
+            0,
+            0,
+            u8::try_from(rest.len()).unwrap(),
+            0x9,
+            0x04, // END_HEADERS
+            0,
+            0,
+            0,
+            5,
+        ];
+        cont.extend_from_slice(rest);
+        let mut assembler = Http2Assembler::default();
+        let _ = assembler.push(&headers);
+        let _ = assembler.push(&cont);
+        let messages = assembler.take_h2_messages();
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert_eq!(messages[0].stream_id, 5);
+        assert!(messages[0]
+            .headers
+            .iter()
+            .any(|(n, v)| n == ":method" && v == "GET"));
+    }
+
+    #[test]
+    fn settings_max_frame_size_is_respected() {
+        let mut assembler = Http2Assembler::default();
+        assert_eq!(assembler.max_frame_size, 256 * 1024);
+        // SETTINGS frame: id=0x5 value=65536
+        let settings = vec![
+            0, 0, 6, // length
+            0x4, 0x0, // SETTINGS
+            0, 0, 0, 0, // stream 0
+            0x00, 0x05, 0x00, 0x01, 0x00, 0x00, // id=5 value=65536
+        ];
+        let _ = assembler.push(&settings);
+        assert_eq!(assembler.max_frame_size, 65536);
+        // A 20KiB DATA frame should now be accepted (previously rejected at 16KiB).
+        let len = 20 * 1024;
+        let mut data = vec![
+            u8::try_from((len >> 16) & 0xff).unwrap(),
+            u8::try_from((len >> 8) & 0xff).unwrap(),
+            u8::try_from(len & 0xff).unwrap(),
+            0x0,
+            0x01,
+            0,
+            0,
+            0,
+            1,
+        ];
+        data.extend(std::iter::repeat(b'z').take(len));
+        // Seed stream headers so finish on END_STREAM yields a message.
+        assembler.streams.insert(
+            1,
+            PartialH2 {
+                headers: vec![
+                    (":method".into(), "POST".into()),
+                    (":path".into(), "/".into()),
+                ],
+                body: Vec::new(),
+            },
+        );
+        let _ = assembler.push(&data);
+        let messages = assembler.take_h2_messages();
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert_eq!(messages[0].body.len(), len);
+        assert_eq!(messages[0].stream_id, 1);
     }
 }

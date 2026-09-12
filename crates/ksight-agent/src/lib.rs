@@ -19,7 +19,8 @@ pub mod collector;
 /// Negotiated durable-session control protocol.
 pub mod control;
 /// Live heap scan for AES/SM4 material while capturing.
-#[cfg(any(target_os = "android", target_os = "linux"))]
+/// Included under `test` so host unit tests can validate needle families on macOS.
+#[cfg(any(test, target_os = "android", target_os = "linux"))]
 pub mod crypto_watch;
 /// Dump decrypted DEX from live process mappings.
 pub mod dexdump;

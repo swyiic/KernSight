@@ -23,7 +23,7 @@ const KEYLOG_TABLE_PATH: &str = "/data/local/tmp/ksight/keylog_offsets.json";
 /// One `ssl_log_secret` argument set.
 const SECRET_MAX_BYTES: usize = 128;
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 struct KeylogEntry {
     /// GNU build-id of the target library. Empty when the ELF ships none
     /// (vendor forks often strip it); `lib_name` (+ size) is matched instead.
@@ -131,6 +131,7 @@ impl KeylogProbe {
     /// Returns the probe plus status lines for the capture log.
     pub fn attach_for_pids(uprobe_object: &Path, pids: &[u32]) -> (Self, Vec<String>) {
         let mut status = Vec::new();
+        status.extend(ensure_device_stack_tables());
         let table_result = load_table(Path::new(KEYLOG_TABLE_PATH));
         let mut entries = match &table_result {
             Ok(entries) if !entries.is_empty() => entries.clone(),
@@ -142,8 +143,9 @@ impl KeylogProbe {
                 Vec::new()
             }
         };
+        let rules = rules_table_entries();
         if entries.is_empty() {
-            entries = rules_table_entries();
+            entries = rules;
             if entries.is_empty() {
                 status.push("keylog probe: no table entries".to_owned());
                 return (
@@ -159,6 +161,15 @@ impl KeylogProbe {
                 "keylog probe: using stack-rules table ({} entries)",
                 entries.len()
             ));
+        } else {
+            let before = entries.len();
+            merge_keylog_entries(&mut entries, rules);
+            if entries.len() > before {
+                status.push(format!(
+                    "keylog probe: merged {} stack-rules entries into device overlay",
+                    entries.len() - before
+                ));
+            }
         }
         let mut handles = Vec::new();
         let mut matched_builds = Vec::new();
@@ -305,6 +316,153 @@ pub fn rules_table_entries() -> Vec<KeylogEntry> {
             note: rule.note,
         })
         .collect()
+}
+
+/// Write `tls_stacks.json` and `keylog_offsets.json` when missing or stale.
+/// Stale = schema/agent/content-hash mismatch against the embedded table.
+/// Local stacks (`source=local`) are merged after the embedded rows.
+pub fn ensure_device_stack_tables() -> Vec<String> {
+    let mut status = Vec::new();
+    let dir = Path::new("/data/local/tmp/ksight");
+    if let Err(error) = std::fs::create_dir_all(dir) {
+        status.push(format!("keylog probe: mkdir {dir:?} failed: {error}"));
+        return status;
+    }
+    let stacks = dir.join("tls_stacks.json");
+    let embedded = ksight_core::EMBEDDED_STACK_RULES;
+    let agent = env!("CARGO_PKG_VERSION");
+    let need_write = match std::fs::read_to_string(&stacks) {
+        Ok(text) => device_stack_table_stale(&text, embedded, agent),
+        Err(_) => true,
+    };
+    if need_write {
+        let payload = merge_local_stack_table(&stacks, embedded, agent);
+        let tmp = dir.join("tls_stacks.json.tmp");
+        match std::fs::write(&tmp, &payload) {
+            Ok(()) => match std::fs::rename(&tmp, &stacks) {
+                Ok(()) => status.push(format!(
+                    "keylog probe: atomically wrote tls_stacks.json schema={} agent={}",
+                    ksight_core::load_stack_rules().schema_version,
+                    agent
+                )),
+                Err(error) => status.push(format!(
+                    "keylog probe: rename tls_stacks.json failed: {error}"
+                )),
+            },
+            Err(error) => status.push(format!(
+                "keylog probe: write tls_stacks.json.tmp failed: {error}"
+            )),
+        }
+    }
+    let keylog = Path::new(KEYLOG_TABLE_PATH);
+    let entries = rules_table_entries();
+    let encoded = serde_json::to_string_pretty(&entries).ok();
+    let keylog_stale = match (std::fs::read_to_string(keylog), encoded.as_ref()) {
+        (Ok(existing), Some(fresh)) => existing != *fresh,
+        _ => true,
+    };
+    if keylog_stale {
+        if let Some(json) = encoded {
+            let tmp = dir.join("keylog_offsets.json.tmp");
+            match std::fs::write(&tmp, json) {
+                Ok(()) => match std::fs::rename(&tmp, keylog) {
+                    Ok(()) => status.push(format!(
+                        "keylog probe: atomically wrote keylog_offsets.json ({} entries)",
+                        entries.len()
+                    )),
+                    Err(error) => status.push(format!(
+                        "keylog probe: rename keylog_offsets.json failed: {error}"
+                    )),
+                },
+                Err(error) => status.push(format!(
+                    "keylog probe: write keylog_offsets.json.tmp failed: {error}"
+                )),
+            }
+        }
+    }
+    status
+}
+
+fn device_stack_table_stale(existing: &str, embedded: &str, agent: &str) -> bool {
+    let Ok(on_device) = serde_json::from_str::<serde_json::Value>(existing) else {
+        return true;
+    };
+    let Ok(want) = serde_json::from_str::<serde_json::Value>(embedded) else {
+        return false;
+    };
+    let schema = on_device
+        .get("schema_version")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let want_schema = want
+        .get("schema_version")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if schema != want_schema {
+        return true;
+    }
+    let device_agent = on_device
+        .get("agent_version")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    device_agent != agent
+}
+
+fn merge_local_stack_table(path: &Path, embedded: &str, agent: &str) -> String {
+    let mut root: serde_json::Value =
+        serde_json::from_str(embedded).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(obj) = root.as_object_mut() {
+        obj.insert(
+            "agent_version".to_owned(),
+            serde_json::Value::String(agent.to_owned()),
+        );
+    }
+    if let Ok(existing) = std::fs::read_to_string(path) {
+        if let Ok(local) = serde_json::from_str::<serde_json::Value>(&existing) {
+            let local_stacks = local
+                .get("stacks")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if let Some(stacks) = root.get_mut("stacks").and_then(|v| v.as_array_mut()) {
+                let embedded_ids: std::collections::BTreeSet<String> = stacks
+                    .iter()
+                    .filter_map(|row| row.get("id").and_then(serde_json::Value::as_str))
+                    .map(ToOwned::to_owned)
+                    .collect();
+                for row in local_stacks {
+                    let source = row
+                        .get("source")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+                    let id = row
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+                    if source == "local" && !id.is_empty() && !embedded_ids.contains(id) {
+                        stacks.push(row);
+                    } else if !id.is_empty() && embedded_ids.contains(id) && source == "local" {
+                        eprintln!("stack rule conflict id={id} source=local discarded in favor of embedded");
+                    }
+                }
+            }
+        }
+    }
+    serde_json::to_string_pretty(&root).unwrap_or_else(|_| embedded.to_owned())
+}
+
+fn merge_keylog_entries(entries: &mut Vec<KeylogEntry>, extra: Vec<KeylogEntry>) {
+    for candidate in extra {
+        let exists = entries.iter().any(|entry| {
+            entry.offset == candidate.offset
+                && entry.build_id == candidate.build_id
+                && entry.lib_name == candidate.lib_name
+                && entry.size == candidate.size
+        });
+        if !exists {
+            entries.push(candidate);
+        }
+    }
 }
 
 /// First mapped file matching the entry: build-id when given, otherwise the

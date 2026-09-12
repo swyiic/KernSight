@@ -143,7 +143,7 @@ enum DeviceCommand {
     },
     /// Copy one installed package's APK, native libraries, repaired DEX, and live images.
     PullPackage {
-        /// Exact Android package name, for example `com.sgcc.wsgw.cn`.
+        /// Exact Android package name, for example `com.example.app`.
         #[arg(long)]
         package: String,
         /// Host directory that receives `dest/<package>/`.
@@ -291,8 +291,8 @@ struct CaptureOptions {
     /// Inspect every app mapping the adapter ELF. Noisy; prefer `--package`.
     #[arg(long)]
     inspect_all_apps: bool,
-    /// Maximum plaintext bytes reconstructed per hit (hard cap 64 KiB).
-    #[arg(long, default_value_t = 4096)]
+    /// Maximum plaintext bytes reconstructed per hit (hard cap 256 KiB).
+    #[arg(long, default_value_t = 65536)]
     inspect_max_bytes: u32,
     /// Maximum Inspect hits; 0 uses the adapter default.
     #[arg(long, default_value_t = 0)]

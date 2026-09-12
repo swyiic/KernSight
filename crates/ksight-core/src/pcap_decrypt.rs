@@ -573,6 +573,28 @@ pub struct DecryptedFlow {
     pub keylog_lines: Vec<String>,
 }
 
+/// Decrypt a TLS 1.3 record stream (Inspect `tls_record` copies) using keylog
+/// secrets. Trial-opens with AES-128-GCM then AES-256-GCM. Empty when no
+/// record tag verifies — never invents plaintext.
+#[must_use]
+pub fn decrypt_tls_application_data(stream: &[u8], secrets: &[KeylogSecret]) -> Option<Vec<u8>> {
+    if stream.len() < 5 || stream.get(1).copied() != Some(0x03) {
+        return None;
+    }
+    if secrets.is_empty() {
+        return None;
+    }
+    let candidates: Vec<Vec<u8>> = secrets.iter().map(|line| line.secret.clone()).collect();
+    for key_len in [16_usize, 32_usize] {
+        let mut dir = DirectionDecryptor::new(key_len);
+        walk_tls_records(stream, &mut dir, &candidates);
+        if !dir.decrypted.is_empty() {
+            return Some(dir.decrypted);
+        }
+    }
+    None
+}
+
 /// Decrypt every flow that matches a keylog secret. `AES-GCM` suites only
 /// (`0x1301`/`0x1302`); `ChaCha20` flows are reported and skipped.
 #[must_use]
@@ -719,6 +741,12 @@ mod tests {
             .step_by(2)
             .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).expect("hex"))
             .collect()
+    }
+
+    #[test]
+    fn decrypt_tls_application_data_rejects_non_record() {
+        assert!(decrypt_tls_application_data(b"GET / HTTP/1.1\r\n\r\n", &[]).is_none());
+        assert!(decrypt_tls_application_data(&[0x17, 0x03, 0x03, 0x00, 0x01, 0xff], &[]).is_none());
     }
 
     #[test]

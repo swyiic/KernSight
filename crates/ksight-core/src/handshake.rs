@@ -337,9 +337,9 @@ mod tests {
     #[test]
     fn tls_client_hello_sni_alpn_ech() {
         let parsed =
-            parse_handshake(&client_hello("bank.example", &["h2", "http/1.1"], true)).expect("tls");
+            parse_handshake(&client_hello("app.example", &["h2", "http/1.1"], true)).expect("tls");
         assert_eq!(parsed.kind, "tls");
-        assert_eq!(parsed.sni.as_deref(), Some("bank.example"));
+        assert_eq!(parsed.sni.as_deref(), Some("app.example"));
         assert_eq!(parsed.alpn.as_deref(), Some("h2,http/1.1"));
         assert!(parsed.ech);
     }
@@ -347,10 +347,10 @@ mod tests {
     #[test]
     fn http_request_line_and_host() {
         let parsed =
-            parse_handshake(b"GET /login HTTP/1.1\r\nHost: pay.example\r\n\r\n").expect("http");
+            parse_handshake(b"GET /v1/ping HTTP/1.1\r\nHost: pay.example\r\n\r\n").expect("http");
         assert_eq!(parsed.kind, "http");
         assert_eq!(parsed.http_method.as_deref(), Some("GET"));
-        assert_eq!(parsed.http_path.as_deref(), Some("/login"));
+        assert_eq!(parsed.http_path.as_deref(), Some("/v1/ping"));
         assert_eq!(parsed.http_host.as_deref(), Some("pay.example"));
     }
 

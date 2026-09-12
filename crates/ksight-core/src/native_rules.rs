@@ -62,7 +62,7 @@ pub enum TlsLibraryKind {
     ConscryptSystem,
     /// Conscrypt JNI helper, not the `SSL_write` boundary.
     ConscryptJni,
-    /// App-private `libssl.so` / `libboringssl.so` / `libhssl`. Inspect attaches only if `SSL_write` is exported.
+    /// App-private `libssl.so` / `libboringssl.so` / `libopenssl.so` (BABASSL) / `libhssl`. Inspect attaches only if `SSL_write` is exported.
     AppLibssl,
     /// Chromium Cronet. Inspect attaches only if that ELF exports `SSL_write`.
     Cronet,
@@ -136,15 +136,19 @@ pub fn classify_tls_library_path(path: &str) -> Option<TlsLibraryKind> {
         return Some(TlsLibraryKind::ConscryptJni);
     }
     if basename.contains("mssl") || basename.contains("infosec") {
-        // 恒生 Infosec GMSSL stacks: JNI-boundary TLS (writeSSLDataNative).
+        // Vendor Infosec GMSSL stacks: JNI-boundary TLS (writeSSLDataNative).
         return Some(TlsLibraryKind::AppLibssl);
     }
     if basename.contains("hssl") || basename.contains("boringssl") {
-        // `libhssl*` (Tonghuashun) and vendor boringssl forks such as
+        // `libhssl*` and vendor boringssl forks such as
         // `libttboringssl.so` export standard `SSL_write` symbols.
         return Some(TlsLibraryKind::AppLibssl);
     }
-    if basename == "libssl.so" || basename == "libboringssl.so" || basename == "libcrypto.so" {
+    if basename == "libssl.so"
+        || basename == "libboringssl.so"
+        || basename == "libopenssl.so"
+        || basename == "libcrypto.so"
+    {
         if lower.contains("conscrypt")
             || lower.contains("/apex/com.android.conscrypt/")
             || lower.starts_with("/system/lib/libssl.so")
@@ -297,7 +301,7 @@ mod tests {
         );
         assert_eq!(
             classify_tls_library_path(
-                "/data/app/~~x==/com.hundsun.winner.pazq-y==/lib/arm64/libttboringssl.so"
+                "/data/app/~~x==/com.example.app-y==/lib/arm64/libttboringssl.so"
             ),
             Some(TlsLibraryKind::AppLibssl)
         );

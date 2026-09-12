@@ -84,7 +84,8 @@ deploy: device
 	$(ADB) push target/$(DEVICE_TARGET)/release/ksight-inject $(DEVICE_STAGE)/ksight-inject
 	$(ADB) push build/native/libksight_tls.so $(DEVICE_STAGE)/libksight_tls.so
 	$(ADB) push build/native/libksight_tls32.so $(DEVICE_STAGE)/libksight_tls32.so
-	$(ADB) shell 'su -c "mkdir -p $(DEVICE_DIR) && cp $(DEVICE_STAGE)/ksightd $(DEVICE_DIR)/ksightd.new && cp $(DEVICE_STAGE)/ksight-inject $(DEVICE_DIR)/ksight-inject && cp $(DEVICE_STAGE)/libksight_tls.so $(DEVICE_DIR)/libksight_tls.so && cp $(DEVICE_STAGE)/libksight_tls32.so $(DEVICE_DIR)/libksight_tls32.so && chown root:root $(DEVICE_DIR) $(DEVICE_DIR)/ksightd.new $(DEVICE_DIR)/ksight-inject $(DEVICE_DIR)/libksight_tls.so $(DEVICE_DIR)/libksight_tls32.so && chmod 0755 $(DEVICE_DIR) $(DEVICE_DIR)/ksightd.new $(DEVICE_DIR)/ksight-inject && chmod 0644 $(DEVICE_DIR)/libksight_tls.so $(DEVICE_DIR)/libksight_tls32.so && mv -f $(DEVICE_DIR)/ksightd.new $(DEVICE_DIR)/ksightd && $(DEVICE_DIR)/ksightd run --dry-run"'
+	$(ADB) push crates/ksight-core/src/stack_rules_default.json $(DEVICE_STAGE)/tls_stacks.json
+	$(ADB) shell 'su -c "mkdir -p $(DEVICE_DIR) && cp $(DEVICE_STAGE)/ksightd $(DEVICE_DIR)/ksightd.new && cp $(DEVICE_STAGE)/ksight-inject $(DEVICE_DIR)/ksight-inject && cp $(DEVICE_STAGE)/libksight_tls.so $(DEVICE_DIR)/libksight_tls.so && cp $(DEVICE_STAGE)/libksight_tls32.so $(DEVICE_DIR)/libksight_tls32.so && cp $(DEVICE_STAGE)/tls_stacks.json $(DEVICE_DIR)/tls_stacks.json && chown root:root $(DEVICE_DIR) $(DEVICE_DIR)/ksightd.new $(DEVICE_DIR)/ksight-inject $(DEVICE_DIR)/libksight_tls.so $(DEVICE_DIR)/libksight_tls32.so $(DEVICE_DIR)/tls_stacks.json && chmod 0755 $(DEVICE_DIR) $(DEVICE_DIR)/ksightd.new $(DEVICE_DIR)/ksight-inject && chmod 0644 $(DEVICE_DIR)/libksight_tls.so $(DEVICE_DIR)/libksight_tls32.so $(DEVICE_DIR)/tls_stacks.json && mv -f $(DEVICE_DIR)/ksightd.new $(DEVICE_DIR)/ksightd && $(DEVICE_DIR)/ksightd run --dry-run"'
 	$(ADB) shell 'rm -rf $(DEVICE_STAGE)'
 
 probe: deploy

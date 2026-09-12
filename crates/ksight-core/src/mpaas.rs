@@ -1,6 +1,6 @@
 //! Ant Financial mPaaS mobile-gateway RPC frame decoding.
 //!
-//! Alipay-family apps (pazq, ALC, bank hybrids) ride a binary gateway protocol
+//! Some apps ride a binary mPaaS gateway protocol
 //! on TLS: a short proprietary header followed by a JSON envelope
 //! (`{"cltver",..,"body":{..},"requestId":..}`), responses optionally
 //! gzip-deflated (`000133..` header then `1f 8b` or bare `{`). The frames are
@@ -90,6 +90,19 @@ fn json_string_field(json: &[u8], key: &str) -> Option<String> {
                 out.push(byte);
                 index += 1;
             }
+        } else if json
+            .get(cursor)
+            .is_some_and(|byte| byte.is_ascii_digit() || *byte == b'-')
+        {
+            let start = cursor;
+            while cursor < json.len()
+                && (json[cursor].is_ascii_digit() || matches!(json[cursor], b'-' | b'.'))
+            {
+                cursor += 1;
+            }
+            return std::str::from_utf8(&json[start..cursor])
+                .ok()
+                .map(ToOwned::to_owned);
         }
         search = pos + needle.len();
     }
@@ -139,14 +152,21 @@ pub fn parse_mpaas_request(bytes: &[u8]) -> Option<MirroredMessage> {
     }
     let request_id = json_string_field(&json, "requestId");
     let app = json_string_field(&json, "appName").unwrap_or_default();
-    let body = json_string_field(&json, "body").unwrap_or_default();
+    let op = json_string_field(&json, "operationType")
+        .or_else(|| json_string_field(&json, "operation-type"))
+        .or_else(|| json_string_field(&json, "action"));
     let mut path = String::from("/mpaas/");
     path.push_str(&app);
+    if let Some(op) = op.as_deref() {
+        if !app.is_empty() {
+            path.push('/');
+        }
+        path.push_str(op);
+    }
     if let Some(request_id) = request_id.as_deref() {
         path.push_str("?requestId=");
         path.push_str(request_id);
     }
-    let _ = body;
     Some(MirroredMessage {
         is_request: true,
         method: "POST".to_owned(),
@@ -160,6 +180,7 @@ pub fn parse_mpaas_request(bytes: &[u8]) -> Option<MirroredMessage> {
         ],
         body: json,
         websocket_upgrade: false,
+        stream_id: None,
     })
 }
 
@@ -188,6 +209,7 @@ pub fn parse_mpaas_response(bytes: &[u8]) -> Option<MirroredMessage> {
         headers: Vec::new(),
         body: json,
         websocket_upgrade: false,
+        stream_id: None,
     })
 }
 
@@ -202,7 +224,9 @@ mod tests {
         let message = parse_mpaas_request(REQUEST_FRAME).expect("request decoded");
         assert!(message.is_request);
         assert_eq!(message.method, "POST");
-        assert!(message.path.starts_with("/mpaas/AYLCAPP?requestId=ff0aa9b1"));
+        assert!(message
+            .path
+            .starts_with("/mpaas/AYLCAPP?requestId=ff0aa9b1"));
         let body = String::from_utf8(message.body.clone()).expect("json");
         assert!(body.contains("N_02B3C41765985EB8"));
         assert!(body.contains("personal_center"));

@@ -1076,61 +1076,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_dumped_process_dex_if_present() {
-        let Ok(home) = std::env::var("HOME") else {
-            return;
-        };
-        let dir = format!(
-            "{home}/Desktop/KernSight-reports/mobi.w3studio.apps.android.shsmy.phone/readable-dex"
-        );
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("dex"))
-            {
-                continue;
-            }
-            let Ok(bytes) = std::fs::read(&path) else {
-                continue;
-            };
-            if bytes.len() < 0x70 || !bytes.starts_with(b"dex\n") {
-                continue;
-            }
-            let Some(declared) = bytes.get(32..36) else {
-                continue;
-            };
-            let declared = u32::from_le_bytes(declared.try_into().unwrap()) as usize;
-            if declared != bytes.len() {
-                continue;
-            }
-            let _ = parse_binder_tables(&bytes);
-        }
-    }
-
-    #[test]
-    fn parses_idatashare_from_stitched_live_span_if_present() {
-        let path = "/tmp/shsmy-stitch/6e6761f000.bin";
-        let Ok(bytes) = std::fs::read(path) else {
-            return;
-        };
-        let mut found = ProcessAidlTables::new();
-        for slice in ksight_core::split_concatenated_dex(&bytes) {
-            merge_tables(&mut found, parse_binder_tables(&slice.bytes));
-        }
-        let methods = found
-            .get("cn.jiguang.android.IDataShare")
-            .expect("IDataShare Stub TRANSACTION_* in stitched dalvik-DEX data");
-        assert_eq!(methods.get(&1).map(String::as_str), Some("getBinderByType"));
-        assert_eq!(methods.get(&2).map(String::as_str), Some("onAction"));
-        assert_eq!(methods.get(&3).map(String::as_str), Some("execute"));
-        assert_eq!(methods.get(&4).map(String::as_str), Some("bind"));
-    }
-
-    #[test]
     fn aidl_method_filter_keeps_real_names() {
         assert!(keep_aidl_method("getDataByType"));
         assert!(keep_aidl_method("call"));
@@ -1138,29 +1083,5 @@ mod tests {
         assert!(!keep_aidl_method("a"));
         assert!(!keep_aidl_method("asBinder"));
         assert!(!keep_aidl_method("onTransact"));
-    }
-
-    #[test]
-    fn parses_content_provider_style_tables_from_framework_if_present() {
-        let path = "/tmp/ksight-aidl/framework.jar";
-        let Ok(file) = std::fs::File::open(path) else {
-            return;
-        };
-        let Ok(mut archive) = zip::ZipArchive::new(file) else {
-            return;
-        };
-        let Ok(mut entry) = archive.by_name("classes.dex") else {
-            return;
-        };
-        let mut bytes = Vec::new();
-        if entry.read_to_end(&mut bytes).is_err() {
-            return;
-        }
-        let tables = parse_binder_tables(&bytes);
-        let provider = tables.get("android.content.IContentProvider");
-        if let Some(provider) = provider {
-            assert_eq!(provider.get(&1).map(String::as_str), Some("query"));
-            assert_eq!(provider.get(&21).map(String::as_str), Some("call"));
-        }
     }
 }

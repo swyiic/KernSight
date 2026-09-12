@@ -1,4 +1,4 @@
-//! Bounded gzip/zlib inflate of Inspect buffers.
+//! Bounded gzip/zlib/brotli inflate of Inspect buffers.
 //!
 //! This is report/device-side analysis of bytes already copied at an authorized
 //! TLS/JNI boundary. It is not MITM. HTTP/2 HPACK lives in `http2`.
@@ -56,6 +56,37 @@ pub fn inflate_gzip_bounded(bytes: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
+/// Inflate brotli (`Content-Encoding: br`). Capped. Invalid input stays encoded.
+#[must_use]
+pub fn inflate_brotli_bounded(bytes: &[u8]) -> Option<Vec<u8>> {
+    if bytes.is_empty() {
+        return None;
+    }
+    read_bounded(brotli_decompressor::Decompressor::new(bytes, 4096))
+}
+
+/// Inflate an HTTP entity body when `Content-Encoding` is gzip, deflate, or br.
+#[must_use]
+pub fn inflate_http_entity(headers: &[(String, String)], body: &[u8]) -> Vec<u8> {
+    if body.is_empty() {
+        return Vec::new();
+    }
+    let encoding = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-encoding"))
+        .map(|(_, value)| value.to_ascii_lowercase());
+    let Some(encoding) = encoding else {
+        return body.to_vec();
+    };
+    if encoding.contains("br") && !encoding.contains("gzip") && !encoding.contains("deflate") {
+        return inflate_brotli_bounded(body).unwrap_or_else(|| body.to_vec());
+    }
+    if encoding.contains("gzip") || encoding.contains("deflate") {
+        return inflate_gzip_bounded(body).unwrap_or_else(|| body.to_vec());
+    }
+    body.to_vec()
+}
+
 /// Inflate gzip/zlib at the start, or after HTTP headers (`Content-Encoding: gzip`).
 #[must_use]
 pub fn inflate_inspect_buffer(bytes: &[u8]) -> Option<Vec<u8>> {
@@ -109,7 +140,7 @@ mod tests {
 
     #[test]
     fn inflates_gzip_json() {
-        let plain = br#"{"host":"ebsnew.boc.cn","path":"/api"}"#;
+        let plain = br#"{"host":"ebs.app.example","path":"/api"}"#;
         let gz = gzip_of(plain);
         assert!(looks_like_gzip(&gz));
         let inflated = inflate_gzip_bounded(&gz).expect("inflate");
@@ -118,25 +149,25 @@ mod tests {
 
     #[test]
     fn inflates_gzip_after_http_headers() {
-        let body = br#"{"list":[{"url":"https://ebsnew.boc.cn/api"}]} "#;
+        let body = br#"{"list":[{"url":"https://ebs.app.example/api"}]} "#;
         let gz = gzip_of(body);
         let mut http = b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n\r\n".to_vec();
         http.extend_from_slice(&gz);
         let inflated = inflate_inspect_buffer(&http).expect("http gzip");
         let text = String::from_utf8_lossy(&inflated);
         assert!(text.contains("HTTP/1.1 200 OK"));
-        assert!(text.contains("ebsnew.boc.cn"));
+        assert!(text.contains("ebs.app.example"));
     }
 
     #[test]
     fn inflates_truncated_gzip_prefix() {
-        let plain = br#"{"url":"https://s.thsi.cn/cd/acrossBar_v1.8.zip","more":"padding-padding-padding"}"#;
+        let plain = br#"{"url":"https://cdn.example/cd/acrossBar_v1.8.zip","more":"padding-padding-padding"}"#;
         let gz = gzip_of(plain);
         let cut = gz.len().saturating_sub(8).max(16);
         let inflated = inflate_gzip_bounded(&gz[..cut]).expect("truncated gzip");
         let text = String::from_utf8_lossy(&inflated);
         assert!(
-            text.contains("s.thsi.cn") || text.contains("acrossBar"),
+            text.contains("cdn.example") || text.contains("acrossBar"),
             "{text:?}"
         );
     }
@@ -145,6 +176,29 @@ mod tests {
     fn rejects_non_gzip() {
         assert!(inflate_gzip_bounded(b"HTTP/1.1 200 OK").is_none());
         assert!(inflate_gzip_bounded(&[0x17, 0x03, 0x03, 0x00, 0x10]).is_none());
+    }
+
+    #[test]
+    fn inflate_http_entity_gunzips_content_encoding() {
+        let gz = gzip_of(b"{\"ok\":true}");
+        let headers = vec![("Content-Encoding".to_owned(), "gzip".to_owned())];
+        assert_eq!(inflate_http_entity(&headers, &gz), b"{\"ok\":true}");
+        let identity = vec![("Content-Type".to_owned(), "text/plain".to_owned())];
+        assert_eq!(inflate_http_entity(&identity, b"hello"), b"hello");
+    }
+
+    #[test]
+    fn inflate_http_entity_decodes_brotli() {
+        // python3: brotli.compress(b"hello-br").hex()
+        let br = decode_hex_bytes("8b038068656c6c6f2d627203").expect("br vector");
+        let headers = vec![("Content-Encoding".to_owned(), "br".to_owned())];
+        assert_eq!(inflate_http_entity(&headers, &br), b"hello-br");
+        assert_eq!(
+            inflate_brotli_bounded(&br).as_deref(),
+            Some(&b"hello-br"[..])
+        );
+        let identity = vec![("Content-Encoding".to_owned(), "identity".to_owned())];
+        assert_eq!(inflate_http_entity(&identity, &br), br);
     }
 
     #[test]

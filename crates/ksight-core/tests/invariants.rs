@@ -29,7 +29,7 @@ fn policies_reject_unbounded_payloads() {
             sensor: SensorKind::Network,
             enabled: true,
             sample_one_in: 1,
-            max_payload_bytes: 65_537,
+            max_payload_bytes: 256 * 1024 + 1,
         }],
     };
     assert!(matches!(

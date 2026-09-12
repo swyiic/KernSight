@@ -11,6 +11,7 @@ license.workspace = true
 ksight-model.workspace = true
 ksight-protocol.workspace = true
 flate2.workspace = true
+brotli-decompressor.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

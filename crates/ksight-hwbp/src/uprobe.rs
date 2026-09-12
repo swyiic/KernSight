@@ -6,6 +6,10 @@
 //! - `bpf_link`：Aya 走 `perf_event` + `bpf_link`，不经过 `tracefs` 枚举
 //! - 命中即撤仍可用于 linker 单次探针；流量采集必须保持挂载并排空 perf buffer
 //! - 不 pin：进程退出即卸载，无 bpffs 残留
+//!
+//! Entry + uretprobe for `SSL_read` MUST share one loaded BPF object so the
+//! `entry_ptr` map written on entry is visible when the return probe snapshots
+//! the filled buffer. Separate `load_file` sessions left return probes blind.
 
 use std::path::Path;
 
@@ -21,12 +25,14 @@ use super::registers::RegisterContext;
 /// 一次 uprobe 采集会话。
 pub struct UprobeSession {
     bpf: Ebpf,
-    program: String,
-    link_id: Option<UProbeLinkId>,
+    /// (program name, link) pairs — one for entry-only, two for entry+return.
+    links: Vec<(String, UProbeLinkId)>,
     buffers: Vec<aya::maps::perf::PerfEventArrayBuffer<MapData>>,
     hit_once: bool,
     finished: bool,
     tgid_keys: Vec<u32>,
+    /// True when this session owns both entry and uretprobe on the same object.
+    pub paired_entry_return: bool,
     /// Total valid records drained from the perf buffers.
     pub drained_total: u64,
     /// Total records the kernel reports as lost (ring overflow).
@@ -65,28 +71,71 @@ impl UprobeSession {
         pid: Option<i32>,
         hit_once: bool,
     ) -> Result<Self> {
-        let mut bpf = Ebpf::load_file(object).context("加载 uprobe BPF 对象")?;
+        Self::start_programs(object, &[program], target, offset, pid, hit_once)
+    }
 
-        let link_id = {
-            let probe: &mut UProbe = bpf
-                .program_mut(program)
-                .with_context(|| format!("{program} 程序缺失"))?
-                .try_into()
-                .context("不是 uprobe 程序")?;
-            probe.load().context("加载 uprobe 程序")?;
-            probe
-                .attach(None, offset, target, pid)
-                .context("挂载 uprobe")?
-        };
+    /// Attach entry + uretprobe from **one** BPF load so `entry_ptr` is shared.
+    ///
+    /// Required for `SSL_read` / JNI region return snapshots. Callers should
+    /// classify hits with `RegisterContext::snapshot_at_return` (BPF sets
+    /// `aux_pad=1` on every uretprobe event).
+    ///
+    /// # Errors
+    ///
+    /// Returns when either program cannot be loaded or attached.
+    pub fn start_entry_return(
+        object: &Path,
+        target: &Path,
+        offset: u64,
+        pid: Option<i32>,
+        hit_once: bool,
+    ) -> Result<Self> {
+        Self::start_programs(
+            object,
+            &["ksight_uprobe_regs", "ksight_uretprobe_regs"],
+            target,
+            offset,
+            pid,
+            hit_once,
+        )
+    }
+
+    fn start_programs(
+        object: &Path,
+        programs: &[&str],
+        target: &Path,
+        offset: u64,
+        pid: Option<i32>,
+        hit_once: bool,
+    ) -> Result<Self> {
+        let mut bpf = Ebpf::load_file(object).context("加载 uprobe BPF 对象")?;
+        let mut links = Vec::with_capacity(programs.len());
+        for program in programs {
+            let link_id = {
+                let probe: &mut UProbe = bpf
+                    .program_mut(program)
+                    .with_context(|| format!("{program} 程序缺失"))?
+                    .try_into()
+                    .context("不是 uprobe 程序")?;
+                probe.load().context("加载 uprobe 程序")?;
+                probe
+                    .attach(None, offset, target, pid)
+                    .context("挂载 uprobe")?
+            };
+            links.push(((*program).to_owned(), link_id));
+        }
 
         let mut events = PerfEventArray::try_from(
             bpf.take_map("hwbp_events")
                 .context("hwbp_events map 缺失")?,
         )
         .context("打开 hwbp_events perf array")?;
+        // Alipay warm attach can burst SSL_read/write across BabaSSL+Cronet+Conscrypt;
+        // 128 pages/CPU overflowed (perf_lost≈1.6k / 90s). 512 pages ≈ 2MiB/CPU @4KiB.
+        const PERF_RING_PAGES: usize = 512;
         let mut buffers = Vec::new();
         for cpu in crate::cpu_list::online_cpu_ids() {
-            if let Ok(buffer) = events.open(cpu, Some(128)) {
+            if let Ok(buffer) = events.open(cpu, Some(PERF_RING_PAGES)) {
                 buffers.push(buffer);
             }
         }
@@ -94,14 +143,17 @@ impl UprobeSession {
             anyhow::bail!("failed to open uprobe perf buffers");
         }
 
+        let paired_entry_return =
+            programs.contains(&"ksight_uprobe_regs") && programs.contains(&"ksight_uretprobe_regs");
+
         Ok(Self {
             bpf,
-            program: program.to_owned(),
-            link_id: Some(link_id),
+            links,
             buffers,
             hit_once,
             finished: false,
             tgid_keys: Vec::new(),
+            paired_entry_return,
             drained_total: 0,
             lost_total: 0,
         })
@@ -187,16 +239,16 @@ impl UprobeSession {
     /// 解除 uprobe。
     fn detach(&mut self) {
         self.finished = true;
-        let Some(link_id) = self.link_id.take() else {
-            return;
-        };
-        let Some(program) = self.bpf.program_mut(&self.program) else {
-            return;
-        };
-        let Ok(probe): Result<&mut UProbe, _> = program.try_into() else {
-            return;
-        };
-        let _ = probe.detach(link_id);
+        let links = std::mem::take(&mut self.links);
+        for (program, link_id) in links {
+            let Some(prog) = self.bpf.program_mut(&program) else {
+                continue;
+            };
+            let Ok(probe): Result<&mut UProbe, _> = prog.try_into() else {
+                continue;
+            };
+            let _ = probe.detach(link_id);
+        }
     }
 }
 

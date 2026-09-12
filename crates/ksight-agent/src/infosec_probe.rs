@@ -1,6 +1,6 @@
 //! Empirical probe for vendor TLS JNI boundaries (InfosecTcp GMSSL stack).
 //!
-//! pazq's login/captcha traffic rides `libInfosecMSSL.so`'s exported
+//! Vendor GM TLS JNI traffic rides `libInfosecMSSL.so`'s exported
 //! `Java_InfosecTcp_writeSSLDataNative` / `readSSLDataNative`. The JNI argument
 //! layout is not documented, so this probe dumps registers x0-x7 plus bounded
 //! memory at each plausible pointer argument for offline layout analysis.
@@ -22,15 +22,40 @@ const FALLBACK_SYMBOLS: [&str; 4] = [
 /// One attached vendor boundary probe.
 struct InfosecHandle {
     session: UprobeSession,
+    /// Optional uretprobe session when capture_phase needs return pairing
+    /// and paired start_entry_return was unavailable.
+    ret_session: Option<UprobeSession>,
+    /// True when entry+return share one BPF load (`snapshot_at_return`).
+    paired_entry_return: bool,
     symbol: String,
     library: String,
     offset: u64,
     direction: &'static str,
     buffer_arg: Option<u8>,
     length_arg: Option<u8>,
+    output_length_arg: Option<u8>,
     connection_arg: Option<u8>,
+    stream_arg: Option<u8>,
+    capture_phase: Option<ksight_core::CapturePhase>,
+    return_semantics: Option<String>,
+    is_header: Option<bool>,
+    is_body: Option<bool>,
+    confidence: Option<String>,
     max_bytes: usize,
     learned_args: Option<(u8, u8)>,
+    /// Consistent inferences in this session for this symbol+build-id only.
+    learned_hits: u8,
+    last_inferred: Option<(u8, u8)>,
+    build_id: Option<String>,
+    /// Entry frames waiting for return when capture_phase requires pairing.
+    pending: std::collections::HashMap<(u32, u32), PendingBoundary>,
+}
+
+struct PendingBoundary {
+    buffer: u64,
+    requested: u64,
+    connection_id: Option<u64>,
+    stream_id: Option<u64>,
 }
 
 /// A decoded plaintext hit from a rule whose ABI layout is pinned.
@@ -42,8 +67,12 @@ pub struct BoundaryCapture {
     pub library: String,
     pub offset: u64,
     pub connection_id: Option<u64>,
+    pub stream_id: Option<u64>,
     pub requested: u64,
     pub bytes: Vec<u8>,
+    pub is_header: Option<bool>,
+    pub is_body: Option<bool>,
+    pub confidence: Option<String>,
 }
 
 /// Live vendor-boundary probes for one capture session.
@@ -118,42 +147,152 @@ impl InfosecProbe {
                     }) {
                         continue;
                     }
-                    match UprobeSession::start_program(
-                        uprobe_object,
-                        "ksight_uprobe_regs",
-                        Path::new(path),
-                        offset,
-                        None,
-                        false,
-                    ) {
-                        Ok(mut session) => {
-                            let _ = session.apply_tgid_filter(Some(pids));
-                            status.push(format!(
-                                "infosec probe attached {name} offset={offset:#x} lib={path}"
-                            ));
-                            handles.push(InfosecHandle {
-                                session,
-                                symbol: name.to_owned(),
-                                library: path.to_owned(),
+                    // Prefer per-function BoundaryFunction row when present.
+                    let function = ksight_core::boundary_functions()
+                        .into_iter()
+                        .find(|(_, function)| function.symbol == name)
+                        .map(|(_, function)| function);
+                    let buffer_arg = function
+                        .as_ref()
+                        .and_then(|f| f.buffer_arg)
+                        .or(boundary.buffer_arg);
+                    let length_arg = function
+                        .as_ref()
+                        .and_then(|f| f.length_arg)
+                        .or(boundary.length_arg);
+                    let connection_arg = function
+                        .as_ref()
+                        .and_then(|f| f.connection_arg)
+                        .or(boundary.connection_arg);
+                    let max_bytes = function
+                        .as_ref()
+                        .and_then(|f| f.max_bytes)
+                        .or(boundary.max_bytes)
+                        .unwrap_or(16 * 1024);
+                    let capture_phase = function.as_ref().and_then(|f| f.capture_phase);
+                    let needs_return = matches!(
+                        capture_phase,
+                        Some(ksight_core::CapturePhase::Return)
+                            | Some(ksight_core::CapturePhase::EntryAndReturn)
+                    ) || function
+                        .as_ref()
+                        .and_then(|f| f.return_semantics.as_deref())
+                        .is_some_and(|s| {
+                            let s = s.to_ascii_lowercase();
+                            s.contains("return") || s.contains("out_len")
+                        });
+                    let started = if needs_return {
+                        match UprobeSession::start_entry_return(
+                            uprobe_object,
+                            Path::new(path),
+                            offset,
+                            None,
+                            false,
+                        ) {
+                            Ok(mut session) => {
+                                let _ = session.apply_tgid_filter(Some(pids));
+                                Some((session, None, true))
+                            }
+                            Err(_) => match UprobeSession::start_program(
+                                uprobe_object,
+                                "ksight_uprobe_regs",
+                                Path::new(path),
                                 offset,
-                                direction,
-                                buffer_arg: boundary.buffer_arg,
-                                length_arg: boundary.length_arg,
-                                connection_arg: boundary.connection_arg,
-                                max_bytes: usize::try_from(boundary.max_bytes.unwrap_or(16 * 1024))
-                                    .unwrap_or(16 * 1024)
-                                    .clamp(1, 64 * 1024),
-                                learned_args: None,
-                            });
-                            status.push(format!(
-                                "vendor boundary stack={} symbol={} layout={} buffer_arg={:?} length_arg={:?}",
-                                stack.id, name, boundary.layout, boundary.buffer_arg, boundary.length_arg
-                            ));
+                                None,
+                                false,
+                            ) {
+                                Ok(mut session) => {
+                                    let _ = session.apply_tgid_filter(Some(pids));
+                                    let ret_session = UprobeSession::start_program(
+                                        uprobe_object,
+                                        "ksight_uretprobe_regs",
+                                        Path::new(path),
+                                        offset,
+                                        None,
+                                        false,
+                                    )
+                                    .ok()
+                                    .map(|mut ret| {
+                                        let _ = ret.apply_tgid_filter(Some(pids));
+                                        ret
+                                    });
+                                    Some((session, ret_session, false))
+                                }
+                                Err(error) => {
+                                    status.push(format!(
+                                        "infosec probe attach failed {name}: {error:#}"
+                                    ));
+                                    None
+                                }
+                            },
                         }
-                        Err(error) => {
-                            status.push(format!("infosec probe attach failed {name}: {error:#}"));
+                    } else {
+                        match UprobeSession::start_program(
+                            uprobe_object,
+                            "ksight_uprobe_regs",
+                            Path::new(path),
+                            offset,
+                            None,
+                            false,
+                        ) {
+                            Ok(mut session) => {
+                                let _ = session.apply_tgid_filter(Some(pids));
+                                Some((session, None, false))
+                            }
+                            Err(error) => {
+                                status.push(format!(
+                                    "infosec probe attach failed {name}: {error:#}"
+                                ));
+                                None
+                            }
                         }
-                    }
+                    };
+                    let Some((session, ret_session, paired_entry_return)) = started else {
+                        continue;
+                    };
+                    let pair_note = if paired_entry_return {
+                        " paired_entry_return=true"
+                    } else if ret_session.is_some() {
+                        " uretprobe=separate"
+                    } else {
+                        ""
+                    };
+                    status.push(format!(
+                        "infosec probe attached {name} offset={offset:#x} lib={path}{pair_note}"
+                    ));
+                    handles.push(InfosecHandle {
+                        session,
+                        ret_session,
+                        paired_entry_return,
+                        symbol: name.to_owned(),
+                        library: path.to_owned(),
+                        offset,
+                        direction,
+                        buffer_arg,
+                        length_arg,
+                        output_length_arg: function.as_ref().and_then(|f| f.output_length_arg),
+                        connection_arg,
+                        stream_arg: function.as_ref().and_then(|f| f.stream_arg),
+                        capture_phase,
+                        return_semantics: function.as_ref().and_then(|f| f.return_semantics.clone()),
+                        is_header: function.as_ref().and_then(|f| f.is_header),
+                        is_body: function.as_ref().and_then(|f| f.is_body),
+                        confidence: function.as_ref().and_then(|f| f.confidence.clone()),
+                        max_bytes: usize::try_from(max_bytes)
+                            .unwrap_or(16 * 1024)
+                            .clamp(1, 64 * 1024),
+                        learned_args: None,
+                        learned_hits: 0,
+                        last_inferred: None,
+                        build_id: None,
+                        pending: std::collections::HashMap::new(),
+                    });
+                    status.push(format!(
+                        "vendor boundary stack={} symbol={} layout={} buffer_arg={:?} length_arg={:?} phase={:?} header={:?} body={:?}",
+                        stack.id, name, boundary.layout, buffer_arg, length_arg, capture_phase,
+                        function.as_ref().and_then(|f| f.is_header),
+                        function.as_ref().and_then(|f| f.is_body)
+                    ));
                 }
             }
         }
@@ -230,10 +369,26 @@ impl InfosecProbe {
     pub fn poll_captures(&mut self) -> Vec<BoundaryCapture> {
         let mut captures = Vec::new();
         for handle in &mut self.handles {
-            let Ok(hits) = handle.session.poll_hits() else {
+            // Entry hits (and return hits when paired_entry_return).
+            let Ok(mut hits) = handle.session.poll_hits() else {
                 continue;
             };
-            for hit in hits.into_iter().take(256) {
+            hits.sort_by_key(|hit| hit.time_ns);
+            let (entry_hits, ret_hits_paired): (Vec<_>, Vec<_>) = if handle.paired_entry_return {
+                let mut entry = Vec::new();
+                let mut ret = Vec::new();
+                for hit in hits.into_iter().take(256) {
+                    if hit.snapshot_at_return {
+                        ret.push(hit);
+                    } else {
+                        entry.push(hit);
+                    }
+                }
+                (entry, ret)
+            } else {
+                (hits.into_iter().take(256).collect(), Vec::new())
+            };
+            for hit in entry_hits {
                 let args = handle
                     .buffer_arg
                     .zip(handle.length_arg)
@@ -249,6 +404,54 @@ impl InfosecProbe {
                 if buffer < 0x1000 || requested == 0 {
                     continue;
                 }
+                if handle.buffer_arg.is_none() && handle.learned_args.is_none() {
+                    let inferred = (buffer_arg, length_arg);
+                    if handle.last_inferred == Some(inferred) {
+                        handle.learned_hits = handle.learned_hits.saturating_add(1);
+                    } else {
+                        handle.last_inferred = Some(inferred);
+                        handle.learned_hits = 1;
+                    }
+                    if handle.learned_hits >= 3 {
+                        handle.learned_args = Some(inferred);
+                        eprintln!(
+                            "vendor boundary learned symbol={} build_id={} buffer=x{} length=x{} hits={}",
+                            handle.symbol,
+                            handle.build_id.as_deref().unwrap_or("-"),
+                            buffer_arg,
+                            length_arg,
+                            handle.learned_hits
+                        );
+                    }
+                }
+                let connection_id = handle
+                    .connection_arg
+                    .and_then(|index| hit.regs.get(usize::from(index)).copied())
+                    .filter(|value| *value >= 0x1000);
+                let stream_id = handle
+                    .stream_arg
+                    .and_then(|index| hit.regs.get(usize::from(index)).copied())
+                    .filter(|value| *value >= 0x1000);
+                let needs_return = handle.ret_session.is_some()
+                    || matches!(
+                        handle.capture_phase,
+                        Some(ksight_core::CapturePhase::Return)
+                            | Some(ksight_core::CapturePhase::EntryAndReturn)
+                    );
+                if needs_return {
+                    if handle.pending.len() < 256 {
+                        handle.pending.insert(
+                            (hit.pid, hit.tid),
+                            PendingBoundary {
+                                buffer,
+                                requested,
+                                connection_id,
+                                stream_id,
+                            },
+                        );
+                    }
+                    continue;
+                }
                 let want = usize::try_from(requested)
                     .unwrap_or(usize::MAX)
                     .min(handle.max_bytes);
@@ -259,20 +462,6 @@ impl InfosecProbe {
                 if bytes.is_empty() {
                     continue;
                 }
-                if handle.buffer_arg.is_none() && handle.learned_args.is_none() {
-                    handle.learned_args = Some((buffer_arg, length_arg));
-                    eprintln!(
-                        "vendor boundary learned symbol={} buffer=x{} length=x{} sample={}B",
-                        handle.symbol,
-                        buffer_arg,
-                        length_arg,
-                        bytes.len()
-                    );
-                }
-                let connection_id = handle
-                    .connection_arg
-                    .and_then(|index| hit.regs.get(usize::from(index)).copied())
-                    .filter(|value| *value >= 0x1000);
                 captures.push(BoundaryCapture {
                     pid: hit.pid,
                     tid: hit.tid,
@@ -281,8 +470,76 @@ impl InfosecProbe {
                     library: handle.library.clone(),
                     offset: handle.offset,
                     connection_id,
+                    stream_id,
                     requested,
                     bytes,
+                    is_header: handle.is_header,
+                    is_body: handle.is_body,
+                    confidence: handle.confidence.clone(),
+                });
+            }
+
+            // Return hits: paired session first, else separate uretprobe.
+            let ret_hits = if handle.paired_entry_return {
+                ret_hits_paired
+            } else {
+                let Some(ret_session) = handle.ret_session.as_mut() else {
+                    continue;
+                };
+                let Ok(hits) = ret_session.poll_hits() else {
+                    continue;
+                };
+                hits.into_iter().take(256).collect()
+            };
+            for hit in ret_hits {
+                let Some(pending) = handle.pending.remove(&(hit.pid, hit.tid)) else {
+                    continue;
+                };
+                let mut requested = pending.requested;
+                if let Some(out_arg) = handle.output_length_arg {
+                    if let Some(&out_len) = hit.regs.get(usize::from(out_arg)) {
+                        if out_len > 0 && out_len <= requested {
+                            requested = out_len;
+                        }
+                    }
+                } else if handle
+                    .return_semantics
+                    .as_deref()
+                    .is_some_and(|s| s.to_ascii_lowercase().contains("return"))
+                {
+                    let signed = hit.regs[0] as i64;
+                    if signed > 0 {
+                        requested = signed as u64;
+                    }
+                }
+                if pending.buffer < 0x1000 || requested == 0 {
+                    continue;
+                }
+                let want = usize::try_from(requested)
+                    .unwrap_or(usize::MAX)
+                    .min(handle.max_bytes);
+                let Some(bytes) =
+                    crate::inspect_runtime::read_remote_bytes(hit.pid, pending.buffer, want)
+                else {
+                    continue;
+                };
+                if bytes.is_empty() {
+                    continue;
+                }
+                captures.push(BoundaryCapture {
+                    pid: hit.pid,
+                    tid: hit.tid,
+                    adapter: format!("vendor_boundary:{}", handle.symbol),
+                    direction: handle.direction,
+                    library: handle.library.clone(),
+                    offset: handle.offset,
+                    connection_id: pending.connection_id,
+                    stream_id: pending.stream_id,
+                    requested,
+                    bytes,
+                    is_header: handle.is_header,
+                    is_body: handle.is_body,
+                    confidence: handle.confidence.clone(),
                 });
             }
         }
@@ -366,8 +623,8 @@ mod tests {
 
     #[test]
     fn boundary_learning_prefers_protocol_and_upload_prefixes() {
-        assert_eq!(boundary_sample_score(b"POST /captcha HTTP/1.1\r\n"), 100);
-        assert!(boundary_sample_score(b"{\"verifyCode\":\"1234\"}") >= 80);
+        assert_eq!(boundary_sample_score(b"POST /v1/ping HTTP/1.1\r\n"), 100);
+        assert!(boundary_sample_score(b"{\"status\":\"ok\"}") >= 80);
         assert!(boundary_sample_score(b"\xff\xd8\xff\xe0image") >= 80);
         assert_eq!(boundary_sample_score(&[0; 64]), 0);
     }

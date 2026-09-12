@@ -9,6 +9,10 @@
 /captures/
 /packages/
 /forensics/
+.overnight/
+__pycache__/
+*.py[cod]
+*.pem
 
 # Architecture and design notes stay local; publish only the repository README.
 *.md

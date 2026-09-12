@@ -260,8 +260,8 @@ struct CaptureArgs {
     /// Inspect every app mapping the adapter ELF. Noisy; prefer `--package`.
     #[arg(long)]
     inspect_all_apps: bool,
-    /// Maximum plaintext bytes reconstructed per hit (hard cap 64 KiB).
-    #[arg(long, default_value_t = 4096)]
+    /// Maximum plaintext bytes reconstructed per hit (hard cap 256 KiB).
+    #[arg(long, default_value_t = 65536)]
     inspect_max_bytes: u32,
     /// Maximum Inspect hits; 0 uses the adapter default.
     #[arg(long, default_value_t = 0)]
@@ -562,7 +562,7 @@ fn run_capture(mut args: CaptureArgs) -> Result<()> {
         max_hits: args.inspect_max_hits,
         max_duration_secs: args.inspect_max_secs,
         whole_device: args.inspect_all_apps,
-        max_payload_bytes: args.inspect_max_bytes.clamp(1, 64 * 1024),
+        max_payload_bytes: args.inspect_max_bytes.clamp(1, 256 * 1024),
         ..ksight_core::InspectPolicy::default()
     };
     ksight_agent::capture::run(CaptureRequest {
@@ -633,6 +633,12 @@ fn run_service(path: &std::path::Path, dry_run: bool) -> Result<()> {
     let config = ksight_agent::service::ServiceConfig::load(path)?;
     config.validate_runtime_paths()?;
     if dry_run {
+        #[cfg(any(target_os = "android", target_os = "linux"))]
+        {
+            for line in ksight_agent::keylog_probe::ensure_device_stack_tables() {
+                eprintln!("{line}");
+            }
+        }
         println!(
             "service configuration valid: schema={} spool={} batch_events={}",
             config.schema_version,

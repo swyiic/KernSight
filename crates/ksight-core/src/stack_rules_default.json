@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.1",
+  "schema_version": "1.3",
   "device_profiles": {
     "pixel6a-gki-6.1": {
       "kernel": "6.1.124-android14",
@@ -11,7 +11,7 @@
         "tcpdump_sll2": true,
         "uprobe_read_cap_4096": true
       },
-      "notes": "Pixel 6a (bluejay) GKI; AArch32 uprobes return ENOTSUP so 32-bit apps (国网) cannot be symbol-probed on this device; KernelSU kernel symbols visible in kallsyms (bank-grade RASP detects; needs SUSFS). tcpdump -i any emits LINKTYPE_LINUX_SLL2 (276)."
+      "notes": "Pixel 6a (bluejay) GKI; AArch32 uprobes return ENOTSUP so 32-bit ELFs cannot be symbol-probed on this device; KernelSU kernel symbols visible in kallsyms (needs SUSFS). tcpdump -i any emits LINKTYPE_LINUX_SLL2 (276)."
     }
   },
   "stacks": [
@@ -19,176 +19,2990 @@
       "id": "conscrypt_system",
       "class": "generic",
       "tier": 1,
-      "match_rules": { "path_contains": ["conscrypt"], "basename": "libssl.so" },
-      "symbols": {
-        "write": ["SSL_write", "SSL_write_ex"],
-        "read": ["SSL_read", "SSL_read_ex"],
-        "keylog": ["SSL_CTX_set_keylog_callback"]
+      "match_rules": {
+        "path_contains": [
+          "conscrypt"
+        ],
+        "basename": "libssl.so"
       },
-      "coverage": { "plaintext_copy": true, "keylog": true, "boundary_dump": false },
-      "notes": "System/Apex Conscrypt. Primary mirror path for OkHttp/Java apps (zcfwnew native layer, alipay partial). SSL_write apex offset 0x723f0 / system 0x59990 on pixel6a-gki-6.1 build 20a7471e/5bb7c9f8."
+      "symbols": {
+        "write": [
+          "SSL_write",
+          "SSL_write_ex",
+          "SSL_write_ex2"
+        ],
+        "read": [
+          "SSL_read",
+          "SSL_read_ex",
+          "SSL_read_ex2",
+          "SSL_peek",
+          "SSL_peek_ex"
+        ],
+        "keylog": [
+          "SSL_CTX_set_keylog_callback"
+        ]
+      },
+      "coverage": {
+        "plaintext_copy": true,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "System/Apex Conscrypt + sibling apex/system libssl.so with SSL_* exports. Primary mirror path for OkHttp/Java. Symbol-export attach (SSL_write/SSL_read). Pixel6a VERIFIED build-id pins (2026-09-10 overnight pull): conscrypt_268ad404 (apex conscrypt/resolv/cfginfra lib64, 489400), system_libssl_5bb7c9f8 (/system/lib64 + virt, 513920), conscrypt_5f60f4e3 (conscrypt/system lib ARM32, 326604). 2026-09-12: BIO_read/BIO_write are DEFINED in conscrypt libcrypto.so (generic BIO) and UND in libssl — never default-attach BIO. SSL_quic_read_level/SSL_quic_write_level are DEFINED on libssl but return ssl_encryption_level_t — not plaintext_probes. Unknown build-id → this generic row (still export-attach). Do NOT invent keylog offsets.",
+      "version": {
+        "kind": "stable",
+        "product": "Android Conscrypt / system libssl",
+        "upgrade_note": "export-name attach; SSL_*/ssl* names usually survive minor upgrades — re-verify dynsym if attach fails; prefer build-id pins conscrypt_268ad404 / system_libssl_5bb7c9f8 / conscrypt_5f60f4e3 when ELF known",
+        "engine_version": "BoringSSL (Conscrypt apex)"
+      }
     },
     {
       "id": "app_libssl_generic",
       "class": "vendor-fork",
       "tier": 2,
-      "match_rules": { "basename": "libssl.so" },
-      "symbols": {
-        "write": ["SSL_write", "SSL_write_ex"],
-        "read": ["SSL_read", "SSL_read_ex"],
-        "keylog": ["SSL_CTX_set_keylog_callback"]
+      "match_rules": {
+        "basename": "libssl.so"
       },
-      "coverage": { "plaintext_copy": true, "keylog": true, "boundary_dump": false },
-      "notes": "App-private OpenSSL/BoringSSL with standard exports (bankabc libssl.so = OpenSSL 3.x with SSL_new_domain/SSL_read_ex)."
+      "symbols": {
+        "write": [
+          "SSL_write",
+          "SSL_write_ex",
+          "SSL_write_ex2"
+        ],
+        "read": [
+          "SSL_read",
+          "SSL_read_ex",
+          "SSL_read_ex2",
+          "SSL_peek",
+          "SSL_peek_ex"
+        ],
+        "keylog": [
+          "SSL_CTX_set_keylog_callback"
+        ]
+      },
+      "coverage": {
+        "plaintext_copy": true,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "App-private OpenSSL/BoringSSL with standard exports (vendor libssl.so = OpenSSL 3.x with SSL_new_domain/SSL_read_ex).",
+      "version": {
+        "kind": "stable",
+        "product": "App-private OpenSSL/BoringSSL (libssl.so)",
+        "upgrade_note": "export-name attach; SSL_*/ssl* names usually survive minor upgrades — re-verify dynsym if attach fails",
+        "engine_version": "OpenSSL 3.x (when SSL_new_domain/SSL_read_ex present)"
+      }
+    },
+    {
+      "id": "openssl3_libssl_908888",
+      "class": "vendor-fork",
+      "tier": 2,
+      "match_rules": {
+        "basename": "libssl.so",
+        "size": 908888
+      },
+      "symbols": {
+        "write": [
+          "SSL_write",
+          "SSL_write_ex",
+          "SSL_write_ex2"
+        ],
+        "read": [
+          "SSL_read",
+          "SSL_read_ex",
+          "SSL_read_ex2",
+          "SSL_peek",
+          "SSL_peek_ex"
+        ],
+        "keylog": [
+          "SSL_CTX_set_keylog_callback"
+        ]
+      },
+      "coverage": {
+        "plaintext_copy": true,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "OpenSSL 3.x libssl.so size-pin 908888, no GNU build-id. Attach by export name. Size-pin only — re-verify size on upgrade. Do not invent offsets.",
+      "version": {
+        "kind": "pinned",
+        "product": "OpenSSL 3.x libssl.so (no GNU build-id)",
+        "upgrade_note": "size-pinned 908888 (no GNU build-id); attach by export name; dynsym versioned OPENSSL_3.0.0..3.5.0 — on APK upgrade re-pull ELF, confirm size+SSL_* dynsym; do not invent offsets",
+        "engine_version": "OpenSSL 3.x (dynsym tags OPENSSL_3.0.0..3.5.0)",
+        "size": 908888,
+        "verified_at": "2026-09-11"
+      }
+    },
+    {
+      "id": "stripped_libssl_405664",
+      "class": "vendor-fork",
+      "tier": 2,
+      "match_rules": {
+        "basename": "libssl.so",
+        "size": 405664
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": false,
+        "boundary_dump": false
+      },
+      "notes": "Stripped app libssl.so size-pin 405664: no GNU build-id, no DT_SYMTAB. Classify as gap so Inspect does not try SSL_write. Do not invent offsets.",
+      "version": {
+        "kind": "gap",
+        "product": "stripped libssl.so (no dynsym)",
+        "upgrade_note": "size-pinned 405664 gap; re-pull ELF on upgrade — attach only if a future build exports GLOBAL SSL_* (then new pin by size/build-id). Do not invent RVAs.",
+        "engine_version": "unknown (stripped, no DT_SYMTAB)",
+        "size": 405664,
+        "verified_at": "2026-09-06"
+      }
+    },
+    {
+      "id": "babassl_openssl",
+      "class": "vendor-fork",
+      "tier": 2,
+      "match_rules": {
+        "basename": "libopenssl.so"
+      },
+      "symbols": {
+        "write": [
+          "SSL_write",
+          "SSL_write_ex",
+          "SSL_write_ex2"
+        ],
+        "read": [
+          "SSL_read",
+          "SSL_read_ex",
+          "SSL_read_ex2",
+          "SSL_peek",
+          "SSL_peek_ex"
+        ],
+        "keylog": [
+          "SSL_CTX_set_keylog_callback"
+        ]
+      },
+      "coverage": {
+        "plaintext_copy": true,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "BABASSL fork as libopenssl.so. Exports SSL_write/SSL_read (+_ex), keylog, often SSL_set_quic_method. Pinned twin: babassl_40f1ff86 (size=2444056). Larger builds without GNU build-id use basename match only; no guessed offsets.",
+      "version": {
+        "kind": "stable",
+        "product": "Ant BABASSL (libopenssl.so)",
+        "upgrade_note": "export-name attach; SSL_*/ssl* names usually survive minor upgrades — re-verify dynsym if attach fails; pinned twin babassl_40f1ff86 (size=2444056); larger libopenssl.so ~2857704 has no GNU build-id",
+        "engine_version": "BABASSL / OpenSSL fork"
+      }
     },
     {
       "id": "libhssl",
       "class": "vendor-fork",
       "tier": 2,
-      "match_rules": { "basename_contains": ["hssl"] },
-      "symbols": {
-        "write": ["sslWrite", "sslWriteEx"],
-        "read": ["sslRead", "sslReadEx"]
+      "match_rules": {
+        "basename_contains": [
+          "hssl"
+        ]
       },
-      "coverage": { "plaintext_copy": true, "keylog": false, "boundary_dump": false },
-      "notes": "同花顺/恒生 HSSL: lowercase sslWrite/sslRead exports (v0.2.8 path). pazq/hexin carry libhssl-2.1.so sslWrite@0x1248c."
+      "symbols": {
+        "write": [
+          "sslWrite",
+          "sslWriteEx"
+        ],
+        "read": [
+          "sslRead",
+          "sslReadEx"
+        ]
+      },
+      "coverage": {
+        "plaintext_copy": true,
+        "keylog": false,
+        "boundary_dump": false
+      },
+      "notes": "vendor HSSL: lowercase sslWrite/sslRead exports (HSSL v0.2.8 path). libhssl-2.1.so size=109912 → matches pin libhssl_0f47c907 (sslWrite@0x1248c). ProbeSpec pins: sslWrite/sslRead=vendor_*; sslWriteEx/sslReadEx=openssl_ex_* (pre-P0 exact-name ABI that delivered pazq; Ex not fuzzy-mapped globally).",
+      "version": {
+        "kind": "stable",
+        "product": "vendor HSSL (sslWrite/sslRead)",
+        "upgrade_note": "export-name attach; SSL_*/ssl* names usually survive minor upgrades — re-verify dynsym if attach fails; pinned twins libhssl_c81d34ed (size=130384) + libhssl_0f47c907 (size=109912, verified 2026-09-11)",
+        "engine_version": "HSSL v0.2.8 path / libhssl-2.1.so"
+      },
+      "probes": [
+        {
+          "symbol": "sslWrite",
+          "abi": "vendor_write",
+          "direction": "send",
+          "validation_state": "enabled",
+          "architecture": "arm64"
+        },
+        {
+          "symbol": "sslWriteEx",
+          "abi": "openssl_ex_write",
+          "direction": "send",
+          "validation_state": "enabled",
+          "architecture": "arm64"
+        },
+        {
+          "symbol": "sslRead",
+          "abi": "vendor_read",
+          "direction": "recv",
+          "validation_state": "enabled",
+          "architecture": "arm64"
+        },
+        {
+          "symbol": "sslReadEx",
+          "abi": "openssl_ex_read",
+          "direction": "recv",
+          "validation_state": "enabled",
+          "architecture": "arm64"
+        }
+      ]
     },
     {
       "id": "ttboringssl",
       "class": "vendor-fork",
       "tier": 2,
-      "match_rules": { "basename_contains": ["ttboringssl"], "size": 369256 },
+      "match_rules": {
+        "basename_contains": [
+          "ttboringssl"
+        ],
+        "size": 369256
+      },
       "symbols": {
-        "write": ["SSL_write"],
-        "read": ["SSL_read"],
-        "keylog": ["SSL_CTX_set_keylog_callback"]
+        "write": [
+          "SSL_write",
+          "SSL_write_ex2"
+        ],
+        "read": [
+          "SSL_read",
+          "SSL_read_ex2",
+          "SSL_peek",
+          "SSL_peek_ex"
+        ],
+        "keylog": [
+          "SSL_CTX_set_keylog_callback"
+        ]
       },
       "keylog": {
         "offset": 359252,
         "lib_name": "libttboringssl.so",
         "size": 369256,
-        "anchors": ["CLIENT_HANDSHAKE_TRAFFIC_SECRET", "CLIENT_RANDOM"],
-        "note": "ssl_log_secret entry via label-xref (0x57b54); ELF has NO GNU build-id — match by basename+size; client_random offset not yet derived."
+        "anchors": [
+          "CLIENT_TRAFFIC_SECRET_0",
+          "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+          "SERVER_TRAFFIC_SECRET_0",
+          "CLIENT_RANDOM"
+        ],
+        "note": "ssl_log_secret entry via quic_keylog_xref multi-label BL cluster (0x57b54 / 359252, refs=4); ELF has NO GNU build-id — match by basename+size. Re-verified 2026-09-11 on this ELF (sha256=774bf979f97fecde263f91839be2f7e23293a067ed94a4801cfac7297d1cccc5); nm -D SSL_write@0x49224 SSL_read@0x48fc0 SSL_CTX_set_keylog_callback@0x4afd4. client_random struct offset not yet derived."
       },
-      "coverage": { "plaintext_copy": true, "keylog": true, "boundary_dump": false },
-      "notes": "字节系 vendor boringssl (pazq). QUIC API exports present (SSL_set_quic_method). Loads lazily — video/live SDK activation required."
+      "coverage": {
+        "plaintext_copy": true,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "ByteDance vendor BoringSSL — pin libttboringssl.so size=369256 (NO GNU build-id). QUIC API exports present (SSL_set_quic_method). Lazy-mapped. Size-gap twins: size=367512 (NO GNU build-id, keylog@0x574e0) and size=341976 (BuildID b854276c…, keylog@0x4db8c) are NOT this pin; do NOT retarget keylog offset 359252 (0x57b54). Offsets are not interchangeable across size pins.",
+      "version": {
+        "kind": "pinned",
+        "product": "ByteDance vendor BoringSSL (libttboringssl.so size=369256)",
+        "upgrade_note": "size-pinned 369256 (no GNU build-id); keylog@0x57b54 re-verified 2026-09-11 via quic_keylog_xref on this ELF — re-pull + re-xref on size change; never retarget 0x57b54 from wrong-size twins (367512 / 341976)",
+        "engine_version": "BoringSSL (tt)",
+        "size": 369256,
+        "verified_at": "2026-09-11"
+      }
+    },
+    {
+      "id": "ttboringssl_367512",
+      "class": "vendor-fork",
+      "tier": 2,
+      "match_rules": {
+        "basename_contains": [
+          "ttboringssl"
+        ],
+        "size": 367512
+      },
+      "symbols": {
+        "write": [
+          "SSL_write",
+          "SSL_write_ex2"
+        ],
+        "read": [
+          "SSL_read",
+          "SSL_read_ex2",
+          "SSL_peek",
+          "SSL_peek_ex"
+        ],
+        "keylog": [
+          "SSL_CTX_set_keylog_callback"
+        ]
+      },
+      "keylog": {
+        "offset": 357600,
+        "lib_name": "libttboringssl.so",
+        "size": 367512,
+        "anchors": [
+          "CLIENT_TRAFFIC_SECRET_0",
+          "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+          "SERVER_TRAFFIC_SECRET_0",
+          "CLIENT_RANDOM"
+        ],
+        "note": "ssl_log_secret entry via scripts/quic_keylog_xref.py multi-label BL cluster (0x574e0 / 357600, refs=4) on this ELF 2026-09-11 size=367512 sha256=5c4562576094041c0374987b14d7acb2fa9d9e6369531492a87bcb4ab39544e7. ELF has NO GNU build-id — match by basename+size. Dynsym VERIFIED: SSL_write@0x48bb0 SSL_read@0x4894c SSL_CTX_set_keylog_callback@0x4a960. Distinct from ttboringssl size=369256 keylog@359252 (0x57b54) — DO NOT retarget."
+      },
+      "coverage": {
+        "plaintext_copy": true,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "ByteDance vendor BoringSSL — size-gap twin. NO GNU build-id; libttboringssl.so size=367512. QUIC API exports present. Lazy-mapped.",
+      "version": {
+        "kind": "pinned",
+        "product": "ByteDance vendor BoringSSL (libttboringssl.so size=367512)",
+        "engine_version": "BoringSSL (tt)",
+        "size": 367512,
+        "verified_at": "2026-09-11",
+        "upgrade_note": "size-pinned 367512 (no GNU build-id); keylog@0x574e0 via quic_keylog_xref multi-label BL cluster refs=4 on this ELF 2026-09-11 — re-pull + re-xref on size change; NEVER reuse 0x57b54 or 0x4db8c from other size pins"
+      }
+    },
+    {
+      "id": "ttboringssl_b854276c",
+      "class": "vendor-fork",
+      "tier": 2,
+      "match_rules": {
+        "basename_contains": [
+          "ttboringssl"
+        ],
+        "build_id": "b854276cc5debb7f195dae237d51cef88f5ce793",
+        "size": 341976
+      },
+      "symbols": {
+        "write": [
+          "SSL_write",
+          "SSL_write_ex2"
+        ],
+        "read": [
+          "SSL_read",
+          "SSL_read_ex2",
+          "SSL_peek",
+          "SSL_peek_ex"
+        ],
+        "keylog": [
+          "SSL_CTX_set_keylog_callback"
+        ]
+      },
+      "keylog": {
+        "offset": 318348,
+        "build_id": "b854276cc5debb7f195dae237d51cef88f5ce793",
+        "lib_name": "libttboringssl.so",
+        "size": 341976,
+        "anchors": [
+          "CLIENT_TRAFFIC_SECRET_0",
+          "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+          "SERVER_TRAFFIC_SECRET_0",
+          "CLIENT_RANDOM"
+        ],
+        "note": "ssl_log_secret entry via scripts/quic_keylog_xref.py multi-label BL cluster (0x4db8c / 318348, refs=4) on this ELF 2026-09-11 BuildID[sha1]=b854276cc5debb7f195dae237d51cef88f5ce793 size=341976 sha256=0fd379978fcfe0031b1010671b2fbc3e9d3e596f6d6a7ab29e747fae3b1c4837. Dynsym VERIFIED: SSL_write@0x39948 SSL_read@0x39688 SSL_CTX_set_keylog_callback@0x3b75c. Distinct from size=369256@0x57b54 and size=367512@0x574e0."
+      },
+      "coverage": {
+        "plaintext_copy": true,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "ByteDance vendor BoringSSL — pin libttboringssl.so by build-id+size (2026-09-11). QUIC API exports present. Lazy-mapped.",
+      "version": {
+        "kind": "pinned",
+        "product": "ByteDance vendor BoringSSL (libttboringssl.so BuildID b854276c size=341976)",
+        "engine_version": "BoringSSL (tt)",
+        "build_id": "b854276cc5debb7f195dae237d51cef88f5ce793",
+        "size": 341976,
+        "verified_at": "2026-09-11",
+        "upgrade_note": "build-id+size pin; keylog@0x4db8c via quic_keylog_xref multi-label BL cluster refs=4 on this ELF 2026-09-11 — re-pull + re-xref on BuildID change; NEVER reuse 0x57b54 or 0x574e0 from other size pins"
+      }
+    },
+    {
+      "id": "ttboringssl_generic",
+      "class": "vendor-fork",
+      "tier": 3,
+      "match_rules": {
+        "basename_contains": [
+          "ttboringssl"
+        ]
+      },
+      "symbols": {
+        "write": [
+          "SSL_write",
+          "SSL_write_ex2"
+        ],
+        "read": [
+          "SSL_read",
+          "SSL_read_ex2",
+          "SSL_peek",
+          "SSL_peek_ex"
+        ]
+      },
+      "coverage": {
+        "plaintext_copy": true,
+        "keylog": false,
+        "boundary_dump": false
+      },
+      "notes": "Unpinned ByteDance libttboringssl.so (size/build-id not 369256 / 367512 / 341976). Export-name SSL_write/SSL_read attach only when dynsym present. Keylog offset MUST NOT be copied from the three pinned twins. New size/build-id pins only after multi-label xref on THAT ELF.",
+      "version": {
+        "kind": "gap",
+        "product": "ByteDance vendor BoringSSL (unpinned libttboringssl size)",
+        "upgrade_note": "coverage gap for keylog; SSL_* export attach if present. Re-classify with a size/build-id pin after quic_keylog_xref on the ELF sample — never reuse 0x57b54 / 0x574e0 / 0x4db8c from other size pins",
+        "engine_version": "BoringSSL (tt / unknown twin)"
+      }
     },
     {
       "id": "cronet",
       "class": "vendor-fork",
       "tier": 2,
-      "match_rules": { "basename_contains": ["cronet"] },
-      "symbols": {
-        "write": ["SSL_write"],
-        "read": ["SSL_read"]
+      "match_rules": {
+        "basename_contains": [
+          "cronet"
+        ]
       },
-      "coverage": { "plaintext_copy": true, "keylog": false, "boundary_dump": false },
-      "notes": "Attach only when SSL_write is exported (stable_cronet_libssl.so works; Google cronet builds are stripped)."
+      "symbols": {
+        "write": [
+          "SSL_write",
+          "SSL_write_ex2"
+        ],
+        "read": [
+          "SSL_read",
+          "SSL_read_ex2",
+          "SSL_peek",
+          "SSL_peek_ex"
+        ]
+      },
+      "coverage": {
+        "plaintext_copy": true,
+        "keylog": false,
+        "boundary_dump": false
+      },
+      "notes": "Attach only when SSL_write is exported (stable_cronet_libssl.so works; Google mainlinecronet / Reqable cronet are stripped or UND). Pixel6a VERIFIED pins: cronet_0dceef13 (lib64, 456088, bid 0dceef13…) and cronet_ccdddb35 (lib ARM32, 299240, bid ccdddb35…). libmainlinecronet.133.0.6876.3.so BuildID=8b9f871f…: SSL_* dynsym UND — coverage gap (importer of stable_cronet_libssl). libreqable_cronet.so — no SSL_* dynsym, coverage gap. No guessed offsets.",
+      "version": {
+        "kind": "stable",
+        "product": "Android Cronet stable_cronet_libssl (export attach)",
+        "upgrade_note": "export-name attach; SSL_*/ssl* names usually survive minor upgrades — re-verify dynsym if attach fails; stripped mainlinecronet/reqable = gap (see notes). Prefer cronet_0dceef13 / cronet_ccdddb35 pins",
+        "engine_version": "Cronet BoringSSL when SSL_write exported"
+      }
     },
     {
       "id": "xquic",
       "class": "vendor-fork",
       "tier": 2,
-      "match_rules": { "basename_contains": ["xquic"], "build_id": "030b5b5657a9aba1b8b4602ad200e489f7088a51" },
-      "symbols": { "write": [], "read": [] },
+      "match_rules": {
+        "basename_contains": [
+          "xquic"
+        ],
+        "build_id": "030b5b5657a9aba1b8b4602ad200e489f7088a51",
+        "size": 1201928
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
       "keylog": {
         "offset": 305616,
         "build_id": "030b5b5657a9aba1b8b4602ad200e489f7088a51",
-        "anchors": ["CLIENT_TRAFFIC_SECRET_0", "CLIENT_HANDSHAKE_TRAFFIC_SECRET", "CLIENT_RANDOM", "EXPORTER_SECRET"],
-        "note": "ssl_log_secret entry 0x4a9d0; validated attached on wandoujia libxquic. client_random struct offset pending (decryptor trial-matches instead)."
+        "anchors": [
+          "CLIENT_TRAFFIC_SECRET_0",
+          "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+          "CLIENT_RANDOM",
+          "EXPORTER_SECRET"
+        ],
+        "note": "ssl_log_secret entry 0x4a9d0; validated attached on libxquic.so size=1201928. client_random struct offset pending (decryptor trial-matches instead)."
       },
-      "coverage": { "plaintext_copy": false, "keylog": true, "boundary_dump": false },
-      "notes": "阿里 XQUIC (QUIC/HTTP3). No SSL_write surface — keylog probe is the only content path. Fires when the app actually uses QUIC."
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "Alibaba XQUIC (QUIC/HTTP3). No SSL_write surface — keylog probe is the only content path. libxquic.so size=1201928 pin confirmed 2026-09-11; keylog.offset=305616 unchanged.",
+      "version": {
+        "kind": "pinned",
+        "product": "Alibaba XQUIC",
+        "upgrade_note": "build-id pin; keylog-only path — re-pin keylog offset on new libxquic.so BuildID",
+        "engine_version": "XQUIC",
+        "build_id": "030b5b5657a9aba1b8b4602ad200e489f7088a51",
+        "size": 1201928,
+        "verified_at": "2026-09-11"
+      }
+    },
+    {
+      "id": "xquic_ff5f8bff",
+      "class": "vendor-fork",
+      "tier": 2,
+      "match_rules": {
+        "basename_contains": [
+          "xquic"
+        ],
+        "build_id": "ff5f8bff320f94bb1e04358cd63f2f86040d4687",
+        "size": 563768
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": false,
+        "boundary_dump": false
+      },
+      "notes": "libxquic.so BuildID[sha1]=ff5f8bff320f94bb1e04358cd63f2f86040d4687 size=563768 sha256=8125055e89df35d3818e5751182a51fbdff4a9ace9f6ae771537277824ca3c60. 2026-09-12 dynsym: no SSL_write/SSL_read/BIO_write; tb_SSL_quic_read_level / tb_SSL_provide_quic_data UND (companion BoringSSL). strings: NO CLIENT_*_SECRET / CLIENT_RANDOM / PRINT_SECRET / ssl_log_secret; quic_keylog_xref: No keylog labels — gap only. Do NOT invent a local write RVA or keylog RVA.",
+      "version": {
+        "kind": "gap",
+        "product": "Alibaba XQUIC (libxquic.so size=563768, no PRINT_SECRET)",
+        "upgrade_note": "build-id+size pin; keylog path ABSENT on this ELF (no CLIENT_*/PRINT_SECRET strings; only UND tb_SSL_CTX_set_keylog_callback). Need a libxquic.so that embeds XQC_PRINT_SECRET / BoringSSL keylog labels for multi-label BL cluster xref — do not invent offsets; re-pull libxquic.so on SO upgrade and re-run scripts/quic_keylog_xref.py",
+        "engine_version": "XQUIC (stripped, no PRINT_SECRET)",
+        "build_id": "ff5f8bff320f94bb1e04358cd63f2f86040d4687",
+        "size": 563768,
+        "verified_at": "2026-09-11"
+      }
     },
     {
       "id": "flutter",
       "class": "framework",
       "tier": 3,
-      "match_rules": { "basename": "libflutter.so" },
-      "symbols": { "write": [], "read": [] },
-      "keylog": {
-        "anchors": ["CLIENT_TRAFFIC_SECRET_0", "CLIENT_RANDOM"],
-        "note": "Labels present in embedded boringssl but referenced via interned table (static init), not direct call sites. Runtime writer needs dynamic anchoring — pending. Offset tables from online engine versions are forbidden (frozen constraint); per-ELF on-device derivation only."
+      "match_rules": {
+        "basename": "libflutter.so"
       },
-      "coverage": { "plaintext_copy": false, "keylog": false, "boundary_dump": false },
-      "notes": "Dart TLS via statically-linked stripped boringssl. pazq/hexin engines carry full keylog labels — anchor path exists once runtime writer is pinned."
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "keylog": {
+        "anchors": [
+          "CLIENT_TRAFFIC_SECRET_0",
+          "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+          "CLIENT_RANDOM",
+          "EXPORTER_SECRET",
+          "SERVER_TRAFFIC_SECRET_0"
+        ],
+        "note": "GENERIC FALLBACK (no build-id). Labels often survive in embedded BoringSSL; writer offset MUST be per-build via ADRP+ADD label-xref → common BL (ssl_log_secret). Never copy offsets across builds. Pipeline: libapp snapshot_hash → reFlutter enginehash → engine DEPS dart_boringssl_rev → locate ssl_log_secret / SSL_write-like anchors in THIS libflutter.so → pin a NEW stack row by build-id ONLY. See .overnight/flutter-quic-version-pipeline.md."
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": false,
+        "boundary_dump": false
+      },
+      "notes": "Dart TLS via statically-linked stripped BoringSSL. Unknown build-id = coverage gap only (this row). Versioned pins live as flutter_<buildid8> rows (xquic/tquic pattern); MatchRules::specificity ensures build-id pins win. Goal is plaintext/keylog boundaries (ssl_log_secret / SSL_write-like / Dart write path), NOT primarily verify_cert_chain MITM bypass.",
+      "version": {
+        "kind": "gap",
+        "product": "Flutter / Dart TLS (unknown build-id)",
+        "upgrade_note": "unknown build-id = gap only; pin via flutter_keylog_xref when libflutter.so BuildID known"
+      }
+    },
+    {
+      "id": "flutter_0a7fde9b",
+      "class": "framework",
+      "tier": 2,
+      "match_rules": {
+        "basename": "libflutter.so",
+        "build_id": "0a7fde9baaf490ad50a8480ebc422ea4ee862a2e",
+        "size": 11107920
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "keylog": {
+        "offset": 7433660,
+        "build_id": "0a7fde9baaf490ad50a8480ebc422ea4ee862a2e",
+        "lib_name": "libflutter.so",
+        "size": 11107920,
+        "anchors": [
+          "CLIENT_TRAFFIC_SECRET_0",
+          "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+          "CLIENT_RANDOM",
+          "EXPORTER_SECRET",
+          "SERVER_TRAFFIC_SECRET_0"
+        ],
+        "note": "ssl_log_secret entry 0x716dbc (7433660) via strings+ADRP/ADD xref without Ghidra: label VAs CLIENT_HANDSHAKE@0x1b7412 / CLIENT_TRAFFIC_0@0x1c6597 / SERVER_TRAFFIC_0@0x1c65af / EXPORTER@0x1b73e6 cluster at 0x71cbe8..0x71ccf4; each loads label into x1 then BL 0x716dbc. CLIENT_RANDOM@0x1ba90e site 0x70af88 also BL 0x716dbc. No SSL_write dynsym. Dart SDK string hint 3.10.8; snapshot_hash from paired libapp.so still needed for engine/DEPS map."
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "Flutter engine pin: libflutter.so BuildID[sha1]=0a7fde9baaf490ad50a8480ebc422ea4ee862a2e size=11107920. plaintext_copy=false (no SSL_write export). keylog=true only for THIS build-id. Other Flutter engines stay on generic flutter gap until separately pinned.",
+      "version": {
+        "kind": "pinned",
+        "product": "libflutter.so size=11107920",
+        "upgrade_note": "re-run flutter_keylog_xref on new libflutter.so",
+        "build_id": "0a7fde9baaf490ad50a8480ebc422ea4ee862a2e",
+        "size": 11107920
+      }
+    },
+    {
+      "id": "flutter_b54809ad",
+      "class": "framework",
+      "tier": 2,
+      "match_rules": {
+        "basename": "libflutter.so",
+        "build_id": "b54809ada11d3ffd5e2fd7e9f8b1da11cd3c8cd6",
+        "size": 10268216
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "keylog": {
+        "offset": 8950372,
+        "build_id": "b54809ada11d3ffd5e2fd7e9f8b1da11cd3c8cd6",
+        "lib_name": "libflutter.so",
+        "size": 10268216,
+        "anchors": [
+          "CLIENT_TRAFFIC_SECRET_0",
+          "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+          "CLIENT_RANDOM",
+          "EXPORTER_SECRET",
+          "SERVER_TRAFFIC_SECRET_0"
+        ],
+        "note": "ssl_log_secret candidate 0x889264 (8950372) via scripts/flutter_keylog_xref.py on libflutter.so. Multi-label BL cluster: CLIENT_TRAFFIC/HANDSHAKE/SERVER_TRAFFIC → 0x889264 (4 refs). CLIENT_RANDOM separate path. snapshot_hash=b528528f06be8b9066a14642a7192808. plaintext_copy=false. Pin by build-id ONLY."
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "libflutter.so BuildID[sha1]=b54809ada11d3ffd5e2fd7e9f8b1da11cd3c8cd6 size=10268216. Distinct from pin 0a7fde9b (size=11107920) and infra unstripped jars.",
+      "version": {
+        "kind": "pinned",
+        "product": "libflutter.so size=10268216",
+        "upgrade_note": "re-run flutter_keylog_xref on new libflutter.so",
+        "build_id": "b54809ada11d3ffd5e2fd7e9f8b1da11cd3c8cd6",
+        "size": 10268216,
+        "verified_at": "2026-09-10"
+      }
+    },
+    {
+      "id": "flutter_e263a16a",
+      "class": "framework",
+      "tier": 2,
+      "match_rules": {
+        "basename": "libflutter.so",
+        "build_id": "e263a16aaa8bf3e0d2b45e1cc4e6207615829b32",
+        "size": 10554680
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "keylog": {
+        "offset": 7081800,
+        "build_id": "e263a16aaa8bf3e0d2b45e1cc4e6207615829b32",
+        "lib_name": "libflutter.so",
+        "size": 10554680,
+        "anchors": [
+          "CLIENT_TRAFFIC_SECRET_0",
+          "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+          "CLIENT_RANDOM",
+          "EXPORTER_SECRET",
+          "SERVER_TRAFFIC_SECRET_0"
+        ],
+        "note": "CORRECTED 2026-09-10 loop-2139: ssl_log_secret @_ZN4bssl14ssl_log_secretE = 0x6c0f48 (7081800) from flutter_infra Flutter 3.19.6 engine c4cd48e18646 symbols.zip .symtab. Stripped artifacts SO shares identical GNU build-id+size with libflutter.so e263a16a… / size=10554680. Prior xref candidate 0x9ac63c (10143292) was a multi-label BL wrapper — same class of false positive as documented for Flutter 3.27.1 loose ADRP. Match ONLY by build-id."
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "libflutter.so BuildID[sha1]=e263a16aaa8bf3e0d2b45e1cc4e6207615829b32 size=10554680. IDENTICAL to flutter_infra Flutter 3.19.6 android-arm64-release stripped artifacts SO. 2026-09-12 dynsym re-scan: no SSL_write/SSL_read/BIO_write/quic exports. Do not invent a local write RVA. Keylog offset 0x6c0f48 from symbols.zip; 0x9ac63c is a documented false-positive wrapper. plaintext_copy=false; no plaintext_probes.",
+      "version": {
+        "kind": "pinned",
+        "product": "Flutter 3.19.6",
+        "upgrade_note": "re-run flutter_keylog_xref on new libflutter.so",
+        "build_id": "e263a16aaa8bf3e0d2b45e1cc4e6207615829b32",
+        "size": 10554680
+      }
     },
     {
       "id": "webview_chromium",
       "class": "framework",
       "tier": 3,
-      "match_rules": { "path_contains": ["webview"] },
-      "symbols": { "write": [], "read": [] },
-      "coverage": { "plaintext_copy": false, "keylog": false, "boundary_dump": false },
-      "notes": "Chromium network service inside webview.apk (H5 hybrid apps: zcfwnew captcha, GeeTest slider). No exported symbols; content path = WebView debugging or SUSFS-era approaches."
+      "match_rules": {
+        "path_contains": [
+          "webview"
+        ]
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": false,
+        "boundary_dump": false
+      },
+      "notes": "Chromium network stack inside WebView. Pixel6a 2026-09-12 dynsym on lib/arm64-v8a/libmonochrome.so (size=124193136, BuildID[sha1]=e784a0ac4a27d41670fff83eb0aa3c8a631385c8): NO SSL_write/SSL_read/BIO_write/SSL_quic_* GLOBAL dynsym (only UND OPENSSL_memory_alloc/free/get_size). Writer is non-exported. Classify-only. Do NOT invent offsets. plaintext_copy=false keylog=false.",
+      "version": {
+        "kind": "gap",
+        "product": "Android WebView Chromium (libmonochrome)",
+        "upgrade_note": "coverage gap — do not invent offsets; re-classify when a build exports GLOBAL SSL_* or a verified keylog xref exists; Pixel6a monochrome observed BuildID+size recorded from notes — no SSL_* GLOBAL dynsym",
+        "build_id": "e784a0ac4a27d41670fff83eb0aa3c8a631385c8",
+        "size": 124193136,
+        "verified_at": "2026-09-12"
+      }
     },
     {
       "id": "infosec_mssl",
       "class": "framework-vendor",
       "tier": 2,
-      "match_rules": { "basename_contains": ["infosecmssl"] },
-      "symbols": { "write": [], "read": [] },
+      "match_rules": {
+        "basename_contains": [
+          "infosecmssl"
+        ]
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
       "boundary": {
-        "write": ["Java_InfosecTcp_writeSSLDataNative", "Java_InfosecTcp_writeSSLData"],
-        "read": ["Java_InfosecTcp_readSSLDataNative", "Java_InfosecTcp_readSSLData"],
+        "write": [
+          "Java_InfosecTcp_writeSSLDataNative",
+          "Java_InfosecTcp_writeSSLData"
+        ],
+        "read": [
+          "Java_InfosecTcp_readSSLDataNative",
+          "Java_InfosecTcp_readSSLData"
+        ],
         "layout": "empirical"
       },
-      "coverage": { "plaintext_copy": false, "keylog": false, "boundary_dump": true },
-      "notes": "恒生 Infosec GMSSL (国密) — pazq login/captcha channel. JNI boundary exported; register layout empirical pending one probe run. infosec_probe dumps x0-x7 + candidate pointer memory."
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": false,
+        "boundary_dump": true
+      },
+      "notes": "Vendor Infosec GMSSL JNI boundary (InfosecTcp). Register layout empirical; probe dumps x0-x7 + candidate pointer memory. Do not invent offsets.",
+      "version": {
+        "kind": "pinned",
+        "product": "vendor Infosec GMSSL (infosecmssl JNI)",
+        "upgrade_note": "JNI boundary writeSSLDataNative/readSSLDataNative; register layout empirical — re-probe on SDK upgrade; do not invent offsets",
+        "engine_version": "Infosec GMSSL"
+      }
+    },
+    {
+      "id": "infosec_vendor_gm",
+      "class": "framework-vendor",
+      "tier": 3,
+      "match_rules": {
+        "basename_contains": [
+          "infosec4"
+        ]
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": false,
+        "boundary_dump": false
+      },
+      "notes": "Vendor Infosec GM helper (basename contains infosec4). Distinct from infosecmssl. Stripped; classify-only gap, plaintext_copy=false. Do not invent offsets.",
+      "version": {
+        "kind": "gap",
+        "product": "vendor Infosec GM helper (stripped)",
+        "upgrade_note": "coverage gap — size 2552048, no GNU build-id. Classify-only; do not invent offsets.",
+        "size": 2552048,
+        "verified_at": "2026-09-10"
+      }
     },
     {
       "id": "tnet_slightssl",
       "class": "framework-vendor",
       "tier": 3,
-      "match_rules": { "basename_contains": ["libtnet"] },
-      "symbols": { "write": [], "read": [] },
+      "match_rules": {
+        "basename_contains": [
+          "libtnet"
+        ]
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
       "boundary": {
-        "write": ["NAL_session_SendHead", "NAL_session_SendData", "NAL_session_SubmitRequest"],
+        "write": [
+          "NAL_session_SendHead",
+          "NAL_session_SendData",
+          "NAL_session_SubmitRequest"
+        ],
         "read": [],
         "layout": "empirical"
       },
-      "coverage": { "plaintext_copy": false, "keylog": false, "boundary_dump": true },
-      "notes": "阿里 TNET: keylog label strings stripped entirely (slightssl custom TLS) — keylog probe impossible; only JNI/NAI boundary capture (B-route). Wandoujia main API (w-api.pp.cn) rides this."
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": false,
+        "boundary_dump": true
+      },
+      "notes": "阿里 TNET/slightssl: keylog labels stripped — keylog impossible. Vendor app ships libtnet-4.0.0.so with SLIGHT_SSL_read only as log strings (no dynsym; .symtab stripped) and it is typically NOT mapped during gateway traffic; responses go libBifrost.so → libopenssl.so SSL_read (BABASSL). Attach SLIGHT_SSL_* only when ELF sample exports resolve — never invent offsets. Boundary NAL_session_Send* remains B-route for apps that do map libtnet.",
+      "version": {
+        "kind": "gap",
+        "product": "Alibaba TNET / slightssl (libtnet)",
+        "upgrade_note": "keylog impossible (labels stripped); attach SLIGHT_SSL_* only when ELF sample exports resolve; vendor Bifrost→BABASSL path preferred",
+        "engine_version": "slightssl (keylog labels stripped)"
+      }
     },
     {
       "id": "mbedtls",
       "class": "vendor-fork",
       "tier": 2,
-      "match_rules": { "basename_contains": ["mbedtls"] },
-      "symbols": { "write": ["mbedtls_ssl_write"], "read": ["mbedtls_ssl_read"] },
-      "coverage": { "plaintext_copy": true, "keylog": false, "boundary_dump": false },
-      "notes": "mbed TLS with standard exports."
+      "match_rules": {
+        "basename_contains": [
+          "mbedtls"
+        ]
+      },
+      "symbols": {
+        "write": [
+          "mbedtls_ssl_write"
+        ],
+        "read": [
+          "mbedtls_ssl_read"
+        ]
+      },
+      "coverage": {
+        "plaintext_copy": true,
+        "keylog": false,
+        "boundary_dump": false
+      },
+      "notes": "mbed TLS with standard exports.",
+      "version": {
+        "kind": "stable",
+        "product": "mbed TLS",
+        "upgrade_note": "export-name attach; SSL_*/ssl* names usually survive minor upgrades — re-verify dynsym if attach fails",
+        "engine_version": "mbedTLS"
+      }
     },
     {
       "id": "wolfssl",
       "class": "vendor-fork",
       "tier": 2,
-      "match_rules": { "basename_contains": ["wolfssl"] },
-      "symbols": { "write": ["wolfSSL_write"], "read": ["wolfSSL_read"] },
-      "coverage": { "plaintext_copy": true, "keylog": false, "boundary_dump": false },
-      "notes": "wolfSSL with standard exports."
+      "match_rules": {
+        "basename_contains": [
+          "wolfssl"
+        ]
+      },
+      "symbols": {
+        "write": [
+          "wolfSSL_write"
+        ],
+        "read": [
+          "wolfSSL_read"
+        ]
+      },
+      "coverage": {
+        "plaintext_copy": true,
+        "keylog": false,
+        "boundary_dump": false
+      },
+      "notes": "wolfSSL with standard exports.",
+      "version": {
+        "kind": "stable",
+        "product": "wolfSSL",
+        "upgrade_note": "export-name attach; SSL_*/ssl* names usually survive minor upgrades — re-verify dynsym if attach fails",
+        "engine_version": "wolfSSL"
+      }
     },
     {
       "id": "gmssl_tassl",
       "class": "vendor-fork",
       "tier": 2,
-      "match_rules": { "basename_contains": ["gmssl", "tassl", "smcrypto"] },
-      "symbols": { "write": ["SSL_write"], "read": ["SSL_read"] },
-      "coverage": { "plaintext_copy": true, "keylog": false, "boundary_dump": false },
-      "notes": "国密 TASSL/GmSSL forks keeping standard symbol names; content is SM-ciphered — plaintext copy yields SM4 records the standard decryptor cannot open."
+      "match_rules": {
+        "basename_contains": [
+          "gmssl",
+          "tassl",
+          "smcrypto"
+        ]
+      },
+      "symbols": {
+        "write": [
+          "SSL_write",
+          "SSL_write_ex2"
+        ],
+        "read": [
+          "SSL_read",
+          "SSL_read_ex2",
+          "SSL_peek",
+          "SSL_peek_ex"
+        ]
+      },
+      "coverage": {
+        "plaintext_copy": true,
+        "keylog": false,
+        "boundary_dump": false
+      },
+      "notes": "GmSSL/TASSL forks keeping standard SSL_* names when they are real TLS stacks. CAUTION: libgmssl.so bid a89971d3… size=783320 has NO SSL_write/SSL_read dynsym — JNI digest/cipher SDK only; name match is misleading. Attach still requires export proof at runtime. plaintext_copy=true only when SSL_write is actually exported.",
+      "version": {
+        "kind": "stable",
+        "product": "GmSSL / TASSL (国密) with SSL_* exports",
+        "upgrade_note": "export-name attach; SSL_*/ssl* names usually survive minor upgrades — re-verify dynsym if attach fails; libgmssl.so without SSL_* dynsym is NOT a TLS stack — require export proof",
+        "engine_version": "GmSSL/TASSL"
+      }
+    },
+    {
+      "id": "curl_embedded_openssl",
+      "class": "vendor-fork",
+      "tier": 3,
+      "match_rules": {
+        "basename": "libcurl.so"
+      },
+      "symbols": {
+        "write": [
+          "SSL_write",
+          "SSL_write_ex",
+          "SSL_write_ex2"
+        ],
+        "read": [
+          "SSL_read",
+          "SSL_read_ex",
+          "SSL_peek",
+          "SSL_read_ex2",
+          "SSL_peek_ex"
+        ]
+      },
+      "coverage": {
+        "plaintext_copy": true,
+        "keylog": false,
+        "boundary_dump": false
+      },
+      "notes": "Vendor curl with OpenSSL statically embedded (CCB libcurl.so size=2420584). GLOBAL dynsym has curl_easy_* only; SSL_write/SSL_read are LOCAL .symtab STT_FUNC on the ELF sample. Attach reads those LOCAL symbols from the mapped file (2026-09-11: SSL_write file offset 0xa25a8, SSL_read 0xa24d8). Product requires plaintext. Do not copy the RVA onto a different libcurl. Stripped curls without .symtab stay unattached.",
+      "version": {
+        "kind": "pinned",
+        "product": "Vendor curl with statically embedded OpenSSL",
+        "upgrade_note": "re-parse .symtab on new libcurl.so; do not reuse a previous LOCAL RVA",
+        "engine_version": "OpenSSL (LOCAL .symtab SSL_write/SSL_read)",
+        "size": 2420584,
+        "verified_at": "2026-09-11"
+      }
+    },
+    {
+      "id": "tquic_dlxx",
+      "class": "vendor-fork",
+      "tier": 2,
+      "match_rules": {
+        "basename": "libtquic.so",
+        "build_id": "2916c4a0a606c37082127aacf169a9ff26fbd20e",
+        "size": 1833968
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "keylog": {
+        "build_id": "2916c4a0a606c37082127aacf169a9ff26fbd20e",
+        "lib_name": "libtquic.so",
+        "size": 1833968,
+        "anchors": [
+          "CLIENT_TRAFFIC_SECRET_0",
+          "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+          "CLIENT_RANDOM",
+          "EXPORTER_SECRET",
+          "SERVER_TRAFFIC_SECRET_0"
+        ],
+        "note": "ssl_log_secret candidate 0x19bf70 (1687408) via scripts/quic_keylog_xref.py on libtquic.so BuildID[sha1]=2916c4a0… size=1833968. Multi-label BL cluster: CLIENT_TRAFFIC/HANDSHAKE/SERVER_TRAFFIC/CLIENT_RANDOM → 0x19bf70 (4 refs). No SSL_write dynsym. Promoted 2026-09-10 with build-id pin + multi-label evidence (same method as flutter_b54809ad). plaintext_copy=false. Soft-demoted 2026-09-10: coverage.keylog=false (attach@0x19bf70 hit unproven; offset retained).",
+        "offset": 1687408
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": false,
+        "boundary_dump": false
+      },
+      "notes": "Tencent TQUIC — libtquic.so BuildID[sha1]=2916c4a0a606c37082127aacf169a9ff26fbd20e size=1833968. keylog offset 0x19bf70 documented for THIS build-id only. Unknown tquic builds stay coverage-gap via quic_generic / separate build-id rows. Soft-demoted keylog attach 2026-09-10 (offset retained, coverage.keylog=false).",
+      "version": {
+        "kind": "pinned",
+        "product": "Tencent TQUIC (libtquic.so size=1833968)",
+        "upgrade_note": "build-id pin; keylog soft-demoted 2026-09-10 — re-verify hit-safety before coverage.keylog=true; unknown builds → quic_generic",
+        "engine_version": "TQUIC",
+        "build_id": "2916c4a0a606c37082127aacf169a9ff26fbd20e",
+        "size": 1833968,
+        "verified_at": "2026-09-11"
+      }
+    },
+    {
+      "id": "tquic_51c6aa5c",
+      "class": "vendor-fork",
+      "tier": 2,
+      "match_rules": {
+        "basename": "libtquic.so",
+        "build_id": "51c6aa5c8968df399ed2752f43b956d7c45f393e",
+        "size": 1993864
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "keylog": {
+        "build_id": "51c6aa5c8968df399ed2752f43b956d7c45f393e",
+        "lib_name": "libtquic.so",
+        "size": 1993864,
+        "anchors": [
+          "CLIENT_TRAFFIC_SECRET_0",
+          "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+          "CLIENT_RANDOM",
+          "EXPORTER_SECRET",
+          "SERVER_TRAFFIC_SECRET_0"
+        ],
+        "note": "Same label set as the size=1833968 pin; distinct build/size. No writer offset — do not guess. Public TQUIC API: quic_conn_set_keylog / set_keylog; stripped ELFs need label-xref before offset pin."
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": false,
+        "boundary_dump": false
+      },
+      "notes": "Tencent TQUIC — libtquic.so BuildID[sha1]=51c6aa5c8968df399ed2752f43b956d7c45f393e size=1993864 sha256=16211357…. Second pinned row (xquic-style version table). plaintext_copy=false.",
+      "version": {
+        "kind": "pinned",
+        "product": "Tencent TQUIC (libtquic.so size=1993864)",
+        "upgrade_note": "build-id pin; plaintext_copy=false — re-pin on new libtquic.so",
+        "engine_version": "TQUIC",
+        "build_id": "51c6aa5c8968df399ed2752f43b956d7c45f393e",
+        "size": 1993864
+      }
+    },
+    {
+      "id": "tquic_e64ce2cf",
+      "class": "vendor-fork",
+      "tier": 2,
+      "match_rules": {
+        "basename": "libtquic.so",
+        "build_id": "e64ce2cf6ffa97ef5c1d140941e31bcd9a079cd7",
+        "size": 1829008
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "keylog": {
+        "offset": 1682744,
+        "build_id": "e64ce2cf6ffa97ef5c1d140941e31bcd9a079cd7",
+        "lib_name": "libtquic.so",
+        "size": 1829008,
+        "anchors": [
+          "CLIENT_TRAFFIC_SECRET_0",
+          "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+          "CLIENT_RANDOM",
+          "EXPORTER_SECRET",
+          "SERVER_TRAFFIC_SECRET_0"
+        ],
+        "note": "ssl_log_secret candidate 0x19ad38 (1682744) via scripts/quic_keylog_xref.py on libtquic.so. Multi-label BL cluster → 0x19ad38 (4 refs). Distinct from tquic_dlxx (2916c4a0 / 1833968 / 0x19bf70). No SSL_write dynsym. Pin by build-id ONLY."
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "Tencent TQUIC — libtquic.so BuildID[sha1]=e64ce2cf6ffa97ef5c1d140941e31bcd9a079cd7 size=1829008. keylog=true for THIS build-id only.",
+      "version": {
+        "kind": "pinned",
+        "product": "Tencent TQUIC (libtquic.so size=1829008)",
+        "upgrade_note": "build-id pin; keylog for this build-id only — re-pin on upgrade",
+        "engine_version": "TQUIC",
+        "build_id": "e64ce2cf6ffa97ef5c1d140941e31bcd9a079cd7",
+        "size": 1829008
+      }
     },
     {
       "id": "quic_generic",
       "class": "generic",
       "tier": 3,
-      "match_rules": { "basename_contains": ["quic"] },
-      "symbols": { "write": [], "read": [] },
+      "match_rules": {
+        "basename_contains": [
+          "quic"
+        ]
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
       "keylog": {
-        "anchors": ["CLIENT_HANDSHAKE_TRAFFIC_SECRET"],
+        "anchors": [
+          "CLIENT_HANDSHAKE_TRAFFIC_SECRET"
+        ],
         "note": "Generic QUIC stacks: keylog probe by anchor-xref where labels survive (xquic proved the procedure)."
       },
-      "coverage": { "plaintext_copy": false, "keylog": false, "boundary_dump": false },
-      "notes": "Placeholder for ttquic/other QUIC engines; keylog anchors presence varies per vendor."
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": false,
+        "boundary_dump": false
+      },
+      "notes": "Placeholder for unknown QUIC engines (ttquic/other) and **unpinned** libtquic.so builds. Known Tencent TQUIC builds are versioned as tquic_dlxx / tquic_51c6aa5c (build-id pin). Keylog anchors presence varies; never invent offsets for unmatched builds — coverage gap only.",
+      "version": {
+        "kind": "gap",
+        "product": "Unknown/unpinned QUIC engine (ttquic/other/unpinned tquic)",
+        "upgrade_note": "coverage gap — do not invent offsets; re-classify when a build exports GLOBAL SSL_* or a verified keylog xref exists; known Tencent TQUIC rows are tquic_* build-id pins"
+      }
+    },
+    {
+      "id": "flutter_dbac22aa",
+      "class": "framework",
+      "tier": 2,
+      "match_rules": {
+        "basename": "libflutter.so",
+        "build_id": "dbac22aadb80e480bb438af805083393e8a064e7",
+        "size": 163761776
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "keylog": {
+        "offset": 7667600,
+        "build_id": "dbac22aadb80e480bb438af805083393e8a064e7",
+        "lib_name": "libflutter.so",
+        "size": 163761776,
+        "anchors": [
+          "CLIENT_TRAFFIC_SECRET_0",
+          "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+          "CLIENT_RANDOM",
+          "EXPORTER_SECRET",
+          "SERVER_TRAFFIC_SECRET_0"
+        ],
+        "note": "ssl_log_secret @_ZN4bssl14ssl_log_secretE = 0x74ff90 (7667600) from flutter_infra android-arm64-release flutter.jar (Flutter 3.44.2, engine 77e2e94772b6, dart_boringssl_rev b0ae229f686f). Derived via readelf -Ws on downloaded SO (LOCAL .symtab), NOT guessed. SSL_write LOCAL @ 0x7510cc present in this unstripped artifact; APK-stripped builds often drop .symtab — match ONLY by build_id. Caveat: jar SO includes .debug_* (~156MB); APK libflutter is typically ~8–12MB. If APK build-id differs, do NOT reuse this offset — treat as coverage gap / new pin."
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "Offline infra sample: Flutter 3.44.2 / SnapshotHash ace654289f5abc240509fc941453ebc5 / engine 77e2e94772b6eb43759e34ed1ad7da4674e19cab / dart_boringssl_rev b0ae229f686f2be70689584d1e1c6a727a2cdfab. Source: flutter_infra_release .../android-arm64-release/artifacts.zip. BuildID[sha1]=dbac22aadb80e480bb438af805083393e8a064e7 size=163761776.",
+      "version": {
+        "kind": "pinned",
+        "product": "Flutter 3.44.2",
+        "upgrade_note": "re-run flutter_keylog_xref on new libflutter.so",
+        "engine_version": "77e2e94772b6eb43759e34ed1ad7da4674e19cab",
+        "build_id": "dbac22aadb80e480bb438af805083393e8a064e7",
+        "size": 163761776
+      }
+    },
+    {
+      "id": "flutter_a72b4908",
+      "class": "framework",
+      "tier": 2,
+      "match_rules": {
+        "basename": "libflutter.so",
+        "build_id": "a72b4908c90c50249269b7bad42fea0b84978c09",
+        "size": 146732856
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "keylog": {
+        "offset": 7587784,
+        "build_id": "a72b4908c90c50249269b7bad42fea0b84978c09",
+        "lib_name": "libflutter.so",
+        "size": 146732856,
+        "anchors": [
+          "CLIENT_TRAFFIC_SECRET_0",
+          "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+          "CLIENT_RANDOM",
+          "EXPORTER_SECRET",
+          "SERVER_TRAFFIC_SECRET_0"
+        ],
+        "note": "ssl_log_secret @_ZN4bssl14ssl_log_secretE = 0x73c7c8 (7587784) from flutter_infra android-arm64-release flutter.jar (Flutter 3.41.1, engine 3452d735bd38, dart_boringssl_rev 9f138d05879f). Derived via readelf -Ws on downloaded SO (LOCAL .symtab), NOT guessed. SSL_write LOCAL @ 0x73d910 present in this unstripped artifact; APK-stripped builds often drop .symtab — match ONLY by build_id. Caveat: jar SO includes .debug_* (~139MB); APK libflutter is typically ~8–12MB. If APK build-id differs, do NOT reuse this offset — treat as coverage gap / new pin."
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "Offline infra sample: Flutter 3.41.1 / SnapshotHash 78da37fed6bf1489361a312568249f3f / engine 3452d735bd38224ef2db85ca763d862d6326b17f / dart_boringssl_rev 9f138d05879fcf61965d1ea9d6c8b2cfc8bc12cb. Source: flutter_infra_release .../android-arm64-release/artifacts.zip. BuildID[sha1]=a72b4908c90c50249269b7bad42fea0b84978c09 size=146732856.",
+      "version": {
+        "kind": "pinned",
+        "product": "Flutter 3.41.1",
+        "upgrade_note": "re-run flutter_keylog_xref on new libflutter.so",
+        "engine_version": "3452d735bd38224ef2db85ca763d862d6326b17f",
+        "build_id": "a72b4908c90c50249269b7bad42fea0b84978c09",
+        "size": 146732856
+      }
+    },
+    {
+      "id": "flutter_19c789d7",
+      "class": "framework",
+      "tier": 2,
+      "match_rules": {
+        "basename": "libflutter.so",
+        "build_id": "19c789d73f23041f9209dc31b7aa2e5f30f7fdff",
+        "size": 144312672
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "keylog": {
+        "offset": 7433660,
+        "build_id": "19c789d73f23041f9209dc31b7aa2e5f30f7fdff",
+        "lib_name": "libflutter.so",
+        "size": 144312672,
+        "anchors": [
+          "CLIENT_TRAFFIC_SECRET_0",
+          "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+          "CLIENT_RANDOM",
+          "EXPORTER_SECRET",
+          "SERVER_TRAFFIC_SECRET_0"
+        ],
+        "note": "ssl_log_secret @_ZN4bssl14ssl_log_secretE = 0x716dbc (7433660) from flutter_infra android-arm64-release flutter.jar (Flutter 3.38.4, engine a5cb96369ef8, dart_boringssl_rev 706742e482d8). Derived via readelf -Ws on downloaded SO (LOCAL .symtab), NOT guessed. SSL_write LOCAL @ 0x717ef0 present in this unstripped artifact; APK-stripped builds often drop .symtab — match ONLY by build_id. Caveat: jar SO includes .debug_* (~137MB); APK libflutter is typically ~8–12MB. If APK build-id differs, do NOT reuse this offset — treat as coverage gap / new pin."
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "Offline infra sample: Flutter 3.38.4 / SnapshotHash 1ce86630892e2dca9a8543fdb8ed8e22 / engine a5cb96369ef86c7e85abf5d662a1ca5d89775053 / dart_boringssl_rev 706742e482d89214f13a642ccfcdad596a24a32f. Source: https://storage.googleapis.com/flutter_infra_release/flutter/a5cb96369ef86c7e85abf5d662a1ca5d89775053/android-arm64-release/artifacts.zip → flutter.jar → lib/arm64-v8a/libflutter.so. BuildID[sha1]=19c789d73f23041f9209dc31b7aa2e5f30f7fdff size=144312672. Interesting: Flutter 3.38.4 offset 0x716dbc equals existing forensics pin flutter_0a7fde9b offset, but build-ids differ — keep SEPARATE rows.",
+      "version": {
+        "kind": "pinned",
+        "product": "Flutter 3.38.4",
+        "upgrade_note": "re-run flutter_keylog_xref on new libflutter.so",
+        "engine_version": "a5cb96369ef86c7e85abf5d662a1ca5d89775053",
+        "build_id": "19c789d73f23041f9209dc31b7aa2e5f30f7fdff",
+        "size": 144312672
+      }
+    },
+    {
+      "id": "flutter_e72fab63",
+      "class": "framework",
+      "tier": 2,
+      "match_rules": {
+        "basename": "libflutter.so",
+        "build_id": "e72fab63e41e9b8ee943d8a8e9cbab8b71aa013f",
+        "size": 147710216
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "keylog": {
+        "offset": 7416824,
+        "build_id": "e72fab63e41e9b8ee943d8a8e9cbab8b71aa013f",
+        "lib_name": "libflutter.so",
+        "size": 147710216,
+        "anchors": [
+          "CLIENT_TRAFFIC_SECRET_0",
+          "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+          "CLIENT_RANDOM",
+          "EXPORTER_SECRET",
+          "SERVER_TRAFFIC_SECRET_0"
+        ],
+        "note": "ssl_log_secret @_ZN4bssl14ssl_log_secretE = 0x712bf8 (7416824) from flutter_infra android-arm64-release flutter.jar (Flutter 3.35.1, engine 1e9a811bf8e7, dart_boringssl_rev be5be0a4f5eb). Derived via readelf -Ws on downloaded SO (LOCAL .symtab), NOT guessed. SSL_write LOCAL @ 0x713d74 present in this unstripped artifact; APK-stripped builds often drop .symtab — match ONLY by build_id. Caveat: jar SO includes .debug_* (~141MB); APK libflutter is typically ~8–12MB. If APK build-id differs, do NOT reuse this offset — treat as coverage gap / new pin."
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "flutter_infra pin: Flutter 3.35.1 snapshot 97ff04a728735e6b6b098bdf983faaba engine 1e9a811bf8e70466596bcf0ea3a8b5adb5f17f7f. Unknown APK build-id = coverage gap only.",
+      "version": {
+        "kind": "pinned",
+        "product": "Flutter 3.35.1",
+        "upgrade_note": "re-run flutter_keylog_xref on new libflutter.so",
+        "engine_version": "1e9a811bf8e70466596bcf0ea3a8b5adb5f17f7f",
+        "build_id": "e72fab63e41e9b8ee943d8a8e9cbab8b71aa013f",
+        "size": 147710216
+      }
+    },
+    {
+      "id": "flutter_fdf0a0a6",
+      "class": "framework",
+      "tier": 2,
+      "match_rules": {
+        "basename": "libflutter.so",
+        "build_id": "fdf0a0a6f673cdcfc6c0e5f8dc7c8828d63fb3b6",
+        "size": 165164528
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "keylog": {
+        "offset": 7838368,
+        "build_id": "fdf0a0a6f673cdcfc6c0e5f8dc7c8828d63fb3b6",
+        "lib_name": "libflutter.so",
+        "size": 165164528,
+        "anchors": [
+          "CLIENT_TRAFFIC_SECRET_0",
+          "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+          "CLIENT_RANDOM",
+          "EXPORTER_SECRET",
+          "SERVER_TRAFFIC_SECRET_0"
+        ],
+        "note": "ssl_log_secret @_ZN4bssl14ssl_log_secretE = 0x779aa0 (7838368) from flutter_infra android-arm64-release flutter.jar (Flutter 3.47-candidate.0 / stable engine.version a804b261645ef8c13eb3d5c44a5c2fb0340c5539). Derived via readelf -Ws on downloaded SO (LOCAL .symtab), NOT guessed. SSL_write LOCAL @ 0x77ac20 present in this unstripped artifact; APK-stripped builds often drop .symtab — match ONLY by build_id. Caveat: jar SO includes .debug_* (~158MB); APK libflutter is typically ~8–12MB. If APK build-id differs, do NOT reuse this offset — treat as coverage gap / new pin."
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "flutter_infra pin: Flutter 3.47-candidate.0 engine a804b261645ef8c13eb3d5c44a5c2fb0340c5539 (box stable-engine.version). Unknown APK build-id = coverage gap only.",
+      "version": {
+        "kind": "pinned",
+        "product": "Flutter 3.47-candidate.0",
+        "upgrade_note": "re-run flutter_keylog_xref on new libflutter.so",
+        "engine_version": "a804b261645ef8c13eb3d5c44a5c2fb0340c5539",
+        "build_id": "fdf0a0a6f673cdcfc6c0e5f8dc7c8828d63fb3b6",
+        "size": 165164528
+      }
+    },
+    {
+      "id": "flutter_9ec216ce",
+      "class": "framework",
+      "tier": 2,
+      "match_rules": {
+        "basename": "libflutter.so",
+        "build_id": "9ec216ce9544799f53126039938e2b66e6d4ca1a",
+        "size": 150451856
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "keylog": {
+        "offset": 7581156,
+        "build_id": "9ec216ce9544799f53126039938e2b66e6d4ca1a",
+        "lib_name": "libflutter.so",
+        "size": 150451856,
+        "anchors": [
+          "CLIENT_TRAFFIC_SECRET_0",
+          "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+          "CLIENT_RANDOM",
+          "EXPORTER_SECRET",
+          "SERVER_TRAFFIC_SECRET_0"
+        ],
+        "note": "ssl_log_secret @_ZN4bssl14ssl_log_secretE = 0x73ade4 (7581156) from flutter_infra Flutter 3.32.0 engine 18818009497c dart_boringssl_rev 8d8df26fc54f. Method: readelf -Ws on flutter_infra android-arm64-release flutter.jar SO. SSL_write LOCAL @ 0x73bf4c. Match ONLY by build_id. Caveat: jar SO includes .debug_* (~150451856 B); APK libflutter is typically ~8–12MB. If APK build-id differs, do NOT reuse this offset — treat as coverage gap / new pin."
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "flutter_infra pin: Flutter 3.32.0 snapshot 830f4f59e7969c70b595182826435c19 engine 18818009497c581ede5d8a3b8b833b81d00cebb7. Unstripped jar SO pin. Unknown APK build-id = coverage gap only.",
+      "version": {
+        "kind": "pinned",
+        "product": "Flutter 3.32.0",
+        "upgrade_note": "re-run flutter_keylog_xref on new libflutter.so",
+        "engine_version": "18818009497c581ede5d8a3b8b833b81d00cebb7",
+        "build_id": "9ec216ce9544799f53126039938e2b66e6d4ca1a",
+        "size": 150451856
+      }
+    },
+    {
+      "id": "flutter_2c0bd202",
+      "class": "framework",
+      "tier": 2,
+      "match_rules": {
+        "basename": "libflutter.so",
+        "build_id": "2c0bd20296bfcbf70a9b1f8a745bd75c64897220",
+        "size": 11057968
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "keylog": {
+        "offset": 7435548,
+        "build_id": "2c0bd20296bfcbf70a9b1f8a745bd75c64897220",
+        "lib_name": "libflutter.so",
+        "size": 11057968,
+        "anchors": [
+          "CLIENT_TRAFFIC_SECRET_0",
+          "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+          "CLIENT_RANDOM",
+          "EXPORTER_SECRET",
+          "SERVER_TRAFFIC_SECRET_0"
+        ],
+        "note": "ssl_log_secret @_ZN4bssl14ssl_log_secretE = 0x71751c (7435548) from flutter_infra Flutter 3.29.3 engine cf56914b326e dart_boringssl_rev 822902749a59. Method: symbols.zip readelf -Ws (build-id identical to stripped artifacts SO) + xref corroboration on stripped. SSL_write LOCAL @ 0x7185a4. Match ONLY by build_id. APK-sized stripped SO (~11057968 B) shares GNU build-id with symbols.zip; offset taken from symbols .symtab and applies to stripped by identical build-id."
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "flutter_infra pin: Flutter 3.29.3 snapshot d91c0e6f35f0eb2e44124e8f42aa44a7 engine cf56914b326edb0ccb123ffdc60f00060bd513fa. APK-sized stripped SO pin (preferred). Unknown APK build-id = coverage gap only.",
+      "version": {
+        "kind": "pinned",
+        "product": "Flutter 3.29.3",
+        "upgrade_note": "re-run flutter_keylog_xref on new libflutter.so",
+        "engine_version": "cf56914b326edb0ccb123ffdc60f00060bd513fa",
+        "build_id": "2c0bd20296bfcbf70a9b1f8a745bd75c64897220",
+        "size": 11057968
+      }
+    },
+    {
+      "id": "flutter_fa30a3ae",
+      "class": "framework",
+      "tier": 2,
+      "match_rules": {
+        "basename": "libflutter.so",
+        "build_id": "fa30a3aeecc8debd0d43411c85ed486060157f89",
+        "size": 10814192
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "keylog": {
+        "offset": 7228024,
+        "build_id": "fa30a3aeecc8debd0d43411c85ed486060157f89",
+        "lib_name": "libflutter.so",
+        "size": 10814192,
+        "anchors": [
+          "CLIENT_TRAFFIC_SECRET_0",
+          "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+          "CLIENT_RANDOM",
+          "EXPORTER_SECRET",
+          "SERVER_TRAFFIC_SECRET_0"
+        ],
+        "note": "ssl_log_secret @_ZN4bssl14ssl_log_secretE = 0x6e4a78 (7228024) from flutter_infra Flutter 3.27.1 engine cb4b5fff7385 dart_boringssl_rev 2db0eb3f96a5. Method: symbols.zip readelf -Ws (build-id identical to stripped artifacts SO). Loose ADRP xref mis-picked 0x9e7114 wrapper — do NOT use that.. SSL_write LOCAL @ 0x6e5a54. Match ONLY by build_id. APK-sized stripped SO (~10814192 B) shares GNU build-id with symbols.zip; offset taken from symbols .symtab and applies to stripped by identical build-id."
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "flutter_infra pin: Flutter 3.27.1 snapshot f956f595844a2f845a55707faaaa51e4 engine cb4b5fff73850b2e42bd4de7cb9a4310a78ac40d. APK-sized stripped SO pin (preferred). Unknown APK build-id = coverage gap only.",
+      "version": {
+        "kind": "pinned",
+        "product": "Flutter 3.27.1",
+        "upgrade_note": "re-run flutter_keylog_xref on new libflutter.so",
+        "engine_version": "cb4b5fff73850b2e42bd4de7cb9a4310a78ac40d",
+        "build_id": "fa30a3aeecc8debd0d43411c85ed486060157f89",
+        "size": 10814192
+      }
+    },
+    {
+      "id": "flutter_d9a7f562",
+      "class": "framework",
+      "tier": 2,
+      "match_rules": {
+        "basename": "libflutter.so",
+        "build_id": "d9a7f562e5595e9913262ba4b5026a0df242ccfd",
+        "size": 10714128
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "keylog": {
+        "offset": 7176348,
+        "build_id": "d9a7f562e5595e9913262ba4b5026a0df242ccfd",
+        "lib_name": "libflutter.so",
+        "size": 10714128,
+        "anchors": [
+          "CLIENT_TRAFFIC_SECRET_0",
+          "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+          "CLIENT_RANDOM",
+          "EXPORTER_SECRET",
+          "SERVER_TRAFFIC_SECRET_0"
+        ],
+        "note": "ssl_log_secret @_ZN4bssl14ssl_log_secretE = 0x6d809c (7176348) from flutter_infra Flutter 3.24.0 engine b8800d88be48 dart_boringssl_rev 9c7294fd5826. Method: symbols.zip readelf -Ws (build-id identical to stripped artifacts SO). SSL_write LOCAL @ 0x6d9060. Match ONLY by build_id. APK-sized stripped SO (~10714128 B) shares GNU build-id with symbols.zip; offset taken from symbols .symtab and applies to stripped by identical build-id."
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "flutter_infra pin: Flutter 3.24.0 snapshot 80a49c7111088100a233b2ae788e1f48 engine b8800d88be4866db1b15f8b954ab2573bba9960f. APK-sized stripped SO pin (preferred). Unknown APK build-id = coverage gap only.",
+      "version": {
+        "kind": "pinned",
+        "product": "Flutter 3.24.0",
+        "upgrade_note": "re-run flutter_keylog_xref on new libflutter.so",
+        "engine_version": "b8800d88be4866db1b15f8b954ab2573bba9960f",
+        "build_id": "d9a7f562e5595e9913262ba4b5026a0df242ccfd",
+        "size": 10714128
+      }
+    },
+    {
+      "id": "flutter_3b363e6e",
+      "class": "framework",
+      "tier": 2,
+      "match_rules": {
+        "basename": "libflutter.so",
+        "build_id": "3b363e6ebb9a868301a94aa52eb28f35b3e38a20",
+        "size": 10601880
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "keylog": {
+        "offset": 7135204,
+        "build_id": "3b363e6ebb9a868301a94aa52eb28f35b3e38a20",
+        "lib_name": "libflutter.so",
+        "size": 10601880,
+        "anchors": [
+          "CLIENT_TRAFFIC_SECRET_0",
+          "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+          "CLIENT_RANDOM",
+          "EXPORTER_SECRET",
+          "SERVER_TRAFFIC_SECRET_0"
+        ],
+        "note": "ssl_log_secret @_ZN4bssl14ssl_log_secretE = 0x6cdfe4 (7135204) from flutter_infra Flutter 3.22.0 engine f6344b75dcf8 dart_boringssl_rev 9c7294fd5826. Method: symbols.zip readelf -Ws (build-id identical to stripped artifacts SO). SSL_write LOCAL @ 0x6cefa0. Match ONLY by build_id. APK-sized stripped SO (~10601880 B) shares GNU build-id with symbols.zip; offset taken from symbols .symtab and applies to stripped by identical build-id."
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "flutter_infra pin: Flutter 3.22.0 snapshot d20a1be77c3d3c41b2a5accaee1ce549 engine f6344b75dcf861d8bf1f1322780b8811f982e31a. APK-sized stripped SO pin (preferred). Unknown APK build-id = coverage gap only.",
+      "version": {
+        "kind": "pinned",
+        "product": "Flutter 3.22.0",
+        "upgrade_note": "re-run flutter_keylog_xref on new libflutter.so",
+        "engine_version": "f6344b75dcf861d8bf1f1322780b8811f982e31a",
+        "build_id": "3b363e6ebb9a868301a94aa52eb28f35b3e38a20",
+        "size": 10601880
+      }
+    },
+    {
+      "id": "flutter_3514e66b",
+      "class": "framework",
+      "tier": 2,
+      "match_rules": {
+        "basename": "libflutter.so",
+        "build_id": "3514e66bbee2689909245c0b27f3f66a56add544",
+        "size": 10555800
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "keylog": {
+        "offset": 7082012,
+        "build_id": "3514e66bbee2689909245c0b27f3f66a56add544",
+        "lib_name": "libflutter.so",
+        "size": 10555800,
+        "anchors": [
+          "CLIENT_TRAFFIC_SECRET_0",
+          "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+          "CLIENT_RANDOM",
+          "EXPORTER_SECRET",
+          "SERVER_TRAFFIC_SECRET_0"
+        ],
+        "note": "ssl_log_secret @_ZN4bssl14ssl_log_secretE = 0x6c101c (7082012) from flutter_infra Flutter 3.19.0 engine 04817c99c9fd dart_boringssl_rev a468ba9fec3f. Method: symbols.zip readelf -Ws (build-id identical to stripped artifacts SO). SSL_write LOCAL @ 0x6c1fe4. Match ONLY by build_id. APK-sized stripped SO (~10555800 B) shares GNU build-id with symbols.zip; offset taken from symbols .symtab and applies to stripped by identical build-id."
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "flutter_infra pin: Flutter 3.19.0 snapshot ee1eb666c76a5cb7746faf39d0b97547 engine 04817c99c9fd4956f27505204f7e344335810aed. APK-sized stripped SO pin (preferred). Unknown APK build-id = coverage gap only.",
+      "version": {
+        "kind": "pinned",
+        "product": "Flutter 3.19.0",
+        "upgrade_note": "re-run flutter_keylog_xref on new libflutter.so",
+        "engine_version": "04817c99c9fd4956f27505204f7e344335810aed",
+        "build_id": "3514e66bbee2689909245c0b27f3f66a56add544",
+        "size": 10555800
+      }
+    },
+    {
+      "id": "flutter_a346b27d",
+      "class": "framework",
+      "tier": 2,
+      "match_rules": {
+        "basename": "libflutter.so",
+        "build_id": "a346b27d0ec2c209b948fa05ad2f255e5bedc592",
+        "size": 10551304
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "keylog": {
+        "offset": 6268000,
+        "build_id": "a346b27d0ec2c209b948fa05ad2f255e5bedc592",
+        "lib_name": "libflutter.so",
+        "size": 10551304,
+        "anchors": [
+          "CLIENT_TRAFFIC_SECRET_0",
+          "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+          "CLIENT_RANDOM",
+          "EXPORTER_SECRET",
+          "SERVER_TRAFFIC_SECRET_0"
+        ],
+        "note": "ssl_log_secret @_ZN4bssl14ssl_log_secretE = 0x5fa460 (6268000) from flutter_infra Flutter 3.16.0 engine 74d16627b940 dart_boringssl_rev 74646566e93d. Method: symbols.zip readelf -Ws (build-id identical to stripped artifacts SO). SSL_write LOCAL @ 0x5fb45c. Match ONLY by build_id. APK-sized stripped SO (~10551304 B) shares GNU build-id with symbols.zip; offset taken from symbols .symtab and applies to stripped by identical build-id."
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "flutter_infra pin: Flutter 3.16.0 snapshot f71c76320d35b65f1164dbaa6d95fe09 engine 74d16627b940bb15e50891f82cad6c3e3465bd6d. APK-sized stripped SO pin (preferred). Unknown APK build-id = coverage gap only.",
+      "version": {
+        "kind": "pinned",
+        "product": "Flutter 3.16.0",
+        "upgrade_note": "re-run flutter_keylog_xref on new libflutter.so",
+        "engine_version": "74d16627b940bb15e50891f82cad6c3e3465bd6d",
+        "build_id": "a346b27d0ec2c209b948fa05ad2f255e5bedc592",
+        "size": 10551304
+      }
+    },
+    {
+      "id": "flutter_ee72ba45",
+      "class": "framework",
+      "tier": 2,
+      "match_rules": {
+        "basename": "libflutter.so",
+        "build_id": "ee72ba453ac1f88753c40758d302dcca1c487a8d",
+        "size": 10464784
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "keylog": {
+        "offset": 6130432,
+        "build_id": "ee72ba453ac1f88753c40758d302dcca1c487a8d",
+        "lib_name": "libflutter.so",
+        "size": 10464784,
+        "anchors": [
+          "CLIENT_TRAFFIC_SECRET_0",
+          "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+          "CLIENT_RANDOM",
+          "EXPORTER_SECRET",
+          "SERVER_TRAFFIC_SECRET_0"
+        ],
+        "note": "ssl_log_secret @_ZN4bssl14ssl_log_secretE = 0x5d8b00 (6130432) from flutter_infra Flutter 3.13.9 engine 0545f8705df3 dart_boringssl_rev 74646566e93d. Method: symbols.zip readelf -Ws (build-id identical to stripped artifacts SO). SSL_write LOCAL @ 0x5d9b20. Match ONLY by build_id. APK-sized stripped SO (~10464784 B) shares GNU build-id with symbols.zip; offset taken from symbols .symtab and applies to stripped by identical build-id."
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "flutter_infra pin: Flutter 3.13.9 snapshot 7dbbeeb8ef7b91338640dca3927636de engine 0545f8705df301877d787107bac1a6e9fc9ee1ad. APK-sized stripped SO pin (preferred). Unknown APK build-id = coverage gap only.",
+      "version": {
+        "kind": "pinned",
+        "product": "Flutter 3.13.9",
+        "upgrade_note": "re-run flutter_keylog_xref on new libflutter.so",
+        "engine_version": "0545f8705df301877d787107bac1a6e9fc9ee1ad",
+        "build_id": "ee72ba453ac1f88753c40758d302dcca1c487a8d",
+        "size": 10464784
+      }
+    },
+    {
+      "id": "flutter_77e2e33e",
+      "class": "framework",
+      "tier": 2,
+      "match_rules": {
+        "basename": "libflutter.so",
+        "build_id": "77e2e33e77cbb489a5e1455de0d14cae06063f30",
+        "size": 10121192
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "keylog": {
+        "offset": 5908048,
+        "build_id": "77e2e33e77cbb489a5e1455de0d14cae06063f30",
+        "lib_name": "libflutter.so",
+        "size": 10121192,
+        "anchors": [
+          "CLIENT_TRAFFIC_SECRET_0",
+          "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+          "CLIENT_RANDOM",
+          "EXPORTER_SECRET",
+          "SERVER_TRAFFIC_SECRET_0"
+        ],
+        "note": "ssl_log_secret @_ZN4bssl14ssl_log_secretE = 0x5a2650 (5908048) from flutter_infra Flutter 3.10.4 engine 2a3401c9bbb5 dart_boringssl_rev 87f316d77482. Method: symbols.zip readelf -Ws (build-id identical to stripped artifacts SO). SSL_write LOCAL @ 0x5a3694. Match ONLY by build_id. APK-sized stripped SO (~10121192 B) shares GNU build-id with symbols.zip; offset taken from symbols .symtab and applies to stripped by identical build-id."
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "flutter_infra pin: Flutter 3.10.4 snapshot 90b56a561f70cd55e972cb49b79b3d8b engine 2a3401c9bbb5a9a9aec74d4f735d18a9dd3ebf2d. APK-sized stripped SO pin (preferred). Unknown APK build-id = coverage gap only.",
+      "version": {
+        "kind": "pinned",
+        "product": "Flutter 3.10.4",
+        "upgrade_note": "re-run flutter_keylog_xref on new libflutter.so",
+        "engine_version": "2a3401c9bbb5a9a9aec74d4f735d18a9dd3ebf2d",
+        "build_id": "77e2e33e77cbb489a5e1455de0d14cae06063f30",
+        "size": 10121192
+      }
+    },
+    {
+      "id": "flutter_2499ab71",
+      "class": "framework",
+      "tier": 2,
+      "match_rules": {
+        "basename": "libflutter.so",
+        "build_id": "2499ab71903c7fc0293385fe61c2b93020281bb1",
+        "size": 10081064
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "keylog": {
+        "offset": 5874260,
+        "build_id": "2499ab71903c7fc0293385fe61c2b93020281bb1",
+        "lib_name": "libflutter.so",
+        "size": 10081064,
+        "anchors": [
+          "CLIENT_TRAFFIC_SECRET_0",
+          "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+          "CLIENT_RANDOM",
+          "EXPORTER_SECRET",
+          "SERVER_TRAFFIC_SECRET_0"
+        ],
+        "note": "ssl_log_secret @_ZN4bssl14ssl_log_secretE = 0x59a254 (5874260) from flutter_infra Flutter 3.12.0 engine b84ad1ad30cc dart_boringssl_rev 74646566e93d. Method: symbols.zip readelf -Ws (build-id identical to stripped artifacts SO). SSL_write LOCAL @ 0x59b278. Match ONLY by build_id. APK-sized stripped SO (~10081064 B) shares GNU build-id with symbols.zip; offset taken from symbols .symtab and applies to stripped by identical build-id."
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "flutter_infra pin: Flutter 3.12.0 snapshot 16ad76edd19b537bf6ea64fdd31977a7 engine b84ad1ad30cca8d303b4bcb2bbd77573e4d66122. APK-sized stripped SO pin (preferred). Unknown APK build-id = coverage gap only.",
+      "version": {
+        "kind": "pinned",
+        "product": "Flutter 3.12.0",
+        "upgrade_note": "re-run flutter_keylog_xref on new libflutter.so",
+        "engine_version": "b84ad1ad30cca8d303b4bcb2bbd77573e4d66122",
+        "build_id": "2499ab71903c7fc0293385fe61c2b93020281bb1",
+        "size": 10081064
+      }
+    },
+    {
+      "id": "flutter_e2cee5df",
+      "class": "framework",
+      "tier": 2,
+      "match_rules": {
+        "basename": "libflutter.so",
+        "build_id": "e2cee5df08eb06fb5b2583dee4f7ebc789c88cd1",
+        "size": 10051936
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "keylog": {
+        "offset": 5844140,
+        "build_id": "e2cee5df08eb06fb5b2583dee4f7ebc789c88cd1",
+        "lib_name": "libflutter.so",
+        "size": 10051936,
+        "anchors": [
+          "CLIENT_TRAFFIC_SECRET_0",
+          "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+          "CLIENT_RANDOM",
+          "EXPORTER_SECRET",
+          "SERVER_TRAFFIC_SECRET_0"
+        ],
+        "note": "ssl_log_secret @_ZN4bssl14ssl_log_secretE = 0x592cac (5844140) from flutter_infra Flutter 3.7.12 engine 1a65d409c7a1 dart_boringssl_rev 87f316d77482. Method: symbols.zip readelf -Ws (build-id identical to stripped artifacts SO). SSL_write LOCAL @ 0x593d00. Match ONLY by build_id. APK-sized stripped SO (~10051936 B) shares GNU build-id with symbols.zip; offset taken from symbols .symtab and applies to stripped by identical build-id."
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "flutter_infra pin: Flutter 3.7.12 snapshot adb4292f3ec25074ca70abcd2d5c7251 engine 1a65d409c7a1438a34d21b60bf30a6fd5db59314. APK-sized stripped SO pin (preferred). Unknown APK build-id = coverage gap only.",
+      "version": {
+        "kind": "pinned",
+        "product": "Flutter 3.7.12",
+        "upgrade_note": "re-run flutter_keylog_xref on new libflutter.so",
+        "engine_version": "1a65d409c7a1438a34d21b60bf30a6fd5db59314",
+        "build_id": "e2cee5df08eb06fb5b2583dee4f7ebc789c88cd1",
+        "size": 10051936
+      }
+    },
+    {
+      "id": "flutter_5ffc6abf",
+      "class": "framework",
+      "tier": 2,
+      "match_rules": {
+        "basename": "libflutter.so",
+        "build_id": "5ffc6abf92a283bcbdcefeb718b87b0faa33aa64",
+        "size": 9936912
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "keylog": {
+        "offset": 4051864,
+        "build_id": "5ffc6abf92a283bcbdcefeb718b87b0faa33aa64",
+        "lib_name": "libflutter.so",
+        "size": 9936912,
+        "anchors": [
+          "CLIENT_TRAFFIC_SECRET_0",
+          "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+          "CLIENT_RANDOM",
+          "EXPORTER_SECRET",
+          "SERVER_TRAFFIC_SECRET_0"
+        ],
+        "note": "ssl_log_secret @_ZN4bssl14ssl_log_secretE = 0x3dd398 (4051864) from flutter_infra Flutter 3.3.10 engine 3316dd872841 dart_boringssl_rev 87f316d77482. Method: symbols.zip readelf -Ws (build-id identical to stripped artifacts SO). SSL_write LOCAL @ 0x3de3fc. Match ONLY by build_id. APK-sized stripped SO (~9936912 B) shares GNU build-id with symbols.zip; offset taken from symbols .symtab and applies to stripped by identical build-id."
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "flutter_infra pin: Flutter 3.3.10 snapshot b6d0a1f034d158b0d37b51d559379697 engine 3316dd8728419ad3534e3f6112aa6291f587078a. APK-sized stripped SO pin (preferred). Unknown APK build-id = coverage gap only.",
+      "version": {
+        "kind": "pinned",
+        "product": "Flutter 3.3.10",
+        "upgrade_note": "re-run flutter_keylog_xref on new libflutter.so",
+        "engine_version": "3316dd8728419ad3534e3f6112aa6291f587078a",
+        "build_id": "5ffc6abf92a283bcbdcefeb718b87b0faa33aa64",
+        "size": 9936912
+      }
+    },
+    {
+      "id": "flutter_48b2191c",
+      "class": "framework",
+      "tier": 2,
+      "match_rules": {
+        "basename": "libflutter.so",
+        "build_id": "48b2191c10204baea72b52eb222ca87f52936d10",
+        "size": 9939352
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "keylog": {
+        "offset": 4053248,
+        "build_id": "48b2191c10204baea72b52eb222ca87f52936d10",
+        "lib_name": "libflutter.so",
+        "size": 9939352,
+        "anchors": [
+          "CLIENT_TRAFFIC_SECRET_0",
+          "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+          "CLIENT_RANDOM",
+          "EXPORTER_SECRET",
+          "SERVER_TRAFFIC_SECRET_0"
+        ],
+        "note": "ssl_log_secret @_ZN4bssl14ssl_log_secretE = 0x3dd900 (4053248) from flutter_infra Flutter 3.3.0-0.1.pre engine fd131c385ee2. Method: symbols.zip readelf -Ws (build-id identical to stripped artifacts SO). Match ONLY by build-id. APK-sized stripped SO (~9939352 B)."
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "flutter_infra pin: Flutter 3.3.0-0.1.pre engine fd131c385ee2a2d0484c49ed859911798e4e177b. APK-sized stripped SO pin (preferred). Unknown APK build-id = coverage gap only. cycle-loop-2135.",
+      "version": {
+        "kind": "pinned",
+        "product": "Flutter 3.3.0-0.1.pre",
+        "upgrade_note": "re-run flutter_keylog_xref on new libflutter.so",
+        "engine_version": "fd131c385ee2a2d0484c49ed859911798e4e177b",
+        "build_id": "48b2191c10204baea72b52eb222ca87f52936d10",
+        "size": 9939352
+      }
+    },
+    {
+      "id": "flutter_53be67e5",
+      "class": "framework",
+      "tier": 2,
+      "match_rules": {
+        "basename": "libflutter.so",
+        "build_id": "53be67e5012b70af35b7a947cf4381dbd8b0e0a4",
+        "size": 10110856
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "keylog": {
+        "offset": 5901140,
+        "build_id": "53be67e5012b70af35b7a947cf4381dbd8b0e0a4",
+        "lib_name": "libflutter.so",
+        "size": 10110856,
+        "anchors": [
+          "CLIENT_TRAFFIC_SECRET_0",
+          "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+          "CLIENT_RANDOM",
+          "EXPORTER_SECRET",
+          "SERVER_TRAFFIC_SECRET_0"
+        ],
+        "note": "ssl_log_secret @_ZN4bssl14ssl_log_secretE = 0x5a0b54 (5901140) from flutter_infra Flutter 3.10.0 engine d44b5a94c976 dart_boringssl_rev 87f316d77482. Method: symbols.zip readelf -Ws (build-id identical to stripped artifacts SO). SSL_write LOCAL @ 0x5a1b98. Match ONLY by build_id. APK-sized stripped SO (~10110856 B) shares GNU build-id with symbols.zip; offset taken from symbols .symtab and applies to stripped by identical build-id."
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "flutter_infra pin: Flutter 3.10.0 snapshot aa64af18e7d086041ac127cc4bc50c5e engine d44b5a94c976fbb65815374f61ab5392a220b084. APK-sized stripped SO pin (preferred). Unknown APK build-id = coverage gap only.",
+      "version": {
+        "kind": "pinned",
+        "product": "Flutter 3.10.0",
+        "upgrade_note": "re-run flutter_keylog_xref on new libflutter.so",
+        "engine_version": "d44b5a94c976fbb65815374f61ab5392a220b084",
+        "build_id": "53be67e5012b70af35b7a947cf4381dbd8b0e0a4",
+        "size": 10110856
+      }
+    },
+    {
+      "id": "flutter_7c4e9dbe",
+      "class": "framework",
+      "tier": 2,
+      "match_rules": {
+        "basename": "libflutter.so",
+        "build_id": "7c4e9dbe851f4af99d74365808edfbf2003fd299",
+        "size": 10048576
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "keylog": {
+        "offset": 5846728,
+        "build_id": "7c4e9dbe851f4af99d74365808edfbf2003fd299",
+        "lib_name": "libflutter.so",
+        "size": 10048576,
+        "anchors": [
+          "CLIENT_TRAFFIC_SECRET_0",
+          "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+          "CLIENT_RANDOM",
+          "EXPORTER_SECRET",
+          "SERVER_TRAFFIC_SECRET_0"
+        ],
+        "note": "ssl_log_secret @_ZN4bssl14ssl_log_secretE = 0x5936c8 (5846728) from flutter_infra Flutter 3.7.0 engine b24591ed328a dart_boringssl_rev 87f316d77482. Method: symbols.zip readelf -Ws (build-id identical to stripped artifacts SO). SSL_write LOCAL @ 0x59471c. Match ONLY by build_id. APK-sized stripped SO (~10048576 B) shares GNU build-id with symbols.zip; offset taken from symbols .symtab and applies to stripped by identical build-id."
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "flutter_infra pin: Flutter 3.7.0 snapshot 501ef5cbd64ca70b6b42672346af6a8a engine b24591ed328a2d4ce6505819e2f5898a78132f7f. APK-sized stripped SO pin (preferred). Unknown APK build-id = coverage gap only.",
+      "version": {
+        "kind": "pinned",
+        "product": "Flutter 3.7.0",
+        "upgrade_note": "re-run flutter_keylog_xref on new libflutter.so",
+        "engine_version": "b24591ed328a2d4ce6505819e2f5898a78132f7f",
+        "build_id": "7c4e9dbe851f4af99d74365808edfbf2003fd299",
+        "size": 10048576
+      }
+    },
+    {
+      "id": "flutter_e3d08cea",
+      "class": "framework",
+      "tier": 2,
+      "match_rules": {
+        "basename": "libflutter.so",
+        "build_id": "e3d08cea3116b44464cd4742176bd1b32cd8a4b7",
+        "size": 10057336
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "keylog": {
+        "offset": 5850716,
+        "build_id": "e3d08cea3116b44464cd4742176bd1b32cd8a4b7",
+        "lib_name": "libflutter.so",
+        "size": 10057336,
+        "anchors": [
+          "CLIENT_TRAFFIC_SECRET_0",
+          "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+          "CLIENT_RANDOM",
+          "EXPORTER_SECRET",
+          "SERVER_TRAFFIC_SECRET_0"
+        ],
+        "note": "ssl_log_secret @_ZN4bssl14ssl_log_secretE = 0x59465c (5850716) from flutter_infra Flutter 3.11.0-0.1.pre engine 7eca5cd1c5cc dart_boringssl_rev 87f316d77482. Method: symbols.zip readelf -Ws (build-id identical to stripped artifacts SO). SSL_write LOCAL @ 0x5956b0. Match ONLY by build_id. APK-sized stripped SO (~10057336 B) shares GNU build-id with symbols.zip; offset taken from symbols .symtab and applies to stripped by identical build-id."
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "flutter_infra pin: Flutter 3.11.0-0.1.pre snapshot 36b0375d284ee2af0d0fffc6e6e48fde engine 7eca5cd1c5cca97929a7c8ea4381441447a36f26. APK-sized stripped SO pin (preferred). Unknown APK build-id = coverage gap only.",
+      "version": {
+        "kind": "pinned",
+        "product": "Flutter 3.11.0-0.1.pre",
+        "upgrade_note": "re-run flutter_keylog_xref on new libflutter.so",
+        "engine_version": "7eca5cd1c5cca97929a7c8ea4381441447a36f26",
+        "build_id": "e3d08cea3116b44464cd4742176bd1b32cd8a4b7",
+        "size": 10057336
+      }
+    },
+    {
+      "id": "cronet_0dceef13",
+      "class": "vendor-fork",
+      "tier": 2,
+      "match_rules": {
+        "basename": "stable_cronet_libssl.so",
+        "build_id": "0dceef1315310b5520aa046f7119d879",
+        "size": 456088
+      },
+      "symbols": {
+        "write": [
+          "SSL_write",
+          "SSL_write_ex2"
+        ],
+        "read": [
+          "SSL_read",
+          "SSL_read_ex2",
+          "SSL_peek",
+          "SSL_peek_ex"
+        ],
+        "keylog": [
+          "SSL_CTX_set_keylog_callback"
+        ]
+      },
+      "coverage": {
+        "plaintext_copy": true,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "Verified build-id pin for Pixel6a apex com.android.tethering lib64/stable_cronet_libssl.so. BuildID[md5/uuid]=0dceef1315310b5520aa046f7119d879 size=456088. Dynsym VERIFIED 2026-09-12: SSL_read@0x4c99c (313756), SSL_write@0x4cdd0 (314832), SSL_peek@0x4ca78 (313976) — attach by NAME (no local-write RVA). SSL_quic_read_level@0x4c408 / SSL_quic_write_level@0x4c414 DEFINED but return ssl_encryption_level_t, not a buffer — never plaintext_probes. BIO_read/BIO_write UND (libcrypto generic BIO, not attached). Mainline cronet.133 remains UND importer of this lib; do NOT promote mainlinecronet or reqable-cronet.",
+      "version": {
+        "kind": "pinned",
+        "product": "Pixel6a apex Cronet stable_cronet_libssl arm64",
+        "upgrade_note": "build-id pin; attach by export name — on apex/SO upgrade re-pull ELF, confirm build-id+size, keep name attach if dynsym still exports SSL_*",
+        "engine_version": "Cronet BoringSSL (apex tethering)",
+        "build_id": "0dceef1315310b5520aa046f7119d879",
+        "size": 456088,
+        "verified_at": "2026-09-12"
+      }
+    },
+    {
+      "id": "flutter_67d6564b",
+      "class": "framework",
+      "tier": 2,
+      "match_rules": {
+        "basename": "libflutter.so",
+        "build_id": "67d6564b8d334123ab2f76cbe8615dc2688a7cf8",
+        "size": 10714752
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "keylog": {
+        "offset": 7176700,
+        "build_id": "67d6564b8d334123ab2f76cbe8615dc2688a7cf8",
+        "lib_name": "libflutter.so",
+        "size": 10714752,
+        "anchors": [
+          "CLIENT_TRAFFIC_SECRET_0",
+          "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+          "CLIENT_RANDOM",
+          "EXPORTER_SECRET",
+          "SERVER_TRAFFIC_SECRET_0"
+        ],
+        "note": "ssl_log_secret @_ZN4bssl14ssl_log_secretE = 0x6d81fc (7176700) from flutter_infra Flutter 3.24.5 engine a18df97ca57a. Method: symbols.zip readelf -Ws (build-id identical to stripped artifacts SO). SSL_write LOCAL @ 0x6d91c0. Match ONLY by build_id. APK-sized stripped SO shares GNU build-id with symbols.zip; offset taken from symbols .symtab and applies to stripped by identical build-id."
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "flutter_infra pin: Flutter 3.24.5 engine a18df97ca57a249df5d8d68cd0820600223ce262. APK-sized stripped SO pin (preferred). Unknown APK build-id = coverage gap only.",
+      "version": {
+        "kind": "pinned",
+        "product": "Flutter 3.24.5",
+        "upgrade_note": "re-run flutter_keylog_xref on new libflutter.so",
+        "engine_version": "a18df97ca57a249df5d8d68cd0820600223ce262",
+        "build_id": "67d6564b8d334123ab2f76cbe8615dc2688a7cf8",
+        "size": 10714752
+      }
+    },
+    {
+      "id": "flutter_31386f7a",
+      "class": "framework",
+      "tier": 2,
+      "match_rules": {
+        "basename": "libflutter.so",
+        "build_id": "31386f7abec07a9f7e731afe5e1e3d88369bf766",
+        "size": 10814048
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "keylog": {
+        "offset": 7227892,
+        "build_id": "31386f7abec07a9f7e731afe5e1e3d88369bf766",
+        "lib_name": "libflutter.so",
+        "size": 10814048,
+        "anchors": [
+          "CLIENT_TRAFFIC_SECRET_0",
+          "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+          "CLIENT_RANDOM",
+          "EXPORTER_SECRET",
+          "SERVER_TRAFFIC_SECRET_0"
+        ],
+        "note": "ssl_log_secret @_ZN4bssl14ssl_log_secretE = 0x6e49f4 (7227892) from flutter_infra Flutter 3.27.4 engine 82bd5b720929. Method: symbols.zip readelf -Ws (build-id identical to stripped artifacts SO). SSL_write LOCAL @ 0x6e59d0. Match ONLY by build_id. APK-sized stripped SO shares GNU build-id with symbols.zip; offset taken from symbols .symtab and applies to stripped by identical build-id."
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "flutter_infra pin: Flutter 3.27.4 engine 82bd5b7209295a5b7ff8cae0df96e7870171e3a5. APK-sized stripped SO pin (preferred). Unknown APK build-id = coverage gap only.",
+      "version": {
+        "kind": "pinned",
+        "product": "Flutter 3.27.4",
+        "upgrade_note": "re-run flutter_keylog_xref on new libflutter.so",
+        "engine_version": "82bd5b7209295a5b7ff8cae0df96e7870171e3a5",
+        "build_id": "31386f7abec07a9f7e731afe5e1e3d88369bf766",
+        "size": 10814048
+      }
+    },
+    {
+      "id": "flutter_b4ba48b1",
+      "class": "framework",
+      "tier": 2,
+      "match_rules": {
+        "basename": "libflutter.so",
+        "build_id": "b4ba48b16f1760763d444d35d5d0106ba554fabd",
+        "size": 10602168
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "keylog": {
+        "offset": 7135224,
+        "build_id": "b4ba48b16f1760763d444d35d5d0106ba554fabd",
+        "lib_name": "libflutter.so",
+        "size": 10602168,
+        "anchors": [
+          "CLIENT_TRAFFIC_SECRET_0",
+          "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+          "CLIENT_RANDOM",
+          "EXPORTER_SECRET",
+          "SERVER_TRAFFIC_SECRET_0"
+        ],
+        "note": "ssl_log_secret @_ZN4bssl14ssl_log_secretE = 0x6cdff8 (7135224) from flutter_infra Flutter 3.22.3 engine 235db911ba27. Method: symbols.zip readelf -Ws (build-id identical to stripped artifacts SO). SSL_write LOCAL @ 0x6cefb4. Match ONLY by build_id. APK-sized stripped SO shares GNU build-id with symbols.zip; offset taken from symbols .symtab and applies to stripped by identical build-id."
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "flutter_infra pin: Flutter 3.22.3 engine 235db911ba279722f5e685f38b0ed30fa7e8570a. APK-sized stripped SO pin (preferred). Unknown APK build-id = coverage gap only.",
+      "version": {
+        "kind": "pinned",
+        "product": "Flutter 3.22.3",
+        "upgrade_note": "re-run flutter_keylog_xref on new libflutter.so",
+        "engine_version": "235db911ba279722f5e685f38b0ed30fa7e8570a",
+        "build_id": "b4ba48b16f1760763d444d35d5d0106ba554fabd",
+        "size": 10602168
+      }
+    },
+    {
+      "id": "flutter_9a7b90fd",
+      "class": "framework",
+      "tier": 2,
+      "match_rules": {
+        "basename": "libflutter.so",
+        "build_id": "9a7b90fd1c96c13ebb562b7724c7016fd5e5ed13",
+        "size": 11057504
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "keylog": {
+        "offset": 7435448,
+        "build_id": "9a7b90fd1c96c13ebb562b7724c7016fd5e5ed13",
+        "lib_name": "libflutter.so",
+        "size": 11057504,
+        "anchors": [
+          "CLIENT_TRAFFIC_SECRET_0",
+          "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+          "CLIENT_RANDOM",
+          "EXPORTER_SECRET",
+          "SERVER_TRAFFIC_SECRET_0"
+        ],
+        "note": "ssl_log_secret @_ZN4bssl14ssl_log_secretE = 0x7174b8 (7435448) from flutter_infra Flutter 3.29.2 engine 18b71d647a29. Method: symbols.zip readelf -Ws (build-id identical to stripped artifacts SO). SSL_write LOCAL @ 0x718540. Match ONLY by build_id. APK-sized stripped SO shares GNU build-id with symbols.zip; offset taken from symbols .symtab and applies to stripped by identical build-id."
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "flutter_infra pin: Flutter 3.29.2 engine 18b71d647a292a980abb405ac7d16fe1f0b20434. APK-sized stripped SO pin (preferred). Unknown APK build-id = coverage gap only.",
+      "version": {
+        "kind": "pinned",
+        "product": "Flutter 3.29.2",
+        "upgrade_note": "re-run flutter_keylog_xref on new libflutter.so",
+        "engine_version": "18b71d647a292a980abb405ac7d16fe1f0b20434",
+        "build_id": "9a7b90fd1c96c13ebb562b7724c7016fd5e5ed13",
+        "size": 11057504
+      }
+    },
+    {
+      "id": "flutter_90678423",
+      "class": "framework",
+      "tier": 2,
+      "match_rules": {
+        "basename": "libflutter.so",
+        "build_id": "906784233a7115d633b9295589a1b16a2329b46a",
+        "size": 10551352
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "keylog": {
+        "offset": 6267768,
+        "build_id": "906784233a7115d633b9295589a1b16a2329b46a",
+        "lib_name": "libflutter.so",
+        "size": 10551352,
+        "anchors": [
+          "CLIENT_TRAFFIC_SECRET_0",
+          "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+          "CLIENT_RANDOM",
+          "EXPORTER_SECRET",
+          "SERVER_TRAFFIC_SECRET_0"
+        ],
+        "note": "ssl_log_secret @_ZN4bssl14ssl_log_secretE = 0x5fa378 (6267768) from flutter_infra Flutter 3.16.9 engine f40e976bedff. Method: symbols.zip readelf -Ws (build-id identical to stripped artifacts SO). SSL_write LOCAL @ 0x5fb374. Match ONLY by build_id. APK-sized stripped SO shares GNU build-id with symbols.zip; offset taken from symbols .symtab and applies to stripped by identical build-id."
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "flutter_infra pin: Flutter 3.16.9 engine f40e976bedff57e69e1b3d89a7c2a3c617a03dad. APK-sized stripped SO pin (preferred). Unknown APK build-id = coverage gap only.",
+      "version": {
+        "kind": "pinned",
+        "product": "Flutter 3.16.9",
+        "upgrade_note": "re-run flutter_keylog_xref on new libflutter.so",
+        "engine_version": "f40e976bedff57e69e1b3d89a7c2a3c617a03dad",
+        "build_id": "906784233a7115d633b9295589a1b16a2329b46a",
+        "size": 10551352
+      }
+    },
+    {
+      "id": "flutter_1164bae6",
+      "class": "framework",
+      "tier": 2,
+      "match_rules": {
+        "basename": "libflutter.so",
+        "build_id": "1164bae6165f15f0ecdcba31ceb73ad2ea73038d",
+        "size": 165164528
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "keylog": {
+        "offset": 7838368,
+        "build_id": "1164bae6165f15f0ecdcba31ceb73ad2ea73038d",
+        "lib_name": "libflutter.so",
+        "size": 165164528,
+        "anchors": [
+          "CLIENT_TRAFFIC_SECRET_0",
+          "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+          "CLIENT_RANDOM",
+          "EXPORTER_SECRET",
+          "SERVER_TRAFFIC_SECRET_0"
+        ],
+        "note": "ssl_log_secret @_ZN4bssl14ssl_log_secretE = 0x779aa0 (7838368) from flutter_infra android-arm64-release flutter.jar (Flutter stable-channel, engine 06a2e2a11008). Derived via readelf -Ws on downloaded SO (LOCAL .symtab), NOT guessed. SSL_write LOCAL @ 0x77ac20 present in this unstripped artifact; APK-stripped builds often drop .symtab — match ONLY by build_id. Caveat: jar SO includes .debug_* (~165164528 B); APK libflutter is typically ~8–12MB. If APK build-id differs, do NOT reuse this offset — treat as coverage gap / new pin."
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "Offline infra sample: Flutter stable-channel / engine 06a2e2a110089dff50fe635cffd2a61e1b24fbcd. Source: flutter_infra_release .../android-arm64-release/artifacts.zip. BuildID[sha1]=1164bae6165f15f0ecdcba31ceb73ad2ea73038d size=165164528.",
+      "version": {
+        "kind": "pinned",
+        "product": "Flutter stable-channel",
+        "upgrade_note": "re-run flutter_keylog_xref on new libflutter.so",
+        "engine_version": "06a2e2a110089dff50fe635cffd2a61e1b24fbcd",
+        "build_id": "1164bae6165f15f0ecdcba31ceb73ad2ea73038d",
+        "size": 165164528
+      }
+    },
+    {
+      "id": "flutter_ab7d19d1",
+      "class": "framework",
+      "tier": 2,
+      "match_rules": {
+        "basename": "libflutter.so",
+        "build_id": "ab7d19d1820e61b09638c90f7e41f0e2f7102bb8",
+        "size": 166274520
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "keylog": {
+        "offset": 7855848,
+        "build_id": "ab7d19d1820e61b09638c90f7e41f0e2f7102bb8",
+        "lib_name": "libflutter.so",
+        "size": 166274520,
+        "anchors": [
+          "CLIENT_TRAFFIC_SECRET_0",
+          "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+          "CLIENT_RANDOM",
+          "EXPORTER_SECRET",
+          "SERVER_TRAFFIC_SECRET_0"
+        ],
+        "note": "ssl_log_secret @_ZN4bssl14ssl_log_secretE = 0x77dee8 (7855848) from flutter_infra android-arm64-release flutter.jar (Flutter beta-channel, engine e2149387c638). Derived via readelf -Ws on downloaded SO (LOCAL .symtab), NOT guessed. SSL_write LOCAL @ 0x77f064 present in this unstripped artifact; APK-stripped builds often drop .symtab — match ONLY by build_id. Caveat: jar SO includes .debug_* (~166274520 B); APK libflutter is typically ~8–12MB. If APK build-id differs, do NOT reuse this offset — treat as coverage gap / new pin."
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "Offline infra sample: Flutter beta-channel / engine e2149387c63888c6a51c8c3569dacda1c1532653. Source: flutter_infra_release .../android-arm64-release/artifacts.zip. BuildID[sha1]=ab7d19d1820e61b09638c90f7e41f0e2f7102bb8 size=166274520.",
+      "version": {
+        "kind": "pinned",
+        "product": "Flutter beta-channel",
+        "upgrade_note": "re-run flutter_keylog_xref on new libflutter.so",
+        "engine_version": "e2149387c63888c6a51c8c3569dacda1c1532653",
+        "build_id": "ab7d19d1820e61b09638c90f7e41f0e2f7102bb8",
+        "size": 166274520
+      }
+    },
+    {
+      "id": "flutter_506c3de6",
+      "class": "framework",
+      "tier": 2,
+      "match_rules": {
+        "basename": "libflutter.so",
+        "build_id": "506c3de6db0ff95417a19593f8bc95a6eb58610b",
+        "size": 147539744
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "keylog": {
+        "offset": 7417028,
+        "build_id": "506c3de6db0ff95417a19593f8bc95a6eb58610b",
+        "lib_name": "libflutter.so",
+        "size": 147539744,
+        "anchors": [
+          "CLIENT_TRAFFIC_SECRET_0",
+          "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+          "CLIENT_RANDOM",
+          "EXPORTER_SECRET",
+          "SERVER_TRAFFIC_SECRET_0"
+        ],
+        "note": "ssl_log_secret @_ZN4bssl14ssl_log_secretE = 0x712cc4 (7417028) from flutter_infra android-arm64-release flutter.jar (Flutter 3.35.5, engine d3d45dcf2518). Derived via readelf -Ws on downloaded SO (LOCAL .symtab), NOT guessed. SSL_write LOCAL @ 0x713e40 present in this unstripped artifact; APK-stripped builds often drop .symtab — match ONLY by build_id. Caveat: jar SO includes .debug_* (~147539744 B); APK libflutter is typically ~8–12MB. If APK build-id differs, do NOT reuse this offset — treat as coverage gap / new pin."
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "Offline infra sample: Flutter 3.35.5 / engine d3d45dcf251823c1769909cd43698d126db38deb. Source: flutter_infra_release .../android-arm64-release/artifacts.zip. BuildID[sha1]=506c3de6db0ff95417a19593f8bc95a6eb58610b size=147539744.",
+      "version": {
+        "kind": "pinned",
+        "product": "Flutter 3.35.5",
+        "upgrade_note": "re-run flutter_keylog_xref on new libflutter.so",
+        "engine_version": "d3d45dcf251823c1769909cd43698d126db38deb",
+        "build_id": "506c3de6db0ff95417a19593f8bc95a6eb58610b",
+        "size": 147539744
+      }
+    },
+    {
+      "id": "flutter_b591603b",
+      "class": "framework",
+      "tier": 2,
+      "match_rules": {
+        "basename": "libflutter.so",
+        "build_id": "b591603beaedfdf081293b20f1abada47edf4132",
+        "size": 144312672
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "keylog": {
+        "offset": 7433660,
+        "build_id": "b591603beaedfdf081293b20f1abada47edf4132",
+        "lib_name": "libflutter.so",
+        "size": 144312672,
+        "anchors": [
+          "CLIENT_TRAFFIC_SECRET_0",
+          "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+          "CLIENT_RANDOM",
+          "EXPORTER_SECRET",
+          "SERVER_TRAFFIC_SECRET_0"
+        ],
+        "note": "ssl_log_secret @_ZN4bssl14ssl_log_secretE = 0x716dbc (7433660) from flutter_infra android-arm64-release flutter.jar (Flutter 3.38.5, engine 1527ae0ec577). Derived via readelf -Ws on downloaded SO (LOCAL .symtab), NOT guessed. SSL_write LOCAL @ 0x717ef0 present in this unstripped artifact; APK-stripped builds often drop .symtab — match ONLY by build_id. Caveat: jar SO includes .debug_* (~144312672 B); APK libflutter is typically ~8–12MB. If APK build-id differs, do NOT reuse this offset — treat as coverage gap / new pin."
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "Offline infra sample: Flutter 3.38.5 / engine 1527ae0ec577a4ef50e65f6fefcfc1326707d9bf. Source: flutter_infra_release .../android-arm64-release/artifacts.zip. BuildID[sha1]=b591603beaedfdf081293b20f1abada47edf4132 size=144312672.",
+      "version": {
+        "kind": "pinned",
+        "product": "Flutter 3.38.5",
+        "upgrade_note": "re-run flutter_keylog_xref on new libflutter.so",
+        "engine_version": "1527ae0ec577a4ef50e65f6fefcfc1326707d9bf",
+        "build_id": "b591603beaedfdf081293b20f1abada47edf4132",
+        "size": 144312672
+      }
+    },
+    {
+      "id": "conscrypt_268ad404",
+      "class": "generic",
+      "tier": 1,
+      "match_rules": {
+        "basename": "libssl.so",
+        "build_id": "268ad40478040d405ef16199f46f137f",
+        "size": 489400
+      },
+      "symbols": {
+        "write": [
+          "SSL_write",
+          "SSL_write_ex2"
+        ],
+        "read": [
+          "SSL_read",
+          "SSL_read_ex2",
+          "SSL_peek",
+          "SSL_peek_ex"
+        ],
+        "keylog": [
+          "SSL_CTX_set_keylog_callback"
+        ]
+      },
+      "coverage": {
+        "plaintext_copy": true,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "Pixel6a ELF sample 2026-09-10: apex com.android.conscrypt/lib64/libssl.so (identical sha256 also at resolv/lib64 + configinfrastructure/lib64). BuildID[md5/uuid]=268ad40478040d405ef16199f46f137f size=489400. Dynsym VERIFIED readelf -Ws: SSL_read@0x563f4 (353268), SSL_write@0x56848 (354376), SSL_CTX_set_keylog_callback@0x59bbc (367548). Attach by NAME only — no invented keylog RVA. No SSL_*_ex on this build.",
+      "version": {
+        "kind": "pinned",
+        "product": "Pixel6a Conscrypt apex libssl arm64",
+        "upgrade_note": "build-id pin; attach by export name — on apex/SO upgrade re-pull ELF, confirm build-id+size, keep name attach if dynsym still exports SSL_*",
+        "engine_version": "BoringSSL (Conscrypt)",
+        "build_id": "268ad40478040d405ef16199f46f137f",
+        "size": 489400,
+        "verified_at": "2026-09-11"
+      }
+    },
+    {
+      "id": "system_libssl_5bb7c9f8",
+      "class": "generic",
+      "tier": 1,
+      "match_rules": {
+        "basename": "libssl.so",
+        "build_id": "5bb7c9f8533f57612a6d8ac7c90d48f8",
+        "size": 513920
+      },
+      "symbols": {
+        "write": [
+          "SSL_write",
+          "SSL_write_ex2"
+        ],
+        "read": [
+          "SSL_read",
+          "SSL_read_ex2",
+          "SSL_peek",
+          "SSL_peek_ex"
+        ],
+        "keylog": [
+          "SSL_CTX_set_keylog_callback"
+        ]
+      },
+      "coverage": {
+        "plaintext_copy": true,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "Pixel6a ELF sample 2026-09-10: /system/lib64/libssl.so (identical sha256 also at apex com.android.virt/lib64/libssl.so). BuildID[md5/uuid]=5bb7c9f8533f57612a6d8ac7c90d48f8 size=513920. Dynsym VERIFIED: SSL_read@0x59530 (365872), SSL_write@0x59990 (366992), SSL_CTX_set_keylog_callback@0x5d760 (382816). Attach by NAME. Note: older spool notes mis-hex'd these decimals as 0x59470/0x598d0 — corrected here from THIS ELF.",
+      "version": {
+        "kind": "pinned",
+        "product": "Pixel6a /system/lib64/libssl.so",
+        "upgrade_note": "build-id pin; attach by export name — on apex/SO upgrade re-pull ELF, confirm build-id+size, keep name attach if dynsym still exports SSL_*",
+        "engine_version": "BoringSSL (system)",
+        "build_id": "5bb7c9f8533f57612a6d8ac7c90d48f8",
+        "size": 513920,
+        "verified_at": "2026-09-11"
+      }
+    },
+    {
+      "id": "vendor_libssl_aebd4413",
+      "class": "generic",
+      "tier": 1,
+      "match_rules": {
+        "basename": "libssl.so",
+        "build_id": "aebd44138c05defb60ce8e74b235121b",
+        "size": 513920
+      },
+      "symbols": {
+        "write": [
+          "SSL_write",
+          "SSL_write_ex2"
+        ],
+        "read": [
+          "SSL_read",
+          "SSL_read_ex2",
+          "SSL_peek",
+          "SSL_peek_ex"
+        ],
+        "keylog": [
+          "SSL_CTX_set_keylog_callback"
+        ]
+      },
+      "coverage": {
+        "plaintext_copy": true,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "Pixel6a ELF sample 2026-09-11: /vendor/lib64/libssl.so. BuildID[md5/uuid]=aebd44138c05defb60ce8e74b235121b size=513920. Distinct from system_libssl_5bb7c9f8 (same size, different BuildID/md5; ~364 bytes differ). Dynsym VERIFIED via nm -D: SSL_read@0x59530, SSL_write@0x59990, SSL_CTX_set_keylog_callback@0x5d760 — same RVAs as system twin. Attach by NAME.",
+      "version": {
+        "kind": "pinned",
+        "product": "Pixel6a /vendor/lib64/libssl.so",
+        "upgrade_note": "build-id pin; attach by export name — on vendor image upgrade re-pull ELF, confirm build-id+size, keep name attach if dynsym still exports SSL_*",
+        "engine_version": "BoringSSL (vendor)",
+        "build_id": "aebd44138c05defb60ce8e74b235121b",
+        "size": 513920,
+        "verified_at": "2026-09-11"
+      }
+    },
+    {
+      "id": "conscrypt_5f60f4e3",
+      "class": "generic",
+      "tier": 1,
+      "match_rules": {
+        "basename": "libssl.so",
+        "build_id": "5f60f4e3725320a87f66156cf343cadb",
+        "size": 326604
+      },
+      "symbols": {
+        "write": [
+          "SSL_write",
+          "SSL_write_ex2"
+        ],
+        "read": [
+          "SSL_read",
+          "SSL_read_ex2",
+          "SSL_peek",
+          "SSL_peek_ex"
+        ],
+        "keylog": [
+          "SSL_CTX_set_keylog_callback"
+        ]
+      },
+      "coverage": {
+        "plaintext_copy": true,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "Pixel6a ELF sample 2026-09-10: apex com.android.conscrypt/lib/libssl.so ARM32 (identical sha256 at /system/lib/libssl.so). BuildID=5f60f4e3725320a87f66156cf343cadb size=326604. Dynsym VERIFIED: SSL_read@0x34605 (214533), SSL_write@0x34901 (215297), SSL_CTX_set_keylog_callback@0x367d9 (223193). Catalog/pin complete; Pixel6a AArch32 uprobe may be ENOTSUP — arm64 pins remain primary on this device.",
+      "version": {
+        "kind": "pinned",
+        "product": "Pixel6a Conscrypt apex libssl ARM32",
+        "upgrade_note": "build-id pin; attach by export name — on apex/SO upgrade re-pull ELF, confirm build-id+size, keep name attach if dynsym still exports SSL_*; AArch32 uprobe ENOTSUP possible",
+        "engine_version": "BoringSSL (Conscrypt ARM32)",
+        "build_id": "5f60f4e3725320a87f66156cf343cadb",
+        "size": 326604,
+        "verified_at": "2026-09-11"
+      }
+    },
+    {
+      "id": "cronet_ccdddb35",
+      "class": "vendor-fork",
+      "tier": 2,
+      "match_rules": {
+        "basename": "stable_cronet_libssl.so",
+        "build_id": "ccdddb35581c6dc25e90ed791d7d9f40",
+        "size": 299240
+      },
+      "symbols": {
+        "write": [
+          "SSL_write",
+          "SSL_write_ex2"
+        ],
+        "read": [
+          "SSL_read",
+          "SSL_read_ex2",
+          "SSL_peek",
+          "SSL_peek_ex"
+        ],
+        "keylog": [
+          "SSL_CTX_set_keylog_callback"
+        ]
+      },
+      "coverage": {
+        "plaintext_copy": true,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "Pixel6a ELF sample 2026-09-10: apex com.android.tethering/lib/stable_cronet_libssl.so (ARM32). BuildID=ccdddb35581c6dc25e90ed791d7d9f40 size=299240. Dynsym VERIFIED: SSL_read@0x2fef5 (196341), SSL_write@0x301dd (197085), SSL_CTX_set_keylog_callback@0x32045 (204869). Attach by NAME. Companion of arm64 cronet_0dceef13. AArch32 uprobe ENOTSUP possible on Pixel6a.",
+      "version": {
+        "kind": "pinned",
+        "product": "Pixel6a apex Cronet stable_cronet_libssl ARM32",
+        "upgrade_note": "build-id pin; attach by export name — on apex/SO upgrade re-pull ELF, confirm build-id+size, keep name attach if dynsym still exports SSL_*; AArch32 uprobe ENOTSUP possible",
+        "engine_version": "Cronet BoringSSL (apex tethering ARM32)",
+        "build_id": "ccdddb35581c6dc25e90ed791d7d9f40",
+        "size": 299240,
+        "verified_at": "2026-09-11"
+      }
+    },
+    {
+      "id": "babassl_40f1ff86",
+      "class": "vendor-fork",
+      "tier": 2,
+      "match_rules": {
+        "basename": "libopenssl.so",
+        "build_id": "40f1ff861a60f7c72def7ee1edf98a21322a6ca9",
+        "size": 2444056
+      },
+      "symbols": {
+        "write": [
+          "SSL_write",
+          "SSL_write_ex",
+          "SSL_write_ex2"
+        ],
+        "read": [
+          "SSL_read",
+          "SSL_read_ex",
+          "SSL_read_ex2",
+          "SSL_peek",
+          "SSL_peek_ex"
+        ],
+        "keylog": [
+          "SSL_CTX_set_keylog_callback"
+        ]
+      },
+      "coverage": {
+        "plaintext_copy": true,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "Vendor-sample identical BABASSL libopenssl.so. BuildID[sha1]=40f1ff861a60f7c72def7ee1edf98a21322a6ca9 size=2444056. Dynsym VERIFIED: SSL_read@0x1a9964, SSL_read_ex@0x1a99bc, SSL_write@0x1a9dd8, SSL_write_ex@0x1a9e30, SSL_CTX_set_keylog_callback@0x1ad8a8. Attach by NAME. vendor larger libopenssl (~2857704) has NO GNU build-id — stays on generic babassl_openssl basename row.",
+      "version": {
+        "kind": "pinned",
+        "product": "Ant BABASSL libopenssl.so size=2444056",
+        "upgrade_note": "build-id pin; attach by export name — on SO upgrade re-pull ELF, confirm build-id+size, keep name attach if dynsym still exports SSL_*; larger libopenssl.so without GNU build-id stays on babassl_openssl basename",
+        "engine_version": "BABASSL",
+        "build_id": "40f1ff861a60f7c72def7ee1edf98a21322a6ca9",
+        "size": 2444056,
+        "verified_at": "2026-09-10"
+      }
+    },
+    {
+      "id": "libhssl_c81d34ed",
+      "class": "vendor-fork",
+      "tier": 2,
+      "match_rules": {
+        "basename_contains": [
+          "hssl"
+        ],
+        "build_id": "c81d34ed7227eb81366e5d8c3bf6db0965cfbf75",
+        "size": 130384
+      },
+      "symbols": {
+        "write": [
+          "sslWrite",
+          "sslWriteEx"
+        ],
+        "read": [
+          "sslRead",
+          "sslReadEx"
+        ]
+      },
+      "coverage": {
+        "plaintext_copy": true,
+        "keylog": false,
+        "boundary_dump": false
+      },
+      "notes": "Forensics libhssl-2.1.so BuildID[sha1]=c81d34ed7227eb81366e5d8c3bf6db0965cfbf75 size=130384. Dynsym VERIFIED: sslWrite@0x124a0, sslWriteEx@0x12b30, sslRead@0x12d60, sslReadEx@0x131ac. Attach by NAME (already in TLS_NAMES). Smaller twin build-id 0f47c907… size=109912 also has sslWrite* — pinned as libhssl_0f47c907. ProbeSpec enabled 2026-09-12: Ex ABI openssl_ex_* + verified file_offsets.",
+      "version": {
+        "kind": "pinned",
+        "product": "vendor HSSL libhssl-2.1.so",
+        "upgrade_note": "build-id pin; attach by export name — on apex/SO upgrade re-pull ELF, confirm build-id+size, keep name attach if dynsym still exports SSL_*",
+        "engine_version": "HSSL 2.1",
+        "build_id": "c81d34ed7227eb81366e5d8c3bf6db0965cfbf75",
+        "size": 130384,
+        "verified_at": "2026-09-10"
+      },
+      "probes": [
+        {
+          "symbol": "sslWrite",
+          "abi": "vendor_write",
+          "direction": "send",
+          "file_offset": 74912,
+          "build_id": "c81d34ed7227eb81366e5d8c3bf6db0965cfbf75",
+          "size": 130384,
+          "validation_state": "enabled",
+          "architecture": "arm64"
+        },
+        {
+          "symbol": "sslWriteEx",
+          "abi": "openssl_ex_write",
+          "direction": "send",
+          "file_offset": 76592,
+          "build_id": "c81d34ed7227eb81366e5d8c3bf6db0965cfbf75",
+          "size": 130384,
+          "validation_state": "enabled",
+          "architecture": "arm64"
+        },
+        {
+          "symbol": "sslRead",
+          "abi": "vendor_read",
+          "direction": "recv",
+          "file_offset": 77152,
+          "build_id": "c81d34ed7227eb81366e5d8c3bf6db0965cfbf75",
+          "size": 130384,
+          "validation_state": "enabled",
+          "architecture": "arm64"
+        },
+        {
+          "symbol": "sslReadEx",
+          "abi": "openssl_ex_read",
+          "direction": "recv",
+          "file_offset": 78252,
+          "build_id": "c81d34ed7227eb81366e5d8c3bf6db0965cfbf75",
+          "size": 130384,
+          "validation_state": "enabled",
+          "architecture": "arm64"
+        }
+      ]
+    },
+    {
+      "id": "libhssl_0f47c907",
+      "class": "vendor-fork",
+      "tier": 2,
+      "match_rules": {
+        "basename_contains": [
+          "hssl"
+        ],
+        "build_id": "0f47c907e5b8dc7706c0154f3943cc71a0ca1c0b",
+        "size": 109912
+      },
+      "symbols": {
+        "write": [
+          "sslWrite",
+          "sslWriteEx"
+        ],
+        "read": [
+          "sslRead",
+          "sslReadEx"
+        ]
+      },
+      "coverage": {
+        "plaintext_copy": true,
+        "keylog": false,
+        "boundary_dump": false
+      },
+      "notes": "libhssl-2.1.so BuildID[sha1]=0f47c907e5b8dc7706c0154f3943cc71a0ca1c0b size=109912. Dynsym VERIFIED 2026-09-11 via nm -D: sslWrite@0x1248c, sslWriteEx@0x12a6c, sslRead@0x12cb4, sslReadEx@0x130fc. Attach by NAME. Companion of libhssl_c81d34ed (size=130384). ProbeSpec enabled 2026-09-12: Ex ABI openssl_ex_* + verified file_offsets.",
+      "version": {
+        "kind": "pinned",
+        "product": "vendor HSSL libhssl-2.1.so (size twin)",
+        "engine_version": "HSSL 2.1",
+        "build_id": "0f47c907e5b8dc7706c0154f3943cc71a0ca1c0b",
+        "size": 109912,
+        "verified_at": "2026-09-11",
+        "upgrade_note": "build-id pin; attach by export name — re-verified 2026-09-11 on this ELF; on SO upgrade re-pull ELF, confirm build-id+size, keep name attach if dynsym still exports sslWrite/sslRead"
+      },
+      "probes": [
+        {
+          "symbol": "sslWrite",
+          "abi": "vendor_write",
+          "direction": "send",
+          "file_offset": 74892,
+          "build_id": "0f47c907e5b8dc7706c0154f3943cc71a0ca1c0b",
+          "size": 109912,
+          "validation_state": "enabled",
+          "architecture": "arm64"
+        },
+        {
+          "symbol": "sslWriteEx",
+          "abi": "openssl_ex_write",
+          "direction": "send",
+          "file_offset": 76396,
+          "build_id": "0f47c907e5b8dc7706c0154f3943cc71a0ca1c0b",
+          "size": 109912,
+          "validation_state": "enabled",
+          "architecture": "arm64"
+        },
+        {
+          "symbol": "sslRead",
+          "abi": "vendor_read",
+          "direction": "recv",
+          "file_offset": 76980,
+          "build_id": "0f47c907e5b8dc7706c0154f3943cc71a0ca1c0b",
+          "size": 109912,
+          "validation_state": "enabled",
+          "architecture": "arm64"
+        },
+        {
+          "symbol": "sslReadEx",
+          "abi": "openssl_ex_read",
+          "direction": "recv",
+          "file_offset": 78076,
+          "build_id": "0f47c907e5b8dc7706c0154f3943cc71a0ca1c0b",
+          "size": 109912,
+          "validation_state": "enabled",
+          "architecture": "arm64"
+        }
+      ]
+    },
+    {
+      "id": "flutter_edfb9140",
+      "class": "framework",
+      "tier": 2,
+      "match_rules": {
+        "basename": "libflutter.so",
+        "build_id": "edfb9140c6b45651bf2f7c04752bc8e1dac58097",
+        "size": 165159248
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "keylog": {
+        "offset": 7838188,
+        "build_id": "edfb9140c6b45651bf2f7c04752bc8e1dac58097",
+        "lib_name": "libflutter.so",
+        "size": 165159248,
+        "anchors": [
+          "CLIENT_TRAFFIC_SECRET_0",
+          "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+          "CLIENT_RANDOM",
+          "EXPORTER_SECRET",
+          "SERVER_TRAFFIC_SECRET_0"
+        ],
+        "note": "ssl_log_secret @_ZN4bssl14ssl_log_secretE = 0x7799ec (7838188) from flutter_infra android-arm64-release flutter.jar (Flutter 3.47.1, engine 5d531788691e). Method: symbols.zip llvm-nm/nm on unstripped SO (build-id identical to artifacts jar SO). Match ONLY by build_id. Caveat: jar SO includes .debug_* (~165159248 B); APK libflutter is typically ~8–12MB. If APK build-id differs, do NOT reuse this offset — coverage gap / new pin."
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "flutter_infra pin: Flutter 3.47.1 engine 5d531788691ec3404cac0cee66ead4007b177363. Jar-only unstripped SO pin (APK-sized twin not published in artifacts.zip). Unknown APK build-id = coverage gap only. Offline loop-1307 2026-09-11.",
+      "version": {
+        "kind": "pinned",
+        "product": "Flutter 3.47.1",
+        "upgrade_note": "re-run flutter_keylog_xref on new libflutter.so",
+        "engine_version": "5d531788691ec3404cac0cee66ead4007b177363",
+        "build_id": "edfb9140c6b45651bf2f7c04752bc8e1dac58097",
+        "size": 165159248
+      }
+    },
+    {
+      "id": "flutter_4ebe3f92",
+      "class": "framework",
+      "tier": 2,
+      "match_rules": {
+        "basename": "libflutter.so",
+        "build_id": "4ebe3f92ee5df0c69d1587f3067500af91ca68e9",
+        "size": 165159248
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "keylog": {
+        "offset": 7838188,
+        "build_id": "4ebe3f92ee5df0c69d1587f3067500af91ca68e9",
+        "lib_name": "libflutter.so",
+        "size": 165159248,
+        "anchors": [
+          "CLIENT_TRAFFIC_SECRET_0",
+          "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+          "CLIENT_RANDOM",
+          "EXPORTER_SECRET",
+          "SERVER_TRAFFIC_SECRET_0"
+        ],
+        "note": "ssl_log_secret @_ZN4bssl14ssl_log_secretE = 0x7799ec (7838188) from flutter_infra android-arm64-release flutter.jar (Flutter 3.47.0, engine 5f7762567324). Method: symbols.zip llvm-nm/nm on unstripped SO (build-id identical to artifacts jar SO). Match ONLY by build_id. Caveat: jar SO includes .debug_* (~165159248 B); APK libflutter is typically ~8–12MB. If APK build-id differs, do NOT reuse this offset — coverage gap / new pin."
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "flutter_infra pin: Flutter 3.47.0 engine 5f77625673248ee5846fbcaf5d3e1a3878386fd7. Jar-only unstripped SO pin (APK-sized twin not published in artifacts.zip). Unknown APK build-id = coverage gap only. Offline loop-1307 2026-09-11.",
+      "version": {
+        "kind": "pinned",
+        "product": "Flutter 3.47.0",
+        "upgrade_note": "re-run flutter_keylog_xref on new libflutter.so",
+        "engine_version": "5f77625673248ee5846fbcaf5d3e1a3878386fd7",
+        "build_id": "4ebe3f92ee5df0c69d1587f3067500af91ca68e9",
+        "size": 165159248
+      }
+    },
+    {
+      "id": "flutter_495e7110",
+      "class": "framework",
+      "tier": 2,
+      "match_rules": {
+        "basename": "libflutter.so",
+        "build_id": "495e71106a82e63b2cc8fee291b7759b06561706",
+        "size": 163774472
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "keylog": {
+        "offset": 7668032,
+        "build_id": "495e71106a82e63b2cc8fee291b7759b06561706",
+        "lib_name": "libflutter.so",
+        "size": 163774472,
+        "anchors": [
+          "CLIENT_TRAFFIC_SECRET_0",
+          "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+          "CLIENT_RANDOM",
+          "EXPORTER_SECRET",
+          "SERVER_TRAFFIC_SECRET_0"
+        ],
+        "note": "ssl_log_secret @_ZN4bssl14ssl_log_secretE = 0x750140 (7668032) from flutter_infra android-arm64-release flutter.jar (Flutter 3.44.9, engine 5a2a6a42cce6). Method: symbols.zip llvm-nm/nm on unstripped SO (build-id identical to artifacts jar SO). Match ONLY by build_id. Caveat: jar SO includes .debug_* (~163774472 B); APK libflutter is typically ~8–12MB. If APK build-id differs, do NOT reuse this offset — coverage gap / new pin."
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "flutter_infra pin: Flutter 3.44.9 engine 5a2a6a42cce67f965cf540fcecf616faca624aa1. Jar-only unstripped SO pin (APK-sized twin not published in artifacts.zip). Unknown APK build-id = coverage gap only. Offline loop-1307 2026-09-11.",
+      "version": {
+        "kind": "pinned",
+        "product": "Flutter 3.44.9",
+        "upgrade_note": "re-run flutter_keylog_xref on new libflutter.so",
+        "engine_version": "5a2a6a42cce67f965cf540fcecf616faca624aa1",
+        "build_id": "495e71106a82e63b2cc8fee291b7759b06561706",
+        "size": 163774472
+      }
+    },
+    {
+      "id": "flutter_206564d9",
+      "class": "framework",
+      "tier": 2,
+      "match_rules": {
+        "basename": "libflutter.so",
+        "build_id": "206564d97b752a17498a800cb2faefce16a84bfb",
+        "size": 166274520
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "keylog": {
+        "offset": 7855848,
+        "build_id": "206564d97b752a17498a800cb2faefce16a84bfb",
+        "lib_name": "libflutter.so",
+        "size": 166274520,
+        "anchors": [
+          "CLIENT_TRAFFIC_SECRET_0",
+          "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+          "CLIENT_RANDOM",
+          "EXPORTER_SECRET",
+          "SERVER_TRAFFIC_SECRET_0"
+        ],
+        "note": "ssl_log_secret @_ZN4bssl14ssl_log_secretE = 0x77dee8 (7855848) from flutter_infra android-arm64-release flutter.jar (Flutter 3.48.0-0.3.pre, engine 3816f7b7a3d4). Method: symbols.zip llvm-nm/nm on unstripped SO (build-id identical to artifacts jar SO). Match ONLY by build_id. Caveat: jar SO includes .debug_* (~166274520 B); APK libflutter is typically ~8–12MB. If APK build-id differs, do NOT reuse this offset — coverage gap / new pin."
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": true,
+        "boundary_dump": false
+      },
+      "notes": "flutter_infra pin: Flutter 3.48.0-0.3.pre engine 3816f7b7a3d4c665ccf850087f39e5e931069752. Jar-only unstripped SO pin (APK-sized twin not published in artifacts.zip). Unknown APK build-id = coverage gap only. Offline loop-1307 2026-09-11.",
+      "version": {
+        "kind": "pinned",
+        "product": "Flutter 3.48.0-0.3.pre",
+        "upgrade_note": "re-run flutter_keylog_xref on new libflutter.so",
+        "engine_version": "3816f7b7a3d4c665ccf850087f39e5e931069752",
+        "build_id": "206564d97b752a17498a800cb2faefce16a84bfb",
+        "size": 166274520
+      }
     }
-  ]
+  ],
+  "meta": {
+    "updated_at": "2026-09-11T13:14:12+08:00",
+    "updated_by": "loop-1307-offline",
+    "stack_count": 70
+  }
 }

@@ -48,13 +48,18 @@ struct {
     __type(value, ksight_u32);
 } tgid_allow SEC(".maps");
 
-/* Entry-time x1 (first user pointer) per tid, so the return probe can snapshot
- * an output buffer (SSL_read) at the exact moment the bytes exist. */
+/* Entry-time buffer pointer + length ceiling per tid. Entry and uretprobe MUST
+ * share one BPF object so this map is visible on return (SSL_read snapshot). */
+struct entry_info {
+    ksight_u64 ptr;
+    ksight_u64 num;
+};
+
 struct {
     __uint(type, KSIGHT_BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 8192);
     __type(key, ksight_u32);
-    __type(value, ksight_u64);
+    __type(value, struct entry_info);
 } entry_ptr SEC(".maps");
 
 static __always_inline int ksight_emit_user_regs(struct ksight_user_regs *ctx,
@@ -88,23 +93,38 @@ static __always_inline int ksight_emit_user_regs(struct ksight_user_regs *ctx,
     ksight_bpf_probe_read_kernel(&out->pstate, sizeof(out->pstate), &ctx->pstate);
     out->time_ns = ksight_bpf_ktime_get_ns();
     out->aux_bytes = 0;
-    out->aux_pad = 0;
+    /* aux_pad / snapshot_at_return: 1 on EVERY uretprobe event so a paired
+     * entry+return session can classify hits without separate LiveProbe rows. */
+    out->aux_pad = at_return ? 1 : 0;
     if (at_return) {
         /* Return probe: argument registers are gone. The entry program saved
-         * x1 (the buffer pointer); x0 is the returned byte count, so snapshot
-         * the buffer NOW while the bytes are still in place. */
+         * x1 (buffer) + x2 (num); x0 is retval. Snapshot NOW while bytes exist.
+         * Plain SSL_read: x0 = byte count. SSL_read_ex: x0 = 0/1 success — use
+         * saved num as ceiling when x0==1. */
         ksight_u32 tid = (ksight_u32)pid_tgid;
-        ksight_u64 *saved = ksight_bpf_map_lookup_elem(&entry_ptr, &tid);
-        ksight_u64 count = out->regs[0];
-        if (saved && *saved >= 0x10000ULL && count > 0) {
-            ksight_u64 src = *saved & 0x00ffffffffffffffULL;
-            ksight_bpf_probe_read_user(out->aux, sizeof(out->aux),
-                                       (const void *)src);
-            out->aux_bytes = count > sizeof(out->aux)
-                                 ? (ksight_u32)sizeof(out->aux)
-                                 : (ksight_u32)count;
-            out->aux_pad = 1; /* snapshot taken at return time */
+        struct entry_info *saved = ksight_bpf_map_lookup_elem(&entry_ptr, &tid);
+        /* regs[0] is a signed return (SSL_read byte count or SSL_read_ex 0/1).
+         * Treating it as u64 made WANT_READ (-1) look like a huge success and
+         * produced 4096-zero false recv fragments on Alipay BABASSL. */
+        ksight_s64 ret = (ksight_s64)out->regs[0];
+        if (saved && (saved->ptr & 0x00ffffffffffffffULL) >= 0x10000ULL &&
+            ret > 0) {
+            ksight_u64 src = saved->ptr & 0x00ffffffffffffffULL;
+            ksight_u64 snap = (ksight_u64)ret;
+            /* SSL_read_ex success is x0==1; use entry num as snapshot ceiling. */
+            if (snap <= 1 && saved->num > 1)
+                snap = saved->num;
+            if (snap > sizeof(out->aux))
+                snap = sizeof(out->aux);
+            /* Size must be compile-time constant for bpf_probe_read_user.
+             * Only publish aux_bytes when the user read succeeds — failed reads
+             * leave stale percpu aux and produced all-zero false SSL_read hits. */
+            if (ksight_bpf_probe_read_user(out->aux, sizeof(out->aux),
+                                           (const void *)src) == 0) {
+                out->aux_bytes = (ksight_u32)snap;
+            }
         }
+        ksight_bpf_map_delete_elem(&entry_ptr, &tid);
         ksight_bpf_perf_event_output(ctx, &hwbp_events, 0, out, sizeof(*out));
         return 0;
     }
@@ -113,8 +133,12 @@ static __always_inline int ksight_emit_user_regs(struct ksight_user_regs *ctx,
      * follow ART heap pointers. */
     ksight_u32 tid = (ksight_u32)pid_tgid;
     ksight_u64 x1 = out->regs[1] & 0x00ffffffffffffffULL;
-    if (x1 >= 0x10000ULL)
-        ksight_bpf_map_update_elem(&entry_ptr, &tid, &out->regs[1], 0);
+    if (x1 >= 0x10000ULL) {
+        struct entry_info info = {};
+        info.ptr = out->regs[1];
+        info.num = out->regs[2];
+        ksight_bpf_map_update_elem(&entry_ptr, &tid, &info, 0);
+    }
     {
         ksight_u64 src1 = out->regs[1] & 0x00ffffffffffffffULL;
         ksight_u64 src2 = out->regs[2] & 0x00ffffffffffffffULL;

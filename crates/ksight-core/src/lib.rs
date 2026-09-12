@@ -11,6 +11,7 @@ mod http_plain;
 mod identity;
 mod inflate;
 mod inspect;
+mod mpaas;
 mod native_rules;
 mod pcap_decrypt;
 mod policy;
@@ -20,6 +21,7 @@ mod report;
 mod sequence;
 mod sm4;
 mod stack_rules;
+mod tls_abi;
 
 pub use capability::{
     current_capabilities, semantic_keypoints, CapabilityArea, CapabilityStage, ObservationTier,
@@ -38,10 +40,11 @@ pub use graph::{
     ranges_overlap, EdgeStrength, GraphEdge, GraphEntity, GraphEntityKind, GraphQuery, SessionGraph,
 };
 pub use handshake::{parse_handshake, HandshakeMeta};
-pub use http2::looks_like_http2;
+pub use http2::{http2_sync_offset, looks_like_http2, unwrap_grpc_length_prefixed};
 pub use http_mirror::{
-    fragment_bytes, parse_mirror_endpoint, request_from_http_url, requests_from_embedded_http_urls,
-    MirroredMessage, StreamReassembler, BURP_PLAYBACK_PORT, BURP_UPSTREAM_PORT,
+    fragment_bytes, looks_like_http_plain, parse_mirror_endpoint, request_from_http_url,
+    requests_from_embedded_http_urls, MirroredMessage, StreamReassembler, BURP_PLAYBACK_PORT,
+    BURP_UPSTREAM_PORT,
 };
 pub use http_plain::{
     format_inspect_url, is_kept_inspect_url, is_third_party_host, parse_http_plain,
@@ -49,19 +52,25 @@ pub use http_plain::{
 };
 pub use identity::IdentityRegistry;
 pub use inflate::{
-    decode_hex_bytes, inflate_gzip_bounded, inflate_inspect_buffer, looks_like_gzip,
-    looks_like_zlib,
+    decode_hex_bytes, inflate_brotli_bounded, inflate_gzip_bounded, inflate_http_entity,
+    inflate_inspect_buffer, looks_like_gzip, looks_like_zlib,
 };
 pub use inspect::{InspectAuditEvent, InspectPolicy};
+pub use mpaas::{looks_like_mpaas, parse_mpaas_request, parse_mpaas_response};
 pub use native_rules::{
     classify_native_frameworks, classify_tls_library_path, native_framework_rule_version,
     NativeFrameworkEvidence, NativeFrameworkMatch, TlsLibraryKind,
 };
-pub use pcap_decrypt::{decrypt_flows, parse_keylog, parse_pcap_tcp_flows, DecryptedFlow};
+pub use pcap_decrypt::{
+    decrypt_flows, decrypt_tls_application_data, parse_keylog, parse_pcap_tcp_flows, DecryptedFlow,
+    KeylogSecret,
+};
 pub use policy::{validate_policy, PolicyError};
 pub use provenance::{
-    anonymous_executable, hashed_file, path_candidate, CodeArtifact, DexArtifactObservation,
-    DexArtifactSet, DexClassConflict, DumpArtifact, PackageDexIndex, ProvenanceClass,
+    anonymous_executable, classify_dex_ownership, classify_dex_ownership_with_context, hashed_file,
+    path_candidate, CodeArtifact, DexArtifactObservation, DexArtifactSet, DexClassConflict,
+    DexOwnershipCategory, DexOwnershipContext, DexOwnershipEntry, DexOwnershipNamespaceSeed,
+    DexOwnershipReport, DumpArtifact, PackageDexIndex, ProvenanceClass,
 };
 pub use quic_initial::{decrypt_initial, QuicInitialHello, QuicInitialTable};
 pub use report::{
@@ -79,6 +88,13 @@ pub use sm4::{
     encrypt_ecb as sm4_encrypt_ecb,
 };
 pub use stack_rules::{
-    boundary_rule_for_symbol, boundary_symbols, keylog_entries, load as load_stack_rules,
-    matching_stacks, stack_for_path, tls_symbol_names, validation_issues,
+    boundary_functions, boundary_rule_for_symbol, boundary_symbols, enabled_plaintext_probes,
+    keylog_entries, live_apk_keylog_pin, load as load_stack_rules, matching_stacks,
+    probe_specs_for_path, ssl_write_attach_allowed, stack_for_path, tls_symbol_names,
+    validation_issues, BoundaryFunction, PlaintextProbe, ProbeSpec,
+    EMBEDDED_RULES as EMBEDDED_STACK_RULES, SCHEMA_VERSION,
+};
+pub use tls_abi::{
+    is_tls_application_data_export, ActualLengthSource, CapturePhase, TlsAbiKind, TlsAbiLayout,
+    TlsDirection,
 };

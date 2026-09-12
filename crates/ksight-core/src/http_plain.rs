@@ -601,7 +601,7 @@ pub(crate) fn embedded_http_urls(bytes: &[u8]) -> Vec<ParsedHttpPlain> {
     out
 }
 
-/// Packed Chromium `host_key` values (`mywap2.icbc.com.cnCK_...`) without `https://`.
+/// Packed Chromium `host_key` values (`wap.app.exampleCK_...`) without `https://`.
 pub(crate) fn embedded_cookie_hosts(bytes: &[u8]) -> Vec<ParsedHttpPlain> {
     const TLDS: [&[u8]; 8] = [
         b".com.cn", b".com.hk", b".co.uk", b".com", b".net", b".org", b".cn", b".hk",
@@ -971,7 +971,7 @@ mod tests {
 
     #[test]
     fn drops_png_keeps_txt_with_scheme() {
-        let preview = r#"{"img":"https://s.thsi.cn/a.png","cfg":"https://hxapp.10jqka.com.cn/config/sc_public_android.v2.txt"}"#;
+        let preview = r#"{"img":"https://cdn.example/a.png","cfg":"https://app.example/config/public.v2.txt"}"#;
         let parsed = parse_http_plain_all(preview, "text");
         let urls: Vec<String> = parsed
             .iter()
@@ -980,11 +980,11 @@ mod tests {
             .collect();
         assert!(
             urls.iter()
-                .any(|url| url == "https://hxapp.10jqka.com.cn/config/sc_public_android.v2.txt"),
+                .any(|url| url == "https://app.example/config/public.v2.txt"),
             "{urls:?}"
         );
         assert!(!urls.iter().any(|url| url.contains(".png")), "{urls:?}");
-        assert!(is_kept_inspect_url("https://ecs.abchina.com.cn/mbfront/"));
+        assert!(is_kept_inspect_url("https://api.app.example/front/"));
         assert!(!is_kept_inspect_url("https://i.pki.goog/we1.crt0"));
         assert!(!is_kept_inspect_url("https://c.pki.goog/r/gsr1.crl0"));
     }
@@ -992,18 +992,18 @@ mod tests {
     #[test]
     fn packed_cookie_host_keys_are_split_from_names() {
         let bytes =
-            b"\0mywap2.icbc.com.cnCK_ISW_WAPB-PORTAL\0cmywap2.icbc.com.cnCK_\0.b2c.icbc.com.cnCK_ISW_EPAY";
+            b"\0wap.example.com.cnCK_ISW_WAPB-PORTAL\0cwap.example.com.cnCK_\0.pay.example.com.cnCK_ISW_EPAY";
         let parsed = parse_http_plain_all_bytes(bytes, "binary");
         assert!(
             parsed
                 .iter()
-                .any(|row| row.host.as_deref() == Some("mywap2.icbc.com.cn")),
+                .any(|row| row.host.as_deref() == Some("wap.example.com.cn")),
             "{parsed:?}"
         );
         assert!(
             parsed
                 .iter()
-                .any(|row| row.host.as_deref() == Some("b2c.icbc.com.cn")),
+                .any(|row| row.host.as_deref() == Some("pay.example.com.cn")),
             "{parsed:?}"
         );
         assert!(!parsed
@@ -1011,32 +1011,32 @@ mod tests {
             .any(|row| row.host.as_deref() == Some("com.cn")));
         assert!(!parsed
             .iter()
-            .any(|row| row.host.as_deref() == Some("cmywap2.icbc.com.cn")));
+            .any(|row| row.host.as_deref() == Some("cwap.example.com.cn")));
     }
 
     #[test]
     fn drops_truncated_host_prefix_of_a_longer_host() {
-        let bytes = b"https://data.10jqka.co\0https://data.10jqka.com.cn/api/quote";
+        let bytes = b"https://data.example.co\0https://data.example.com/api/quote";
         let parsed = parse_http_plain_all_bytes(bytes, "text");
         assert!(
             parsed
                 .iter()
-                .any(|row| row.host.as_deref() == Some("data.10jqka.com.cn")),
+                .any(|row| row.host.as_deref() == Some("data.example.com")),
             "{parsed:?}"
         );
         assert!(
             !parsed
                 .iter()
-                .any(|row| row.host.as_deref() == Some("data.10jqka.co")),
+                .any(|row| row.host.as_deref() == Some("data.example.co")),
             "{parsed:?}"
         );
         assert!(sanitize_host("t.com").is_none());
         assert!(sanitize_host("this.constructor.com").is_none());
         assert!(!is_kept_inspect_url(
-            "https://www.citibank.com.hk/english/insurance/pdf/terms.pdf"
+            "https://www.app.example/english/insurance/pdf/terms.pdf"
         ));
         assert!(!is_kept_inspect_url("https://khms0.google.com/*"));
-        assert!(sanitize_host("alipay.kylinbridge").is_none());
+        assert!(sanitize_host("app.kylinbridge").is_none());
     }
 
     #[test]
@@ -1050,25 +1050,25 @@ mod tests {
     #[test]
     fn extracts_urls_from_truncated_json() {
         let preview = concat!(
-            r#"9fa5b256894d4a31","esType":-1,"url":"https://s.thsi.cn/cd/acrossBar_v1.8.zip","status":1}"#,
-            r#",{"url":"https://sp.thsi.cn/staticS3/pkg/e5db.zip"}"#
+            r#"9fa5b256894d4a31","esType":-1,"url":"https://cdn.example/cd/acrossBar_v1.8.zip","status":1}"#,
+            r#",{"url":"https://static.example/pkg/e5db.zip"}"#
         );
         let parsed = parse_http_plain_all(preview, "mixed");
         assert!(
             parsed.iter().any(|row| {
-                row.host.as_deref() == Some("s.thsi.cn") && row.path == "/cd/acrossBar_v1.8.zip"
+                row.host.as_deref() == Some("cdn.example") && row.path == "/cd/acrossBar_v1.8.zip"
             }),
             "{parsed:?}"
         );
         assert!(parsed
             .iter()
-            .any(|row| row.host.as_deref() == Some("sp.thsi.cn")));
+            .any(|row| row.host.as_deref() == Some("static.example")));
     }
 
     #[test]
     fn inflates_gzip_hex_preview_to_json() {
         use std::io::Write as _;
-        let plain = br#"{"url":"https://ebsnew.boc.cn/api/login"}"#;
+        let plain = br#"{"url":"https://ebs.app.example/api/session"}"#;
         let mut gz = Vec::new();
         {
             let mut encoder =
@@ -1084,7 +1084,7 @@ mod tests {
         assert!(
             parsed
                 .iter()
-                .any(|row| row.host.as_deref() == Some("ebsnew.boc.cn")),
+                .any(|row| row.host.as_deref() == Some("ebs.app.example")),
             "{parsed:?}"
         );
     }
@@ -1117,7 +1117,7 @@ mod tests {
     #[test]
     fn parses_lf_only_headers_and_json_body() {
         let preview = concat!(
-            "POST /v1/login HTTP/1.1\n",
+            "POST /v1/session HTTP/1.1\n",
             "Host: pay.example\n",
             "Authorization: Bearer secret\n",
             "Content-Type: application/json\n",
@@ -1125,7 +1125,7 @@ mod tests {
             "{\"phone\":\"1\",\"password\":\"x\"}"
         );
         let parsed = parse_http_plain(preview, "text").expect("http");
-        assert_eq!(parsed.path, "/v1/login");
+        assert_eq!(parsed.path, "/v1/session");
         assert_eq!(parsed.host.as_deref(), Some("pay.example"));
         assert!(parsed
             .redacted_headers

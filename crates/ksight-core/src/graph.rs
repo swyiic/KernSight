@@ -1292,12 +1292,8 @@ mod tests {
             dex_offset: Some(0),
             sha256: None,
         };
-        let graph = SessionGraph::from_package_dump(
-            Uuid::nil(),
-            "mobi.w3studio.apps.android.shsmy.phone",
-            &[1],
-            &[artifact],
-        );
+        let graph =
+            SessionGraph::from_package_dump(Uuid::nil(), "com.example.app", &[1], &[artifact]);
         assert!(graph
             .edges
             .iter()
@@ -1413,7 +1409,7 @@ mod tests {
         };
         let mut graph = SessionGraph::from_package_dump(
             Uuid::nil(),
-            "com.icbc",
+            "com.example.app",
             &[3],
             std::slice::from_ref(&artifact),
         );

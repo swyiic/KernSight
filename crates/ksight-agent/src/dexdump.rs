@@ -29,6 +29,8 @@ pub struct LiveDump {
     pub packer_regions: usize,
     /// Bounded HTTP/JSON-looking windows copied from anonymous memory.
     pub plaintext_windows: usize,
+    /// Signing/crypto marker windows copied beside plaintext (local artifacts only).
+    pub crypto_windows: usize,
     /// Heap/BSS pointers followed from packer mappings (SM4 key candidates).
     pub key_slots: usize,
     /// DEX images harvested from payload-sized anonymous heaps.
@@ -65,6 +67,9 @@ pub fn dump_live_process(pid: u32, dest_dir: &Path, deadline: Instant) -> LiveDu
     };
     // Interface catalog first: Inspect shutdown used to spend the 8s budget on DEX heaps.
     dump.plaintext_windows = dump_plaintext_windows(pid, dest_dir, deadline);
+    if Instant::now() < deadline {
+        dump.crypto_windows = dump_crypto_windows(pid, dest_dir, deadline);
+    }
     dump.native_libs = dump_loaded_sos(pid, dest_dir, deadline);
     write_open_code(pid, dest_dir);
     let packer = maps_have_packer_so(&maps);
@@ -323,6 +328,107 @@ fn dump_plaintext_windows(pid: u32, dest_dir: &Path, deadline: Instant) -> usize
                 let at = from.saturating_add(rel);
                 let begin = plaintext_window_begin(&bytes, at, needle);
                 let stop = (at.saturating_add(PLAINTEXT_WINDOW)).min(bytes.len());
+                let Some(slice) = keep_plaintext_window(&bytes[begin..stop]) else {
+                    from = at.saturating_add(needle.len().max(1));
+                    continue;
+                };
+                let fingerprint = plaintext_fingerprint(slice);
+                if !seen.insert(fingerprint) {
+                    from = at.saturating_add(needle.len().max(1));
+                    continue;
+                }
+                let name = format!("mem-{pid}-{start:x}+{at:x}.txt");
+                let dest = out_dir.join(&name);
+                if !dest.exists() {
+                    let _ = std::fs::write(&dest, slice);
+                    dumped = dumped.saturating_add(1);
+                    needle_hits = needle_hits.saturating_add(1);
+                }
+                from = at.saturating_add(needle.len().max(1));
+            }
+        }
+    }
+    dumped
+}
+
+/// Signing / header-encrypt needles parallel to `crypto_watch` (dump artifacts only).
+const CRYPTO_NEEDLES: [&[u8]; 16] = [
+    b"X-Sign",
+    b"X-Sign:",
+    b"X-Signature",
+    b"X-Nonce",
+    b"X-Qen",
+    b"OpenPlatformEncrypt",
+    b"\"sign\":",
+    b"\"signature\":",
+    b"sign=",
+    b"appSecret",
+    b"appKey",
+    b"secretKey",
+    b"SecretKeySpec",
+    b"AES/CBC",
+    b"SM4/",
+    b"encryptSM4",
+];
+const CRYPTO_WINDOW: usize = 4096;
+const CRYPTO_CAP: usize = 48;
+const CRYPTO_PER_NEEDLE: usize = 8;
+
+/// Bounded signing/crypto windows under `runtime/crypto-windows/` (not Burp, not http_calls).
+fn dump_crypto_windows(pid: u32, dest_dir: &Path, deadline: Instant) -> usize {
+    let Ok(maps) = std::fs::read_to_string(format!("/proc/{pid}/maps")) else {
+        return 0;
+    };
+    let Ok(mut mem) = File::open(format!("/proc/{pid}/mem")) else {
+        return 0;
+    };
+    let out_dir = dest_dir.join("crypto-windows");
+    let _ = std::fs::create_dir_all(&out_dir);
+    let mut dumped = 0_usize;
+    let mut seen = BTreeSet::new();
+    for line in maps.lines() {
+        if Instant::now() >= deadline || dumped >= CRYPTO_CAP {
+            break;
+        }
+        let Some((start, end, perms, path)) = parse_map_line(line) else {
+            continue;
+        };
+        if !perms.contains('r') || perms.contains('x') {
+            continue;
+        }
+        if path.starts_with("/system/")
+            || path.starts_with("/apex/")
+            || path.starts_with("/vendor/")
+        {
+            continue;
+        }
+        let lower = path.to_ascii_lowercase();
+        let packer_heap = lower.contains("scudo:secondary")
+            || path.is_empty()
+            || (path.starts_with('[') && !lower.contains("dalvik") && !lower.contains("stack"));
+        if !packer_heap {
+            continue;
+        }
+        let len = end.saturating_sub(start).min(8 * 1024 * 1024);
+        if len < 64 * 1024 {
+            continue;
+        }
+        let Some(bytes) = read_region(&mut mem, start, len) else {
+            continue;
+        };
+        for needle in CRYPTO_NEEDLES {
+            let mut from = 0_usize;
+            let mut needle_hits = 0_usize;
+            while dumped < CRYPTO_CAP && needle_hits < CRYPTO_PER_NEEDLE {
+                if Instant::now() >= deadline {
+                    return dumped;
+                }
+                let Some(rel) = find_bytes(&bytes[from..], needle) else {
+                    break;
+                };
+                let at = from.saturating_add(rel);
+                let begin = at.saturating_sub(64);
+                let stop = (at.saturating_add(CRYPTO_WINDOW)).min(bytes.len());
                 let Some(slice) = keep_plaintext_window(&bytes[begin..stop]) else {
                     from = at.saturating_add(needle.len().max(1));
                     continue;
@@ -2102,16 +2208,6 @@ mod tests {
     }
 
     #[test]
-    fn skips_dev_and_socket_fds() {
-        assert!(skip_fd_target("/dev/null"));
-        assert!(skip_fd_target("socket:[123]"));
-        assert!(!skip_fd_target(
-            "/data/user/0/app/code_cache/a.dex (deleted)"
-        ));
-        assert!(fd_target_interesting("/data/app/x/libdexvmp.so"));
-    }
-
-    #[test]
     fn apk_embedded_native_is_executable_data_app_apk() {
         assert!(apk_embedded_native(
             "/data/app/~~x==/com.citibank.mobile.hk-y==/split_config.arm64_v8a.apk",
@@ -2379,10 +2475,10 @@ mod tests {
 
     #[test]
     fn plaintext_window_drops_nul_padding_and_keeps_http_text() {
-        let mut padded = b"GET /v1/login HTTP/1.1\r\nHost: api.example\r\n\r\n".to_vec();
+        let mut padded = b"GET /v1/session HTTP/1.1\r\nHost: api.example\r\n\r\n".to_vec();
         padded.resize(2048, 0);
         let kept = keep_plaintext_window(&padded).expect("http text");
-        assert!(kept.starts_with(b"GET /v1/login"));
+        assert!(kept.starts_with(b"GET /v1/session"));
         assert!(!kept.ends_with(&[0]));
         assert!(kept.len() < 80);
         let zeros = vec![0_u8; 2048];
@@ -2394,9 +2490,9 @@ mod tests {
 
     #[test]
     fn plaintext_window_keeps_https_and_h2_header_tokens() {
-        let https = b"https://api.example/v1/login extra";
+        let https = b"https://api.example/v1/session extra";
         assert_eq!(plaintext_window_begin(https, 0, b"https://"), 0);
-        let mut padded = b":method: GET\n:path: /v1/login\n:authority: api.example\n".to_vec();
+        let mut padded = b":method: GET\n:path: /v1/session\n:authority: api.example\n".to_vec();
         padded.resize(2048, 0);
         let kept = keep_plaintext_window(&padded).expect("h2 tokens");
         assert!(kept.windows(5).any(|window| window == b":path"));

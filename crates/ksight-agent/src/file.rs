@@ -383,7 +383,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ksight-forensic-{}", std::process::id()));
         let logs = dir.join("connlogs");
         std::fs::create_dir_all(&logs).expect("temp connlogs");
-        let src = logs.join("icbcim_test.txt");
+        let src = logs.join("sample_test.txt");
         std::fs::write(&src, b"CinClient : connect host:example\n").expect("write connlog");
         let mut open = FileOpen {
             directory_fd: AT_FDCWD,
@@ -408,7 +408,7 @@ mod tests {
     #[test]
     fn packer_and_gadget_names_are_interesting() {
         assert!(is_interesting_native("/data/app/x/libdexvmp.so"));
-        assert!(is_interesting_native("/data/app/x/libiProtectSGCC.so"));
+        assert!(is_interesting_native("/data/app/x/libiProtect.so"));
         assert!(is_interesting_native("/data/app/x/libFridaGadget.so"));
         assert!(is_interesting_native("/data/app/x/libbangcle_risk.so"));
         assert!(is_interesting_native("/data/app/x/libjiagu.so"));

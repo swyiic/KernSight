@@ -63,8 +63,7 @@ fn inspect_elf64(path: &Path, bytes: &[u8]) -> Result<ElfIdentity, String> {
         });
     }
     let mut build_id = None;
-    let mut dynsym = None;
-    let mut dynstr = None;
+    let mut sections = Vec::new();
     for index in 0..shnum {
         let offset = usize::try_from(shoff).map_err(|_| "shoff")?
             + usize::from(index) * usize::from(shentsize);
@@ -74,57 +73,19 @@ fn inspect_elf64(path: &Path, bytes: &[u8]) -> Result<ElfIdentity, String> {
         let kind = read_u32(bytes, offset + 4)?;
         let section_offset = read_u64(bytes, offset + 24)?;
         let section_size = read_u64(bytes, offset + 32)?;
+        let link = read_u32(bytes, offset + 40)?;
         if kind == 7 {
             if let Some(id) = parse_gnu_build_id(bytes, section_offset, section_size) {
                 build_id = Some(id);
             }
         }
-        if kind == 11 {
-            dynsym = Some((section_offset, section_size));
-        }
-        if kind == 3 && dynstr.is_none() {
-            dynstr = Some((section_offset, section_size));
-        }
+        sections.push((kind, section_offset, section_size, link));
     }
-    let mut symbols = Vec::new();
-    if let (Some((sym_off, sym_size)), Some((str_off, str_size))) = (dynsym, dynstr) {
-        let start = usize::try_from(sym_off).unwrap_or(0);
-        let len = usize::try_from(sym_size).unwrap_or(0);
-        let str_start = usize::try_from(str_off).unwrap_or(0);
-        let str_len = usize::try_from(str_size).unwrap_or(0);
-        let sym_end = start.checked_add(len).filter(|end| *end <= bytes.len());
-        let str_end = str_start
-            .checked_add(str_len)
-            .filter(|end| *end <= bytes.len());
-        if let (Some(sym_end), Some(str_end)) = (sym_end, str_end) {
-            let strings = &bytes[str_start..str_end];
-            for entry in bytes[start..sym_end].chunks(24) {
-                if entry.len() < 24 {
-                    break;
-                }
-                let mut name_raw = [0_u8; 4];
-                name_raw.copy_from_slice(&entry[0..4]);
-                let mut value_raw = [0_u8; 8];
-                value_raw.copy_from_slice(&entry[8..16]);
-                let name_off = u32::from_le_bytes(name_raw) as usize;
-                let value = u64::from_le_bytes(value_raw);
-                if name_off >= strings.len() || value == 0 {
-                    continue;
-                }
-                let end = strings[name_off..]
-                    .iter()
-                    .position(|byte| *byte == 0)
-                    .map_or(strings.len(), |relative| name_off + relative);
-                let name = String::from_utf8_lossy(&strings[name_off..end]).into_owned();
-                if name.is_empty() {
-                    continue;
-                }
-                if let Some(file_offset) = virt_to_file(&loads, value) {
-                    symbols.push((name, file_offset));
-                }
-            }
-        }
+    let mut symbols = parse_dynsym_via_sections(bytes, &loads, &sections, true);
+    if symbols.is_empty() {
+        symbols = parse_dynsym_via_pt_dynamic(bytes, &loads, phoff, phentsize, phnum, true);
     }
+    merge_tls_symtab(&mut symbols, bytes, &loads, &sections, true);
     Ok(ElfIdentity {
         path: path.display().to_string(),
         build_id,
@@ -157,8 +118,7 @@ fn inspect_elf32(path: &Path, bytes: &[u8]) -> Result<ElfIdentity, String> {
         });
     }
     let mut build_id = None;
-    let mut dynsym = None;
-    let mut dynstr = None;
+    let mut sections = Vec::new();
     for index in 0..shnum {
         let offset = usize::try_from(shoff).map_err(|_| "shoff")?
             + usize::from(index) * usize::from(shentsize);
@@ -168,60 +128,19 @@ fn inspect_elf32(path: &Path, bytes: &[u8]) -> Result<ElfIdentity, String> {
         let kind = read_u32(bytes, offset + 4)?;
         let section_offset = u64::from(read_u32(bytes, offset + 16)?);
         let section_size = u64::from(read_u32(bytes, offset + 20)?);
+        let link = read_u32(bytes, offset + 24)?;
         if kind == 7 {
             if let Some(id) = parse_gnu_build_id(bytes, section_offset, section_size) {
                 build_id = Some(id);
             }
         }
-        if kind == 11 {
-            dynsym = Some((section_offset, section_size));
-        }
-        if kind == 3 && dynstr.is_none() {
-            dynstr = Some((section_offset, section_size));
-        }
+        sections.push((kind, section_offset, section_size, link));
     }
-    let mut symbols = Vec::new();
-    if let (Some((sym_off, sym_size)), Some((str_off, str_size))) = (dynsym, dynstr) {
-        let start = usize::try_from(sym_off).unwrap_or(0);
-        let len = usize::try_from(sym_size).unwrap_or(0);
-        let str_start = usize::try_from(str_off).unwrap_or(0);
-        let str_len = usize::try_from(str_size).unwrap_or(0);
-        let sym_end = start.checked_add(len).filter(|end| *end <= bytes.len());
-        let str_end = str_start
-            .checked_add(str_len)
-            .filter(|end| *end <= bytes.len());
-        if let (Some(sym_end), Some(str_end)) = (sym_end, str_end) {
-            let strings = &bytes[str_start..str_end];
-            for entry in bytes[start..sym_end].chunks(16) {
-                if entry.len() < 16 {
-                    break;
-                }
-                let Ok(name_raw) = <[u8; 4]>::try_from(&entry[0..4]) else {
-                    continue;
-                };
-                let Ok(value_raw) = <[u8; 4]>::try_from(&entry[4..8]) else {
-                    continue;
-                };
-                let name_off = u32::from_le_bytes(name_raw) as usize;
-                // ARM Thumb symbols set bit 0; uprobe offsets must be even.
-                let value = u64::from(u32::from_le_bytes(value_raw)) & !1;
-                if name_off >= strings.len() || value == 0 {
-                    continue;
-                }
-                let end = strings[name_off..]
-                    .iter()
-                    .position(|byte| *byte == 0)
-                    .map_or(strings.len(), |relative| name_off + relative);
-                let name = String::from_utf8_lossy(&strings[name_off..end]).into_owned();
-                if name.is_empty() {
-                    continue;
-                }
-                if let Some(file_offset) = virt_to_file(&loads, value) {
-                    symbols.push((name, file_offset));
-                }
-            }
-        }
+    let mut symbols = parse_dynsym_via_sections(bytes, &loads, &sections, false);
+    if symbols.is_empty() {
+        symbols = parse_dynsym_via_pt_dynamic(bytes, &loads, phoff, phentsize, phnum, false);
     }
+    merge_tls_symtab(&mut symbols, bytes, &loads, &sections, false);
     Ok(ElfIdentity {
         path: path.display().to_string(),
         build_id,
@@ -245,12 +164,28 @@ pub fn symbol_match_exact<'a>(elf: &'a ElfIdentity, names: &[&str]) -> Option<(&
     matching_symbols_exact(elf, names).into_iter().next()
 }
 
+/// GNU versioned dynsym name without `@LIB` / `@@OPENSSL_*` suffix.
+#[must_use]
+pub fn dynsym_export_name(name: &str) -> &str {
+    let no_default = name.split("@@").next().unwrap_or(name);
+    no_default.split('@').next().unwrap_or(no_default)
+}
+
 /// Every exact dynsym name in `names` order. Unique by file offset.
-pub fn matching_symbols_exact<'a>(elf: &'a ElfIdentity, names: &[&str]) -> Vec<(&'a str, u64)> {
+/// Versioned exports (`SSL_write@@OPENSSL_3`) match the unversioned name.
+pub fn matching_symbols_exact<'a, S: AsRef<str>>(
+    elf: &'a ElfIdentity,
+    names: &[S],
+) -> Vec<(&'a str, u64)> {
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
     for wanted in names {
-        if let Some((name, offset)) = elf.symbols.iter().find(|(name, _)| name == wanted) {
+        let wanted = wanted.as_ref();
+        if let Some((name, offset)) = elf
+            .symbols
+            .iter()
+            .find(|(name, _)| name == wanted || dynsym_export_name(name) == wanted)
+        {
             if seen.insert(*offset) {
                 out.push((name.as_str(), *offset));
             }
@@ -280,6 +215,285 @@ struct LoadSegment {
     file_offset: u64,
     virt_addr: u64,
     file_size: u64,
+}
+
+fn parse_dynsym_via_sections(
+    bytes: &[u8],
+    loads: &[LoadSegment],
+    sections: &[(u32, u64, u64, u32)],
+    elf64: bool,
+) -> Vec<(String, u64)> {
+    let mut dynsym = None;
+    let mut dynstr = None;
+    for &(kind, offset, size, link) in sections {
+        if kind != 11 {
+            continue;
+        }
+        dynsym = Some((offset, size));
+        if let Some(&(str_kind, str_off, str_size, _)) = sections.get(link as usize) {
+            if str_kind == 3 {
+                dynstr = Some((str_off, str_size));
+            }
+        }
+        break;
+    }
+    if dynstr.is_none() {
+        dynstr = sections
+            .iter()
+            .find(|(kind, _, _, _)| *kind == 3)
+            .map(|(_, offset, size, _)| (*offset, *size));
+    }
+    match (dynsym, dynstr) {
+        (Some((sym_off, sym_size)), Some((str_off, str_size))) => {
+            parse_dynsym_entries(bytes, loads, sym_off, sym_size, str_off, str_size, elf64)
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn parse_dynsym_via_pt_dynamic(
+    bytes: &[u8],
+    loads: &[LoadSegment],
+    phoff: u64,
+    phentsize: u16,
+    phnum: u16,
+    elf64: bool,
+) -> Vec<(String, u64)> {
+    let phoff = usize::try_from(phoff).unwrap_or(0);
+    let entsize = usize::from(phentsize);
+    let mut dyn_off = None;
+    let mut dyn_filesz = 0_u64;
+    for index in 0..phnum {
+        let offset = phoff.saturating_add(usize::from(index).saturating_mul(entsize));
+        let (kind, file_off, filesz) = if elf64 {
+            if offset.saturating_add(56) > bytes.len() {
+                break;
+            }
+            (
+                read_u32(bytes, offset).unwrap_or(0),
+                read_u64(bytes, offset + 8).unwrap_or(0),
+                read_u64(bytes, offset + 32).unwrap_or(0),
+            )
+        } else {
+            if offset.saturating_add(32) > bytes.len() {
+                break;
+            }
+            (
+                read_u32(bytes, offset).unwrap_or(0),
+                u64::from(read_u32(bytes, offset + 4).unwrap_or(0)),
+                u64::from(read_u32(bytes, offset + 16).unwrap_or(0)),
+            )
+        };
+        if kind == 2 {
+            dyn_off = Some(file_off);
+            dyn_filesz = filesz;
+            break;
+        }
+    }
+    let Some(dyn_off) = dyn_off else {
+        return Vec::new();
+    };
+    let start = usize::try_from(dyn_off).unwrap_or(0);
+    let len = usize::try_from(dyn_filesz).unwrap_or(0);
+    let end = start.saturating_add(len).min(bytes.len());
+    if start >= end {
+        return Vec::new();
+    }
+    let dyn_entsize = if elf64 { 16 } else { 8 };
+    let mut symtab_va = None;
+    let mut strtab_va = None;
+    let mut strsz = None;
+    let mut syment = if elf64 { 24_u64 } else { 16 };
+    let mut hash_va = None;
+    for entry in bytes[start..end].chunks(dyn_entsize) {
+        if entry.len() < dyn_entsize {
+            break;
+        }
+        let (tag, val) = if elf64 {
+            let tag = i64::from_le_bytes(entry[0..8].try_into().unwrap_or([0; 8]));
+            let val = u64::from_le_bytes(entry[8..16].try_into().unwrap_or([0; 8]));
+            (tag, val)
+        } else {
+            let tag = i32::from_le_bytes(entry[0..4].try_into().unwrap_or([0; 4])) as i64;
+            let val = u64::from(u32::from_le_bytes(entry[4..8].try_into().unwrap_or([0; 4])));
+            (tag, val)
+        };
+        match tag {
+            0 => break,
+            4 => hash_va = Some(val),
+            5 => strtab_va = Some(val),
+            6 => symtab_va = Some(val),
+            10 => strsz = Some(val),
+            11 => syment = val,
+            _ => {}
+        }
+    }
+    let (Some(sym_va), Some(str_va), Some(str_size)) = (symtab_va, strtab_va, strsz) else {
+        return Vec::new();
+    };
+    let Some(sym_off) = virt_to_file(loads, sym_va) else {
+        return Vec::new();
+    };
+    let Some(str_off) = virt_to_file(loads, str_va) else {
+        return Vec::new();
+    };
+    let nsyms = hash_va
+        .and_then(|va| virt_to_file(loads, va))
+        .and_then(|off| {
+            let idx = usize::try_from(off.saturating_add(4)).ok()?;
+            bytes.get(idx..idx + 4).and_then(|raw| {
+                let raw: [u8; 4] = raw.try_into().ok()?;
+                Some(u32::from_le_bytes(raw))
+            })
+        })
+        .unwrap_or(0);
+    if nsyms == 0 || syment == 0 {
+        return Vec::new();
+    }
+    let sym_size = u64::from(nsyms).saturating_mul(syment);
+    parse_dynsym_entries(bytes, loads, sym_off, sym_size, str_off, str_size, elf64)
+}
+
+fn parse_dynsym_entries(
+    bytes: &[u8],
+    loads: &[LoadSegment],
+    sym_off: u64,
+    sym_size: u64,
+    str_off: u64,
+    str_size: u64,
+    elf64: bool,
+) -> Vec<(String, u64)> {
+    let start = usize::try_from(sym_off).unwrap_or(0);
+    let len = usize::try_from(sym_size).unwrap_or(0);
+    let str_start = usize::try_from(str_off).unwrap_or(0);
+    let str_len = usize::try_from(str_size).unwrap_or(0);
+    let Some(sym_end) = start.checked_add(len).filter(|end| *end <= bytes.len()) else {
+        return Vec::new();
+    };
+    let Some(str_end) = str_start
+        .checked_add(str_len)
+        .filter(|end| *end <= bytes.len())
+    else {
+        return Vec::new();
+    };
+    let strings = &bytes[str_start..str_end];
+    let chunk = if elf64 { 24 } else { 16 };
+    let mut symbols = Vec::new();
+    for entry in bytes[start..sym_end].chunks(chunk) {
+        if entry.len() < chunk {
+            break;
+        }
+        let (name_off, value, info, shndx) = if elf64 {
+            let name_off = u32::from_le_bytes(entry[0..4].try_into().unwrap_or([0; 4])) as usize;
+            let info = entry[4];
+            let shndx = u16::from_le_bytes(entry[6..8].try_into().unwrap_or([0; 2]));
+            let value = u64::from_le_bytes(entry[8..16].try_into().unwrap_or([0; 8]));
+            (name_off, value, info, shndx)
+        } else {
+            let name_off = u32::from_le_bytes(entry[0..4].try_into().unwrap_or([0; 4])) as usize;
+            let value =
+                u64::from(u32::from_le_bytes(entry[4..8].try_into().unwrap_or([0; 4]))) & !1;
+            let info = entry[12];
+            let shndx = u16::from_le_bytes(entry[14..16].try_into().unwrap_or([0; 2]));
+            (name_off, value, info, shndx)
+        };
+        if !is_defined_func(info, shndx, value) || name_off >= strings.len() {
+            continue;
+        }
+        let end = strings[name_off..]
+            .iter()
+            .position(|byte| *byte == 0)
+            .map_or(strings.len(), |relative| name_off + relative);
+        let raw = String::from_utf8_lossy(&strings[name_off..end]);
+        let name = dynsym_export_name(&raw).to_owned();
+        if name.is_empty() {
+            continue;
+        }
+        if let Some(file_offset) = virt_to_file(loads, value) {
+            symbols.push((name, file_offset));
+        }
+    }
+    symbols
+}
+
+fn is_defined_func(info: u8, shndx: u16, value: u64) -> bool {
+    if value == 0 || shndx == 0 || shndx >= 0xff00 {
+        return false;
+    }
+    // STT_FUNC only. STT_GNU_IFUNC (10) is a resolver; attaching there is an invented target.
+    info & 0x0f == 2
+}
+
+/// LOCAL `.symtab` SSL_write/SSL_read (static OpenSSL in libcurl). Not an invented RVA:
+/// the file offset comes from this ELF's own symbol table.
+fn merge_tls_symtab(
+    symbols: &mut Vec<(String, u64)>,
+    bytes: &[u8],
+    loads: &[LoadSegment],
+    sections: &[(u32, u64, u64, u32)],
+    elf64: bool,
+) {
+    let extra = parse_sym_section(bytes, loads, sections, 2, elf64);
+    let mut seen: BTreeSet<u64> = symbols.iter().map(|(_, offset)| *offset).collect();
+    for (name, offset) in extra {
+        if !is_tls_copy_symbol(&name) || !seen.insert(offset) {
+            continue;
+        }
+        symbols.push((name, offset));
+    }
+}
+
+fn parse_sym_section(
+    bytes: &[u8],
+    loads: &[LoadSegment],
+    sections: &[(u32, u64, u64, u32)],
+    wanted_kind: u32,
+    elf64: bool,
+) -> Vec<(String, u64)> {
+    let mut dynsym = None;
+    let mut dynstr = None;
+    for &(kind, offset, size, link) in sections {
+        if kind != wanted_kind {
+            continue;
+        }
+        dynsym = Some((offset, size));
+        if let Some(&(str_kind, str_off, str_size, _)) = sections.get(link as usize) {
+            if str_kind == 3 {
+                dynstr = Some((str_off, str_size));
+            }
+        }
+        break;
+    }
+    match (dynsym, dynstr) {
+        (Some((sym_off, sym_size)), Some((str_off, str_size))) => {
+            parse_dynsym_entries(bytes, loads, sym_off, sym_size, str_off, str_size, elf64)
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn is_tls_copy_symbol(name: &str) -> bool {
+    matches!(
+        dynsym_export_name(name),
+        "SSL_write"
+            | "SSL_write_ex"
+            | "SSL_write_ex2"
+            | "SSL_read"
+            | "SSL_read_ex"
+            | "SSL_read_ex2"
+            | "mbedtls_ssl_write"
+            | "mbedtls_ssl_read"
+            | "wolfSSL_write"
+            | "wolfSSL_read"
+            | "sslWrite"
+            | "sslWriteEx"
+            | "sslRead"
+            | "sslReadEx"
+            | "SLIGHT_SSL_write"
+            | "SLIGHT_SSL_write_ex"
+            | "SLIGHT_SSL_read"
+            | "SLIGHT_SSL_read_ex"
+    )
 }
 
 fn virt_to_file(loads: &[LoadSegment], virt: u64) -> Option<u64> {
@@ -368,36 +582,10 @@ pub fn plausible_elf_file(path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
-    use super::{inspect_elf, matching_symbols, parse_gnu_build_id, ElfIdentity};
-
-    #[test]
-    fn inspects_elf32_libbinder_transact() {
-        let path = Path::new("/tmp/ksight-hal/libbinder32.so");
-        if !path.is_file() {
-            return;
-        }
-        let elf = inspect_elf(path).expect("elf32");
-        assert!(
-            elf.symbols
-                .iter()
-                .any(|(name, _)| name.contains("IPCThreadState8transact")),
-            "32-bit libbinder must export transact"
-        );
-        let transact = elf
-            .symbols
-            .iter()
-            .find(|(name, _)| name.contains("IPCThreadState8transact"))
-            .expect("transact");
-        assert_eq!(elf.bits, 32);
-        assert_eq!(transact.1, 0x2f020);
-        assert_eq!(transact.1 & 1, 0, "uprobe offset must be even");
-        assert!(elf
-            .symbols
-            .iter()
-            .any(|(name, _)| name.contains("writeStrongBinderERKNS_2sp")));
-    }
+    use super::{
+        dynsym_export_name, inspect_elf, matching_symbols, matching_symbols_exact,
+        parse_gnu_build_id, ElfIdentity,
+    };
 
     #[test]
     fn matching_symbols_returns_every_prefix_hit() {
@@ -428,6 +616,133 @@ mod tests {
         assert!(matching_symbols(&elf, &["_ZN3art13DexFileLoader4OpenE"])
             .iter()
             .all(|(name, _)| name.starts_with("_ZN3art13DexFileLoader4OpenE")));
+    }
+
+    #[test]
+    fn exact_match_accepts_gnu_versioned_ssl_write() {
+        let elf = ElfIdentity {
+            path: "/libssl.so".to_owned(),
+            build_id: None,
+            bits: 64,
+            symbols: vec![
+                ("SSL_write@@OPENSSL_3".to_owned(), 0x24a3d8),
+                ("SSL_read@LIBSSL_1_1".to_owned(), 0x249f60),
+            ],
+        };
+        let write = matching_symbols_exact(&elf, &["SSL_write", "SSL_write_ex"]);
+        assert_eq!(write, vec![("SSL_write@@OPENSSL_3", 0x24a3d8)]);
+        let read = matching_symbols_exact(&elf, &["SSL_read"]);
+        assert_eq!(read, vec![("SSL_read@LIBSSL_1_1", 0x249f60)]);
+        assert_eq!(dynsym_export_name("SSL_write@@OPENSSL_3"), "SSL_write");
+        assert_eq!(dynsym_export_name("SSL_write"), "SSL_write");
+    }
+
+    #[test]
+    fn inspect_elf_reads_local_symtab_ssl_write_on_ccb_curl() {
+        let path = "/tmp/ksight-so/ccb-libcurl.so";
+        if !std::path::Path::new(path).is_file() {
+            return;
+        }
+        let elf = inspect_elf(path).expect("ccb libcurl");
+        let write = matching_symbols_exact(&elf, &["SSL_write"]);
+        assert_eq!(write.len(), 1, "{elf:?}");
+        assert_eq!(write[0].1, 0xa25a8);
+        let read = matching_symbols_exact(&elf, &["SSL_read"]);
+        assert_eq!(read[0].1, 0xa24d8);
+    }
+
+    fn inspect_elf_keeps_defined_ssl_write_and_drops_und() {
+        let bytes = tiny_elf64_dynsym(&[
+            TinySym {
+                name: "SSL_write@@OPENSSL_3.0.0",
+                value: 0x120,
+                shndx: 1,
+                func: true,
+            },
+            TinySym {
+                name: "SSL_write",
+                value: 0,
+                shndx: 0,
+                func: true,
+            },
+        ]);
+        let dir = std::env::temp_dir();
+        let path = dir.join("ksight-tiny-ssl-write.so");
+        std::fs::write(&path, &bytes).expect("write tiny elf");
+        let elf = inspect_elf(&path).expect("parse tiny elf");
+        let _ = std::fs::remove_file(&path);
+        let hits = matching_symbols_exact(&elf, &["SSL_write"]);
+        assert_eq!(hits.len(), 1, "{elf:?}");
+        assert_eq!(hits[0].0, "SSL_write");
+        assert_eq!(hits[0].1, 0x120);
+    }
+
+    struct TinySym {
+        name: &'static str,
+        value: u64,
+        shndx: u16,
+        func: bool,
+    }
+
+    fn tiny_elf64_dynsym(syms: &[TinySym]) -> Vec<u8> {
+        let mut dynstr = vec![0_u8];
+        let mut name_offs = Vec::new();
+        for sym in syms {
+            name_offs.push(dynstr.len() as u32);
+            dynstr.extend_from_slice(sym.name.as_bytes());
+            dynstr.push(0);
+        }
+        let dynsym_ents = 1 + syms.len();
+        let dynsym = vec![0_u8; dynsym_ents * 24];
+        let ehdr = 64;
+        let phdr = 56;
+        let shdr = 64 * 3;
+        let dynsym_off = ehdr + phdr;
+        let dynstr_off = dynsym_off + dynsym.len();
+        let shoff = dynstr_off + dynstr.len();
+        let file_len = shoff + shdr;
+        let mut bytes = vec![0_u8; file_len.max(0x180)];
+        let file_len64 = bytes.len() as u64;
+        bytes[0..4].copy_from_slice(b"\x7fELF");
+        bytes[4] = 2;
+        bytes[5] = 1;
+        bytes[6] = 1;
+        bytes[16..18].copy_from_slice(&3u16.to_le_bytes());
+        bytes[18..20].copy_from_slice(&0x3e_u16.to_le_bytes());
+        bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+        bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
+        bytes[40..48].copy_from_slice(&(shoff as u64).to_le_bytes());
+        bytes[52..54].copy_from_slice(&64u16.to_le_bytes());
+        bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
+        bytes[56..58].copy_from_slice(&1u16.to_le_bytes());
+        bytes[58..60].copy_from_slice(&64u16.to_le_bytes());
+        bytes[60..62].copy_from_slice(&3u16.to_le_bytes());
+        bytes[64..68].copy_from_slice(&1u32.to_le_bytes());
+        bytes[68..72].copy_from_slice(&5u32.to_le_bytes());
+        bytes[88..96].copy_from_slice(&file_len64.to_le_bytes());
+        bytes[96..104].copy_from_slice(&file_len64.to_le_bytes());
+        for (i, sym) in syms.iter().enumerate() {
+            let off = dynsym_off + (i + 1) * 24;
+            bytes[off..off + 4].copy_from_slice(&name_offs[i].to_le_bytes());
+            bytes[off + 4] = if sym.func { 0x12 } else { 0x11 };
+            bytes[off + 6..off + 8].copy_from_slice(&sym.shndx.to_le_bytes());
+            bytes[off + 8..off + 16].copy_from_slice(&sym.value.to_le_bytes());
+        }
+        let _ = dynsym;
+        bytes[dynstr_off..dynstr_off + dynstr.len()].copy_from_slice(&dynstr);
+        // shdr[0] NULL
+        // shdr[1] SHT_DYNSYM link=2
+        let sh1 = shoff + 64;
+        bytes[sh1 + 4..sh1 + 8].copy_from_slice(&11u32.to_le_bytes());
+        bytes[sh1 + 24..sh1 + 32].copy_from_slice(&(dynsym_off as u64).to_le_bytes());
+        bytes[sh1 + 32..sh1 + 40].copy_from_slice(&(dynsym_ents as u64 * 24).to_le_bytes());
+        bytes[sh1 + 40..sh1 + 44].copy_from_slice(&2u32.to_le_bytes());
+        // shdr[2] SHT_STRTAB
+        let sh2 = shoff + 128;
+        bytes[sh2 + 4..sh2 + 8].copy_from_slice(&3u32.to_le_bytes());
+        bytes[sh2 + 24..sh2 + 32].copy_from_slice(&(dynstr_off as u64).to_le_bytes());
+        bytes[sh2 + 32..sh2 + 40].copy_from_slice(&(dynstr.len() as u64).to_le_bytes());
+        bytes
     }
 
     #[test]

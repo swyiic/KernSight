@@ -198,7 +198,7 @@ fn proxy_one(
         || peek.starts_with(b"PATCH")
         || peek.starts_with(b"DELETE")
         || peek.starts_with(b"OPTIONS");
-    // Custom API ports (SGCC 28083 / Aliyun 28630) are TLS, not 443.
+    // Custom API ports (28083 / 28630) are TLS, not 443.
     if tls || orig_port == 443 || orig_port == 8443 || !looks_http {
         let host = sni
             .clone()
@@ -1459,9 +1459,9 @@ mod tests {
     #[test]
     fn parse_connect_host_port() {
         let got = parse_connect_target(
-            "CONNECT map.sgcc.com.cn:443 HTTP/1.1\r\nHost: map.sgcc.com.cn:443\r\n\r\n",
+            "CONNECT map.grid.example:443 HTTP/1.1\r\nHost: map.grid.example:443\r\n\r\n",
         );
-        assert_eq!(got, Some(("map.sgcc.com.cn".into(), 443)));
+        assert_eq!(got, Some(("map.grid.example".into(), 443)));
         assert_eq!(
             split_host_port("[2001:db8::1]:8443"),
             Some(("2001:db8::1".into(), 8443))

@@ -650,7 +650,9 @@ fn stream_events(
     publish_service_health(request, &pipeline, &sensors)?;
     let mut next_heartbeat = Instant::now() + Duration::from_secs(1);
     let mut next_crypto = Instant::now() + Duration::from_secs(3);
-    let mut next_inspect_stats = Instant::now() + Duration::from_secs(10);
+    // Publish the first payload-free coverage snapshot quickly enough for the
+    // desktop UI to distinguish startup from a missing boundary.
+    let mut next_inspect_stats = Instant::now() + Duration::from_secs(3);
     let environment_check_interval = match request.collector_mode {
         ksight_model::CollectorMode::ForegroundAdb => Duration::from_secs(1),
         ksight_model::CollectorMode::DetachedDaemon => Duration::from_secs(30),
@@ -680,6 +682,7 @@ fn stream_events(
     let mut next_keylog_try = Instant::now();
     let mut infosec_probe: Option<crate::infosec_probe::InfosecProbe> = None;
     let mut next_infosec_try = Instant::now();
+    let mut next_stack_inventory = Instant::now();
     let keylog_file = pcap_dest
         .as_ref()
         .map(|pcap| pcap.with_file_name("sslkeylog.txt"));
@@ -873,6 +876,9 @@ fn stream_events(
                         }
                     }
                     eprintln!("keylog lines captured: {}", lines.len());
+                    if let Some(mirror) = pipeline.burp_mirror.as_mut() {
+                        mirror.ingest_keylog_lines(&lines);
+                    }
                 }
             }
             if let Some(probe) = infosec_probe.as_mut() {
@@ -911,8 +917,19 @@ fn stream_events(
                 }
             }
         }
+        if request.mirror_burp.is_some() && Instant::now() >= next_stack_inventory {
+            if let (Some(package), Some(mirror)) =
+                (request.package.as_deref(), pipeline.burp_mirror.as_mut())
+            {
+                mirror.set_stack_coverage(mapped_stack_coverage(package));
+            }
+            next_stack_inventory = Instant::now() + Duration::from_secs(15);
+        }
         if Instant::now() >= next_inspect_stats {
             let (raw, decoded, lost) = inspect.drain_totals();
+            let (ssl_re, ssl_rr, ssl_rok, ssl_rf, ssl_rw) = inspect.ssl_read_funnel();
+            let (ssl_gt0, ssl_dgt0, ssl_wo, ssl_wc, ssl_oko, ssl_okc, ssl_gto, ssl_gtc) =
+                inspect.ssl_read_funnel_ex();
             let mirror_diagnostics = pipeline
                 .burp_mirror
                 .as_ref()
@@ -923,7 +940,7 @@ fn stream_events(
                 .map(crate::burp_mirror::BurpMirror::diagnostic_metrics)
                 .unwrap_or_default();
             eprintln!(
-                "inspect layers: raw_uprobe={raw} decoded={decoded} perf_lost={lost} {}",
+                "inspect layers: raw_uprobe={raw} decoded={decoded} perf_lost={lost} ssl_read_entry={ssl_re} ssl_read_ret={ssl_rr} ssl_read_ok={ssl_rok} ssl_read_fail={ssl_rf} ssl_read_want={ssl_rw} ssl_read_ret_gt0={ssl_gt0} ssl_read_drop_gt0={ssl_dgt0} ssl_read_want_openssl={ssl_wo} ssl_read_want_conscrypt={ssl_wc} ssl_read_ok_openssl={ssl_oko} ssl_read_ok_conscrypt={ssl_okc} ssl_read_gt0_openssl={ssl_gto} ssl_read_gt0_conscrypt={ssl_gtc} {}",
                 mirror_diagnostics.as_deref().unwrap_or("mirror=disabled")
             );
             if let Some(detail) = mirror_diagnostics {
@@ -943,9 +960,32 @@ fn stream_events(
         if Instant::now() >= next_crypto {
             if let Some(package) = request.package.as_deref() {
                 if let Some(pid) = crate::tls_inject::TlsInject::main_pid(package) {
-                    let found = crate::crypto_watch::scan_pid(pid, package);
-                    if found > 0 {
-                        eprintln!("crypto-watch pid={pid} new={found} log=/data/local/tmp/ksight/crypto-watch.log");
+                    let result = crate::crypto_watch::scan_pid_ex(
+                        pid,
+                        package,
+                        crate::crypto_watch::Paths::device(),
+                    );
+                    if result.added > 0 {
+                        eprintln!(
+                            "crypto-watch pid={pid} new={} log=/data/local/tmp/ksight/crypto-watch.log events=crypto-watch-events.jsonl",
+                            result.added
+                        );
+                        let mut metrics = std::collections::BTreeMap::new();
+                        metrics.insert("hits".to_owned(), result.added as u64);
+                        for (family, count) in &result.family_hits {
+                            metrics.insert((*family).to_owned(), *count as u64);
+                        }
+                        pipeline.emit_inspect(ksight_model::InspectObservation {
+                            adapter: "crypto_watch".to_owned(),
+                            attached: true,
+                            hit: true,
+                            detail: crate::crypto_watch::observation_detail(&result),
+                            metrics,
+                            detectability_notice:
+                                "heap needle scan; durable events retain sha256 fingerprints + redacted previews only — never raw secrets to Burp"
+                                    .to_owned(),
+                            ..ksight_model::InspectObservation::default()
+                        })?;
                     }
                 }
             }
@@ -983,9 +1023,17 @@ fn stream_events(
         );
     }
     if request.inspect.enabled {
+        // Seal mirror before the final line so session-end unpaired/H2 soft
+        // flushes count in mirror_deliveries (Drop alone runs too late).
+        if let Some(mirror) = pipeline.burp_mirror.as_mut() {
+            mirror.seal();
+        }
         let (raw, decoded, lost) = inspect.drain_totals();
+        let (ssl_re, ssl_rr, ssl_rok, ssl_rf, ssl_rw) = inspect.ssl_read_funnel();
+        let (ssl_gt0, ssl_dgt0, ssl_wo, ssl_wc, ssl_oko, ssl_okc, ssl_gto, ssl_gtc) =
+            inspect.ssl_read_funnel_ex();
         eprintln!(
-            "inspect final: raw_uprobe={raw} decoded={decoded} perf_lost={lost} mirror_deliveries={}",
+            "inspect final: raw_uprobe={raw} decoded={decoded} perf_lost={lost} ssl_read_entry={ssl_re} ssl_read_ret={ssl_rr} ssl_read_ok={ssl_rok} ssl_read_fail={ssl_rf} ssl_read_want={ssl_rw} ssl_read_ret_gt0={ssl_gt0} ssl_read_drop_gt0={ssl_dgt0} ssl_read_want_openssl={ssl_wo} ssl_read_want_conscrypt={ssl_wc} ssl_read_ok_openssl={ssl_oko} ssl_read_ok_conscrypt={ssl_okc} ssl_read_gt0_openssl={ssl_gto} ssl_read_gt0_conscrypt={ssl_gtc} mirror_deliveries={}",
             pipeline
                 .burp_mirror
                 .as_ref()
@@ -1398,6 +1446,14 @@ impl EventPipeline {
         self.publish_event(&event)
     }
 
+    /// Active capture package for inspect/crypto-watch correlation (no offsets).
+    fn package_name(&self) -> Option<&str> {
+        self.scope
+            .target_package
+            .as_deref()
+            .filter(|p| !p.is_empty())
+    }
+
     fn emit_inspect(&mut self, observation: ksight_model::InspectObservation) -> Result<()> {
         self.emit_inspect_payload(
             None,
@@ -1423,11 +1479,44 @@ impl EventPipeline {
                 connection_id: _,
                 fragment,
                 raw: _,
-            } => self.emit_inspect_payload(
-                Some(pid),
-                Some(tid),
-                ksight_model::EventPayload::InspectPlaintext(fragment),
-            ),
+            } => {
+                // Opt-in corridor: feed pre-encrypt markers into versioned rules.
+                // Keep --inspect-jni opt-in (packer grace). Do NOT auto-enable with --mirror-burp.
+                // Never push crypto-watch raw windows to Burp — fingerprints / path_hint only.
+                // Live guards: skip empty preview and content_class=="tls_record".
+                if !fragment.preview.is_empty() && fragment.content_class != "tls_record" {
+                    if let Some(package) = self.package_name() {
+                        if let Some(hit) = crate::crypto_watch::ingest_inspect_plaintext(
+                            package,
+                            fragment.adapter.as_str(),
+                            fragment.preview.as_str(),
+                            Some(fragment.sha256.as_str()).filter(|s| !s.is_empty()),
+                            &crate::crypto_watch::Paths::device(),
+                        ) {
+                            let mut metrics = std::collections::BTreeMap::new();
+                            metrics.insert("ingest".to_owned(), 1);
+                            metrics.insert(hit.family.to_owned(), 1);
+                            let _ = self.emit_inspect(ksight_model::InspectObservation {
+                                adapter: format!("crypto_watch:{}", hit.source),
+                                attached: true,
+                                hit: true,
+                                path_hint: Some(hit.path_hint.clone()),
+                                detail: hit.detail.clone(),
+                                metrics,
+                                detectability_notice:
+                                    "inspect plaintext classified into crypto-watch-rules.json; redacted preview + sha256 only — never raw secrets to Burp"
+                                        .to_owned(),
+                                ..ksight_model::InspectObservation::default()
+                            });
+                        }
+                    }
+                }
+                self.emit_inspect_payload(
+                    Some(pid),
+                    Some(tid),
+                    ksight_model::EventPayload::InspectPlaintext(fragment),
+                )
+            }
         }
     }
 
@@ -1489,21 +1578,35 @@ impl EventPipeline {
         }
         self.fd_lineage.correlate(event);
         self.dns_lineage.correlate(event);
+        if let Some(mirror) = self.burp_mirror.as_mut() {
+            match &event.payload {
+                EventPayload::SocketConnect(_) => mirror.observe_network_connect(),
+                EventPayload::NetworkHandshake(_) => mirror.observe_network_handshake(),
+                _ => {}
+            }
+        }
+        let pid = event.header.process.key.pid;
+        let tid = event.header.process.tid;
+        if let (Some(mirror), EventPayload::SocketConnect(connect)) =
+            (self.burp_mirror.as_mut(), &event.payload)
+        {
+            if let Some(name) = connect
+                .resolved_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+            {
+                mirror.observe_peer_on_thread(pid, tid, name.to_owned());
+            }
+        }
         if let (Some(mirror), EventPayload::NetworkHandshake(handshake)) =
             (self.burp_mirror.as_mut(), &event.payload)
         {
-            let pid = event.header.process.key.pid;
             if let Some(host) = handshake_mirror_host(handshake) {
-                mirror.observe_peer(pid, host);
+                mirror.observe_peer_on_thread(pid, tid, host);
             }
             if let Some(prefix) = handshake.request_prefix.as_deref() {
-                mirror.observe_bytes(
-                    pid,
-                    event.header.process.tid,
-                    "handshake_http",
-                    "send",
-                    prefix.as_bytes(),
-                );
+                mirror.observe_bytes(pid, tid, "handshake_http", "send", prefix.as_bytes());
             }
         }
         if !self.output.include_threads
@@ -1836,6 +1939,80 @@ fn handshake_mirror_host(handshake: &ksight_model::NetworkHandshake) -> Option<S
     }
 }
 
+/// Classify mapped network/crypto stacks using path, file-size and the embedded
+/// rule table. Build-id-only rules remain candidates here; actual attachment
+/// still requires the stricter probe-side validation.
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn mapped_stack_coverage(package: &str) -> crate::burp_mirror::StackCoverageSnapshot {
+    let mut paths = std::collections::BTreeSet::new();
+    for pid in crate::dexdump::pids_for_package(package)
+        .into_iter()
+        .take(8)
+    {
+        let Ok(maps) = std::fs::read_to_string(format!("/proc/{pid}/maps")) else {
+            continue;
+        };
+        for line in maps.lines() {
+            let Some(path) = line.split_whitespace().last() else {
+                continue;
+            };
+            if path.starts_with('/') && !path.contains(" (deleted)") {
+                paths.insert(path.to_owned());
+            }
+        }
+    }
+
+    let mut matched = std::collections::BTreeMap::new();
+    for path in paths {
+        let size = std::fs::metadata(&path).ok().map(|meta| meta.len());
+        for stack in &ksight_core::load_stack_rules().stacks {
+            let mut path_rule = stack.match_rules.clone();
+            path_rule.build_id = None;
+            if path_rule.matches(&path, size, None) {
+                matched.entry(stack.id.clone()).or_insert(stack);
+            }
+        }
+    }
+
+    let mut snapshot = crate::burp_mirror::StackCoverageSnapshot {
+        candidates: u64::try_from(matched.len()).unwrap_or(u64::MAX),
+        ..crate::burp_mirror::StackCoverageSnapshot::default()
+    };
+    for stack in matched.values() {
+        let export_candidate = stack.coverage.plaintext_copy
+            && (!stack.symbols.write.is_empty() || !stack.symbols.read.is_empty());
+        let pinned_boundary = stack
+            .boundary
+            .as_ref()
+            .is_some_and(|boundary| boundary.layout.eq_ignore_ascii_case("pinned"));
+        let empirical_boundary = stack
+            .boundary
+            .as_ref()
+            .is_some_and(|boundary| !boundary.layout.eq_ignore_ascii_case("pinned"));
+        let keylog_candidate = stack.coverage.keylog == Some(true)
+            && stack
+                .keylog
+                .as_ref()
+                .is_some_and(|rule| rule.offset.is_some());
+        snapshot.export_candidates = snapshot
+            .export_candidates
+            .saturating_add(u64::from(export_candidate));
+        snapshot.pinned_boundaries = snapshot
+            .pinned_boundaries
+            .saturating_add(u64::from(pinned_boundary));
+        snapshot.empirical_boundaries = snapshot
+            .empirical_boundaries
+            .saturating_add(u64::from(empirical_boundary));
+        snapshot.keylog_candidates = snapshot
+            .keylog_candidates
+            .saturating_add(u64::from(keylog_candidate));
+        if !export_candidate && !pinned_boundary && !keylog_candidate {
+            snapshot.uncovered = snapshot.uncovered.saturating_add(1);
+        }
+    }
+    snapshot
+}
+
 #[cfg(any(target_os = "android", target_os = "linux"))]
 fn print_event(event: &ksight_model::Event) {
     let process = &event.header.process;
@@ -2135,109 +2312,5 @@ fn format_payload(payload: &ksight_model::EventPayload) -> (String, String) {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::HashSet;
-
-    use ksight_model::{
-        BinderTransaction, BinderTransactionDirection, BinderTransactionStage, EventPayload,
-    };
-
-    use super::{
-        apply_pending_parcel, binder_event_matches_scope, insert_capped, push_capped_deque,
-        PendingParcel,
-    };
-
-    #[test]
-    fn binder_follow_on_stages_keep_the_originating_process_scope() {
-        let mut tracked = HashSet::new();
-        assert!(binder_event_matches_scope(
-            true,
-            &binder(BinderTransactionStage::Submitted, 42),
-            &mut tracked,
-        ));
-        assert!(binder_event_matches_scope(
-            false,
-            &binder(BinderTransactionStage::BufferAllocated, 42),
-            &mut tracked,
-        ));
-        assert!(binder_event_matches_scope(
-            false,
-            &binder(BinderTransactionStage::Received, 42),
-            &mut tracked,
-        ));
-        assert!(tracked.is_empty());
-        assert!(!binder_event_matches_scope(
-            false,
-            &binder(BinderTransactionStage::Received, 43),
-            &mut tracked,
-        ));
-    }
-
-    #[test]
-    fn pending_parcel_fills_submit_token_and_hex() {
-        let EventPayload::BinderTransaction(mut transaction) =
-            binder(BinderTransactionStage::Submitted, 42)
-        else {
-            panic!("binder");
-        };
-        apply_pending_parcel(
-            &mut transaction,
-            PendingParcel {
-                interface_token: Some("android.os.IServiceManager".to_owned()),
-                binder_method: Some("getService".to_owned()),
-                binder_method_source: Some("aosp_stub".to_owned()),
-                parcel_prefix_hex: Some("04000000".to_owned()),
-            },
-        );
-        assert_eq!(
-            transaction.interface_token.as_deref(),
-            Some("android.os.IServiceManager")
-        );
-        assert_eq!(transaction.binder_method.as_deref(), Some("getService"));
-        assert_eq!(transaction.parcel_prefix_hex.as_deref(), Some("04000000"));
-        let mut map = std::collections::HashMap::new();
-        insert_capped(&mut map, 1_i32, 1_u8);
-        assert_eq!(map.get(&1), Some(&1));
-        let mut queues = std::collections::HashMap::new();
-        push_capped_deque(&mut queues, 7_u32, "a", 2);
-        push_capped_deque(&mut queues, 7_u32, "b", 2);
-        push_capped_deque(&mut queues, 7_u32, "c", 2);
-        assert_eq!(
-            queues
-                .get_mut(&7)
-                .and_then(std::collections::VecDeque::pop_front),
-            Some("b")
-        );
-    }
-
-    fn binder(stage: BinderTransactionStage, transaction_id: i32) -> EventPayload {
-        EventPayload::BinderTransaction(BinderTransaction {
-            stage,
-            transaction_id,
-            target_node: None,
-            target_process_id: None,
-            target_thread_id: None,
-            target_kind: None,
-            reply: false,
-            direction: BinderTransactionDirection::Request,
-            reply_to_request_id: None,
-            reply_latency_ns: None,
-            code: 0,
-            code_kind: None,
-            flags: 0,
-            decoded_flags: Vec::new(),
-            data_size: None,
-            offsets_size: None,
-            extra_buffers_size: None,
-            file_descriptor: None,
-            object_offset: None,
-            transferred_fd_origin: None,
-            transferred_fd_source_pid: None,
-            transferred_fd_source_fd: None,
-            interface_token: None,
-            binder_method: None,
-            binder_method_source: None,
-            parcel_prefix_hex: None,
-        })
-    }
-}
+#[path = "tests.rs"]
+mod tests;

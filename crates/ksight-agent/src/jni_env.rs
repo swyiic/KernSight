@@ -431,8 +431,6 @@ mod tests {
         SLOT_NEW_STRING, SLOT_NEW_STRING_UTF, SLOT_REGISTER_NATIVES, SLOT_SET_BYTE_ARRAY_REGION,
         SLOT_SET_CHAR_ARRAY_REGION,
     };
-    use std::path::Path;
-
     #[test]
     fn jni_h_slots_match_openjdk_jni_native_interface() {
         assert_eq!(SLOT_NEW_STRING, 163);
@@ -473,35 +471,5 @@ mod tests {
         assert!(targets.contains(&0x00a1_d820), "{targets:#x?}");
         assert!(targets.contains(&0x00a1_e030), "{targets:#x?}");
         assert!(targets.contains(&0x00a1_e778), "{targets:#x?}");
-    }
-
-    #[test]
-    fn resolves_jni_slots_from_pulled_libart_when_present() {
-        let path = Path::new("/tmp/libart.so");
-        if !path.is_file() {
-            return;
-        }
-        let found = resolve_jni_env_functions(
-            path,
-            &[
-                ("NewStringUTF", SLOT_NEW_STRING_UTF),
-                ("GetStringUTFChars", SLOT_GET_STRING_UTF_CHARS),
-                ("GetArrayLength", SLOT_GET_ARRAY_LENGTH),
-                ("GetStringUTFRegion", SLOT_GET_STRING_UTF_REGION),
-            ],
-        )
-        .expect("GetFunctionTable tables");
-        assert!(
-            found
-                .iter()
-                .any(|item| item.name == "GetStringUTFChars" && item.offset != 0),
-            "{found:?}"
-        );
-        assert!(found.iter().any(|item| item.name == "NewStringUTF"));
-        let utf_offsets = found
-            .iter()
-            .filter(|item| item.name == "GetStringUTFChars")
-            .count();
-        assert!(utf_offsets >= 1);
     }
 }

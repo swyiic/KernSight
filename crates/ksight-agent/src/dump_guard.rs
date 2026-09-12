@@ -179,8 +179,11 @@ mod tests {
 
     #[test]
     fn ranks_main_package_ahead_of_services() {
-        assert_eq!(cmdline_dump_rank("com.icbc", "com.icbc"), 0);
-        assert_eq!(cmdline_dump_rank("com.icbc", "com.icbc:push"), 1);
-        assert_eq!(cmdline_dump_rank("com.icbc", "zygote"), 2);
+        assert_eq!(cmdline_dump_rank("com.example.app", "com.example.app"), 0);
+        assert_eq!(
+            cmdline_dump_rank("com.example.app", "com.example.app:push"),
+            1
+        );
+        assert_eq!(cmdline_dump_rank("com.example.app", "zygote"), 2);
     }
 }

@@ -4,7 +4,7 @@ use ksight_model::SensorKind;
 use ksight_protocol::UpdatePolicy;
 use thiserror::Error;
 
-const MAX_PAYLOAD_BYTES: u32 = 64 * 1024;
+const MAX_PAYLOAD_BYTES: u32 = 256 * 1024;
 
 /// Invalid capture policy.
 #[derive(Debug, Error, PartialEq, Eq)]

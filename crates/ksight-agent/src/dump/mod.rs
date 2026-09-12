@@ -19,9 +19,9 @@ use crate::dexdump::{
 
 const MAX_APK_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_TREE_FILE_BYTES: u64 = 128 * 1024 * 1024;
-const MAX_PRIVATE_FILE_BYTES: u64 = 8 * 1024 * 1024;
-const MAX_PRIVATE_FILES: usize = 512;
-const APP_PRIVATE_DIRS: [&str; 7] = [
+pub(super) const MAX_PRIVATE_FILE_BYTES: u64 = 8 * 1024 * 1024;
+pub(super) const MAX_PRIVATE_FILES: usize = 512;
+pub(super) const APP_PRIVATE_DIRS: [&str; 7] = [
     "shared_prefs",
     "databases",
     "files",
@@ -293,6 +293,9 @@ pub struct PackageDumpReport {
     /// HTTP/JSON-looking windows copied from anonymous process memory.
     #[serde(default)]
     pub plaintext_windows: usize,
+    /// Signing/crypto marker windows under `runtime/crypto-windows/` (local only).
+    #[serde(default)]
+    pub crypto_windows: usize,
     /// Followed packer BSS/heap key slots.
     #[serde(default)]
     pub key_slots: usize,
@@ -326,6 +329,12 @@ pub struct PackageDumpReport {
     /// Package-wide logical DEX index; physical evidence files remain independent.
     #[serde(default)]
     pub dex_index: ksight_core::PackageDexIndex,
+    /// Deterministic class-level ownership summary and per-DEX explanations.
+    #[serde(default)]
+    pub dex_ownership: ksight_core::DexOwnershipReport,
+    /// Android-registered component classes that were also found in collected DEX declarations.
+    #[serde(default)]
+    pub registered_component_classes: Vec<String>,
     /// Version of the embedded SO/framework identification rules.
     #[serde(default)]
     pub native_rule_version: String,
@@ -350,6 +359,12 @@ pub struct PackageDumpReport {
     /// Total bytes under this package dump root at catalog time.
     #[serde(default)]
     pub total_bytes: u64,
+    /// Unique allocated bytes after exact-content hard-link deduplication.
+    #[serde(default)]
+    pub physical_bytes: u64,
+    /// Logical bytes saved by exact-content hard links.
+    #[serde(default)]
+    pub deduplicated_bytes: u64,
     /// Honest interpretation and compatibility warnings for clients.
     #[serde(default)]
     pub warnings: Vec<String>,
@@ -456,6 +471,7 @@ pub fn dump_package_with(
         runtime_libs: 0,
         packer_regions: 0,
         plaintext_windows: 0,
+        crypto_windows: 0,
         key_slots: 0,
         secneo_decrypted: 0,
         readable_dex: 0,
@@ -467,6 +483,8 @@ pub fn dump_package_with(
         artifacts: Vec::new(),
         dex_sets: Vec::new(),
         dex_index: ksight_core::PackageDexIndex::default(),
+        dex_ownership: ksight_core::DexOwnershipReport::default(),
+        registered_component_classes: Vec::new(),
         native_rule_version: String::new(),
         native_framework_matches: Vec::new(),
         graph: ksight_core::SessionGraph::l0_placeholder(),
@@ -475,6 +493,8 @@ pub fn dump_package_with(
         http_code_refs: Vec::new(),
         jni_exports: Vec::new(),
         total_bytes: 0,
+        physical_bytes: 0,
+        deduplicated_bytes: 0,
         warnings: default_dump_warnings(),
         snapshots: Vec::new(),
         mapped_code: Vec::new(),
@@ -616,6 +636,7 @@ pub fn dump_package_with(
         report.recovered_sm4_key = recovered_key.map(hex_key);
     }
     report.readable_dex = ksight_core::publish_readable_dex(dest).unwrap_or(0);
+    deduplicate_code_evidence(dest)?;
     if runtime_only {
         prune_install_trees(dest);
     }
@@ -666,6 +687,7 @@ pub fn recatalog_package(dest: &Path) -> Result<PackageDumpReport> {
             runtime_libs: 0,
             packer_regions: 0,
             plaintext_windows: 0,
+            crypto_windows: 0,
             key_slots: 0,
             secneo_decrypted: 0,
             readable_dex: 0,
@@ -677,6 +699,8 @@ pub fn recatalog_package(dest: &Path) -> Result<PackageDumpReport> {
             artifacts: Vec::new(),
             dex_sets: Vec::new(),
             dex_index: ksight_core::PackageDexIndex::default(),
+            dex_ownership: ksight_core::DexOwnershipReport::default(),
+            registered_component_classes: Vec::new(),
             native_rule_version: String::new(),
             native_framework_matches: Vec::new(),
             graph: ksight_core::SessionGraph::l0_placeholder(),
@@ -685,6 +709,8 @@ pub fn recatalog_package(dest: &Path) -> Result<PackageDumpReport> {
             http_code_refs: Vec::new(),
             jni_exports: Vec::new(),
             total_bytes: 0,
+            physical_bytes: 0,
+            deduplicated_bytes: 0,
             warnings: default_dump_warnings(),
             snapshots: Vec::new(),
             mapped_code: Vec::new(),
@@ -700,6 +726,7 @@ pub fn recatalog_package(dest: &Path) -> Result<PackageDumpReport> {
     if report.dump_id.is_empty() {
         report.dump_id = uuid::Uuid::new_v4().to_string();
     }
+    deduplicate_code_evidence(dest)?;
     finalize_catalog(&mut report, dest)?;
     Ok(report)
 }
@@ -709,6 +736,17 @@ fn finalize_catalog(report: &mut PackageDumpReport, dest: &Path) -> Result<()> {
     report.artifacts = catalog_dump(dest);
     attach_artifact_hashes(dest, &mut report.artifacts);
     (report.dex_sets, report.dex_index) = build_dex_sets(dest, &report.artifacts);
+    report.registered_component_classes =
+        catalog_registered_component_classes(&report.package, &report.dex_sets, dest);
+    let ownership_context = ksight_core::DexOwnershipContext {
+        registered_component_classes: report.registered_component_classes.clone(),
+    };
+    report.dex_ownership = ksight_core::classify_dex_ownership_with_context(
+        &report.package,
+        &report.dex_sets,
+        &ownership_context,
+    );
+    write_dex_classification_index(dest, &report.dex_ownership)?;
     report.native_rule_version = ksight_core::native_framework_rule_version();
     report.native_framework_matches = ksight_core::classify_native_frameworks(&report.artifacts);
     report.sensitive_files = catalog_sensitive_files(dest);
@@ -744,6 +782,8 @@ fn finalize_catalog(report: &mut PackageDumpReport, dest: &Path) -> Result<()> {
         });
     }
     report.total_bytes = tree_bytes(dest);
+    report.physical_bytes = tree_physical_bytes(dest);
+    report.deduplicated_bytes = report.total_bytes.saturating_sub(report.physical_bytes);
     PACKAGE_DUMP_SCHEMA.clone_into(&mut report.schema_version);
     env!("CARGO_PKG_VERSION").clone_into(&mut report.agent_version);
     if report.created_unix_ms == 0 {
@@ -776,7 +816,9 @@ fn finalize_catalog(report: &mut PackageDumpReport, dest: &Path) -> Result<()> {
 
 fn default_dump_warnings() -> Vec<String> {
     vec![
-        "plaintext_windows and key_slots are bounded candidate counts, not confirmed secrets"
+        "plaintext_windows, crypto_windows, and key_slots are bounded candidate counts, not confirmed secrets"
+            .to_owned(),
+        "runtime/crypto-windows are signing/header-encrypt heap cuts (X-Sign/OpenPlatformEncrypt/appKey/…); local dump artifacts only — not mirrored to Burp"
             .to_owned(),
         "dump http_calls are parsed from runtime/plaintext heap windows and data-private CE/DE copies (HTTP/1, JSON, embedded URLs, or HTTP/2 HEADERS HPACK; NUL or CRLF). Heap rows are correlated, not Inspect SSL_write. Responses have no URL path. Windows are an 8192-byte cut around HTTP/1.1, GET/POST, https://, \"url\", /api/, /login, /mbfront, or :path/:authority then trimmed of trailing NULs; mostly-zero slices are not written."
             .to_owned(),
@@ -942,6 +984,7 @@ fn catalog_sensitive_files(dest: &Path) -> Vec<DumpEvidenceFile> {
     let mut files = Vec::<DumpEvidenceFile>::new();
     for (relative, class) in [
         ("runtime/plaintext", "plaintext_candidate"),
+        ("runtime/crypto-windows", "key_candidate"),
         ("runtime/packer-keys", "key_candidate"),
         ("data-private", "private_store"),
     ] {
@@ -1057,6 +1100,26 @@ fn tree_bytes(root: &Path) -> u64 {
     bytes
 }
 
+#[cfg(unix)]
+fn tree_physical_bytes(root: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt as _;
+    let mut seen = BTreeSet::<(u64, u64)>::new();
+    let mut bytes = 0_u64;
+    visit_files(root, &mut |path| {
+        if let Ok(metadata) = path.metadata() {
+            if seen.insert((metadata.dev(), metadata.ino())) {
+                bytes = bytes.saturating_add(metadata.blocks().saturating_mul(512));
+            }
+        }
+    });
+    bytes
+}
+
+#[cfg(not(unix))]
+fn tree_physical_bytes(root: &Path) -> u64 {
+    tree_bytes(root)
+}
+
 fn visit_files(root: &Path, visitor: &mut impl FnMut(&Path)) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
@@ -1086,6 +1149,90 @@ fn sha256_file(path: &Path) -> Option<String> {
         digest.update(&buffer[..read]);
     }
     Some(format!("{:x}", digest.finalize()))
+}
+
+fn deduplicate_code_evidence(dest: &Path) -> Result<(usize, u64)> {
+    let mut candidates = Vec::<PathBuf>::new();
+    for root in ["apk-dex", "readable-dex", "runtime", "lib", "apk-assets"] {
+        visit_files(&dest.join(root), &mut |path| {
+            let extension = path
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if matches!(extension.as_str(), "dex" | "so" | "vdex" | "oat" | "art") {
+                candidates.push(path.to_path_buf());
+            }
+        });
+    }
+    candidates.sort();
+    let mut canonical = BTreeMap::<(String, u64), PathBuf>::new();
+    let mut linked = 0_usize;
+    let mut saved = 0_u64;
+    for path in candidates {
+        let metadata = path.metadata()?;
+        let bytes = metadata.len();
+        let Some(sha256) = sha256_file(&path) else {
+            continue;
+        };
+        let key = (sha256, bytes);
+        let Some(source) = canonical.get(&key) else {
+            canonical.insert(key, path);
+            continue;
+        };
+        if source == &path {
+            continue;
+        }
+        std::fs::remove_file(&path)?;
+        if let Err(link_error) = std::fs::hard_link(source, &path) {
+            std::fs::copy(source, &path).with_context(|| {
+                format!(
+                    "restore {} after hard-link failure ({link_error})",
+                    path.display()
+                )
+            })?;
+            continue;
+        }
+        linked = linked.saturating_add(1);
+        saved = saved.saturating_add(bytes);
+    }
+    Ok((linked, saved))
+}
+
+fn write_dex_classification_index(
+    dest: &Path,
+    report: &ksight_core::DexOwnershipReport,
+) -> Result<()> {
+    let root = dest.join("dex-classification");
+    if root.exists() {
+        std::fs::remove_dir_all(&root)?;
+    }
+    std::fs::create_dir_all(&root)?;
+    std::fs::write(
+        root.join("manifest.json"),
+        serde_json::to_vec_pretty(report)?,
+    )?;
+    for category in [
+        ksight_core::DexOwnershipCategory::Business,
+        ksight_core::DexOwnershipCategory::InternalComponent,
+        ksight_core::DexOwnershipCategory::DynamicPayload,
+        ksight_core::DexOwnershipCategory::ThirdPartySdk,
+        ksight_core::DexOwnershipCategory::Mixed,
+        ksight_core::DexOwnershipCategory::Unknown,
+    ] {
+        let directory = root.join(category.directory());
+        std::fs::create_dir_all(&directory)?;
+        let rows = report
+            .entries
+            .iter()
+            .filter(|entry| entry.category == category)
+            .collect::<Vec<_>>();
+        std::fs::write(
+            directory.join("index.json"),
+            serde_json::to_vec_pretty(&rows)?,
+        )?;
+    }
+    Ok(())
 }
 
 fn write_dump_howto(dest: &Path, package: &str) {
@@ -1155,6 +1302,7 @@ fn write_evidence_index(dest: &Path, report: &PackageDumpReport) {
         "runtime",
         "readable-dex",
         "apk-dex",
+        "dex-classification",
     ] {
         if dest.join(name).exists() {
             lines.push(format!("  {name}"));
@@ -1189,114 +1337,6 @@ fn catalog_snapshots(dest: &Path) -> Vec<MemorySnapshot> {
     }
     out.sort_by_key(|row| row.pid);
     out
-}
-
-fn join_art_opens(loaders: &mut [CodeLoaderEntry], artifacts: &[ksight_core::DumpArtifact]) {
-    for loader in loaders
-        .iter_mut()
-        .filter(|loader| loader.origin == "art_open")
-    {
-        let Some(artifact) = match_art_open_artifact(loader, artifacts) else {
-            continue;
-        };
-        loader.joined_relative_path = Some(artifact.relative_path.clone());
-        loader.joined_sha256.clone_from(&artifact.sha256);
-    }
-}
-
-fn art_open_joins(
-    loaders: &[CodeLoaderEntry],
-    artifacts: &[ksight_core::DumpArtifact],
-) -> Vec<(u32, String, String)> {
-    let mut joins = Vec::new();
-    for loader in loaders.iter().filter(|loader| loader.origin == "art_open") {
-        for artifact in artifacts
-            .iter()
-            .filter(|artifact| art_open_matches(loader, artifact))
-        {
-            joins.push((
-                loader.pid,
-                loader.path.clone(),
-                artifact_graph_key(artifact),
-            ));
-        }
-    }
-    joins
-}
-
-fn artifact_graph_key(artifact: &ksight_core::DumpArtifact) -> String {
-    artifact.sha256.as_ref().map_or_else(
-        || format!("artifact:{}", artifact.relative_path),
-        |sha256| format!("artifact:sha256:{sha256}"),
-    )
-}
-
-fn match_art_open_artifact<'a>(
-    loader: &CodeLoaderEntry,
-    artifacts: &'a [ksight_core::DumpArtifact],
-) -> Option<&'a ksight_core::DumpArtifact> {
-    artifacts
-        .iter()
-        .filter(|artifact| art_open_matches(loader, artifact))
-        .max_by_key(|artifact| artifact.bytes)
-}
-
-fn art_open_matches(loader: &CodeLoaderEntry, artifact: &ksight_core::DumpArtifact) -> bool {
-    if artifact.kind != "dex" {
-        return false;
-    }
-    if let Some((base, size)) = parse_memory_open(&loader.path) {
-        if let (Some(start), Some(end)) = (artifact.vma_start, artifact.vma_end) {
-            if base >= start && base < end {
-                return true;
-            }
-        }
-        let opened = loader.opened_bytes.unwrap_or(size);
-        return artifact.bytes.abs_diff(opened) <= 4096;
-    }
-    let open = loader.path.trim();
-    if open.is_empty() {
-        return false;
-    }
-    if artifact.map_path.as_deref() == Some(open) {
-        return true;
-    }
-    if artifact
-        .map_path
-        .as_deref()
-        .is_some_and(|path| path.ends_with(open) || open.ends_with(path))
-    {
-        return true;
-    }
-    let open_name = std::path::Path::new(open)
-        .file_name()
-        .and_then(|name| name.to_str());
-    let artifact_name = std::path::Path::new(&artifact.relative_path)
-        .file_name()
-        .and_then(|name| name.to_str());
-    if open_name.is_some() && open_name == artifact_name {
-        return true;
-    }
-    let open_ext = std::path::Path::new(open).extension();
-    if open_ext
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("apk") || ext.eq_ignore_ascii_case("jar"))
-        && artifact.source == "apk-dex"
-    {
-        let lower = open.to_ascii_lowercase();
-        return lower.contains("/data/app")
-            || lower.contains("/priv-app/")
-            || lower.contains("split_config")
-            || open_name == Some("base.apk");
-    }
-    false
-}
-
-fn parse_memory_open(path: &str) -> Option<(u64, u64)> {
-    let rest = path.strip_prefix("memory:")?;
-    let (base, size) = rest.split_once('+')?;
-    let base = u64::from_str_radix(base.trim_start_matches("0x"), 16).ok()?;
-    let size = size.parse().ok()?;
-    Some((base, size))
 }
 
 fn catalog_code_loaders(dest: &Path) -> Vec<CodeLoaderEntry> {
@@ -1359,6 +1399,16 @@ fn catalog_tls_stacks(
             .filter(|artifact| artifact.kind == "elf")
             .map(|artifact| artifact.relative_path.as_str()),
     );
+    let mut sizes = BTreeMap::new();
+    for artifact in artifacts {
+        if artifact.kind != "elf" {
+            continue;
+        }
+        sizes.insert(artifact.relative_path.as_str(), artifact.bytes);
+        if let Some(map_path) = artifact.map_path.as_deref() {
+            sizes.insert(map_path, artifact.bytes);
+        }
+    }
     for path in paths {
         let Some(kind) = ksight_core::classify_tls_library_path(path) else {
             continue;
@@ -1366,10 +1416,17 @@ fn catalog_tls_stacks(
         if !seen.insert((kind.as_str(), path)) {
             continue;
         }
+        let size = sizes.get(path).copied().or_else(|| {
+            mapped
+                .iter()
+                .find(|row| row.path == path)
+                .map(|row| row.end.saturating_sub(row.start))
+        });
+        let inspect_tries_ssl_write = ksight_core::ssl_write_attach_allowed(path, size, None);
         out.push(TlsStackObservation {
             kind: kind.as_str().to_owned(),
             path: path.to_owned(),
-            inspect_tries_ssl_write: kind.inspect_tries_ssl_write(),
+            inspect_tries_ssl_write,
         });
     }
     out.sort_by(|left, right| {
@@ -1479,229 +1536,12 @@ fn artifact_keep_score(artifact: &ksight_core::DumpArtifact) -> (u8, u64) {
     (source, artifact.bytes)
 }
 
-#[derive(Debug, Clone)]
-struct MapRange {
-    start: u64,
-    end: u64,
-    perms: String,
-    path: String,
-}
-
-impl MapRange {
-    fn contains(&self, addr: u64) -> bool {
-        addr >= self.start && addr < self.end
-    }
-
-    fn readable(&self) -> bool {
-        self.perms.contains('r')
-    }
-
-    fn executable(&self) -> bool {
-        self.perms.contains('x')
-    }
-}
-
-fn load_maps_file(dest: &Path) -> std::collections::BTreeMap<u32, Vec<MapRange>> {
-    let runtime = dest.join("runtime");
-    let Ok(entries) = std::fs::read_dir(&runtime) else {
-        return std::collections::BTreeMap::new();
-    };
-    let mut maps = std::collections::BTreeMap::<u32, Vec<MapRange>>::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
-            continue;
-        };
-        let Some(pid_s) = name
-            .strip_prefix("maps-")
-            .and_then(|rest| rest.strip_suffix(".txt"))
-        else {
-            continue;
-        };
-        let Ok(pid) = pid_s.parse::<u32>() else {
-            continue;
-        };
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        maps.insert(pid, parse_maps_ranges(&text));
-    }
-    maps
-}
-
-fn maps_as_observed(
-    dest: &Path,
-    artifacts: &[ksight_core::DumpArtifact],
-) -> Vec<ksight_core::ObservedMapping> {
-    let mut mappings = Vec::new();
-    for (pid, ranges) in load_maps_file(dest) {
-        for range in ranges {
-            if range.end <= range.start || !mapping_needed(pid, &range, artifacts) {
-                continue;
-            }
-            mappings.push(ksight_core::ObservedMapping {
-                process_id: pid,
-                start: range.start,
-                end: range.end,
-                backing_path: nonempty_path(&range.path),
-                source: ksight_core::MappingSource::ProcMaps,
-                mapping_generation: 0,
-            });
-        }
-    }
-    ksight_core::rank_observed_mappings(&mut mappings);
-    mappings.truncate(512);
-    mappings
-}
-
-fn mapping_needed(pid: u32, range: &MapRange, artifacts: &[ksight_core::DumpArtifact]) -> bool {
-    artifacts.iter().any(|artifact| {
-        if artifact.pid != Some(pid) {
-            return false;
-        }
-        if let (Some(start), Some(end)) = (artifact.vma_start, artifact.vma_end) {
-            if ksight_core::ranges_overlap(start, end, range.start, range.end) {
-                return true;
-            }
-        } else if let Some(start) = artifact.vma_start {
-            if range.contains(start) {
-                return true;
-            }
-        }
-        so_file_name(artifact).is_some_and(|name| so_map_matches(range, &name))
-    })
-}
-
-fn enrich_artifacts_from_maps(dest: &Path, artifacts: &mut [ksight_core::DumpArtifact]) {
-    let maps = load_maps_file(dest);
-    for artifact in artifacts.iter_mut() {
-        if artifact.map_path.as_deref().is_some_and(str::is_empty) {
-            artifact.map_path = None;
-        }
-        let Some(pid) = artifact.pid else {
-            continue;
-        };
-        let Some(ranges) = maps.get(&pid) else {
-            continue;
-        };
-        if artifact.vma_start.is_none() {
-            if let Some(name) = so_file_name(artifact) {
-                if let Some(range) = so_map(ranges, &name) {
-                    artifact.vma_start = Some(range.start);
-                    artifact.vma_end = Some(range.end);
-                    if artifact.map_path.is_none() {
-                        artifact.map_path = nonempty_path(&range.path);
-                    }
-                }
-            }
-        }
-        let Some(start) = artifact.vma_start else {
-            continue;
-        };
-        let prefer_anon = artifact.source == "heap-blob";
-        let Some(range) = covering_map(ranges, start, prefer_anon) else {
-            continue;
-        };
-        if artifact.vma_end.is_none() && range.readable() {
-            artifact.vma_end = Some(range.end);
-        }
-        if artifact.map_path.is_none() {
-            artifact.map_path = nonempty_path(&range.path);
-        }
-    }
-}
-
-fn covering_map(ranges: &[MapRange], start: u64, prefer_anon: bool) -> Option<&MapRange> {
-    ranges
-        .iter()
-        .filter(|range| range.contains(start))
-        .max_by_key(|range| {
-            (
-                range.readable(),
-                prefer_anon && map_is_anon(&range.path),
-                !range.path.starts_with('/'),
-                u64::MAX - range.end.saturating_sub(range.start),
-            )
-        })
-}
-
-fn map_is_anon(path: &str) -> bool {
-    path.is_empty() || path.starts_with('[') || path.starts_with("anon:")
-}
-
-fn so_map<'a>(ranges: &'a [MapRange], so_name: &str) -> Option<&'a MapRange> {
-    ranges
-        .iter()
-        .filter(|range| so_map_matches(range, so_name))
-        .max_by_key(|range| {
-            (
-                range.executable(),
-                range.readable(),
-                range.end.saturating_sub(range.start),
-            )
-        })
-}
-
-fn so_map_matches(range: &MapRange, so_name: &str) -> bool {
-    Path::new(&range.path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        == Some(so_name)
-}
-
-fn so_file_name(artifact: &ksight_core::DumpArtifact) -> Option<String> {
-    if artifact.source != "runtime-so" {
-        return None;
-    }
-    let name = Path::new(&artifact.relative_path)
-        .file_name()
-        .and_then(|name| name.to_str())?;
-    if let Some(pid) = artifact.pid {
-        let prefix = format!("{pid}-");
-        if let Some(stripped) = name.strip_prefix(&prefix) {
-            return Some(stripped.to_owned());
-        }
-    }
-    Some(name.to_owned())
-}
-
-fn nonempty_path(path: &str) -> Option<String> {
-    let trimmed = path.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_owned())
-}
-
-fn parse_maps_ranges(text: &str) -> Vec<MapRange> {
-    let mut ranges = Vec::new();
-    for line in text.lines() {
-        let mut fields = line.split_whitespace();
-        let Some(range) = fields.next() else {
-            continue;
-        };
-        let Some((start_s, end_s)) = range.split_once('-') else {
-            continue;
-        };
-        let Ok(start) = u64::from_str_radix(start_s, 16) else {
-            continue;
-        };
-        let Ok(end) = u64::from_str_radix(end_s, 16) else {
-            continue;
-        };
-        let Some(perms) = fields.next() else {
-            continue;
-        };
-        let _offset = fields.next();
-        let _dev = fields.next();
-        let _inode = fields.next();
-        let path = fields.collect::<Vec<_>>().join(" ");
-        ranges.push(MapRange {
-            start,
-            end,
-            perms: perms.to_owned(),
-            path,
-        });
-    }
-    ranges
-}
+mod maps;
+use maps::*;
+mod art_open;
+use art_open::*;
+mod private_copy;
+use private_copy::*;
 
 fn heal_blob_sidecars(dest: &Path, artifacts: &[ksight_core::DumpArtifact]) {
     let dir = dest.join("runtime").join("blob-dex");
@@ -2113,6 +1953,7 @@ fn accumulate_live(report: &mut PackageDumpReport, live: crate::dexdump::LiveDum
     report.plaintext_windows = report
         .plaintext_windows
         .saturating_add(live.plaintext_windows);
+    report.crypto_windows = report.crypto_windows.saturating_add(live.crypto_windows);
     report.key_slots = report.key_slots.saturating_add(live.key_slots);
     report.runtime_blob_dex = report.runtime_blob_dex.saturating_add(live.blob_dex);
     report.stitched_spans = report.stitched_spans.saturating_add(live.stitched_spans);
@@ -2290,11 +2131,7 @@ fn key_search_files(dest: &Path, include_heap: bool) -> Vec<PathBuf> {
 }
 
 fn validate_package(package: &str) -> Result<()> {
-    if package.is_empty()
-        || !package
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_'))
-    {
+    if !crate::identity::valid_package_name(package) {
         bail!("Android package name contains unsupported characters");
     }
     Ok(())
@@ -2335,6 +2172,60 @@ fn run_optional(program: &str, args: &[&str]) -> String {
         .ok()
         .and_then(|output| String::from_utf8(output.stdout).ok())
         .unwrap_or_default()
+}
+
+fn catalog_registered_component_classes(
+    package: &str,
+    sets: &[ksight_core::DexArtifactSet],
+    dest: &Path,
+) -> Vec<String> {
+    let declared = sets
+        .iter()
+        .filter_map(|set| set.semantic.as_ref())
+        .flat_map(|semantic| semantic.class_descriptors.iter())
+        .filter_map(|descriptor| normalize_dex_class_descriptor(descriptor))
+        .collect::<BTreeMap<_, _>>();
+    if declared.is_empty() {
+        return Vec::new();
+    }
+    let package_dump = run_optional("/system/bin/dumpsys", &["package", package]);
+    let mut classes = package_dump
+        .split(|character: char| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '$'))
+        })
+        .filter(|token| token.contains('.'))
+        .filter_map(|token| declared.get(&token.replace('.', "/").to_ascii_lowercase()))
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .take(4096)
+        .collect::<Vec<_>>();
+    classes.sort();
+    if !classes.is_empty() {
+        let metadata_dir = dest.join("metadata");
+        if std::fs::create_dir_all(&metadata_dir).is_ok() {
+            let _ = std::fs::write(
+                metadata_dir.join("registered-components.json"),
+                serde_json::to_vec_pretty(&classes).unwrap_or_default(),
+            );
+        }
+    }
+    classes
+}
+
+fn normalize_dex_class_descriptor(descriptor: &str) -> Option<(String, String)> {
+    let class_name = descriptor
+        .trim()
+        .trim_start_matches('[')
+        .trim_start_matches('L')
+        .trim_end_matches(';');
+    if !class_name.contains('/') {
+        return None;
+    }
+    Some((
+        class_name.to_ascii_lowercase(),
+        class_name.replace('/', "."),
+    ))
 }
 
 fn walk_data_app(package: &str) -> Vec<PathBuf> {
@@ -2474,158 +2365,6 @@ fn copy_matching_files(src: &Path, dest: &Path, depth: u32) -> Result<usize> {
     Ok(copied)
 }
 
-fn copy_app_private(package: &str, dest: &Path) -> Result<usize> {
-    let mut copied = 0_usize;
-    let mut seen = BTreeSet::new();
-    for (label, root) in [
-        ("ce", format!("/data/user/0/{package}")),
-        ("de", format!("/data/user_de/0/{package}")),
-        ("ce", format!("/data/data/{package}")),
-    ] {
-        for dir in APP_PRIVATE_DIRS {
-            copied = copied.saturating_add(copy_private_tree(
-                &PathBuf::from(&root).join(dir),
-                &dest.join(label).join(dir),
-                dest,
-                &mut seen,
-                0,
-            )?);
-            if copied >= MAX_PRIVATE_FILES {
-                return Ok(copied);
-            }
-        }
-    }
-    Ok(copied)
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-fn copy_app_private_from(roots: &[PathBuf], dest: &Path) -> Result<usize> {
-    let mut copied = 0_usize;
-    let mut seen = BTreeSet::new();
-    for root in roots {
-        for dir in APP_PRIVATE_DIRS {
-            copied = copied.saturating_add(copy_private_tree(
-                &root.join(dir),
-                &dest.join(dir),
-                dest,
-                &mut seen,
-                0,
-            )?);
-            if copied >= MAX_PRIVATE_FILES {
-                return Ok(copied);
-            }
-        }
-    }
-    Ok(copied)
-}
-
-fn copy_private_tree(
-    src: &Path,
-    dest: &Path,
-    dest_root: &Path,
-    seen: &mut BTreeSet<String>,
-    depth: u32,
-) -> Result<usize> {
-    if depth > 6 || !src.is_dir() {
-        return Ok(0);
-    }
-    let mut copied = 0_usize;
-    let Ok(entries) = std::fs::read_dir(src) else {
-        return Ok(0);
-    };
-    for entry in entries.flatten() {
-        if seen.len() >= MAX_PRIVATE_FILES {
-            break;
-        }
-        let path = entry.path();
-        if path.is_dir() {
-            if skip_private_dir(&entry.file_name().to_string_lossy()) {
-                continue;
-            }
-            copied = copied.saturating_add(copy_private_tree(
-                &path,
-                &dest.join(entry.file_name()),
-                dest_root,
-                seen,
-                depth.saturating_add(1),
-            )?);
-            continue;
-        }
-        if !path.is_file() {
-            continue;
-        }
-        if skip_private_file(&path) {
-            continue;
-        }
-        let target = dest.join(entry.file_name());
-        let Ok(rel) = target.strip_prefix(dest_root) else {
-            continue;
-        };
-        let key = rel.to_string_lossy().replace('\\', "/");
-        if !seen.insert(key) {
-            continue;
-        }
-        if copy_capped_path(&path, &target, MAX_PRIVATE_FILE_BYTES).is_ok() && target.is_file() {
-            copied = copied.saturating_add(1);
-        }
-    }
-    Ok(copied)
-}
-
-fn skip_private_dir(name: &str) -> bool {
-    matches!(
-        name,
-        "fresco_disk_cache"
-            | "image_manager_disk_cache"
-            | "Crash Reports"
-            | "HTTP Cache"
-            | "Code Cache"
-            | "Cache_Data"
-            | "oat_primary"
-            | "shaders_cache"
-            | "com.android.opengl.shaders_cache.multifile"
-            | "com.android.skia.shaders_cache"
-    )
-}
-
-fn skip_private_file(path: &Path) -> bool {
-    if has_ext(path, "cnt") || has_ext(path, "baj") || has_ext(path, "baf") {
-        return true;
-    }
-    [
-        "jpg", "jpeg", "png", "webp", "mp4", "webm", "gif", "so", "apk", "dex", "jar", "oat",
-        "vdex", "odex", "mp3", "aac", "wav",
-    ]
-    .iter()
-    .any(|ext| has_ext(path, ext))
-}
-
-fn copy_capped_path(src: &Path, dest: &Path, cap: u64) -> Result<()> {
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let meta = src.metadata()?;
-    if meta.len() > cap {
-        return Ok(());
-    }
-    let mut input = File::open(src)?;
-    let mut output = File::create(dest)?;
-    let mut buffer = [0_u8; 8192];
-    let mut total = 0_u64;
-    loop {
-        let read = input.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        if total.saturating_add(u64::try_from(read).unwrap_or(0)) > cap {
-            break;
-        }
-        output.write_all(&buffer[..read])?;
-        total = total.saturating_add(u64::try_from(read).unwrap_or(0));
-    }
-    Ok(())
-}
-
 fn force_stop_package(package: &str) {
     let _ = Command::new("/system/bin/am")
         .args(["force-stop", package])
@@ -2658,7 +2397,7 @@ fn start_package(package: &str) {
         .status();
 }
 
-fn has_ext(path: &Path, ext: &str) -> bool {
+pub(super) fn has_ext(path: &Path, ext: &str) -> bool {
     path.extension()
         .and_then(|value| value.to_str())
         .is_some_and(|value| value.eq_ignore_ascii_case(ext))
@@ -2763,582 +2502,5 @@ fn package_cmdline(pid: u32) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn dex_sets_deduplicate_bytes_and_preserve_observations() {
-        let dir = std::env::temp_dir().join(format!("ksight-dex-set-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("runtime")).expect("runtime");
-        let mut dex = vec![0_u8; 0x70];
-        dex[..8].copy_from_slice(b"dex\n035\0");
-        dex[32..36].copy_from_slice(&0x70_u32.to_le_bytes());
-        dex[40..44].copy_from_slice(&0x1234_5678_u32.to_le_bytes());
-        std::fs::write(dir.join("runtime/a.dex"), &dex).expect("dex");
-        let artifacts = vec![
-            ksight_core::DumpArtifact {
-                kind: "dex".to_owned(),
-                source: "memory-dex".to_owned(),
-                relative_path: "runtime/a.dex".to_owned(),
-                bytes: 0x70,
-                magic: "dex".to_owned(),
-                pid: Some(7),
-                vma_start: Some(0x1000),
-                vma_end: Some(0x2000),
-                map_path: Some("[anon:dalvik-classes.dex]".to_owned()),
-                dex_offset: Some(0),
-                sha256: Some("same".to_owned()),
-            },
-            ksight_core::DumpArtifact {
-                kind: "dex".to_owned(),
-                source: "apk-dex".to_owned(),
-                relative_path: "apk-dex/classes.dex".to_owned(),
-                bytes: 0x70,
-                magic: "dex".to_owned(),
-                pid: None,
-                vma_start: None,
-                vma_end: None,
-                map_path: None,
-                dex_offset: None,
-                sha256: Some("same".to_owned()),
-            },
-        ];
-        let (sets, index) = build_dex_sets(&dir, &artifacts);
-        assert_eq!(sets.len(), 1);
-        assert_eq!(sets[0].observations.len(), 2);
-        assert_eq!(sets[0].canonical_relative_path, "runtime/a.dex");
-        assert!(sets[0].semantic.is_some());
-        assert_eq!(index.unique_dex, 1);
-        assert_eq!(index.observations, 2);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn recatalog_accepts_legacy_dump_reports() {
-        let report: PackageDumpReport = serde_json::from_str(
-            r#"{"package":"com.icbc","install_dir":null,"apk_files":0,"native_libs":0,"oat_files":0,"apk_dex":0,"launched":false,"pids":[1],"memory_images":0,"vdex_images":0,"fd_images":0,"runtime_libs":0,"packer_regions":32}"#,
-        )
-        .expect("legacy");
-        assert_eq!(report.package, "com.icbc");
-        assert_eq!(report.packer_regions, 32);
-        assert_eq!(report.asset_files, 0);
-        assert!(report.artifacts.is_empty());
-        assert!(report.schema_version.is_empty());
-        assert!(!report.observation_env.hide_debug_requested);
-        assert!(!report.observation_env.denylist_applied);
-    }
-
-    #[test]
-    fn sensitive_catalog_hashes_plaintext_and_key_candidates() {
-        let dir = std::env::temp_dir().join(format!("ksight-sensitive-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(dir.join("runtime/plaintext")).expect("plaintext dir");
-        std::fs::create_dir_all(dir.join("runtime/packer-keys")).expect("key dir");
-        std::fs::write(dir.join("runtime/plaintext/http.txt"), b"GET / HTTP/1.1")
-            .expect("plaintext");
-        std::fs::write(dir.join("runtime/packer-keys/slot.bin"), [7_u8; 16]).expect("key");
-        let files = catalog_sensitive_files(&dir);
-        assert_eq!(files.len(), 2);
-        assert!(files.iter().all(|file| file.sha256.len() == 64));
-        assert!(files.iter().all(|file| !file.confirmed));
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn catalog_parses_nul_http_response_without_fake_path() {
-        let dir = std::env::temp_dir().join(format!("ksight-http-calls-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(dir.join("runtime/plaintext")).expect("plaintext dir");
-        let mut bytes = vec![0_u8; 0x40];
-        bytes[0x28..0x2c].copy_from_slice(&[0x9d, 0xb8, 0x2f, 0x00]);
-        bytes.extend_from_slice(
-            b"HTTP/1.1 200 OK\0Content-Type: image/jpeg\0Content-Length: 73045\0",
-        );
-        std::fs::write(dir.join("runtime/plaintext/mem-4321-7b00+40.txt"), &bytes).expect("window");
-        let calls = catalog_plaintext_http_calls(&dir, "com.example");
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].origin, "heap");
-        assert_eq!(calls[0].process_id, 4321);
-        assert_eq!(calls[0].status, Some(200));
-        assert!(calls[0].path.is_empty());
-        assert_eq!(calls[0].content_type.as_deref(), Some("image/jpeg"));
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn catalog_parses_http2_hpack_and_https_needles() {
-        let dir = std::env::temp_dir().join(format!("ksight-h2-calls-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(dir.join("runtime/plaintext")).expect("plaintext dir");
-        let block = [
-            0x82, 0x86, 0x84, 0x41, 0x0f, 0x77, 0x77, 0x77, 0x2e, 0x65, 0x78, 0x61, 0x6d, 0x70,
-            0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d,
-        ];
-        let mut frame = vec![
-            0,
-            0,
-            u8::try_from(block.len()).unwrap(),
-            0x1,
-            0x04,
-            0,
-            0,
-            0,
-            1,
-        ];
-        frame.extend_from_slice(&block);
-        std::fs::write(dir.join("runtime/plaintext/mem-99-1000+0.txt"), &frame).expect("h2");
-        std::fs::write(
-            dir.join("runtime/plaintext/mem-99-2000+0.txt"),
-            b"https://api.example/v1/login?token=x",
-        )
-        .expect("https");
-        let calls = catalog_plaintext_http_calls(&dir, "com.example");
-        assert!(
-            calls.iter().any(|call| {
-                call.kind == "http2_request"
-                    && call.host.as_deref() == Some("www.example.com")
-                    && call.path == "/"
-                    && call.origin == "heap"
-            }),
-            "{calls:?}"
-        );
-        assert!(
-            calls.iter().any(|call| {
-                call.host.as_deref() == Some("api.example") && call.path == "/v1/login"
-            }),
-            "{calls:?}"
-        );
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn catalog_parses_private_sqlite_https_urls() {
-        let dir = std::env::temp_dir().join(format!("ksight-private-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(dir.join("data-private/ce/databases")).expect("db dir");
-        let mut bytes = vec![0_u8; 64];
-        bytes.extend_from_slice(b"https://mbas.mbs.boc.cn/WeiBankFront/supportUNI/8");
-        bytes.extend_from_slice(&[0, 0, 0]);
-        bytes.extend_from_slice(b"https://wap.boc.cn/cs/fd5/index_2220.html");
-        std::fs::write(
-            dir.join("data-private/ce/databases/boc_mobile_database.db"),
-            &bytes,
-        )
-        .expect("db");
-        let calls = ksight_core::http_calls_from_private_dir(&dir.join("data-private"), "com.boc");
-        assert!(
-            calls.iter().any(|call| {
-                call.origin == "private"
-                    && call.host.as_deref() == Some("mbas.mbs.boc.cn")
-                    && call.path.starts_with("/WeiBankFront/")
-            }),
-            "{calls:?}"
-        );
-        assert!(
-            calls
-                .iter()
-                .any(|call| call.host.as_deref() == Some("wap.boc.cn")),
-            "{calls:?}"
-        );
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn parses_pm_path_lines() {
-        let paths = parse_pm_paths(
-            "package:/data/app/~~x==/com.sgcc.wsgw.cn-y==/base.apk\npackage:/data/app/~~x==/com.sgcc.wsgw.cn-y==/split_config.apk\n",
-        );
-        assert_eq!(paths.len(), 2);
-        assert!(paths[0].ends_with("base.apk"));
-    }
-
-    #[test]
-    fn prune_install_trees_keeps_evidence_dirs() {
-        let dir = std::env::temp_dir().join(format!("ksight-prune-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(dir.join("apk")).expect("apk");
-        std::fs::create_dir_all(dir.join("lib")).expect("lib");
-        std::fs::create_dir_all(dir.join("runtime")).expect("runtime");
-        std::fs::create_dir_all(dir.join("data-private")).expect("private");
-        std::fs::write(dir.join("apk/base.apk"), b"apk").expect("apk file");
-        std::fs::write(dir.join("runtime/maps.txt"), b"maps").expect("maps");
-        prune_install_trees(&dir);
-        assert!(!dir.join("apk").exists());
-        assert!(!dir.join("lib").exists());
-        assert!(dir.join("runtime/maps.txt").is_file());
-        assert!(dir.join("data-private").is_dir());
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn copies_bounded_app_private_prefs_and_skips_media() {
-        let root = std::env::temp_dir().join(format!("ksight-private-{}", uuid::Uuid::new_v4()));
-        let dest =
-            std::env::temp_dir().join(format!("ksight-private-out-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(root.join("shared_prefs")).expect("prefs");
-        std::fs::create_dir_all(root.join("databases")).expect("db");
-        std::fs::create_dir_all(root.join("files")).expect("files");
-        std::fs::write(
-            root.join("shared_prefs/token.xml"),
-            b"<map><string name=\"t\">x</string></map>",
-        )
-        .expect("xml");
-        std::fs::write(root.join("databases/app.db"), b"SQLite format 3\0").expect("db");
-        std::fs::write(root.join("files/photo.jpg"), b"not-a-jpeg").expect("jpg");
-        let copied = copy_app_private_from(std::slice::from_ref(&root), &dest).expect("copy");
-        assert_eq!(copied, 2);
-        assert!(dest.join("shared_prefs/token.xml").is_file());
-        assert!(dest.join("databases/app.db").is_file());
-        assert!(!dest.join("files/photo.jpg").exists());
-        let _ = std::fs::remove_dir_all(root);
-        let _ = std::fs::remove_dir_all(dest);
-    }
-
-    #[test]
-    fn ranks_main_pid_before_service_processes() {
-        assert_eq!(crate::dump_guard::cmdline_dump_rank("pkg", "pkg"), 0);
-        assert_eq!(crate::dump_guard::cmdline_dump_rank("pkg", "pkg:push"), 1);
-    }
-
-    #[test]
-    fn rejects_unsafe_package_names() {
-        assert!(validate_package("com.sgcc.wsgw.cn").is_ok());
-        assert!(validate_package("com.foo; rm -rf /").is_err());
-    }
-
-    #[test]
-    fn catalogs_heap_blob_sidecars_as_correlated_artifacts() {
-        let dir = std::env::temp_dir().join(format!("ksight-catalog-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let split = dir.join("apk-dex").join("split");
-        let blob = dir.join("runtime").join("blob-dex");
-        std::fs::create_dir_all(&split).expect("split");
-        std::fs::create_dir_all(&blob).expect("blob");
-        let name = "blob-9-abc_part00_0.dex";
-        let mut dex = vec![0_u8; 0x70];
-        dex[..8].copy_from_slice(b"dex\n035\0");
-        std::fs::write(split.join(name), &dex).expect("dex");
-        std::fs::write(
-            blob.join("9-abc.json"),
-            r#"{"pid":9,"vma_start":2748,"vma_end":4096,"map_path":"[anon:scudo:secondary]","files":["blob-9-abc_part00_0.dex"]}"#,
-        )
-        .expect("json");
-        std::fs::write(
-            dir.join("runtime").join("maps-9.txt"),
-            "00000abc-00001000 rw-p 00000000 00:00 0 [anon:scudo:secondary]\n",
-        )
-        .expect("maps");
-        let artifacts = catalog_dump(&dir);
-        let heap = artifacts
-            .iter()
-            .find(|row| row.source == "heap-blob")
-            .expect("heap");
-        assert_eq!(heap.pid, Some(9));
-        assert_eq!(heap.vma_start, Some(2748));
-        assert_eq!(heap.map_path.as_deref(), Some("[anon:scudo:secondary]"));
-        assert_eq!(
-            parse_blob_name("blob-17628-6e61c7b000_part00_2344.dex"),
-            Some((17628, 0x006e_61c7_b000, Some(2344)))
-        );
-        assert_eq!(
-            parse_mem_name("mem-28735-6ec9458c90.dex"),
-            Some((28735, 0x006e_c945_8c90, None))
-        );
-        assert_eq!(
-            parse_mem_name("mem-2706-6ec9587000+5cd0.dex"),
-            Some((2706, 0x006e_c958_7000, Some(0x5cd0)))
-        );
-        let mut graph = ksight_core::SessionGraph::from_package_dump(
-            uuid::Uuid::nil(),
-            "demo.pkg",
-            &[9],
-            &artifacts,
-        );
-        graph.correlate_dump_vmas(
-            uuid::Uuid::nil(),
-            &artifacts,
-            &maps_as_observed(&dir, &artifacts),
-        );
-        assert!(graph
-            .edges
-            .iter()
-            .all(|edge| edge.strength == ksight_core::EdgeStrength::Correlated));
-        assert!(graph
-            .edges
-            .iter()
-            .any(|edge| edge.relation == "overlaps_mmap"
-                && edge.strength == ksight_core::EdgeStrength::Correlated
-                && edge.to.starts_with("proc_maps:9:")));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn ok_marker_survives_guard_maps_and_high_address_noise() {
-        let dir = std::env::temp_dir().join(format!("ksight-ok-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let split = dir.join("apk-dex").join("split");
-        let blob = dir.join("runtime").join("blob-dex");
-        let so_dir = dir.join("runtime").join("runtime-so");
-        std::fs::create_dir_all(&split).expect("split");
-        std::fs::create_dir_all(&blob).expect("blob");
-        std::fs::create_dir_all(&so_dir).expect("so");
-        let name = "blob-9-6e5f3f1000_part00_40.dex";
-        let mut dex = vec![0_u8; 0x70];
-        dex[..8].copy_from_slice(b"dex\n035\0");
-        std::fs::write(split.join(name), &dex).expect("dex");
-        std::fs::write(
-            blob.join("9-6e5f3f1000.ok"),
-            "seq=56 bytes=53604352 slices=1\n",
-        )
-        .expect("ok");
-        std::fs::write(
-            so_dir.join("9-libexec.so"),
-            [0x7f, b'E', b'L', b'F', 0, 0, 0, 0],
-        )
-        .expect("so");
-        let mut maps = String::new();
-        for index in 0..600_u32 {
-            let start = index * 0x1000;
-            let _ = std::fmt::Write::write_fmt(
-                &mut maps,
-                format_args!(
-                    "{start:08x}-{:08x} rw-p 00000000 00:00 0 [anon:pad]\n",
-                    start + 0x1000
-                ),
-            );
-        }
-        maps.push_str("6e5de00000-6e60c00000 ---p 00000000 00:00 0 \n");
-        maps.push_str(
-            "6ec9464000-6ec94a4000 r-xp 00000000 fe:37 1 /data/data/demo/files/libexec.so\n",
-        );
-        std::fs::write(dir.join("runtime").join("maps-9.txt"), maps).expect("maps");
-
-        let artifacts = catalog_dump(&dir);
-        let heap = artifacts
-            .iter()
-            .find(|row| row.source == "heap-blob")
-            .expect("heap");
-        assert_eq!(heap.vma_start, Some(0x006e_5f3f_1000));
-        assert_eq!(heap.vma_end, Some(0x006e_5f3f_1000 + 53_604_352));
-        assert_eq!(heap.map_path, None);
-        let so = artifacts
-            .iter()
-            .find(|row| row.source == "runtime-so")
-            .expect("so");
-        assert_eq!(so.vma_start, Some(0x006e_c946_4000));
-        assert_eq!(so.vma_end, Some(0x006e_c94a_4000));
-        assert_eq!(
-            so.map_path.as_deref(),
-            Some("/data/data/demo/files/libexec.so")
-        );
-
-        let mut graph = ksight_core::SessionGraph::from_package_dump(
-            uuid::Uuid::nil(),
-            "demo.pkg",
-            &[9],
-            &artifacts,
-        );
-        graph.correlate_dump_vmas(
-            uuid::Uuid::nil(),
-            &artifacts,
-            &maps_as_observed(&dir, &artifacts),
-        );
-        assert!(graph
-            .edges
-            .iter()
-            .filter(|edge| edge.relation == "overlaps_mmap")
-            .all(|edge| edge.strength == ksight_core::EdgeStrength::Correlated));
-        assert!(graph.edges.iter().any(|edge| {
-            edge.relation == "overlaps_mmap" && edge.from.starts_with("vma:9:6e5f3f1000-")
-        }));
-        assert!(graph
-            .edges
-            .iter()
-            .any(|edge| { edge.relation == "extracted_from" && edge.from.contains("libexec.so") }));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn catalogs_live_memory_dex_with_vma() {
-        let dir = std::env::temp_dir().join(format!("ksight-memdex-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let runtime = dir.join("runtime");
-        std::fs::create_dir_all(&runtime).expect("runtime");
-        let mut dex = vec![0_u8; 2048];
-        dex[..8].copy_from_slice(b"dex\n035\0");
-        std::fs::write(runtime.join("mem-11-6ec9458c90.dex"), &dex).expect("dex");
-        std::fs::write(
-            runtime.join("maps-11.txt"),
-            "6ec9458000-6ec9460000 r--p 00000000 00:00 0 [anon:dalvik-classes.dex]\n",
-        )
-        .expect("maps");
-        let artifacts = catalog_dump(&dir);
-        let mem = artifacts
-            .iter()
-            .find(|row| row.source == "memory-dex")
-            .expect("memory-dex");
-        assert_eq!(mem.pid, Some(11));
-        assert_eq!(mem.vma_start, Some(0x006e_c945_8c90));
-        assert_eq!(mem.vma_end, Some(0x006e_c946_0000));
-        assert_eq!(mem.map_path.as_deref(), Some("[anon:dalvik-classes.dex]"));
-        let graph = ksight_core::SessionGraph::from_package_dump(
-            uuid::Uuid::nil(),
-            "com.icbc",
-            &[11],
-            &artifacts,
-        );
-        assert!(graph.edges.iter().any(|edge| edge.relation == "produced"));
-        assert!(graph
-            .edges
-            .iter()
-            .all(|edge| edge.strength == ksight_core::EdgeStrength::Correlated));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn catalog_skips_duplicate_apk_dex_and_file_backed_heaps() {
-        let dir = std::env::temp_dir().join(format!("ksight-dedupe-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let split = dir.join("apk-dex").join("split");
-        let blob = dir.join("runtime").join("blob-dex");
-        std::fs::create_dir_all(&split).expect("split");
-        std::fs::create_dir_all(&blob).expect("blob");
-        let mut dex = vec![0_u8; 2048];
-        dex[..8].copy_from_slice(b"dex\n035\0");
-        std::fs::write(split.join("classes.dex"), &dex).expect("split");
-        std::fs::write(dir.join("apk-dex").join("classes.dex"), &dex).expect("root");
-        std::fs::write(split.join("blob-8-abc_part00_0.dex"), &dex).expect("heap");
-        std::fs::write(
-            blob.join("8-abc.json"),
-            r#"{"pid":8,"vma_start":2748,"vma_end":4096,"map_path":"/data/app/x/oat/arm64/base.vdex","files":["blob-8-abc_part00_0.dex"]}"#,
-        )
-        .expect("json");
-        std::fs::write(
-            dir.join("runtime").join("maps-8.txt"),
-            "00000abc-00001000 r--p 00000000 00:00 0 /data/app/x/oat/arm64/base.vdex\n",
-        )
-        .expect("maps");
-        std::fs::write(dir.join("runtime").join("mem-8-1000.dex"), vec![0_u8; 200]).expect("tiny");
-        let artifacts = catalog_dump(&dir);
-        assert_eq!(
-            artifacts
-                .iter()
-                .filter(|row| row.source == "apk-dex")
-                .count(),
-            1
-        );
-        assert!(artifacts.iter().all(|row| row.source != "heap-blob"));
-        assert!(artifacts.iter().all(|row| row.source != "memory-dex"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn catalog_keeps_writable_app_so_blobs() {
-        let dir = std::env::temp_dir().join(format!("ksight-so-blob-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let split = dir.join("apk-dex").join("split");
-        let blob = dir.join("runtime").join("blob-dex");
-        std::fs::create_dir_all(&split).expect("split");
-        std::fs::create_dir_all(&blob).expect("blob");
-        let mut dex = vec![0_u8; 2048];
-        dex[..8].copy_from_slice(b"dex\n035\0");
-        std::fs::write(split.join("blob-8-aaa_part00_0.dex"), &dex).expect("so blob");
-        std::fs::write(split.join("blob-8-bbb_part00_0.dex"), &dex).expect("vdex blob");
-        std::fs::write(
-            blob.join("8-aaa.json"),
-            r#"{"pid":8,"vma_start":1000,"vma_end":2000,"map_path":"/data/app/x/lib/arm64/libpayload.so","files":["blob-8-aaa_part00_0.dex"]}"#,
-        )
-        .expect("so json");
-        std::fs::write(
-            blob.join("8-bbb.json"),
-            r#"{"pid":8,"vma_start":3000,"vma_end":4000,"map_path":"/data/app/x/oat/arm64/base.vdex","files":["blob-8-bbb_part00_0.dex"]}"#,
-        )
-        .expect("vdex json");
-        std::fs::write(split.join("blob-8-ccc_part00_0.dex"), &dex).expect("memfd blob");
-        std::fs::write(
-            blob.join("8-ccc.json"),
-            r#"{"pid":8,"vma_start":5000,"vma_end":6000,"map_path":"/memfd:classes","files":["blob-8-ccc_part00_0.dex"]}"#,
-        )
-        .expect("memfd json");
-        let artifacts = catalog_dump(&dir);
-        let kept: Vec<_> = artifacts
-            .iter()
-            .filter(|row| row.source == "heap-blob")
-            .collect();
-        assert_eq!(kept.len(), 2);
-        assert!(kept
-            .iter()
-            .any(|row| { row.map_path.as_deref() == Some("/data/app/x/lib/arm64/libpayload.so") }));
-        assert!(kept
-            .iter()
-            .any(|row| row.map_path.as_deref() == Some("/memfd:classes")));
-        assert!(kept.iter().all(|row| {
-            row.map_path.as_deref().is_none_or(|path| {
-                std::path::Path::new(path)
-                    .extension()
-                    .is_none_or(|ext| !ext.eq_ignore_ascii_case("vdex"))
-            })
-        }));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn art_file_open_joins_apk_dex_from_data_app() {
-        let mut loaders = vec![CodeLoaderEntry {
-            pid: 9,
-            order: 1,
-            role: "install".to_owned(),
-            origin: "art_open".to_owned(),
-            path: "/data/app/~~x==/pkg-y==/base.apk".to_owned(),
-            ..CodeLoaderEntry::default()
-        }];
-        let artifacts = vec![ksight_core::DumpArtifact {
-            kind: "dex".to_owned(),
-            source: "apk-dex".to_owned(),
-            relative_path: "apk-dex/classes.dex".to_owned(),
-            bytes: 128,
-            magic: "dex".to_owned(),
-            pid: None,
-            vma_start: None,
-            vma_end: None,
-            map_path: None,
-            dex_offset: None,
-            sha256: Some("abc".to_owned()),
-        }];
-        join_art_opens(&mut loaders, &artifacts);
-        assert_eq!(
-            loaders[0].joined_relative_path.as_deref(),
-            Some("apk-dex/classes.dex")
-        );
-        assert_eq!(loaders[0].joined_sha256.as_deref(), Some("abc"));
-        let joins = art_open_joins(&loaders, &artifacts);
-        assert_eq!(joins[0].2, "artifact:sha256:abc");
-    }
-
-    #[test]
-    fn art_memory_open_joins_containing_vma() {
-        let mut loaders = vec![CodeLoaderEntry {
-            pid: 4,
-            order: 1,
-            role: "in_memory".to_owned(),
-            origin: "art_open".to_owned(),
-            path: "memory:0x1200+64".to_owned(),
-            opened_bytes: Some(64),
-            ..CodeLoaderEntry::default()
-        }];
-        let artifacts = vec![ksight_core::DumpArtifact {
-            kind: "dex".to_owned(),
-            source: "heap-blob".to_owned(),
-            relative_path: "apk-dex/split/blob.dex".to_owned(),
-            bytes: 64,
-            magic: "dex".to_owned(),
-            pid: Some(4),
-            vma_start: Some(0x1000),
-            vma_end: Some(0x2000),
-            map_path: Some("[anon:scudo:secondary]".to_owned()),
-            dex_offset: Some(0),
-            sha256: Some("heap".to_owned()),
-        }];
-        join_art_opens(&mut loaders, &artifacts);
-        assert_eq!(
-            loaders[0].joined_relative_path.as_deref(),
-            Some("apk-dex/split/blob.dex")
-        );
-    }
-}
+#[path = "tests.rs"]
+mod tests;

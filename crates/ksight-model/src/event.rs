@@ -783,6 +783,41 @@ pub struct InspectPlaintext {
     /// `text`, `tls_record`, or `binary`. TLS records are ciphertext, not HTTP.
     #[serde(default)]
     pub content_class: String,
+    /// Monotonic fragment sequence in this process capture.
+    #[serde(default)]
+    pub sequence: u64,
+    /// Exported symbol or plaintext_probe id when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+    /// False for SSL_peek (copy without consuming the TLS stream).
+    #[serde(default = "default_true")]
+    pub consumes: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for InspectPlaintext {
+    fn default() -> Self {
+        Self {
+            adapter: String::new(),
+            direction: String::new(),
+            library: String::new(),
+            build_id: None,
+            offset: None,
+            requested_bytes: 0,
+            captured_bytes: 0,
+            truncated: false,
+            sha256: String::new(),
+            preview: String::new(),
+            preview_encoding: String::new(),
+            content_class: String::new(),
+            sequence: 0,
+            symbol: None,
+            consumes: true,
+        }
+    }
 }
 
 /// End-of-session evidence used to distinguish complete execution from a broken capture.
