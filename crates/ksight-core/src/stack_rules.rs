@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::tls_abi::{CapturePhase, TlsAbiKind, TlsDirection};
 
+/// Default on-device rule override; diagnostics must not silently hide read errors.
 pub const DEVICE_TABLE_PATH: &str = "/data/local/tmp/ksight/tls_stacks.json";
 pub const SCHEMA_VERSION: &str = "1.3";
 
@@ -80,6 +81,27 @@ impl MatchRules {
         file_size: Option<u64>,
         actual_build_id: Option<&str>,
     ) -> bool {
+        if self.is_empty()
+            || self
+                .basename
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+            || self
+                .basename_contains
+                .iter()
+                .chain(&self.path_contains)
+                .any(|value| value.trim().is_empty())
+            || self
+                .build_id
+                .as_deref()
+                .is_some_and(|value| !valid_build_id(value))
+            || self
+                .architecture
+                .as_deref()
+                .is_some_and(|value| !known_architecture(value))
+        {
+            return false;
+        }
         let lower = path.to_ascii_lowercase();
         let basename = std::path::Path::new(&lower)
             .file_name()
@@ -178,7 +200,9 @@ fn path_matches_architecture(path: &str, architecture: &str) -> bool {
                 && !lower.contains("arm64")
                 && !lower.contains("/lib64/")
         }
-        other => lower.contains(other),
+        "x86_64" => lower.contains("/x86_64/"),
+        "x86" => lower.contains("/x86/"),
+        _ => false,
     }
 }
 
@@ -438,7 +462,8 @@ impl StackRule {
         file_size: Option<u64>,
         actual_build_id: Option<&str>,
     ) -> bool {
-        self.match_rules.matches(path, file_size, actual_build_id)
+        rule_constraint_issues(self).is_empty()
+            && self.match_rules.matches(path, file_size, actual_build_id)
     }
 }
 
@@ -517,7 +542,7 @@ pub fn validation_issues(rules: &StackRulesFile) -> Vec<String> {
     let mut issues = Vec::new();
     if rules.schema_version.trim().is_empty() {
         issues.push("stack rules schema_version is empty".to_owned());
-    } else if !rules.schema_version.starts_with("1.") {
+    } else if !matches!(rules.schema_version.as_str(), "1.0" | "1.1" | "1.2" | "1.3") {
         issues.push(format!(
             "unsupported stack rules schema_version={}",
             rules.schema_version
@@ -536,6 +561,11 @@ pub fn validation_issues(rules: &StackRulesFile) -> Vec<String> {
                 stack.id
             ));
         }
+        issues.extend(
+            rule_constraint_issues(stack)
+                .into_iter()
+                .map(|issue| format!("stack rule id={}: {issue}", stack.id)),
+        );
         if let Some(keylog) = &stack.keylog {
             if keylog.offset.is_some()
                 && keylog.build_id.is_none()
@@ -561,6 +591,91 @@ pub fn validation_issues(rules: &StackRulesFile) -> Vec<String> {
                     "stack rule id={} plaintext_probe offset without build-id/size cannot be enabled",
                     stack.id
                 ));
+            }
+        }
+    }
+    issues
+}
+
+pub(crate) fn valid_build_id(value: &str) -> bool {
+    !value.is_empty() && value.len() % 2 == 0 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn known_architecture(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "arm64" | "aarch64" | "arm" | "arm32" | "aarch32" | "x86" | "x86_64"
+    )
+}
+
+pub(crate) fn rule_constraint_issues(stack: &StackRule) -> Vec<String> {
+    let mut issues = Vec::new();
+    let rule = &stack.match_rules;
+    if rule
+        .basename
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty())
+        || rule
+            .basename_contains
+            .iter()
+            .chain(&rule.path_contains)
+            .any(|value| value.trim().is_empty())
+    {
+        issues.push("empty path/basename match constraint".into());
+    }
+    if rule
+        .architecture
+        .as_deref()
+        .is_some_and(|value| !known_architecture(value))
+    {
+        issues.push("unknown architecture constraint".into());
+    }
+    let keylog = stack.keylog.as_ref();
+    let ids: Vec<_> = [
+        rule.build_id.as_deref(),
+        stack.version.build_id.as_deref(),
+        keylog.and_then(|value| value.build_id.as_deref()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if ids.iter().any(|id| !valid_build_id(id)) {
+        issues.push("invalid build ID (expected nonempty hex bytes)".into());
+    }
+    if ids
+        .first()
+        .is_some_and(|first| ids.iter().any(|id| !id.eq_ignore_ascii_case(first)))
+    {
+        issues.push("match/version/keylog build IDs disagree".into());
+    }
+    let sizes: Vec<_> = [
+        rule.size,
+        stack.version.size,
+        keylog.and_then(|value| value.size),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if sizes.contains(&0)
+        || sizes
+            .first()
+            .is_some_and(|first| sizes.iter().any(|size| size != first))
+    {
+        issues.push("match/version/keylog sizes are zero or disagree".into());
+    }
+    if let Some(keylog) = keylog {
+        if keylog
+            .lib_name
+            .as_deref()
+            .is_some_and(|name| name.trim().is_empty())
+        {
+            issues.push("empty keylog library name".into());
+        }
+        if let (Some(expected), Some(actual)) =
+            (rule.basename.as_deref(), keylog.lib_name.as_deref())
+        {
+            if expected != actual {
+                issues.push("match/keylog library names disagree".into());
             }
         }
     }
@@ -613,6 +728,9 @@ pub fn tls_symbol_names() -> Vec<String> {
 pub fn enabled_plaintext_probes() -> Vec<(String, PlaintextProbe)> {
     let mut out = Vec::new();
     for stack in &load().stacks {
+        if !rule_constraint_issues(stack).is_empty() {
+            continue;
+        }
         for probe in &stack.plaintext_probes {
             if !probe.validation_state.eq_ignore_ascii_case("enabled") {
                 continue;
@@ -730,6 +848,7 @@ pub fn keylog_entries() -> Vec<KeylogRule> {
         .stacks
         .iter()
         .filter(|stack| stack.coverage.keylog == Some(true))
+        .filter(|stack| rule_constraint_issues(stack).is_empty())
         .filter_map(|stack| stack.keylog.as_ref())
         .filter(|rule| rule.offset.is_some())
         .cloned()
@@ -816,6 +935,49 @@ pub fn boundary_rule_for_symbol(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_patterns_and_unknown_architecture_never_match() {
+        for rules in [
+            MatchRules::default(),
+            MatchRules {
+                basename_contains: vec![String::new()],
+                ..MatchRules::default()
+            },
+            MatchRules {
+                path_contains: vec![" ".into()],
+                ..MatchRules::default()
+            },
+            MatchRules {
+                architecture: Some("mystery".into()),
+                ..MatchRules::default()
+            },
+            MatchRules {
+                build_id: Some(String::new()),
+                ..MatchRules::default()
+            },
+        ] {
+            assert!(!rules.matches("/mystery/lib64/libfixture.so", Some(16), Some("")));
+        }
+    }
+
+    #[test]
+    fn conflicting_rule_identity_cannot_match_a_library() {
+        let stack = StackRule {
+            id: "fixture".into(),
+            match_rules: MatchRules {
+                basename: Some("libfixture.so".into()),
+                build_id: Some("aabb".into()),
+                ..MatchRules::default()
+            },
+            version: StackVersion {
+                build_id: Some("ccdd".into()),
+                ..StackVersion::default()
+            },
+            ..StackRule::default()
+        };
+        assert!(!stack.matches("/libfixture.so", Some(16), Some("aabb")));
+    }
 
     #[test]
     fn embedded_table_parses_and_classifies() {
@@ -1291,7 +1453,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn libhssl_probespecs_pin_ex_abi_and_offsets() {
         // Basename-only match: name attach, openssl_ex_* for Ex (pre-P0 pazq ABI).
         let generic = probe_specs_for_path(
@@ -1328,16 +1489,20 @@ mod tests {
             pinned.iter().all(|(id, _)| id == "libhssl_0f47c907"),
             "winning build-id pin must not co-emit generic libhssl ProbeSpecs: {pinned:?}"
         );
-        let by_sym: std::collections::BTreeMap<_, _> = pinned
-            .iter()
-            .map(|(_, p)| (p.symbol.as_str(), p))
-            .collect();
+        let by_sym: std::collections::BTreeMap<_, _> =
+            pinned.iter().map(|(_, p)| (p.symbol.as_str(), p)).collect();
         assert_eq!(by_sym["sslWrite"].file_offset, Some(0x1248c));
         assert_eq!(by_sym["sslWriteEx"].file_offset, Some(0x12a6c));
         assert_eq!(by_sym["sslRead"].file_offset, Some(0x12cb4));
         assert_eq!(by_sym["sslReadEx"].file_offset, Some(0x130fc));
-        assert_eq!(by_sym["sslWriteEx"].abi, Some(crate::TlsAbiKind::OpensslExWrite));
-        assert_eq!(by_sym["sslReadEx"].abi, Some(crate::TlsAbiKind::OpensslExRead));
+        assert_eq!(
+            by_sym["sslWriteEx"].abi,
+            Some(crate::TlsAbiKind::OpensslExWrite)
+        );
+        assert_eq!(
+            by_sym["sslReadEx"].abi,
+            Some(crate::TlsAbiKind::OpensslExRead)
+        );
         assert_eq!(by_sym["sslWrite"].abi, Some(crate::TlsAbiKind::VendorWrite));
         assert_eq!(by_sym["sslRead"].abi, Some(crate::TlsAbiKind::VendorRead));
 
@@ -1355,6 +1520,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn pixel6a_elfs_do_not_invent_local_write_or_bio_or_quic_level() {
         let names = tls_symbol_names();
         assert!(names.iter().any(|name| name == "SSL_write"));

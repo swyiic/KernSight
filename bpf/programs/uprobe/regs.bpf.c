@@ -2,6 +2,11 @@
 #include "ksight_bpf_helpers.h"
 #include "ksight_hwbp.h"
 
+/* BPF_F_CURRENT_CPU: a perf event belongs to the CPU that opened it.
+ * Index 0 only works on CPU 0; other CPUs reject that output (-EOPNOTSUPP).
+ * Apply this to both entry and return events, independently of TGID scope. */
+#define KSIGHT_BPF_F_CURRENT_CPU 0xffffffffULL
+
 /* uprobe 命中时 ctx 即用户态 pt_regs 现场（ARM64 前 34 个字段）。 */
 struct ksight_user_regs {
     ksight_u64 regs[31]; /* x0 - x30 */
@@ -10,7 +15,7 @@ struct ksight_user_regs {
     ksight_u64 pstate;
 };
 
-static void *(*const ksight_bpf_perf_event_output)(const void *ctx,
+static long (*const ksight_bpf_perf_event_output)(const void *ctx,
                                                    const void *map,
                                                    ksight_u64 flags,
                                                    const void *data,
@@ -125,7 +130,8 @@ static __always_inline int ksight_emit_user_regs(struct ksight_user_regs *ctx,
             }
         }
         ksight_bpf_map_delete_elem(&entry_ptr, &tid);
-        ksight_bpf_perf_event_output(ctx, &hwbp_events, 0, out, sizeof(*out));
+        ksight_bpf_perf_event_output(ctx, &hwbp_events,
+                                     KSIGHT_BPF_F_CURRENT_CPU, out, sizeof(*out));
         return 0;
     }
     /* Entry probe: x1 is a user pointer for Parcel UTF-16 / TLS buffers;
@@ -162,7 +168,8 @@ static __always_inline int ksight_emit_user_regs(struct ksight_user_regs *ctx,
         }
     }
 
-    ksight_bpf_perf_event_output(ctx, &hwbp_events, 0, out, sizeof(*out));
+    ksight_bpf_perf_event_output(ctx, &hwbp_events,
+                                 KSIGHT_BPF_F_CURRENT_CPU, out, sizeof(*out));
     return 0;
 }
 

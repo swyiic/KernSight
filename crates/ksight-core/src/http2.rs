@@ -405,12 +405,19 @@ pub(crate) struct H2Message {
     pub body: Vec<u8>,
     /// HTTP/2 stream identifier.
     pub stream_id: u32,
+    /// END_STREAM was observed; idle/session-end flushes are incomplete.
+    pub complete: bool,
+    /// DATA bytes omitted by the per-stream body limit.
+    pub dropped_body_bytes: u64,
+    /// Whether :authority was filled from earlier traffic rather than this stream.
+    pub authority_inferred: bool,
 }
 
 #[derive(Debug, Default)]
 struct PartialH2 {
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+    dropped_body_bytes: u64,
 }
 
 /// Reassemble HTTP/2 frames and HPACK state across TLS/JNI copy fragments.
@@ -513,7 +520,7 @@ impl Http2Assembler {
         std::mem::take(&mut self.h2_messages)
     }
 
-    fn finish_stream(&mut self, stream: u32) {
+    fn finish_stream(&mut self, stream: u32, complete: bool) {
         let Some(mut partial) = self.streams.remove(&stream) else {
             return;
         };
@@ -524,9 +531,12 @@ impl Http2Assembler {
             // DATA-only copy (inspect attached after HEADERS). Salvage as a
             // response so SSL_read plaintext still pairs instead of orig=0.
             self.h2_messages.push(H2Message {
-                headers: vec![(":status".to_owned(), "200".to_owned())],
-                body: crate::inflate_inspect_buffer(&partial.body).unwrap_or(partial.body),
+                headers: Vec::new(),
+                body: partial.body,
                 stream_id: stream,
+                complete: false,
+                dropped_body_bytes: partial.dropped_body_bytes,
+                authority_inferred: false,
             });
             return;
         }
@@ -546,18 +556,13 @@ impl Http2Assembler {
                 partial.headers.push((":authority".to_owned(), authority));
             }
         }
-        let grpc = partial.headers.iter().any(|(name, value)| {
-            name.eq_ignore_ascii_case("content-type") && value.to_ascii_lowercase().contains("grpc")
-        });
-        let body = if grpc {
-            unwrap_grpc_length_prefixed(&partial.body)
-        } else {
-            crate::inflate_inspect_buffer(&partial.body).unwrap_or(partial.body)
-        };
         self.h2_messages.push(H2Message {
             headers: partial.headers,
-            body,
+            body: partial.body,
             stream_id: stream,
+            complete: complete && partial.dropped_body_bytes == 0,
+            dropped_body_bytes: partial.dropped_body_bytes,
+            authority_inferred: !has_authority && self.last_authority.is_some(),
         });
     }
 
@@ -571,7 +576,7 @@ impl Http2Assembler {
             .map(|(id, _)| *id)
             .collect();
         for stream in open {
-            self.finish_stream(stream);
+            self.finish_stream(stream, false);
         }
     }
 
@@ -585,7 +590,7 @@ impl Http2Assembler {
             .map(|(id, _)| *id)
             .collect();
         for stream in data_only {
-            self.finish_stream(stream);
+            self.finish_stream(stream, false);
         }
     }
 
@@ -665,7 +670,7 @@ impl Http2Assembler {
                             );
                         }
                         if end_stream {
-                            self.finish_stream(self.headers_stream);
+                            self.finish_stream(self.headers_stream, true);
                         }
                     }
                 }
@@ -682,11 +687,14 @@ impl Http2Assembler {
                     }
                     let entry = self.streams.entry(stream).or_default();
                     let remaining = STREAM_BODY_CAP.saturating_sub(entry.body.len());
+                    entry.dropped_body_bytes = entry
+                        .dropped_body_bytes
+                        .saturating_add(body.len().saturating_sub(remaining) as u64);
                     entry
                         .body
                         .extend_from_slice(&body[..body.len().min(remaining)]);
                     if flags & 0x01 != 0 {
-                        self.finish_stream(stream);
+                        self.finish_stream(stream, true);
                     }
                 }
                 0x3 => {
@@ -1468,6 +1476,7 @@ mod tests {
                     (":path".into(), "/".into()),
                 ],
                 body: Vec::new(),
+                dropped_body_bytes: 0,
             },
         );
         let _ = assembler.push(&data);

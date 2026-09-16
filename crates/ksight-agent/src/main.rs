@@ -22,6 +22,15 @@ struct Args {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Audit configured library rules without loading probes or inspecting Apps.
+    RulesAudit {
+        /// JSON rules file; otherwise inspect the device table, or embedded defaults if absent.
+        #[arg(long)]
+        rules: Option<PathBuf>,
+        /// Emit machine-readable diagnostics (never implies runtime verification).
+        #[arg(long)]
+        json: bool,
+    },
     /// Perform a read-only capability probe.
     Probe {
         /// Emit machine-readable JSON.
@@ -285,8 +294,8 @@ struct CaptureArgs {
     #[arg(long, default_value = "/data/local/tmp/ksight/uprobe_regs.bpf.o")]
     uprobe_object: PathBuf,
     /// Burp HTTP proxy `host:port`. Copies TLS HTTP/WS to that listener; app TLS is unchanged.
-    #[arg(long, value_name = "HOST:PORT")]
-    mirror_burp: Option<String>,
+    #[arg(long, alias = "mirror-burp", value_name = "HOST:PORT")]
+    mirror_http: Option<String>,
     /// Transparent UID REDIRECT of 80/443 to Burp (CONNECT uses SNI). Pinning still applies.
     #[arg(long)]
     mitm_burp: bool,
@@ -305,6 +314,7 @@ fn main() -> Result<()> {
         ksight_agent::embedded::prepare_default_layout()?;
     }
     match args.command {
+        Command::RulesAudit { rules, json } => rules_audit(rules.as_deref(), json),
         Command::Probe { json } => probe(json),
         Command::Run { config, dry_run } => run_service(&config, dry_run),
         Command::Status { config, json } => show_service_status(&config, json),
@@ -360,6 +370,55 @@ fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn rules_audit(path: Option<&std::path::Path>, json: bool) -> Result<()> {
+    use std::io::Read as _;
+    let selected =
+        path.unwrap_or_else(|| std::path::Path::new(ksight_core::STACK_RULES_DEVICE_PATH));
+    let (text, source) = match std::fs::File::open(selected) {
+        Ok(file) => {
+            let mut text = String::new();
+            file.take(ksight_core::STACK_AUDIT_MAX_BYTES as u64 + 1)
+                .read_to_string(&mut text)?;
+            (text, selected.display().to_string())
+        }
+        Err(error) if path.is_none() && error.kind() == std::io::ErrorKind::NotFound => (
+            ksight_core::EMBEDDED_STACK_RULES.to_owned(),
+            "embedded".to_owned(),
+        ),
+        Err(error) => bail!("cannot read rules {}: {error}", selected.display()),
+    };
+    let report =
+        ksight_core::audit_stack_rules_json(&text).map_err(|error| anyhow::anyhow!(error))?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({"source": source, "report": report}))?
+        );
+    } else {
+        println!(
+            "source={source} rules={} valid={} runtime_verification=not_assessed",
+            report.rule_count, report.valid
+        );
+        for error in &report.errors {
+            println!("ERROR: {error}");
+        }
+        for row in &report.rules {
+            println!("{}: identity={} plaintext_configured={} keylog_configured={} runtime_verification={}",
+                row.id, row.identity_basis, row.plaintext_configured, row.keylog_configured, row.runtime_verification);
+            for diagnostic in &row.diagnostics {
+                println!("  {diagnostic}");
+            }
+        }
+        for limitation in &report.limitations {
+            println!("NOTE: {limitation}");
+        }
+    }
+    if !report.valid {
+        bail!("library rule validation failed; no capture started");
+    }
+    Ok(())
 }
 
 #[allow(clippy::fn_params_excessive_bools)]
@@ -487,7 +546,7 @@ fn run_capture(mut args: CaptureArgs) -> Result<()> {
     }
     let inspect_adapter_set = args.inspect_adapter.is_some();
     let mut inspect_adapters = Vec::new();
-    if let Some(endpoint) = args.mirror_burp.as_deref() {
+    if let Some(endpoint) = args.mirror_http.as_deref() {
         if let Err(error) = ksight_core::parse_mirror_endpoint(endpoint) {
             bail!("{error}");
         }
@@ -504,8 +563,8 @@ fn run_capture(mut args: CaptureArgs) -> Result<()> {
         }
     }
     if args.mitm_burp {
-        if args.mirror_burp.is_none() || args.package.is_none() {
-            bail!("--mitm-burp requires --mirror-burp HOST:PORT and --package");
+        if args.mirror_http.is_none() || args.package.is_none() {
+            bail!("--mitm-burp requires --mirror-http HOST:PORT and --package");
         }
         eprintln!(
             "mitm-burp: UID REDIRECT every TCP port; non-DNS UDP rejected (QUIC cannot skip); Intercept off; Proxy HTTP history; Burp upstream 127.0.0.1:18888; pinning still applies on bank apps"
@@ -624,7 +683,7 @@ fn run_capture(mut args: CaptureArgs) -> Result<()> {
         inspect,
         inspect_adapters,
         uprobe_object: args.uprobe_object,
-        mirror_burp: args.mirror_burp,
+        mirror_http: args.mirror_http,
         mitm_burp: args.mitm_burp,
     })
 }
@@ -821,4 +880,61 @@ fn probe(json: bool) -> Result<()> {
         println!("note: {note}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rules_audit_is_a_separate_read_only_command() {
+        let args = Args::try_parse_from([
+            "ksightd",
+            "rules-audit",
+            "--rules",
+            "fixture.json",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            args.command,
+            Command::RulesAudit {
+                rules: Some(_),
+                json: true
+            }
+        ));
+    }
+
+    #[test]
+    fn mirror_http_accepts_legacy_device_flag() {
+        let args = Args::try_parse_from([
+            "ksightd",
+            "capture",
+            "--package",
+            "com.example.app",
+            "--mirror-http",
+            "127.0.0.1:8080",
+            "--mitm-burp",
+        ])
+        .unwrap();
+        let Command::Capture(capture) = args.command else {
+            panic!("expected capture command");
+        };
+        assert_eq!(capture.mirror_http.as_deref(), Some("127.0.0.1:8080"));
+        assert!(capture.mitm_burp);
+
+        let legacy = Args::try_parse_from([
+            "ksightd",
+            "capture",
+            "--package",
+            "com.example.app",
+            "--mirror-burp",
+            "127.0.0.1:8080",
+        ])
+        .unwrap();
+        let Command::Capture(capture) = legacy.command else {
+            panic!("expected capture command");
+        };
+        assert_eq!(capture.mirror_http.as_deref(), Some("127.0.0.1:8080"));
+    }
 }

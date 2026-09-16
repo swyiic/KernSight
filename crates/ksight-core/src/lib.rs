@@ -20,6 +20,7 @@ mod quic_initial;
 mod report;
 mod sequence;
 mod sm4;
+mod stack_audit;
 mod stack_rules;
 mod tls_abi;
 
@@ -43,7 +44,8 @@ pub use handshake::{parse_handshake, HandshakeMeta};
 pub use http2::{http2_sync_offset, looks_like_http2, unwrap_grpc_length_prefixed};
 pub use http_mirror::{
     fragment_bytes, looks_like_http_plain, parse_mirror_endpoint, request_from_http_url,
-    requests_from_embedded_http_urls, MirroredMessage, StreamReassembler, BURP_PLAYBACK_PORT,
+    requests_from_embedded_http_urls, MessageCompleteness, MessageEvidence, MessageOrigin,
+    MirrorSource, MirroredMessage, PairingBasis, StreamReassembler, BURP_PLAYBACK_PORT,
     BURP_UPSTREAM_PORT,
 };
 pub use http_plain::{
@@ -87,12 +89,16 @@ pub use sm4::{
     decrypt_block as sm4_decrypt_block, decrypt_ecb as sm4_decrypt_ecb,
     encrypt_ecb as sm4_encrypt_ecb,
 };
+pub use stack_audit::{
+    audit_stack_rules_json, StackAuditRow, StackRulesAudit, STACK_AUDIT_MAX_BYTES,
+};
 pub use stack_rules::{
     boundary_functions, boundary_rule_for_symbol, boundary_symbols, enabled_plaintext_probes,
     keylog_entries, live_apk_keylog_pin, load as load_stack_rules, matching_stacks,
     probe_specs_for_path, ssl_write_attach_allowed, stack_for_path, tls_symbol_names,
     validation_issues, BoundaryFunction, PlaintextProbe, ProbeSpec,
-    EMBEDDED_RULES as EMBEDDED_STACK_RULES, SCHEMA_VERSION,
+    DEVICE_TABLE_PATH as STACK_RULES_DEVICE_PATH, EMBEDDED_RULES as EMBEDDED_STACK_RULES,
+    SCHEMA_VERSION,
 };
 pub use tls_abi::{
     is_tls_application_data_export, ActualLengthSource, CapturePhase, TlsAbiKind, TlsAbiLayout,

@@ -322,9 +322,9 @@ struct CaptureOptions {
     #[arg(long)]
     hide_debug: bool,
     /// Burp HTTP proxy `host:port` on the computer. Enables `--inspect-tls`. Phone feeds HTTP/WS; app TLS is unchanged.
-    #[arg(long, value_name = "HOST:PORT")]
-    mirror_burp: Option<String>,
-    /// Transparent UID REDIRECT of 80/443 to Burp. Requires `--mirror-burp` and `--package`. Pinning still applies.
+    #[arg(long, alias = "mirror-burp", value_name = "HOST:PORT")]
+    mirror_http: Option<String>,
+    /// Transparent UID REDIRECT of 80/443 to Burp. Requires `--mirror-http` and `--package`. Pinning still applies.
     #[arg(long)]
     mitm_burp: bool,
 }
@@ -460,6 +460,10 @@ fn run_device_command(serial: Option<&str>, command: DeviceCommand) -> Result<()
     Ok(())
 }
 
+fn format_mirror_http_flag(endpoint: Option<&str>) -> String {
+    endpoint.map_or_else(String::new, |value| format!(" --mirror-http {value}"))
+}
+
 #[allow(clippy::too_many_lines)]
 fn run_capture(serial: Option<&str>, mut options: CaptureOptions) -> Result<()> {
     let json_flag = if options.json { " --json" } else { "" };
@@ -513,18 +517,18 @@ fn run_capture(serial: Option<&str>, mut options: CaptureOptions) -> Result<()> 
     } else {
         String::new()
     };
-    if let Some(endpoint) = options.mirror_burp.as_deref() {
+    if let Some(endpoint) = options.mirror_http.as_deref() {
         if let Err(error) = ksight_core::parse_mirror_endpoint(endpoint) {
             bail!("{error}");
         }
         options.inspect_tls = true;
         options.network = true;
         if options.package.is_none() && options.pid.is_none() && options.uid.is_none() {
-            bail!("--mirror-burp requires --package, --pid, or --uid");
+            bail!("--mirror-http requires --package, --pid, or --uid");
         }
     }
-    if options.mitm_burp && (options.mirror_burp.is_none() || options.package.is_none()) {
-        bail!("--mitm-burp requires --mirror-burp HOST:PORT and --package");
+    if options.mitm_burp && (options.mirror_http.is_none() || options.package.is_none()) {
+        bail!("--mitm-burp requires --mirror-http HOST:PORT and --package");
     }
     if options.inspect_linker
         && (options.inspect_tls
@@ -593,17 +597,14 @@ fn run_capture(serial: Option<&str>, mut options: CaptureOptions) -> Result<()> 
         .inspect_offset
         .map_or_else(String::new, |value| format!(" --inspect-offset {value}"));
     let inspect_max_flag = format!(" --inspect-max-secs {}", options.inspect_max_secs);
-    let mirror_burp_flag = options
-        .mirror_burp
-        .as_deref()
-        .map_or_else(String::new, |value| format!(" --mirror-burp {value}"));
+    let mirror_http_flag = format_mirror_http_flag(options.mirror_http.as_deref());
     let mitm_burp_flag = if options.mitm_burp {
         " --mitm-burp"
     } else {
         ""
     };
     let command = format!(
-        "{DEVICE_AGENT} capture --object {DEVICE_PROCESS_OBJECT} --file-object {DEVICE_FILE_OBJECT} --network-object {DEVICE_NETWORK_OBJECT} --memory-object {DEVICE_MEMORY_OBJECT} --binder-object {DEVICE_BINDER_OBJECT} --sched-object {DEVICE_SCHED_OBJECT} --uprobe-object {DEVICE_UPROBE_OBJECT} --count {} --duration-seconds {}{json_flag}{quiet_flag}{threads_flag}{files_flag}{files_fd_flag}{network_flag}{network_io_flag}{memory_flag}{memory_all_flag}{binder_flag}{sched_flag}{all_flag}{pid_flag}{uid_flag}{package_flag}{spool_flag}{sampling_flag}{inspect_linker_flag}{inspect_tls_flag}{inspect_jni_flag}{inspect_all_apps_flag}{inspect_adapter_flag}{inspect_build_id_flag}{inspect_elf_flag}{inspect_offset_flag}{inspect_max_flag}{inspect_max_bytes_flag}{inspect_max_hits_flag}{mirror_burp_flag}{mitm_burp_flag}",
+        "{DEVICE_AGENT} capture --object {DEVICE_PROCESS_OBJECT} --file-object {DEVICE_FILE_OBJECT} --network-object {DEVICE_NETWORK_OBJECT} --memory-object {DEVICE_MEMORY_OBJECT} --binder-object {DEVICE_BINDER_OBJECT} --sched-object {DEVICE_SCHED_OBJECT} --uprobe-object {DEVICE_UPROBE_OBJECT} --count {} --duration-seconds {}{json_flag}{quiet_flag}{threads_flag}{files_flag}{files_fd_flag}{network_flag}{network_io_flag}{memory_flag}{memory_all_flag}{binder_flag}{sched_flag}{all_flag}{pid_flag}{uid_flag}{package_flag}{spool_flag}{sampling_flag}{inspect_linker_flag}{inspect_tls_flag}{inspect_jni_flag}{inspect_all_apps_flag}{inspect_adapter_flag}{inspect_build_id_flag}{inspect_elf_flag}{inspect_offset_flag}{inspect_max_flag}{inspect_max_bytes_flag}{inspect_max_hits_flag}{mirror_http_flag}{mitm_burp_flag}",
         options.count, options.duration_seconds
     );
     eprintln!(
@@ -617,7 +618,7 @@ fn run_capture(serial: Option<&str>, mut options: CaptureOptions) -> Result<()> 
     if options.files && !options.files_fd {
         eprintln!("file sensor: openat only (dup/close off). Do not add --files-fd unless chasing FD leaks.");
     }
-    if options.mirror_burp.is_some() {
+    if options.mirror_http.is_some() {
         adb_forward_burp_playback(serial)?;
         eprintln!(
             "adb forward tcp:{} tcp:{} (Burp fetches original SSL_read on 127.0.0.1)",
@@ -655,4 +656,56 @@ fn run_capture(serial: Option<&str>, mut options: CaptureOptions) -> Result<()> 
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mirror_http_accepts_legacy_host_flag() {
+        let args = Args::try_parse_from([
+            "ksightctl",
+            "device",
+            "capture",
+            "--package",
+            "com.example.app",
+            "--mirror-http",
+            "127.0.0.1:8080",
+        ])
+        .unwrap();
+        let Command::Device { command, .. } = args.command else {
+            panic!("expected device command");
+        };
+        let DeviceCommand::Capture(capture) = *command else {
+            panic!("expected capture command");
+        };
+        assert_eq!(capture.mirror_http.as_deref(), Some("127.0.0.1:8080"));
+
+        let legacy = Args::try_parse_from([
+            "ksightctl",
+            "device",
+            "capture",
+            "--package",
+            "com.example.app",
+            "--mirror-burp",
+            "127.0.0.1:8080",
+        ])
+        .unwrap();
+        let Command::Device { command, .. } = legacy.command else {
+            panic!("expected device command");
+        };
+        let DeviceCommand::Capture(capture) = *command else {
+            panic!("expected capture command");
+        };
+        assert_eq!(capture.mirror_http.as_deref(), Some("127.0.0.1:8080"));
+    }
+
+    #[test]
+    fn device_command_uses_mirror_http_flag() {
+        let flag = format_mirror_http_flag(Some("127.0.0.1:8080"));
+        assert_eq!(flag, " --mirror-http 127.0.0.1:8080");
+        assert!(!flag.contains("mirror-burp"));
+        assert!(format_mirror_http_flag(None).is_empty());
+    }
 }

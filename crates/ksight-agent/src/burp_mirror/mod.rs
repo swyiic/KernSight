@@ -40,7 +40,13 @@ use ksight_core::{
     fragment_bytes, parse_mirror_endpoint, request_from_http_url, requests_from_embedded_http_urls,
     MirroredMessage, StreamReassembler, BURP_PLAYBACK_PORT, BURP_UPSTREAM_PORT,
 };
+use ksight_core::{MessageCompleteness, MessageOrigin, MirrorSource, PairingBasis};
 use ksight_model::InspectPlaintext;
+use sha2::{Digest as _, Sha256};
+
+mod evidence_store;
+mod pairing;
+use pairing::{take_orphan_response, take_pending_for_response};
 
 /// Live Burp feed for one capture session.
 pub struct BurpMirror {
@@ -94,9 +100,8 @@ pub struct BurpMirror {
     tid_connection: HashMap<(u32, u32), (u64, Instant)>,
     /// Handshake/connect SNI waiting for the next SSL stream_key on that tid.
     pending_tid_sni: HashMap<(u32, u32), String>,
-    /// Cross-adapter content fingerprint (pid, hash) so JNI/TLS/vendor copies
-    /// of the same bytes are not reconstructed twice.
-    content_seen: HashMap<(u32, u64), Instant>,
+    /// Session-local reconstructed message sequence (not raw fragment IDs).
+    message_sequence: u64,
     /// Peek (= consumes=false) preview evidence. Does not advance the stream
     /// cursor; a later recv that shares a prefix becomes canonical. Timed-out
     /// peeks may promote as low-confidence inbound.
@@ -131,6 +136,15 @@ struct DeliveryMetrics {
     retry_pending: AtomicU64,
     retry_delivered: AtomicU64,
     retry_exhausted: AtomicU64,
+    paired_responses: AtomicU64,
+    unknown_status_responses: AtomicU64,
+    incomplete_messages: AtomicU64,
+    unpaired_requests: AtomicU64,
+    unpaired_responses: AtomicU64,
+    synthetic_requests: AtomicU64,
+    orphan_overflow_preserved: AtomicU64,
+    evidence_archived: AtomicU64,
+    evidence_archive_failed: AtomicU64,
 }
 
 fn new_direction_streams() -> DirectionStreams {
@@ -198,44 +212,48 @@ struct PendingPeek {
 #[derive(Default)]
 struct PlaybackStore {
     entries: VecDeque<(String, Vec<u8>)>,
-    /// Soft index: latest playback id queued for a Host (CONNECT fallback).
-    by_host: HashMap<String, String>,
 }
 
 impl PlaybackStore {
-    fn insert(&mut self, id: String, response: Vec<u8>) {
-        while self.entries.len() >= 64 {
-            if let Some((old_id, _)) = self.entries.pop_front() {
-                self.by_host.retain(|_, stored| stored != &old_id);
-            }
+    fn insert(&mut self, id: String, response: Vec<u8>) -> Result<(), String> {
+        if self.entries.len() >= 64 {
+            return Err("playback_queue_full: retained existing entries; retry required".into());
         }
         self.entries.push_back((id, response));
+        Ok(())
     }
 
-    fn insert_for_host(&mut self, host: &str, id: String, response: Vec<u8>) {
-        let host_key = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
-        self.by_host.insert(host_key, id.clone());
-        self.insert(id, response);
+    fn insert_for_host(
+        &mut self,
+        _host: &str,
+        id: String,
+        response: Vec<u8>,
+    ) -> Result<(), String> {
+        self.insert(id, response)
     }
 
     fn take(&mut self, id: Option<&str>) -> Option<Vec<u8>> {
         if let Some(id) = id {
             if let Some(position) = self.entries.iter().position(|(stored, _)| stored == id) {
                 let (_, response) = self.entries.remove(position)?;
-                self.by_host.retain(|_, stored| stored != id);
                 return Some(response);
             }
             return None;
         }
-        let (id, response) = self.entries.pop_front()?;
-        self.by_host.retain(|_, stored| stored != &id);
-        Some(response)
+        None
     }
+}
 
-    fn take_for_host(&mut self, host: &str) -> Option<Vec<u8>> {
-        let host_key = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
-        let id = self.by_host.get(&host_key).cloned();
-        self.take(id.as_deref())
+/// Cancel only this attempt's queued entry on failure/success, never another request.
+struct PlaybackLease<'a> {
+    queue: &'a Mutex<PlaybackStore>,
+    id: &'a str,
+}
+impl Drop for PlaybackLease<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut queue) = self.queue.lock() {
+            let _ = queue.take(Some(self.id));
+        }
     }
 }
 
@@ -1003,9 +1021,20 @@ impl BurpMirror {
     ///
     /// Returns when the endpoint cannot be parsed.
     pub fn start_for_session(endpoint: &str, session_id: Option<&str>) -> Result<Self, String> {
+        Self::start_with_queue(
+            endpoint,
+            session_id,
+            Arc::new(Mutex::new(PlaybackStore::default())),
+        )
+    }
+
+    fn start_with_queue(
+        endpoint: &str,
+        session_id: Option<&str>,
+        queue: Arc<Mutex<PlaybackStore>>,
+    ) -> Result<Self, String> {
         let endpoint = parse_mirror_endpoint(endpoint)?;
         let session_id = session_id.unwrap_or("-").to_owned();
-        let queue = Arc::new(Mutex::new(PlaybackStore::default()));
         let stop = Arc::new(AtomicBool::new(false));
         if let Ok(listener) = TcpListener::bind(("0.0.0.0", BURP_PLAYBACK_PORT)) {
             let queue = Arc::clone(&queue);
@@ -1093,7 +1122,7 @@ impl BurpMirror {
             recent_fragments: HashMap::new(),
             tid_connection: HashMap::new(),
             pending_tid_sni: HashMap::new(),
-            content_seen: HashMap::new(),
+            message_sequence: 0,
             pending_peeks: VecDeque::new(),
             promoted_peeks: VecDeque::new(),
             keylog_secrets: Vec::new(),
@@ -1156,6 +1185,43 @@ impl BurpMirror {
             "reconstructed_responses".to_owned(),
             self.reconstructed_responses,
         );
+        for (name, counter) in [
+            (
+                "evidence_archived",
+                &self.delivery_metrics.evidence_archived,
+            ),
+            (
+                "evidence_archive_failed",
+                &self.delivery_metrics.evidence_archive_failed,
+            ),
+            (
+                "orphan_overflow_preserved",
+                &self.delivery_metrics.orphan_overflow_preserved,
+            ),
+            ("paired_responses", &self.delivery_metrics.paired_responses),
+            (
+                "unknown_status_responses",
+                &self.delivery_metrics.unknown_status_responses,
+            ),
+            (
+                "incomplete_messages",
+                &self.delivery_metrics.incomplete_messages,
+            ),
+            (
+                "unpaired_requests",
+                &self.delivery_metrics.unpaired_requests,
+            ),
+            (
+                "unpaired_responses",
+                &self.delivery_metrics.unpaired_responses,
+            ),
+            (
+                "synthetic_requests",
+                &self.delivery_metrics.synthetic_requests,
+            ),
+        ] {
+            metrics.insert(name.to_owned(), counter.load(Ordering::Relaxed));
+        }
         metrics.insert("send_fragments".to_owned(), self.send_fragments);
         metrics.insert("recv_fragments".to_owned(), self.recv_fragments);
         metrics.insert("delivered".to_owned(), self.delivery_count());
@@ -1342,13 +1408,7 @@ impl BurpMirror {
             self.record_peek(pid, stream_key, adapter, bytes);
             return;
         }
-        // Conscrypt/BIO noise: all-zero SSL_write copies inflate Unknown send
-        // buffers (BOC leftover buffered_bytes / unknown_directions) and never
-        // promote to HTTP. Drop before stream accounting.
-        if is_inert_tls_fragment(bytes) {
-            self.rejected_fragments = self.rejected_fragments.saturating_add(1);
-            return;
-        }
+        // Nonempty binary entities, including all-zero chunks, are legitimate data.
         // Flush idle recv/send from sibling streams before accepting new bytes so
         // partial SSL_read HTTP / H2 HEADERS can pair before PAIRING_GRACE.
         self.soft_flush_idle_recv();
@@ -1385,6 +1445,9 @@ impl BurpMirror {
             bytes
         };
         let stream_key = self.stream_key_for(pid, tid, connection_id);
+        // Only the L0 first-write adapter supplies cumulative prefix snapshots.
+        // Consuming TLS reads/writes can legally repeat identical body bytes.
+        let snapshot_copy = adapter == "handshake_http";
         if adapter.starts_with("jni_") {
             // JNI strings fill Host on parked TLS requests. HTTP-shaped JNI
             // copies join the same stream as TLS; URL-only copies stay Host
@@ -1424,11 +1487,8 @@ impl BurpMirror {
         } else {
             bytes
         };
-        if self.remember_content(pid, bytes)
-            && (adapter.starts_with("jni_") || adapter.starts_with("vendor_boundary:"))
-        {
-            return;
-        }
+        // Content alone cannot establish a duplicate: repeated submissions and
+        // opposite directions may contain identical bytes. Preserve both.
         let outbound = outbound_copy(adapter, direction, bytes);
         if outbound {
             self.send_fragments = self.send_fragments.saturating_add(1);
@@ -1480,10 +1540,14 @@ impl BurpMirror {
             } else {
                 stream.recv_last.as_slice()
             };
-            let already_applied = assembler.ends_with(bytes);
-            let stale_shorter =
-                !last.is_empty() && last.starts_with(bytes) && last.len() > bytes.len();
-            let progressive_tail = if !last.is_empty()
+            let already_applied = snapshot_copy && assembler.ends_with(bytes);
+            let stale_shorter = snapshot_copy
+                && assembler.buffered_bytes() > 0
+                && !last.is_empty()
+                && last.starts_with(bytes)
+                && last.len() > bytes.len();
+            let progressive_tail = if snapshot_copy
+                && !last.is_empty()
                 && bytes.starts_with(last)
                 && bytes.len() > last.len()
                 && assembler.ends_with(last)
@@ -1515,7 +1579,15 @@ impl BurpMirror {
         if let Some(prev) = self.recent_fragments.get(&recent_key) {
             let same_bytes = prev.hash == hash && prev.len == len;
             let within = now.duration_since(prev.seen_at) <= FRAGMENT_DEBOUNCE;
-            if same_bytes && within && prev.pos_after == accepted_before {
+            let still_buffered = self.streams.get(&(pid, stream_key)).is_some_and(|stream| {
+                (if outbound { &stream.send } else { &stream.recv }).buffered_bytes() > 0
+            });
+            if snapshot_copy
+                && same_bytes
+                && within
+                && prev.pos_after == accepted_before
+                && still_buffered
+            {
                 self.duplicate_fragments = self.duplicate_fragments.saturating_add(1);
                 self.duplicate_probe = self.duplicate_probe.saturating_add(1);
                 return;
@@ -1719,11 +1791,13 @@ impl BurpMirror {
         }
     }
 
-    fn handle_message(&mut self, pid: u32, stream_id: u64, message: MirroredMessage) {
+    fn handle_message(&mut self, pid: u32, stream_id: u64, mut message: MirroredMessage) {
+        message.preserve_destination();
         if message.is_request {
             self.emit_request(pid, stream_id, message);
             return;
         }
+        self.stamp_source(pid, stream_id, &mut message);
         // Pairing happens on the worker thread; the fallback GET keeps an
         // SSL_read-only response visible when no request is in flight.
         let fallback = self.synthesize_request(pid, stream_id, &message);
@@ -1789,6 +1863,8 @@ impl BurpMirror {
     }
 
     fn emit_request(&mut self, pid: u32, stream_id: u64, mut request: MirroredMessage) {
+        request.preserve_destination();
+        self.stamp_source(pid, stream_id, &mut request);
         request.apply_gateway_rpc_hints();
         self.finish_request(pid, stream_id, &mut request);
         let mut hosted = looks_like_mirror_host(&request.host);
@@ -1997,23 +2073,16 @@ impl BurpMirror {
         }
     }
 
-    fn remember_content(&mut self, pid: u32, bytes: &[u8]) -> bool {
-        let mut hasher = DefaultHasher::new();
-        bytes.hash(&mut hasher);
-        let hash = hasher.finish();
-        let now = Instant::now();
-        let key = (pid, hash);
-        if let Some(seen) = self.content_seen.get(&key) {
-            if now.duration_since(*seen) <= Duration::from_millis(2500) {
-                return true;
-            }
+    fn stamp_source(&mut self, pid: u32, connection_key: u64, message: &mut MirroredMessage) {
+        if message.evidence.source.is_none() {
+            self.message_sequence = self.message_sequence.saturating_add(1);
+            message.evidence.source = Some(MirrorSource {
+                session_id: self.session_id.clone(),
+                pid,
+                connection_key,
+                message_number: self.message_sequence,
+            });
         }
-        self.content_seen.insert(key, now);
-        if self.content_seen.len() > 1024 {
-            self.content_seen
-                .retain(|_, seen| now.duration_since(*seen) <= Duration::from_secs(8));
-        }
-        false
     }
 
     /// Inspect preview fallback when raw bytes were not attached.
@@ -2131,7 +2200,7 @@ impl BurpMirror {
     }
 
     fn push_promoted_peek(&mut self, pid: u32, stream_key: u64, adapter: &str, bytes: &[u8]) {
-        if bytes.is_empty() || is_inert_tls_fragment(bytes) {
+        if bytes.is_empty() {
             return;
         }
         if !self.streams.contains_key(&(pid, stream_key)) && self.streams.len() >= STREAM_CAP {
@@ -2314,16 +2383,6 @@ fn replace_last_fragment(slot: &mut Vec<u8>, bytes: &[u8]) {
     slot.extend_from_slice(&bytes[..take]);
 }
 
-/// True for near-all-zero TLS copies that never look like HTTP (BIO/padding).
-fn is_inert_tls_fragment(bytes: &[u8]) -> bool {
-    if bytes.is_empty() {
-        return true;
-    }
-    let nonzero = bytes.iter().filter(|byte| **byte != 0).count();
-    // <5% nonzero ⇒ treat as inert padding / cleared buffer snapshot.
-    nonzero.saturating_mul(20) < bytes.len()
-}
-
 fn outbound_copy(adapter: &str, direction: &str, bytes: &[u8]) -> bool {
     // Standard OpenSSL/BoringSSL/Conscrypt probes: adapter name is authoritative.
     // Mis-tagged direction must not park SSL_read plaintext on the send assembler
@@ -2474,6 +2533,14 @@ fn worker_loop(
         metrics,
         session_id,
         absolute_timeout_streak: &absolute_timeout_streak,
+        archive: if cfg!(all(target_os = "linux", not(test))) {
+            Some(Mutex::new(evidence_store::EvidenceStore::new(
+                std::path::Path::new("/data/local/tmp/ksight/mirror-evidence"),
+                session_id,
+            )))
+        } else {
+            None
+        },
     };
     let mut pending: HashMap<
         (u32, u64),
@@ -2493,7 +2560,7 @@ fn worker_loop(
                     &runtime,
                     peer_book,
                 );
-                orphan_responses.clear();
+                flush_orphan_responses(&mut orphan_responses, &mut retries, &runtime, true);
                 // Playback is still up (Drop joins us before flipping `stop`).
                 // Give in-flight retries a short final window so paired orig≠0
                 // bodies are not abandoned solely because of teardown ordering.
@@ -2569,12 +2636,11 @@ fn worker_loop(
                 // pairing slot — the real response follows on the same stream.
                 if response
                     .status
-                    .is_some_and(|code| (100..200).contains(&code))
+                    .is_some_and(|code| (100..200).contains(&code) && code != 101)
                 {
                     continue;
                 }
                 let request = take_pending_for_response(&mut pending, pid, stream_id, &response)
-                    .or_else(|| take_pending_for_pid(&mut pending, pid, &response.host))
                     .or_else(|| {
                         // Never invent synthetic while this pid still has pending
                         // requests — last_url-shaped GET would steal the body.
@@ -2618,7 +2684,19 @@ fn worker_loop(
                     }
                 } else {
                     // Keep for a late request on the same stream / host (Alipay H2).
-                    store_orphan_response(&mut orphan_responses, pid, stream_id, *response);
+                    if let Some(response) =
+                        store_orphan_response(&mut orphan_responses, pid, stream_id, *response)
+                    {
+                        runtime
+                            .metrics
+                            .orphan_overflow_preserved
+                            .fetch_add(1, Ordering::Relaxed);
+                        log_mirror(
+                            runtime.session_id,
+                            "burp-mirror orphan_queue_full: preserving oldest as unpaired display",
+                        );
+                        enqueue_unpaired_response(&runtime, &mut retries, response);
+                    }
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -2637,7 +2715,7 @@ fn worker_loop(
             recv_busy_pids,
             peer_book,
         );
-        sweep_orphan_responses(&mut orphan_responses);
+        flush_orphan_responses(&mut orphan_responses, &mut retries, &runtime, false);
         sweep_retries(&runtime, &mut retries);
     }
 }
@@ -2648,14 +2726,115 @@ struct DeliveryRuntime<'a> {
     metrics: &'a DeliveryMetrics,
     session_id: &'a str,
     absolute_timeout_streak: &'a AtomicU64,
+    archive: Option<Mutex<evidence_store::EvidenceStore>>,
 }
 
 fn enqueue_delivery(
     runtime: &DeliveryRuntime<'_>,
     retries: &mut VecDeque<RetryDelivery>,
-    request: MirroredMessage,
-    response: Option<MirroredMessage>,
+    mut request: MirroredMessage,
+    mut response: Option<MirroredMessage>,
 ) {
+    let synthetic = matches!(
+        request.evidence.origin,
+        MessageOrigin::SyntheticRequest | MessageOrigin::UrlHint
+    );
+    if let Some(response) = response.as_mut() {
+        let basis = if synthetic {
+            PairingBasis::DisplayOnly
+        } else if response.evidence.pairing != PairingBasis::Unpaired {
+            response.evidence.pairing
+        } else {
+            request.evidence.pairing
+        };
+        request.evidence.pairing = basis;
+        response.evidence.pairing = basis;
+        if matches!(
+            basis,
+            PairingBasis::ConnectionOrder | PairingBasis::ConnectionAndH2Stream
+        ) {
+            runtime
+                .metrics
+                .paired_responses
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            runtime
+                .metrics
+                .unpaired_responses
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if response.status.is_none() {
+            runtime
+                .metrics
+                .unknown_status_responses
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    } else {
+        runtime
+            .metrics
+            .unpaired_requests
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    if synthetic {
+        runtime
+            .metrics
+            .synthetic_requests
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    for message in std::iter::once(&request).chain(response.as_ref()) {
+        if message.evidence.completeness != MessageCompleteness::Complete {
+            runtime
+                .metrics
+                .incomplete_messages
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    // Machine-readable metadata only; payload bytes remain in the normal evidence path.
+    if let Some(archive) = &runtime.archive {
+        let saved = archive
+            .lock()
+            .map_err(|_| "evidence_store_poisoned".to_owned())
+            .and_then(|mut archive| {
+                archive
+                    .save(&request, response.as_ref())
+                    .map_err(|e| e.to_string())
+            });
+        match saved {
+            Ok(path) => {
+                runtime
+                    .metrics
+                    .evidence_archived
+                    .fetch_add(1, Ordering::Relaxed);
+                log_mirror(
+                    runtime.session_id,
+                    &format!("burp-mirror evidence_saved={}", path.display()),
+                );
+            }
+            Err(error) => {
+                runtime
+                    .metrics
+                    .evidence_archive_failed
+                    .fetch_add(1, Ordering::Relaxed);
+                log_mirror(
+                    runtime.session_id,
+                    &format!("burp-mirror evidence_archive_failed={error}"),
+                );
+            }
+        }
+    }
+    let evidence = serde_json::json!({
+        "schema_version": "kernsight.mirror-evidence/v1",
+        "request": diagnostic_evidence(&request),
+        "response": response.as_ref().map(diagnostic_evidence),
+        "observed_status": response.as_ref().and_then(|r| r.status),
+        "h2_stream_id": request.stream_id,
+        "request_body_bytes": request.body.len(),
+        "response_body_bytes": response.as_ref().map(|r| r.body.len()),
+    });
+    log_mirror(
+        runtime.session_id,
+        &format!("burp-mirror evidence={evidence}"),
+    );
     match deliver(
         runtime.endpoint,
         &request,
@@ -2695,6 +2874,15 @@ fn enqueue_delivery(
             );
         }
     }
+}
+
+fn diagnostic_evidence(message: &MirroredMessage) -> serde_json::Value {
+    let mut metadata = serde_json::to_value(&message.evidence).unwrap_or_default();
+    // Detailed destinations stay in the evidence artifact, not the diagnostic summary.
+    if let Some(fields) = metadata.as_object_mut() {
+        fields.remove("original_destination");
+    }
+    metadata
 }
 
 fn sweep_retries(runtime: &DeliveryRuntime<'_>, retries: &mut VecDeque<RetryDelivery>) {
@@ -2770,271 +2958,46 @@ fn store_orphan_response(
     pid: u32,
     stream_id: u64,
     response: MirroredMessage,
-) {
-    let slot = orphans.entry((pid, stream_id)).or_default();
-    while slot.len() >= ORPHAN_RESPONSE_CAP {
-        slot.pop_front();
-    }
-    slot.push_back((response, Instant::now()));
-}
-
-fn orphan_usable_for_request(request: &MirroredMessage, response: &MirroredMessage) -> bool {
-    let req_hostless = !looks_like_mirror_host(&request.host);
-    let same = looks_like_mirror_host(&request.host)
-        && looks_like_mirror_host(&response.host)
-        && (same_site(&response.host, &request.host)
-            || response.host.eq_ignore_ascii_case(&request.host));
-    if same {
-        return true;
-    }
-    // datagw / turkey-sls / ACS must not steal empty-host API orphans.
-    if is_cdn_steal_host(&request.host) || is_cdn_steal_host(&response.host) {
-        return false;
-    }
-    // SystemLogHandler last-resorts log.cmbchina.com and must not take
-    // empty-host SSL_read meant for GetRedPoint / wangdun APIs
-    // (cycle-010644 orig=0 on wd-config/trtd while log POST orig=200).
-    if looks_like_cmb_log_path(&request.path) && !looks_like_mirror_host(&response.host) {
-        return false;
-    }
-    // CCB ads/gifs must not take empty-host SSL_read meant for txCtrl / ccbNewClient.
-    if is_ad_asset_host(&request.host) && !looks_like_mirror_host(&response.host) {
-        return false;
-    }
-    // Hostless Alipay mgw may take an empty-host SSL_read across stream_key.
-    if req_hostless {
-        return true;
-    }
-    if !looks_like_mirror_host(&response.host) && is_mgw_request(request) {
-        return true;
-    }
-    // CCB ccbNewClient / CMB GetRedPoint: SSL_write and SSL_read disagree on
-    // stream_key so the HTTP status copy has an empty Host. Pair it to a hosted
-    // non-telemetry API when the reconstructed response actually has a status
-    // (not a header-less salvage). datagw/ACS stay blocked above.
-    !looks_like_mirror_host(&response.host)
-        && looks_like_mirror_host(&request.host)
-        && !is_cdn_steal_host(&request.host)
-        && response.status.is_some()
-}
-
-fn take_orphan_response(
-    orphans: &mut HashMap<(u32, u64), VecDeque<(MirroredMessage, Instant)>>,
-    pid: u32,
-    stream_id: u64,
-    request: &MirroredMessage,
 ) -> Option<MirroredMessage> {
-    // Prefer same connection/stream key.
-    if let Some(slot) = orphans.get_mut(&(pid, stream_id)) {
-        if let Some(h2_id) = request.stream_id {
-            if let Some(idx) = slot
-                .iter()
-                .position(|(resp, _)| resp.stream_id == Some(h2_id))
-            {
-                return slot.remove(idx).map(|(response, _)| response);
-            }
-        }
-        if let Some((response, _)) = slot.pop_front() {
-            if slot.is_empty() {
-                orphans.remove(&(pid, stream_id));
-            }
-            return Some(response);
-        }
-    }
-    // Same pid, other stream_key: pair hostless ↔ empty-host, or same-host.
-    // Never let datagw/ACS/turkey-sls steal an API orphan.
-    let key = orphans
-        .iter()
-        .filter(|((process, key), slot)| *process == pid && *key != stream_id && !slot.is_empty())
-        .filter(|(_, slot)| {
-            slot.front()
-                .is_some_and(|(resp, _)| orphan_usable_for_request(request, resp))
-        })
-        .min_by_key(|(_, slot)| {
-            slot.front()
-                .map(|(_, queued_at)| *queued_at)
-                .unwrap_or_else(Instant::now)
-        })
-        .map(|(key, _)| *key)?;
-    let slot = orphans.get_mut(&key)?;
-    let (response, _) = slot.pop_front()?;
-    if slot.is_empty() {
-        orphans.remove(&key);
-    }
-    Some(response)
+    let slot = orphans.entry((pid, stream_id)).or_default();
+    let displaced = if slot.len() >= ORPHAN_RESPONSE_CAP {
+        slot.pop_front().map(|(response, _)| response)
+    } else {
+        None
+    };
+    slot.push_back((response, Instant::now()));
+    displaced
 }
 
-fn sweep_orphan_responses(orphans: &mut HashMap<(u32, u64), VecDeque<(MirroredMessage, Instant)>>) {
+fn enqueue_unpaired_response(
+    runtime: &DeliveryRuntime<'_>,
+    retries: &mut VecDeque<RetryDelivery>,
+    response: MirroredMessage,
+) {
+    let mut request = response.synthetic_request_for_response();
+    if !looks_like_mirror_host(&request.host) {
+        request.host = "unpaired-response.invalid".to_owned();
+    }
+    enqueue_delivery(runtime, retries, request, Some(response));
+}
+
+/// Preserve expired/unpaired responses as explicitly synthetic display entries.
+fn flush_orphan_responses(
+    orphans: &mut pairing::OrphanResponses,
+    retries: &mut VecDeque<RetryDelivery>,
+    runtime: &DeliveryRuntime<'_>,
+    all: bool,
+) {
     let now = Instant::now();
     for slot in orphans.values_mut() {
-        while let Some((_, queued_at)) = slot.front() {
-            if now.duration_since(*queued_at) < ORPHAN_RESPONSE_GRACE {
-                break;
-            }
-            slot.pop_front();
+        while slot.front().is_some_and(|(_, queued_at)| {
+            all || now.duration_since(*queued_at) >= ORPHAN_RESPONSE_GRACE
+        }) {
+            let (response, _) = slot.pop_front().expect("front checked");
+            enqueue_unpaired_response(runtime, retries, response);
         }
     }
     orphans.retain(|_, slot| !slot.is_empty());
-}
-
-/// Pair a response to a pending request.
-///
-/// Prefer HTTP/2 `MirroredMessage.stream_id` match (multiplexed out-of-order
-/// responses on one TLS connection) before FIFO `pop_front` on the TCP key.
-fn take_pending_for_response(
-    pending: &mut HashMap<
-        (u32, u64),
-        VecDeque<(MirroredMessage, Option<MirroredMessage>, Instant)>,
-    >,
-    pid: u32,
-    conn_key: u64,
-    response: &MirroredMessage,
-) -> Option<MirroredMessage> {
-    if let Some(h2_id) = response.stream_id {
-        // Exact connection + H2 stream.
-        if let Some(slot) = pending.get_mut(&(pid, conn_key)) {
-            if let Some(idx) = slot
-                .iter()
-                .position(|(req, resp, _)| resp.is_none() && req.stream_id == Some(h2_id))
-            {
-                return slot.remove(idx).map(|(request, _, _)| request);
-            }
-        }
-        // Same pid, any connection: H2 stream ids are unique per connection but
-        // write/read may disagree on conn_key; still prefer H2 id over FIFO.
-        let cross = pending
-            .iter()
-            .filter(|((process, _), slot)| *process == pid && !slot.is_empty())
-            .find_map(|(key, slot)| {
-                slot.iter()
-                    .position(|(req, resp, _)| resp.is_none() && req.stream_id == Some(h2_id))
-                    .map(|idx| (*key, idx))
-            });
-        if let Some((key, idx)) = cross {
-            return pending
-                .get_mut(&key)
-                .and_then(|slot| slot.remove(idx))
-                .map(|(request, _, _)| request);
-        }
-    }
-    pending.get_mut(&(pid, conn_key)).and_then(|slot| {
-        let idx = slot.iter().position(|(_, resp, _)| resp.is_none())?;
-        slot.remove(idx).map(|(request, _, _)| request)
-    })
-}
-
-/// When SSL_write and SSL_read disagree on stream_key, still pair a pending
-/// request for this pid rather than dropping the response copy.
-/// Prefer same-host, then hostless; never let datagw/ACS steal an API waiter.
-fn take_pending_for_pid(
-    pending: &mut HashMap<
-        (u32, u64),
-        VecDeque<(MirroredMessage, Option<MirroredMessage>, Instant)>,
-    >,
-    pid: u32,
-    response_host: &str,
-) -> Option<MirroredMessage> {
-    let take_unpaired =
-        |slot: &mut VecDeque<(MirroredMessage, Option<MirroredMessage>, Instant)>,
-         pred: &dyn Fn(&MirroredMessage) -> bool| {
-            let idx = slot
-                .iter()
-                .position(|(req, resp, _)| resp.is_none() && pred(req))?;
-            slot.remove(idx).map(|(request, _, _)| request)
-        };
-    if looks_like_mirror_host(response_host) {
-        let host_key = pending
-            .iter()
-            .filter(|((process, _), slot)| *process == pid && !slot.is_empty())
-            .find_map(|(key, slot)| {
-                slot.iter()
-                    .position(|(req, resp, _)| {
-                        resp.is_none()
-                            && looks_like_mirror_host(&req.host)
-                            && (same_site(&req.host, response_host)
-                                || req.host.eq_ignore_ascii_case(response_host))
-                    })
-                    .map(|_| *key)
-            });
-        if let Some(key) = host_key {
-            return pending.get_mut(&key).and_then(|slot| {
-                take_unpaired(slot, &|req| {
-                    looks_like_mirror_host(&req.host)
-                        && (same_site(&req.host, response_host)
-                            || req.host.eq_ignore_ascii_case(response_host))
-                })
-            });
-        }
-        if is_cdn_steal_host(response_host) {
-            return None;
-        }
-    }
-    let oldest_key = |pending: &HashMap<
-        (u32, u64),
-        VecDeque<(MirroredMessage, Option<MirroredMessage>, Instant)>,
-    >,
-                      pred: &dyn Fn(&MirroredMessage) -> bool| {
-        pending
-            .iter()
-            .filter(|((process, _), slot)| {
-                *process == pid
-                    && slot
-                        .iter()
-                        .any(|(req, resp, _)| resp.is_none() && pred(req))
-            })
-            .min_by_key(|(_, slot)| {
-                slot.iter()
-                    .find(|(req, resp, _)| resp.is_none() && pred(req))
-                    .map(|(_, _, queued_at)| *queued_at)
-                    .unwrap_or_else(Instant::now)
-            })
-            .map(|(key, _)| *key)
-    };
-    // Hostless mgw / CMB /mainpage/ — not SystemLogHandler telemetry.
-    let hostless_api = |req: &MirroredMessage| {
-        !looks_like_mirror_host(&req.host)
-            && !looks_like_cmb_log_path(&req.path)
-            && (is_mgw_request(req) || looks_like_cmb_mainpage_path(&req.path))
-    };
-    // Hosted bank/Alipay APIs (CCB ccbNewClient, CMB /mainpage/). Log POSTs
-    // last-resort log.cmbchina.com and must not steal these empty-host copies
-    // (cycle-003731 /mainpage/ orig=0 while hostless SystemLogHandler waited).
-    // Ads (imageadv) also skip — cycle-021444 txCtrl orig=0 while gifs paired.
-    let hosted_api = |req: &MirroredMessage| {
-        looks_like_mirror_host(&req.host)
-            && !is_cdn_steal_host(&req.host)
-            && !looks_like_cmb_log_path(&req.path)
-            && !is_ad_asset_host(&req.host)
-    };
-    let hostless_other = |req: &MirroredMessage| {
-        !looks_like_mirror_host(&req.host)
-            && !looks_like_cmb_log_path(&req.path)
-            && !is_ad_asset_host(&req.host)
-    };
-    if !looks_like_mirror_host(response_host) {
-        if let Some(key) = oldest_key(pending, &hostless_api) {
-            return pending
-                .get_mut(&key)
-                .and_then(|slot| take_unpaired(slot, &hostless_api));
-        }
-        if let Some(key) = oldest_key(pending, &hosted_api) {
-            return pending
-                .get_mut(&key)
-                .and_then(|slot| take_unpaired(slot, &hosted_api));
-        }
-        if let Some(key) = oldest_key(pending, &hostless_other) {
-            return pending
-                .get_mut(&key)
-                .and_then(|slot| take_unpaired(slot, &hostless_other));
-        }
-        return None;
-    }
-    // Named leftover host, no same-host waiter: only hostless API, never log.
-    oldest_key(pending, &hostless_api).and_then(|key| {
-        pending
-            .get_mut(&key)
-            .and_then(|slot| take_unpaired(slot, &hostless_api))
-    })
 }
 
 /// Deliver requests whose pairing grace elapsed without a response copy.
@@ -3125,6 +3088,10 @@ fn flush_pending(
     pending.clear();
 }
 
+fn missing_response_wire() -> Vec<u8> {
+    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\nX-KernSight-Observed-Status: unknown\r\nX-KernSight-Display-Status-Only: 1\r\nX-KernSight-Evidence-Reason: response_not_captured\r\nX-KernSight-Pairing: unpaired\r\n\r\n".to_vec()
+}
+
 fn deliver(
     endpoint: SocketAddr,
     request: &MirroredMessage,
@@ -3138,18 +3105,31 @@ fn deliver(
     stream
         .set_write_timeout(Some(Duration::from_secs(10)))
         .map_err(|error| error.to_string())?;
-    let playback_body = response.map_or_else(
-        || b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
-        MirroredMessage::to_http1_response,
-    );
+    let playback_body =
+        response.map_or_else(missing_response_wire, MirroredMessage::to_http1_response);
+    let expected_body_start = playback_body
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map_or(playback_body.len(), |p| p + 4);
+    let expected_body_hash = Sha256::digest(&playback_body[expected_body_start..]);
+    let expected_status = wire_status(&playback_body);
+    let reply_cap = playback_body
+        .len()
+        .saturating_add(64 * 1024)
+        .min(16 * 1024 * 1024);
     let playback_id = format!(
         "{:x}-{:x}",
         std::process::id(),
         NEXT_PLAYBACK_ID.fetch_add(1, Ordering::Relaxed)
     );
-    if let Ok(mut q) = queue.lock() {
-        q.insert_for_host(&request.host, playback_id.clone(), playback_body);
-    }
+    queue
+        .lock()
+        .map_err(|_| "playback_queue_poisoned".to_owned())?
+        .insert_for_host(&request.host, playback_id.clone(), playback_body)?;
+    let _lease = PlaybackLease {
+        queue,
+        id: &playback_id,
+    };
     // Visible wire is always absolute http://host:443/path — never /_ksight or :18081.
     let absolute = request.to_proxy_absolute_with_id(&playback_id);
     let streak = absolute_timeout_streak.load(Ordering::Relaxed);
@@ -3169,7 +3149,7 @@ fn deliver(
         ABS_PROBE_TIMEOUT
     };
     let (absolute_reply, abs_read_why) =
-        write_and_read_burp_reply(&mut stream, &absolute, read_timeout)?;
+        write_and_read_burp_reply(&mut stream, &absolute, read_timeout, reply_cap)?;
     let abs_line = absolute_reply
         .split(|byte| *byte == b'\n')
         .next()
@@ -3178,9 +3158,11 @@ fn deliver(
     // Burp's own listener page is HTTP 200 with this title, including
     // `<h1>Error</h1>Failed to connect to 127.0.0.1:18888`. That is not an
     // origin/playback 200 and is not HTTP history.
-    let absolute_burp_error = absolute_reply
-        .windows(b"Burp Suite Professional".len())
-        .any(|window| window == b"Burp Suite Professional");
+    let absolute_burp_error = header_value(&absolute_reply, "x-kernsight-playback-ack").as_deref()
+        != Some(playback_id.as_str())
+        && absolute_reply
+            .windows(b"Burp Suite Professional".len())
+            .any(|window| window == b"Burp Suite Professional");
     let absolute_bad = absolute_reply.is_empty() || absolute_burp_error;
     let (wire_kind, reply) = if !absolute_bad {
         absolute_timeout_streak.store(0, Ordering::Relaxed);
@@ -3234,7 +3216,7 @@ fn deliver(
                         response.and_then(|item| item.status).unwrap_or(0)
                     ),
                 );
-                return Ok(());
+                // A queued playback body is not an acknowledgement from Burp.
             }
             return Err(format!(
                 "Burp absolute fetch returned no response ({why}); on hotspot set Burp upstream 127.0.0.1:{BURP_UPSTREAM_PORT} (adb forward) not phone LAN; home Wi-Fi may use phone:18888; allow unsafe SSL for that upstream"
@@ -3247,6 +3229,44 @@ fn deliver(
         .next()
         .map(|line| String::from_utf8_lossy(line).trim().to_owned())
         .unwrap_or_default();
+    if header_value(&reply, "x-kernsight-playback-ack").as_deref() != Some(playback_id.as_str()) {
+        return Err(
+            "playback_ack_missing_or_mismatched: proxy reply is not confirmed playback".into(),
+        );
+    }
+    if abs_read_why != "ok"
+        || header_value(&reply, "content-length")
+            .and_then(|n| n.parse::<usize>().ok())
+            .is_none()
+        || header_value(&reply, "transfer-encoding").is_some()
+    {
+        return Err(format!(
+            "playback_reply_incomplete_or_unsupported_framing: {abs_read_why}"
+        ));
+    }
+    if queue
+        .lock()
+        .map_err(|_| "playback_queue_poisoned".to_owned())?
+        .entries
+        .iter()
+        .any(|(id, _)| id == &playback_id)
+    {
+        return Err("playback_not_consumed: acknowledgement without matching queue fetch".into());
+    }
+    let body_start = reply
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map_or(reply.len(), |p| p + 4);
+    if Sha256::digest(&reply[body_start..]) != expected_body_hash {
+        return Err(
+            "playback_body_mismatch: returned entity differs from queued display entity".into(),
+        );
+    }
+    if wire_status(&reply) != expected_status {
+        return Err(
+            "playback_status_mismatch: returned display status differs from queued response".into(),
+        );
+    }
     let upload = upload_kind(&request.body);
     log_mirror(
         session_id,
@@ -3285,6 +3305,7 @@ fn write_and_read_burp_reply(
     stream: &mut TcpStream,
     wire: &[u8],
     read_timeout: Duration,
+    reply_cap: usize,
 ) -> Result<(Vec<u8>, &'static str), String> {
     stream
         .set_read_timeout(Some(read_timeout))
@@ -3293,7 +3314,7 @@ fn write_and_read_burp_reply(
         .write_all(wire)
         .map_err(|error| format!("write: {error}"))?;
     let _ = stream.flush();
-    Ok(read_http_message_with_why(stream, 512 * 1024))
+    Ok(read_http_message_with_why(stream, reply_cap))
 }
 
 /// Read one complete HTTP/1 message (headers + Content-Length body) without
@@ -3336,10 +3357,13 @@ fn read_http_message_with_why(stream: &mut TcpStream, cap: usize) -> (Vec<u8>, &
                 out.extend_from_slice(&buf[..n]);
                 if expected.is_none() {
                     if let Some(header_end) = out.windows(4).position(|item| item == b"\r\n\r\n") {
-                        let body_length = header_value(&out[..header_end], "content-length")
-                            .and_then(|value| value.parse::<usize>().ok())
-                            .unwrap_or(0);
-                        expected = Some(header_end.saturating_add(4).saturating_add(body_length));
+                        if let Some(body_length) =
+                            header_value(&out[..header_end], "content-length")
+                                .and_then(|value| value.parse::<usize>().ok())
+                        {
+                            expected =
+                                Some(header_end.saturating_add(4).saturating_add(body_length));
+                        }
                     }
                 }
                 if expected.is_some_and(|length| out.len() >= length) {
@@ -3382,13 +3406,38 @@ fn read_http_message(stream: &mut TcpStream, cap: usize) -> Vec<u8> {
 }
 
 fn header_value(message: &[u8], wanted: &str) -> Option<String> {
-    let text = String::from_utf8_lossy(message);
-    text.lines().skip(1).find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-        name.trim()
-            .eq_ignore_ascii_case(wanted)
-            .then(|| value.trim().to_owned())
-    })
+    let end = message
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .unwrap_or(message.len());
+    let text = String::from_utf8_lossy(&message[..end]);
+    let mut values = text
+        .lines()
+        .skip(1)
+        .take_while(|line| !line.trim().is_empty())
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case(wanted)
+                .then(|| value.trim().to_owned())
+        });
+    let value = values.next()?;
+    // Conflicting/duplicated correlation headers are ambiguous, never pick one.
+    if values.next().is_some() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn wire_status(message: &[u8]) -> Option<u16> {
+    let line = message.split(|b| *b == b'\n').next()?;
+    let status = line.split(|b| *b == b' ').nth(1)?;
+    std::str::from_utf8(status)
+        .ok()?
+        .parse::<u16>()
+        .ok()
+        .filter(|n| (100..600).contains(n))
 }
 
 fn upstream_loop(
@@ -3480,11 +3529,8 @@ fn serve_connect_tunnel(
     }
     // TLS record ContentType=0x16 (Handshake) — cannot plaintext-inject.
     if first.first() == Some(&0x16) {
-        let body = queue
-            .lock()
-            .ok()
-            .and_then(|mut q| q.take_for_host(connect_host));
-        let _ = body; // reserved for future musl-safe TLS terminate
+        // No Playback-ID is available inside this unsupported TLS tunnel.
+        // Do not consume a queued transaction merely because its host matches.
         eprintln!(
             "burp-mirror upstream CONNECT {connect_host}: TLS ClientHello (no origin dial; configure absolute history URL; body needs TLS terminate)"
         );
@@ -3517,21 +3563,30 @@ fn serve_connect_tunnel(
 fn take_playback_for_request(
     request: &[u8],
     queue: &Mutex<PlaybackStore>,
-    forced_host: Option<&str>,
+    _forced_host: Option<&str>,
 ) -> Vec<u8> {
     let playback_id = header_value(request, "x-kernsight-playback-id");
-    let host = forced_host
-        .map(str::to_owned)
-        .or_else(|| header_value(request, "host"));
     let body = queue.lock().ok().and_then(|mut q| {
-        if let Some(response) = q.take(playback_id.as_deref()) {
-            return Some(response);
+        if playback_id.is_some() {
+            return q.take(playback_id.as_deref());
         }
-        host.as_deref().and_then(|host| q.take_for_host(host))
+        // A request without an ID cannot safely consume the FIFO or a
+        // same-host transaction. Host-only lookup is deliberately not used.
+        None
     });
-    body.unwrap_or_else(|| {
-        b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
-    })
+    match (body, playback_id) {
+        (Some(body), Some(id)) => playback_ack_wire(body, &id),
+        _ => missing_response_wire(),
+    }
+}
+
+fn playback_ack_wire(mut body: Vec<u8>, id: &str) -> Vec<u8> {
+    // IDs originate from the in-memory queue, never from an unmatched request.
+    if let Some(end) = body.windows(4).position(|w| w == b"\r\n\r\n") {
+        let marker = format!("\r\nX-KernSight-Playback-Ack: {id}");
+        body.splice(end..end, marker.bytes());
+    }
+    body
 }
 
 fn read_http_headers(stream: &mut TcpStream, cap: usize) -> Result<Vec<u8>, String> {
@@ -3594,15 +3649,7 @@ fn playback_loop(
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
                 let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
                 let request = read_http_message(&mut stream, 8 * 1024 * 1024);
-                let playback_id = header_value(&request, "x-kernsight-playback-id");
-                let body = queue
-                    .lock()
-                    .ok()
-                    .and_then(|mut q| q.take(playback_id.as_deref()))
-                    .unwrap_or_else(|| {
-                        b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                            .to_vec()
-                    });
+                let body = take_playback_for_request(&request, queue, None);
                 let _ = stream.write_all(&body);
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {

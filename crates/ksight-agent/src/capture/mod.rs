@@ -187,7 +187,7 @@ pub struct CaptureRequest {
     /// Compiled uprobe object used by Inspect adapters.
     pub uprobe_object: PathBuf,
     /// Optional Burp HTTP proxy `host:port`. Device feeds reconstructed HTTP/WS there.
-    pub mirror_burp: Option<String>,
+    pub mirror_http: Option<String>,
     /// Transparent per-UID REDIRECT of 80/443 through a CONNECT forwarder to Burp.
     pub mitm_burp: bool,
 }
@@ -551,11 +551,11 @@ fn stream_events(
             }
             Err(error) => eprintln!("tls-inject skipped: {error}"),
         }
-    } else if request.mirror_burp.is_some() {
+    } else if request.mirror_http.is_some() {
         eprintln!("tls-inject off (no ptrace); inspect-tls uprobe only; app TLS unchanged");
     }
     let _mitm = if request.mitm_burp {
-        match (request.package.as_deref(), request.mirror_burp.as_deref()) {
+        match (request.package.as_deref(), request.mirror_http.as_deref()) {
             (Some(package), Some(endpoint)) => {
                 match (
                     crate::mitm_redirect::uid_for_package(package),
@@ -582,14 +582,14 @@ fn stream_events(
                 }
             }
             _ => {
-                eprintln!("mitm-burp requires --package and --mirror-burp host:port");
+                eprintln!("mitm-burp requires --package and --mirror-http host:port");
                 None
             }
         }
     } else {
         None
     };
-    pipeline.burp_mirror = match request.mirror_burp.as_deref() {
+    pipeline.burp_mirror = match request.mirror_http.as_deref() {
         Some(endpoint) => match crate::burp_mirror::BurpMirror::start_for_session(
             endpoint,
             Some(&pipeline.normalizer.session_id().to_string()),
@@ -618,7 +618,7 @@ fn stream_events(
         request.sensors.binder,
         request.inspect.enabled,
         request.package.as_deref().unwrap_or("-"),
-        request.mirror_burp.as_deref().unwrap_or("-")
+        request.mirror_http.as_deref().unwrap_or("-")
     );
     if request.sensors.files && !request.sensors.file_descriptors {
         eprintln!("file sensor: openat only; dup/close is off unless --files-fd");
@@ -687,7 +687,7 @@ fn stream_events(
         .as_ref()
         .map(|pcap| pcap.with_file_name("sslkeylog.txt"));
 
-    if request.mirror_burp.is_some() {
+    if request.mirror_http.is_some() {
         if let Some(dest) = pcap_dest.as_ref() {
             let filter = "tcp port 443 or udp port 443";
             for iface in ["any", "wlan0", "rmnet_data0"] {
@@ -793,11 +793,11 @@ fn stream_events(
             if let Some(observation) = inspect.expire_if_needed() {
                 pipeline.emit_inspect(observation)?;
             }
-            if request.mirror_burp.is_some() && Instant::now() >= next_keylog_try {
+            if request.mirror_http.is_some() && Instant::now() >= next_keylog_try {
                 if !keylog_attached {
                     eprintln!(
                         "keylog attempt: mirror={} pids={:?} table={}",
-                        request.mirror_burp.is_some(),
+                        request.mirror_http.is_some(),
                         request
                             .package
                             .as_deref()
@@ -917,7 +917,7 @@ fn stream_events(
                 }
             }
         }
-        if request.mirror_burp.is_some() && Instant::now() >= next_stack_inventory {
+        if request.mirror_http.is_some() && Instant::now() >= next_stack_inventory {
             if let (Some(package), Some(mirror)) =
                 (request.package.as_deref(), pipeline.burp_mirror.as_mut())
             {
@@ -1481,7 +1481,7 @@ impl EventPipeline {
                 raw: _,
             } => {
                 // Opt-in corridor: feed pre-encrypt markers into versioned rules.
-                // Keep --inspect-jni opt-in (packer grace). Do NOT auto-enable with --mirror-burp.
+                // Keep --inspect-jni opt-in (packer grace). Do NOT auto-enable with --mirror-http.
                 // Never push crypto-watch raw windows to Burp — fingerprints / path_hint only.
                 // Live guards: skip empty preview and content_class=="tls_record".
                 if !fragment.preview.is_empty() && fragment.content_class != "tls_record" {

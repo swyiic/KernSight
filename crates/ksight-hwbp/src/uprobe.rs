@@ -21,6 +21,43 @@ use aya::{
 };
 
 use super::registers::RegisterContext;
+use super::tgid_filter::{self, FilterMaps};
+
+struct BpfFilterMaps<'a>(&'a mut Ebpf);
+
+impl FilterMaps for BpfFilterMaps<'_> {
+    fn enable(&mut self, enabled: bool) -> Result<()> {
+        let map = self
+            .0
+            .map_mut("tgid_filter")
+            .context("tgid_filter map 缺失")?;
+        let mut filter: Array<&mut MapData, u32> =
+            Array::try_from(map).context("打开 tgid_filter")?;
+        filter
+            .set(0, u32::from(enabled), 0)
+            .context("写入 tgid_filter")
+    }
+
+    fn remove(&mut self, tgid: u32) -> Result<()> {
+        let map = self
+            .0
+            .map_mut("tgid_allow")
+            .context("tgid_allow map 缺失")?;
+        let mut allow: HashMap<&mut MapData, u32, u32> =
+            HashMap::try_from(map).context("打开 tgid_allow")?;
+        allow.remove(&tgid).context("移除旧 tgid_allow")
+    }
+
+    fn insert(&mut self, tgid: u32) -> Result<()> {
+        let map = self
+            .0
+            .map_mut("tgid_allow")
+            .context("tgid_allow map 缺失")?;
+        let mut allow: HashMap<&mut MapData, u32, u32> =
+            HashMap::try_from(map).context("打开 tgid_allow")?;
+        allow.insert(tgid, 1, 0).context("写入 tgid_allow")
+    }
+}
 
 /// 一次 uprobe 采集会话。
 pub struct UprobeSession {
@@ -71,7 +108,31 @@ impl UprobeSession {
         pid: Option<i32>,
         hit_once: bool,
     ) -> Result<Self> {
-        Self::start_programs(object, &[program], target, offset, pid, hit_once)
+        Self::start_programs(object, &[program], target, offset, pid, hit_once, None)
+    }
+
+    /// Configure the allowlist before any link exists; failure attaches nothing.
+    /// An empty scope denies all events.
+    ///
+    /// # Errors
+    /// Returns when filter configuration, program load or attachment fails.
+    pub fn start_program_scoped(
+        object: &Path,
+        program: &str,
+        target: &Path,
+        offset: u64,
+        tgids: &[u32],
+        hit_once: bool,
+    ) -> Result<Self> {
+        Self::start_programs(
+            object,
+            &[program],
+            target,
+            offset,
+            None,
+            hit_once,
+            Some(tgids),
+        )
     }
 
     /// Attach entry + uretprobe from **one** BPF load so `entry_ptr` is shared.
@@ -97,6 +158,7 @@ impl UprobeSession {
             offset,
             pid,
             hit_once,
+            None,
         )
     }
 
@@ -107,8 +169,15 @@ impl UprobeSession {
         offset: u64,
         pid: Option<i32>,
         hit_once: bool,
+        tgids: Option<&[u32]>,
     ) -> Result<Self> {
         let mut bpf = Ebpf::load_file(object).context("加载 uprobe BPF 对象")?;
+        let tgid_keys = if tgids.is_some() {
+            tgid_filter::configure(&mut BpfFilterMaps(&mut bpf), &[], tgids)
+                .context("拒绝挂载：TGID 过滤配置失败")?
+        } else {
+            Vec::new()
+        };
         let mut links = Vec::with_capacity(programs.len());
         for program in programs {
             let link_id = {
@@ -152,7 +221,7 @@ impl UprobeSession {
             buffers,
             hit_once,
             finished: false,
-            tgid_keys: Vec::new(),
+            tgid_keys,
             paired_entry_return,
             drained_total: 0,
             lost_total: 0,
@@ -162,36 +231,26 @@ impl UprobeSession {
     /// Restrict emission to these thread-group IDs.
     ///
     /// `None` records every mapping process. An empty slice still enables the
-    /// filter, so callers should pass `None` until at least one TGID is known.
+    /// filter and denies all events. Never use `None` for an unknown scope.
     ///
     /// # Errors
     ///
-    /// Returns when the filter maps are missing or cannot be updated.
+    /// Returns when the filter maps are missing or cannot be updated, detaching
+    /// the session so a partial update cannot leave an active probe behind.
     pub fn apply_tgid_filter(&mut self, tgids: Option<&[u32]>) -> Result<()> {
-        if let Some(tgids) = tgids {
-            let map = self
-                .bpf
-                .map_mut("tgid_allow")
-                .context("tgid_allow map 缺失")?;
-            let mut allow: HashMap<&mut MapData, u32, u32> =
-                HashMap::try_from(map).context("打开 tgid_allow")?;
-            for old in self.tgid_keys.drain(..) {
-                let _ = allow.remove(&old);
+        if self.finished {
+            anyhow::bail!("cannot update a detached uprobe session");
+        }
+        match tgid_filter::configure(&mut BpfFilterMaps(&mut self.bpf), &self.tgid_keys, tgids) {
+            Ok(keys) => {
+                self.tgid_keys = keys;
+                Ok(())
             }
-            for tgid in tgids.iter().copied().filter(|tgid| *tgid > 0).take(128) {
-                allow.insert(tgid, 1, 0).context("写入 tgid_allow")?;
-                self.tgid_keys.push(tgid);
+            Err(error) => {
+                self.detach();
+                Err(error.context("TGID filter failed; session detached"))
             }
         }
-        let enabled = u32::from(tgids.is_some_and(|tgids| !tgids.is_empty()));
-        let map = self
-            .bpf
-            .map_mut("tgid_filter")
-            .context("tgid_filter map 缺失")?;
-        let mut filter: Array<&mut MapData, u32> =
-            Array::try_from(map).context("打开 tgid_filter")?;
-        filter.set(0, enabled, 0).context("写入 tgid_filter")?;
-        Ok(())
     }
 
     /// 非阻塞排空当前可读命中。

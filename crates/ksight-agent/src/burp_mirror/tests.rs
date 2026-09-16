@@ -14,6 +14,207 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 #[test]
+fn missing_playback_id_never_consumes_another_transaction() {
+    let queue = Mutex::new(PlaybackStore::default());
+    queue.lock().unwrap().insert_for_host(
+        "fixture.example",
+        "right-id".into(),
+        b"real-response".to_vec(),
+    );
+    let missing =
+        b"GET / HTTP/1.1\r\nHost: fixture.example\r\nX-KernSight-Playback-ID: wrong-id\r\n\r\n";
+    let no_id = b"GET / HTTP/1.1\r\nHost: fixture.example\r\n\r\n";
+    for request in [missing.as_slice(), no_id.as_slice()] {
+        let wire = super::take_playback_for_request(request, &queue, None);
+        assert!(String::from_utf8_lossy(&wire).contains("X-KernSight-Observed-Status: unknown"));
+        assert!(!wire.ends_with(b"real-response"));
+    }
+    assert!(queue.lock().unwrap().take(None).is_none());
+    assert_eq!(
+        queue.lock().unwrap().take(Some("right-id")).unwrap(),
+        b"real-response"
+    );
+}
+
+#[test]
+fn full_playback_queue_rejects_new_entry_without_evicting_old() {
+    let mut store = PlaybackStore::default();
+    for id in 0..64 {
+        store.insert(id.to_string(), vec![id as u8]).unwrap();
+    }
+    assert!(store.insert("overflow".into(), vec![255]).is_err());
+    assert_eq!(store.entries.len(), 64);
+    assert_eq!(store.take(Some("0")), Some(vec![0]));
+    assert_eq!(store.take(Some("63")), Some(vec![63]));
+}
+
+#[test]
+fn orphan_overflow_returns_evidence_instead_of_discarding_it() {
+    let mut orphans = HashMap::new();
+    for index in 0..=super::ORPHAN_RESPONSE_CAP {
+        let mut response = ksight_core::StreamReassembler::default()
+            .push(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nx")
+            .remove(0);
+        response.body = vec![index as u8];
+        let displaced = super::store_orphan_response(&mut orphans, 1, 2, response);
+        if index == super::ORPHAN_RESPONSE_CAP {
+            assert_eq!(displaced.unwrap().body, vec![0]);
+        } else {
+            assert!(displaced.is_none());
+        }
+    }
+    assert_eq!(orphans[&(1, 2)].len(), super::ORPHAN_RESPONSE_CAP);
+}
+
+#[test]
+fn echoed_ack_without_queue_consumption_is_rejected_and_cleaned() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let wire = read_http_message(&mut socket, 8192);
+        let id = header_value(&wire, "x-kernsight-playback-id").unwrap();
+        socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX-KernSight-Playback-Ack: {id}\r\n\r\n").as_bytes()).unwrap();
+    });
+    let queue = Mutex::new(PlaybackStore::default());
+    let request = ksight_core::StreamReassembler::default()
+        .push(b"GET / HTTP/1.1\r\nHost: fixture.example\r\n\r\n")
+        .remove(0);
+    let error = deliver(
+        endpoint,
+        &request,
+        None,
+        &queue,
+        "fixture",
+        &AtomicU64::new(0),
+    )
+    .unwrap_err();
+    assert!(error.contains("playback_not_consumed"));
+    assert!(queue.lock().unwrap().entries.is_empty());
+    server.join().unwrap();
+}
+
+#[test]
+fn playback_receipt_checks_id_body_framing_and_large_responses() {
+    for mode in ["valid_large", "wrong_id", "short_body", "wrong_body"] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let queue = Arc::new(Mutex::new(PlaybackStore::default()));
+        let server_queue = Arc::clone(&queue);
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let request = read_http_message(&mut socket, 8192);
+            let mut reply = super::take_playback_for_request(&request, &server_queue, None);
+            if mode == "wrong_id" {
+                let id = header_value(&request, "x-kernsight-playback-id").unwrap();
+                let head = format!("X-KernSight-Playback-Ack: {id}");
+                let at = reply
+                    .windows(head.len())
+                    .position(|w| w == head.as_bytes())
+                    .unwrap();
+                reply.splice(
+                    at..at + head.len(),
+                    b"X-KernSight-Playback-Ack: wrong".iter().copied(),
+                );
+            } else if mode == "short_body" {
+                reply.truncate(reply.len() - 1);
+            } else if mode == "wrong_body" {
+                *reply.last_mut().unwrap() = b'y';
+            }
+            socket.write_all(&reply).unwrap();
+        });
+        let request = ksight_core::StreamReassembler::default()
+            .push(b"GET /fixture HTTP/1.1\r\nHost: fixture.example\r\n\r\n")
+            .remove(0);
+        let mut response = ksight_core::StreamReassembler::default()
+            .push(b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\n\r\nok")
+            .remove(0);
+        response.body = vec![b'x'; 600 * 1024];
+        // A legitimate response may contain Burp's product name; it is not automatically an error page.
+        response.body[..23].copy_from_slice(b"Burp Suite Professional");
+        let result = deliver(
+            endpoint,
+            &request,
+            Some(&response),
+            &queue,
+            "fixture",
+            &AtomicU64::new(0),
+        );
+        server.join().unwrap();
+        assert_eq!(result.is_ok(), mode == "valid_large", "{mode}: {result:?}");
+        assert!(queue.lock().unwrap().entries.is_empty());
+    }
+}
+
+#[test]
+fn consuming_repeated_body_chunks_are_kept() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let wire = read_http_message(&mut stream, 8192);
+        stream
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        wire
+    });
+    let mut mirror = BurpMirror::start(&addr.to_string()).unwrap();
+    for bytes in [
+        b"POST /repeat HTTP/1.1\r\nHost: fixture.example\r\nContent-Length: 8\r\n\r\n".as_slice(),
+        b"aaaa",
+        b"aaaa",
+    ] {
+        mirror.observe_bytes_for_connection(123, 1, Some(0x9000), "tls_ssl_write", "send", bytes);
+    }
+    assert_eq!(mirror.diagnostic_metrics()["reconstructed_requests"], 1);
+    assert_eq!(mirror.diagnostic_metrics()["duplicate_fragments"], 0);
+    mirror.seal();
+    assert!(server.join().unwrap().ends_with(b"aaaaaaaa"));
+}
+
+#[test]
+fn unacknowledged_playback_is_not_a_successful_delivery() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let _ = read_http_message(&mut stream, 8192);
+        // Deliberately close without acknowledging the display request.
+    });
+    let request = ksight_core::StreamReassembler::default()
+        .push(b"GET / HTTP/1.1\r\nHost: fixture.example\r\n\r\n")
+        .remove(0);
+    let response = ksight_core::StreamReassembler::default()
+        .push(b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\n\r\nok")
+        .remove(0);
+    let result = deliver(
+        addr,
+        &request,
+        Some(&response),
+        &Mutex::new(PlaybackStore::default()),
+        "fixture",
+        &AtomicU64::new(0),
+    );
+    server.join().unwrap();
+    assert!(
+        result.is_err(),
+        "a queued body alone does not confirm delivery"
+    );
+}
+
+#[test]
 fn playback_store_pairs_out_of_order_fetches_by_id() {
     let mut store = PlaybackStore::default();
     store.insert("first".into(), b"response-one".to_vec());
@@ -135,6 +336,8 @@ fn absolute_timeout_keeps_absolute_wire_no_ksight_rewrite() {
 fn absolute_skipped_still_sends_absolute_not_playback_identity() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
+    let queue = Arc::new(Mutex::new(PlaybackStore::default()));
+    let server_queue = Arc::clone(&queue);
     let received = thread::spawn(move || {
         listener.set_nonblocking(false).unwrap();
         let (mut stream, _) = listener.accept().unwrap();
@@ -143,11 +346,10 @@ fn absolute_skipped_still_sends_absolute_not_playback_identity() {
             .unwrap();
         let mut buf = vec![0_u8; 8192];
         let n = stream.read(&mut buf).unwrap_or(0);
-        let _ =
-            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        super::serve_playback_plain(&mut stream, &buf[..n], &server_queue, None).unwrap();
         String::from_utf8_lossy(&buf[..n]).into_owned()
     });
-    let queue = Mutex::new(PlaybackStore::default());
+
     let streak = AtomicU64::new(ABS_TIMEOUT_SKIP_AFTER);
     let request = ksight_core::MirroredMessage {
         is_request: true,
@@ -159,6 +361,7 @@ fn absolute_skipped_still_sends_absolute_not_playback_identity() {
         headers: vec![],
         body: vec![],
         websocket_upgrade: false,
+        evidence: ksight_core::MessageEvidence::default(),
         stream_id: None,
     };
     deliver(addr, &request, None, &queue, "test-skip", &streak).expect("deliver");
@@ -318,9 +521,11 @@ fn repeated_endpoint_requests_with_distinct_bodies_are_not_suppressed() {
 fn delivery_retries_after_listener_becomes_available() {
     let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = reservation.local_addr().unwrap();
+    let queue = Arc::new(Mutex::new(PlaybackStore::default()));
+    let server_queue = Arc::clone(&queue);
     drop(reservation);
 
-    let mut mirror = BurpMirror::start(&addr.to_string()).expect("mirror");
+    let mut mirror = BurpMirror::start_with_queue(&addr.to_string(), None, queue).expect("mirror");
     mirror.observe_bytes_for_connection(
         22,
         201,
@@ -336,9 +541,7 @@ fn delivery_retries_after_listener_becomes_available() {
     let received = thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         let request = read_http_message(&mut stream, 4096);
-        let _ = stream.write_all(
-            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        );
+        super::serve_playback_plain(&mut stream, &request, &server_queue, None).unwrap();
         request
     });
     let deadline = std::time::Instant::now() + Duration::from_secs(8);
@@ -359,9 +562,11 @@ fn delivery_retries_after_listener_becomes_available() {
 }
 
 #[test]
-fn exact_duplicate_probe_fragment_is_debounced() {
+fn identical_complete_requests_are_not_content_deduplicated() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
+    let queue = Arc::new(Mutex::new(PlaybackStore::default()));
+    let server_queue = Arc::clone(&queue);
     let received = thread::spawn(move || {
         listener.set_nonblocking(true).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
@@ -369,12 +574,15 @@ fn exact_duplicate_probe_fragment_is_debounced() {
         while std::time::Instant::now() < deadline {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .unwrap();
                     count += 1;
-                    let mut buf = vec![0_u8; 4096];
-                    let _ = stream.read(&mut buf);
-                    let _ = stream.write_all(
-                            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                        );
+                    let buf = read_http_message(&mut stream, 8192);
+                    let n = buf.len();
+                    super::serve_playback_plain(&mut stream, &buf[..n], &server_queue, None)
+                        .unwrap();
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(10));
@@ -384,7 +592,7 @@ fn exact_duplicate_probe_fragment_is_debounced() {
         }
         count
     });
-    let mut mirror = BurpMirror::start(&addr.to_string()).expect("mirror");
+    let mut mirror = BurpMirror::start_with_queue(&addr.to_string(), None, queue).expect("mirror");
     mirror.observe_network_connect();
     mirror.observe_network_handshake();
     let raw = b"POST /once HTTP/1.1\r\nHost: api.example.test\r\nContent-Length: 2\r\n\r\n{}";
@@ -392,22 +600,24 @@ fn exact_duplicate_probe_fragment_is_debounced() {
     mirror.observe_bytes_for_connection(22, 201, Some(0x2222), "tls_ssl_write", "send", raw);
     let metrics = mirror.diagnostic_metrics();
     assert_eq!(metrics.get("observed_fragments"), Some(&2));
-    assert_eq!(metrics.get("duplicate_fragments"), Some(&1));
-    assert_eq!(metrics.get("duplicate_probe"), Some(&1));
-    assert_eq!(metrics.get("reconstructed_requests"), Some(&1));
+    assert_eq!(metrics.get("duplicate_fragments"), Some(&0));
+    assert_eq!(metrics.get("duplicate_probe"), Some(&0));
+    assert_eq!(metrics.get("reconstructed_requests"), Some(&2));
     assert_eq!(metrics.get("reconstructed_responses"), Some(&0));
     assert_eq!(metrics.get("queue_failures"), Some(&0));
     assert_eq!(metrics.get("network_connects"), Some(&1));
     assert_eq!(metrics.get("network_handshakes"), Some(&1));
     assert_eq!(metrics.get("standard_tls_fragments"), Some(&2));
     drop(mirror);
-    assert_eq!(received.join().unwrap(), 1);
+    assert_eq!(received.join().unwrap(), 2);
 }
 
 #[test]
 fn progressive_truncated_prefix_is_coalesced_not_dropped() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
+    let queue = Arc::new(Mutex::new(PlaybackStore::default()));
+    let server_queue = Arc::clone(&queue);
     let received = thread::spawn(move || {
         listener.set_nonblocking(true).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
@@ -415,12 +625,15 @@ fn progressive_truncated_prefix_is_coalesced_not_dropped() {
         while std::time::Instant::now() < deadline {
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    let mut buf = vec![0_u8; 4096];
-                    let n = stream.read(&mut buf).unwrap_or(0);
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .unwrap();
+                    let buf = read_http_message(&mut stream, 8192);
+                    let n = buf.len();
                     wires.push(String::from_utf8_lossy(&buf[..n]).into_owned());
-                    let _ = stream.write_all(
-                            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                        );
+                    super::serve_playback_plain(&mut stream, &buf[..n], &server_queue, None)
+                        .unwrap();
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(10));
@@ -430,12 +643,12 @@ fn progressive_truncated_prefix_is_coalesced_not_dropped() {
         }
         wires
     });
-    let mut mirror = BurpMirror::start(&addr.to_string()).expect("mirror");
+    let mut mirror = BurpMirror::start_with_queue(&addr.to_string(), None, queue).expect("mirror");
     let prefix = b"POST /grow HTTP/1.1\r\nHost: api.example.test\r\nContent-Length: 4\r\n\r\n";
     let mut full = prefix.to_vec();
     full.extend_from_slice(b"ping");
-    mirror.observe_bytes_for_connection(9, 1, Some(0x3001), "tls_ssl_write", "send", prefix);
-    mirror.observe_bytes_for_connection(9, 1, Some(0x3001), "tls_ssl_write", "send", &full);
+    mirror.observe_bytes_for_connection(9, 1, Some(0x3001), "handshake_http", "send", prefix);
+    mirror.observe_bytes_for_connection(9, 1, Some(0x3001), "handshake_http", "send", &full);
     let metrics = mirror.diagnostic_metrics();
     assert_eq!(metrics.get("observed_fragments"), Some(&2));
     assert_eq!(metrics.get("duplicate_fragments"), Some(&0));
@@ -458,6 +671,8 @@ fn progressive_truncated_prefix_is_coalesced_not_dropped() {
 fn identical_payload_after_stream_progress_is_kept() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
+    let queue = Arc::new(Mutex::new(PlaybackStore::default()));
+    let server_queue = Arc::clone(&queue);
     let received = thread::spawn(move || {
         listener.set_nonblocking(true).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
@@ -465,12 +680,15 @@ fn identical_payload_after_stream_progress_is_kept() {
         while std::time::Instant::now() < deadline {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .unwrap();
                     count += 1;
-                    let mut buf = vec![0_u8; 4096];
-                    let _ = stream.read(&mut buf);
-                    let _ = stream.write_all(
-                            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                        );
+                    let buf = read_http_message(&mut stream, 8192);
+                    let n = buf.len();
+                    super::serve_playback_plain(&mut stream, &buf[..n], &server_queue, None)
+                        .unwrap();
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(10));
@@ -480,7 +698,7 @@ fn identical_payload_after_stream_progress_is_kept() {
         }
         count
     });
-    let mut mirror = BurpMirror::start(&addr.to_string()).expect("mirror");
+    let mut mirror = BurpMirror::start_with_queue(&addr.to_string(), None, queue).expect("mirror");
     let one = b"POST /a HTTP/1.1\r\nHost: api.example.test\r\nContent-Length: 1\r\n\r\n1";
     let two = b"POST /b HTTP/1.1\r\nHost: api.example.test\r\nContent-Length: 1\r\n\r\n2";
     // Advance stream position with a distinct fragment, then repeat `one`.
@@ -498,7 +716,7 @@ fn identical_payload_after_stream_progress_is_kept() {
 }
 
 #[test]
-fn stale_shorter_truncated_prefix_is_probe_duplicate() {
+fn next_request_prefix_after_complete_message_is_preserved() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let mut mirror = BurpMirror::start(&addr.to_string()).expect("mirror");
@@ -508,9 +726,10 @@ fn stale_shorter_truncated_prefix_is_probe_duplicate() {
     mirror.observe_bytes_for_connection(12, 1, Some(0x5001), "tls_ssl_write", "send", shorter);
     let metrics = mirror.diagnostic_metrics();
     assert_eq!(metrics.get("observed_fragments"), Some(&2));
-    assert_eq!(metrics.get("duplicate_probe"), Some(&1));
-    assert_eq!(metrics.get("duplicate_fragments"), Some(&1));
-    // First fragment already completed the request.
+    assert_eq!(metrics.get("duplicate_probe"), Some(&0));
+    assert_eq!(metrics.get("duplicate_fragments"), Some(&0));
+    assert!(metrics["buffered_bytes"] > 0);
+    // The shorter prefix may belong to a second request; keep it buffered.
     assert_eq!(metrics.get("reconstructed_requests"), Some(&1));
 }
 
@@ -972,6 +1191,7 @@ fn http2_out_of_order_streams_pair_by_stream_id() {
         headers: vec![],
         body: vec![],
         websocket_upgrade: false,
+        evidence: ksight_core::MessageEvidence::default(),
         stream_id: Some(sid),
     };
     let resp = |sid: u32, status: u16| MirroredMessage {
@@ -984,6 +1204,7 @@ fn http2_out_of_order_streams_pair_by_stream_id() {
         headers: vec![],
         body: vec![],
         websocket_upgrade: false,
+        evidence: ksight_core::MessageEvidence::default(),
         stream_id: Some(sid),
     };
     pending
@@ -1051,13 +1272,46 @@ fn delayed_ssl_read_pairs_within_pairing_grace() {
 }
 
 #[test]
-fn inert_all_zero_tls_fragment_is_rejected() {
-    assert!(super::is_inert_tls_fragment(&[0u8; 660]));
-    assert!(super::is_inert_tls_fragment(&[0u8; 16]));
-    assert!(!super::is_inert_tls_fragment(
-        b"POST /x HTTP/1.1\r\nHost: a\r\n\r\n"
-    ));
-    assert!(!super::is_inert_tls_fragment(br#"{"a":1}"#));
+fn all_zero_entity_is_preserved() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    let queue = Arc::new(Mutex::new(PlaybackStore::default()));
+    let server_queue = Arc::clone(&queue);
+    let server = thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let request = read_http_message(&mut socket, 8192);
+        super::serve_playback_plain(&mut socket, &request, &server_queue, None).unwrap();
+        request
+    });
+    let mut mirror = BurpMirror::start_with_queue(&endpoint.to_string(), None, queue).unwrap();
+    for bytes in [
+        b"POST /binary HTTP/1.1\r\nHost: fixture.example\r\nContent-Length: 660\r\n\r\n".as_slice(),
+        &[0u8; 660],
+    ] {
+        mirror.observe_bytes_for_connection(1, 1, Some(0x9000), "tls_ssl_write", "send", bytes);
+    }
+    assert_eq!(mirror.diagnostic_metrics()["reconstructed_requests"], 1);
+    assert_eq!(mirror.diagnostic_metrics()["rejected_fragments"], 0);
+    mirror.seal();
+    assert_eq!(mirror.delivery_count(), 1);
+    assert!(server.join().unwrap().ends_with(&[0u8; 660]));
+}
+
+#[test]
+fn body_text_and_duplicate_headers_cannot_supply_a_playback_id() {
+    assert!(header_value(
+        b"POST / HTTP/1.1\r\nHost: fixture.example\r\n\r\nX-KernSight-Playback-ID: fake",
+        "x-kernsight-playback-id"
+    )
+    .is_none());
+    assert!(header_value(
+        b"GET / HTTP/1.1\r\nX-KernSight-Playback-ID: a\r\nX-KernSight-Playback-ID: b\r\n\r\n",
+        "x-kernsight-playback-id"
+    )
+    .is_none());
 }
 
 #[test]
@@ -1133,16 +1387,18 @@ fn drop_drains_worker_while_playback_still_up() {
 fn informational_100_continue_does_not_consume_pairing_slot() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
+    let queue = Arc::new(Mutex::new(PlaybackStore::default()));
+    let server_queue = Arc::clone(&queue);
     let received = thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(8)))
             .unwrap();
         let request = read_http_message(&mut stream, 8192);
-        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        super::serve_playback_plain(&mut stream, &request, &server_queue, None).unwrap();
         String::from_utf8_lossy(&request).into_owned()
     });
-    let mut mirror = BurpMirror::start(&addr.to_string()).expect("mirror");
+    let mut mirror = BurpMirror::start_with_queue(&addr.to_string(), None, queue).expect("mirror");
     mirror.observe_bytes_for_connection(
             9,
             1,
@@ -1189,16 +1445,18 @@ fn informational_100_continue_does_not_consume_pairing_slot() {
 fn seal_soft_flush_salvages_incomplete_ssl_read_before_unpaired() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
+    let queue = Arc::new(Mutex::new(PlaybackStore::default()));
+    let server_queue = Arc::clone(&queue);
     let received = thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(8)))
             .unwrap();
         let request = read_http_message(&mut stream, 8192);
-        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        super::serve_playback_plain(&mut stream, &request, &server_queue, None).unwrap();
         String::from_utf8_lossy(&request).into_owned()
     });
-    let mut mirror = BurpMirror::start(&addr.to_string()).expect("mirror");
+    let mut mirror = BurpMirror::start_with_queue(&addr.to_string(), None, queue).expect("mirror");
     mirror.observe_bytes_for_connection(
         88,
         1,
@@ -1251,16 +1509,18 @@ fn seal_soft_flush_salvages_incomplete_ssl_read_before_unpaired() {
 fn seal_salvages_incomplete_response_headers_before_unpaired() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
+    let queue = Arc::new(Mutex::new(PlaybackStore::default()));
+    let server_queue = Arc::clone(&queue);
     let received = thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(8)))
             .unwrap();
         let request = read_http_message(&mut stream, 8192);
-        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        super::serve_playback_plain(&mut stream, &request, &server_queue, None).unwrap();
         String::from_utf8_lossy(&request).into_owned()
     });
-    let mut mirror = BurpMirror::start(&addr.to_string()).expect("mirror");
+    let mut mirror = BurpMirror::start_with_queue(&addr.to_string(), None, queue).expect("mirror");
     mirror.observe_bytes_for_connection(
         90,
         1,
@@ -1300,16 +1560,18 @@ fn seal_salvages_incomplete_response_headers_before_unpaired() {
 fn seal_orphan_recv_salvages_before_unpaired() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
+    let queue = Arc::new(Mutex::new(PlaybackStore::default()));
+    let server_queue = Arc::clone(&queue);
     let received = thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(8)))
             .unwrap();
         let request = read_http_message(&mut stream, 8192);
-        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        super::serve_playback_plain(&mut stream, &request, &server_queue, None).unwrap();
         String::from_utf8_lossy(&request).into_owned()
     });
-    let mut mirror = BurpMirror::start(&addr.to_string()).expect("mirror");
+    let mut mirror = BurpMirror::start_with_queue(&addr.to_string(), None, queue).expect("mirror");
     mirror.observe_bytes_for_connection(
         89,
         1,
@@ -1340,15 +1602,17 @@ fn seal_before_final_counts_session_end_delivery() {
     // session-end unpaired delivers. seal() must flush+join first.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
+    let queue = Arc::new(Mutex::new(PlaybackStore::default()));
+    let server_queue = Arc::clone(&queue);
     let _burp = thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(8)))
             .unwrap();
-        let _ = read_http_message(&mut stream, 4096);
-        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        let request = read_http_message(&mut stream, 4096);
+        super::serve_playback_plain(&mut stream, &request, &server_queue, None).unwrap();
     });
-    let mut mirror = BurpMirror::start(&addr.to_string()).expect("mirror");
+    let mut mirror = BurpMirror::start_with_queue(&addr.to_string(), None, queue).expect("mirror");
     mirror.observe_bytes_for_connection(
         77,
         1,
@@ -1379,29 +1643,19 @@ fn peek_then_read_prefers_read_dedupe() {
     let mut mirror = BurpMirror::start(&addr.to_string()).expect("mirror");
     let body = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\npong";
     // Peek must not advance the stream cursor.
-    mirror.observe_bytes_for_connection(
-        55,
-        1,
-        Some(0x7001),
-        "tls_ssl_read",
-        "peek",
-        body,
-    );
+    mirror.observe_bytes_for_connection(55, 1, Some(0x7001), "tls_ssl_read", "peek", body);
     assert_eq!(
         mirror.recv_fragments, 0,
         "peek must not count as consuming recv"
     );
     assert_eq!(mirror.pending_peeks.len(), 1);
     // Matching read suppresses the peek and becomes canonical.
-    mirror.observe_bytes_for_connection(
-        55,
-        1,
-        Some(0x7001),
-        "tls_ssl_read",
-        "recv",
-        body,
+    mirror.observe_bytes_for_connection(55, 1, Some(0x7001), "tls_ssl_read", "recv", body);
+    assert_eq!(
+        mirror.pending_peeks.len(),
+        0,
+        "read must suppress matched peek"
     );
-    assert_eq!(mirror.pending_peeks.len(), 0, "read must suppress matched peek");
     assert!(mirror.recv_fragments >= 1);
 }
 
@@ -1414,14 +1668,7 @@ fn peek_without_read_promotes_after_idle() {
     });
     let mut mirror = BurpMirror::start(&addr.to_string()).expect("mirror");
     let body = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
-    mirror.observe_bytes_for_connection(
-        56,
-        2,
-        Some(0x7002),
-        "tls_ssl_read",
-        "peek",
-        body,
-    );
+    mirror.observe_bytes_for_connection(56, 2, Some(0x7002), "tls_ssl_read", "peek", body);
     assert_eq!(mirror.pending_peeks.len(), 1);
     // Age the peek past promote idle.
     if let Some(peek) = mirror.pending_peeks.front_mut() {

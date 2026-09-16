@@ -678,6 +678,7 @@ const PTRACE_SEIZE: i32 = 0x4206;
 const PTRACE_INTERRUPT: i32 = 0x4207;
 const WAIT_WALL: i32 = 0x4000_0000;
 
+#[cfg(any(target_os = "android", target_os = "linux"))]
 fn attach_main(pid: i32) -> Result<Vec<i32>, String> {
     unsafe {
         // libc exposes the ptrace request as c_uint on glibc and c_int on
@@ -1354,6 +1355,7 @@ fn process_vm_rw(pid: i32, addr: u64, buf: &[u8], write: bool) -> Result<(), Str
     }
 }
 
+#[cfg(any(target_os = "android", target_os = "linux"))]
 fn poke_bytes(pid: i32, addr: u64, bytes: &[u8]) -> Result<(), String> {
     let mut off = 0_usize;
     while off < bytes.len() {

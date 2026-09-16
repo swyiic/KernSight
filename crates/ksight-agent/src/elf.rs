@@ -651,6 +651,7 @@ mod tests {
         assert_eq!(read[0].1, 0xa24d8);
     }
 
+    #[test]
     fn inspect_elf_keeps_defined_ssl_write_and_drops_und() {
         let bytes = tiny_elf64_dynsym(&[
             TinySym {

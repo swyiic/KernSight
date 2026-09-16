@@ -361,7 +361,7 @@ impl ServiceConfig {
             inspect: ksight_core::InspectPolicy::default(),
             inspect_adapters: vec![crate::inspect_runtime::InspectAdapterKind::LinkerSoLoad],
             uprobe_object: PathBuf::from("/data/local/tmp/ksight/uprobe_regs.bpf.o"),
-            mirror_burp: None,
+            mirror_http: None,
             mitm_burp: false,
         })
     }

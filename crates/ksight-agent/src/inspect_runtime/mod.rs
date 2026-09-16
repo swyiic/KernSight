@@ -1958,8 +1958,7 @@ fn evaluate_tls_symbol_exports(
                 adapter.as_str()
             );
         } else {
-            observation.detail =
-                format!("uprobe object missing: {}", uprobe_object.display());
+            observation.detail = format!("uprobe object missing: {}", uprobe_object.display());
         }
         seen_offsets.insert(offset);
         plans.push(InspectPlan {

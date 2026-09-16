@@ -10,6 +10,8 @@
 
 mod cpu_list;
 pub mod registers;
+#[cfg(any(test, target_os = "android", target_os = "linux"))]
+mod tgid_filter;
 
 pub use registers::RegisterContext;
 

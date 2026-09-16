@@ -4,6 +4,11 @@
 //! buffers. The app's TLS session is not terminated and no VPN/iptables path is
 //! installed. Flutter Dart TLS and QUIC/HTTP3 remain out of scope.
 
+mod evidence;
+pub use evidence::{
+    MessageCompleteness, MessageEvidence, MessageOrigin, MirrorSource, PairingBasis,
+};
+
 use std::net::{SocketAddr, ToSocketAddrs};
 
 use crate::http2::{http2_sync_offset, looks_like_http2, Http2Assembler};
@@ -44,8 +49,10 @@ pub struct MirroredMessage {
     pub host: String,
     /// Path including the query string.
     pub path: String,
-    /// Response status when this is a response.
+    /// Observed HTTP status; missing or protocol-derived statuses stay None.
     pub status: Option<u16>,
+    /// Evidence independent of the HTTP display envelope.
+    pub evidence: MessageEvidence,
     /// Original header names and values, not redacted.
     pub headers: Vec<(String, String)>,
     /// Request or response body as copied (app-layer encryption is left intact).
@@ -54,6 +61,28 @@ pub struct MirroredMessage {
     pub websocket_upgrade: bool,
     /// HTTP/2 stream identifier when reconstructed from H2; `None` for HTTP/1.
     pub stream_id: Option<u32>,
+}
+
+fn evidence_token(value: &impl serde::Serialize) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn is_evidence_header(name: &str) -> bool {
+    if name.eq_ignore_ascii_case("x-kernsight-playback-ack") {
+        return true;
+    }
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "x-kernsight-evidence-origin"
+            | "x-kernsight-completeness"
+            | "x-kernsight-pairing"
+            | "x-kernsight-observed-status"
+            | "x-kernsight-display-status-only"
+            | "x-kernsight-evidence-reason"
+    )
 }
 
 /// Ensure path is empty→`/` or starts with `/` so absolute URLs never glue host+path
@@ -94,6 +123,28 @@ fn proxy_absolute_target(scheme: &str, host: &str, path: &str) -> String {
 }
 
 impl MirroredMessage {
+    /// Transform a display entity while retaining the pre-transform entity.
+    fn replace_display_entity(&mut self, body: Vec<u8>, transform: &'static str) {
+        if body != self.body {
+            if self.evidence.original_entity.is_none() {
+                self.evidence.original_entity = Some(self.body.clone());
+            }
+            self.evidence.transformations.push(transform);
+            self.body = body;
+        }
+    }
+    /// Keep the parsed destination even when later display hints fill or rewrite it.
+    pub fn preserve_destination(&mut self) {
+        self.evidence
+            .original_destination
+            .get_or_insert_with(|| (self.host.clone(), self.path.clone()));
+    }
+
+    fn mark_incomplete(&mut self, reason: &'static str) {
+        self.evidence.completeness = MessageCompleteness::Incomplete;
+        self.evidence.reason = Some(reason);
+    }
+
     /// Absolute-form request Burp's HTTP proxy accepts without a CONNECT/TLS crate.
     ///
     /// TLS copies are sent as `http://host:443/path` so Burp treats them as
@@ -154,7 +205,7 @@ impl MirroredMessage {
     /// Origin-form HTTP/1.1 response for the playback listener to return to Burp.
     #[must_use]
     pub fn to_http1_response(&self) -> Vec<u8> {
-        let status = self.status.unwrap_or(200);
+        let status = self.status.or(self.evidence.display_status).unwrap_or(200);
         let reason = reason_phrase(status);
         let start = format!("HTTP/1.1 {status} {reason}");
         self.write_http1_start(&start, None)
@@ -178,6 +229,12 @@ impl MirroredMessage {
             host,
             path: "/".to_owned(),
             status: None,
+            evidence: MessageEvidence {
+                origin: MessageOrigin::SyntheticRequest,
+                pairing: PairingBasis::DisplayOnly,
+                source: self.evidence.source.clone(),
+                ..MessageEvidence::default()
+            },
             headers: Vec::new(),
             body: Vec::new(),
             websocket_upgrade: false,
@@ -205,7 +262,8 @@ impl MirroredMessage {
             out.extend_from_slice(b"\r\n");
         }
         for (name, value) in &self.headers {
-            if skip_header(name, self.websocket_upgrade) {
+            // Captured headers cannot override authoritative evidence markers.
+            if is_evidence_header(name) || skip_header(name, self.websocket_upgrade) {
                 continue;
             }
             if host.is_some() && name.eq_ignore_ascii_case("host") {
@@ -237,6 +295,24 @@ impl MirroredMessage {
         if let Some(stream_id) = self.stream_id {
             out.extend_from_slice(format!("X-KernSight-H2-Stream-ID: {stream_id}\r\n").as_bytes());
         }
+        let metadata = &self.evidence;
+        out.extend_from_slice(format!("X-KernSight-Evidence-Origin: {}\r\nX-KernSight-Completeness: {}\r\nX-KernSight-Pairing: {}\r\n",
+            evidence_token(&metadata.origin), evidence_token(&metadata.completeness), evidence_token(&metadata.pairing)).as_bytes());
+        if !self.is_request {
+            let observed = self
+                .status
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_owned());
+            out.extend_from_slice(
+                format!("X-KernSight-Observed-Status: {observed}\r\n").as_bytes(),
+            );
+            if self.status.is_none() {
+                out.extend_from_slice(b"X-KernSight-Display-Status-Only: 1\r\n");
+            }
+        }
+        if let Some(reason) = metadata.reason {
+            out.extend_from_slice(format!("X-KernSight-Evidence-Reason: {reason}\r\n").as_bytes());
+        }
         out.extend_from_slice(b"\r\n");
         out.extend_from_slice(&self.body);
         out
@@ -246,6 +322,8 @@ impl MirroredMessage {
         headers: &[(String, String)],
         body: Vec<u8>,
         stream_id: Option<u32>,
+        outbound: bool,
+        complete: bool,
     ) -> Option<Self> {
         let mut method = String::new();
         let mut scheme = "https";
@@ -295,24 +373,19 @@ impl MirroredMessage {
         }) || headers
             .iter()
             .any(|(name, _)| name.eq_ignore_ascii_case("grpc-status"));
+        let mut display_status = None;
         if let Some((_, value)) = headers
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case("grpc-status"))
         {
             if status.is_none() {
-                status = Some(if value == "0" { 200 } else { 503 });
+                display_status = Some(if value == "0" { 200 } else { 503 });
             }
         }
-        if grpc && method.is_empty() && status.is_none() {
+        if outbound && grpc && method.is_empty() && status.is_none() {
             "POST".clone_into(&mut method);
         }
-        let body = if grpc {
-            crate::unwrap_grpc_length_prefixed(&body)
-        } else {
-            body
-        };
-        let body = crate::inflate_http_entity(&out_headers, &body);
-        let is_request = status.is_none();
+        let is_request = status.is_none() && (!method.is_empty() || outbound);
         if is_request {
             // Require :method; host/:authority may be absent on DATA-only or
             // authority-less fragments — burp_mirror::finish_request fills SNI/peer.
@@ -331,11 +404,42 @@ impl MirroredMessage {
             host,
             path,
             status,
+            evidence: MessageEvidence {
+                origin: if headers.is_empty() {
+                    MessageOrigin::BodyFragment
+                } else {
+                    MessageOrigin::ObservedHttp
+                },
+                completeness: if complete && !headers.is_empty() {
+                    MessageCompleteness::Complete
+                } else {
+                    MessageCompleteness::Incomplete
+                },
+                reason: if headers.is_empty() {
+                    Some("h2_missing_headers")
+                } else if !complete {
+                    Some("h2_missing_end_stream")
+                } else {
+                    None
+                },
+                display_status,
+                ..MessageEvidence::default()
+            },
             headers: out_headers,
             body,
             websocket_upgrade,
             stream_id,
         };
+        if grpc {
+            message.replace_display_entity(
+                crate::unwrap_grpc_length_prefixed(&message.body),
+                "grpc_unwrap",
+            );
+        }
+        message.replace_display_entity(
+            crate::inflate_http_entity(&message.headers, &message.body),
+            "http_content_decode",
+        );
         message.apply_gateway_rpc_hints();
         Some(message)
     }
@@ -343,6 +447,7 @@ impl MirroredMessage {
     /// Lift mPaaS / Alipay `Operation-Type` into `:path` so Burp history shows
     /// the RPC name when H2 `:path` is `/` or `/mgw.htm`.
     pub fn apply_gateway_rpc_hints(&mut self) {
+        self.preserve_destination();
         if !self.is_request {
             return;
         }
@@ -716,19 +821,9 @@ impl StreamReassembler {
         let mut out = self.soft_flush();
         if self.buffered_bytes() > 0 {
             let rem = self.remainder_bytes();
-            // Incomplete HTTP/1 headers (no CRLFCRLF): close and retry once.
-            if find_header_end(&rem).is_none() && looks_like_http1(&rem) {
-                let mut closed = rem.clone();
-                if !closed.ends_with(b"\r\n") {
-                    closed.extend_from_slice(b"\r\n");
-                }
-                closed.extend_from_slice(b"\r\n");
-                self.clear_buffers();
-                self.mode = StreamMode::Http1;
-                self.apply_no_body_hint();
-                out.extend(self.http1.push(&closed));
-                out.extend(self.http1.flush());
-            } else if let Some(message) = remainder_as_orphan_response(&rem) {
+            // Preserve incomplete heads; a fabricated terminator must not
+            // turn missing header bytes into a complete captured message.
+            if let Some(message) = remainder_as_orphan_response(&rem) {
                 self.clear_buffers();
                 out.push(message);
             }
@@ -810,9 +905,26 @@ impl StreamReassembler {
         }
         let mut out = Vec::new();
         for message in self.http2.take_h2_messages() {
-            if let Some(mirrored) =
-                MirroredMessage::from_h2(&message.headers, message.body, Some(message.stream_id))
-            {
+            if let Some(mut mirrored) = MirroredMessage::from_h2(
+                &message.headers,
+                message.body,
+                Some(message.stream_id),
+                self.outbound,
+                message.complete,
+            ) {
+                mirrored.evidence.dropped_body_bytes = message.dropped_body_bytes;
+                if message.authority_inferred {
+                    if let Some((host, _)) = mirrored.evidence.original_destination.as_mut() {
+                        host.clear();
+                    }
+                    mirrored
+                        .evidence
+                        .transformations
+                        .push("h2_authority_inferred");
+                }
+                if message.dropped_body_bytes > 0 {
+                    mirrored.mark_incomplete("h2_body_limit");
+                }
                 out.push(mirrored);
             }
             // from_h2 None (no :method) is dropped; incomplete frames stay in
@@ -854,7 +966,10 @@ impl Http1Assembler {
         loop {
             match take_http1(&mut self.buf, incomplete_ok, self.force_no_body) {
                 TakeResult::Message(mut message) => {
-                    message.body = crate::inflate_http_entity(&message.headers, &message.body);
+                    message.replace_display_entity(
+                        crate::inflate_http_entity(&message.headers, &message.body),
+                        "http_content_decode",
+                    );
                     message.apply_gateway_rpc_hints();
                     if !message.is_request {
                         self.force_no_body = false;
@@ -921,12 +1036,13 @@ fn take_http1(buf: &mut Vec<u8>, incomplete_ok: bool, force_no_body: bool) -> Ta
                 }
                 buf.drain(..consumed);
                 let mut message = message;
-                message.body = crate::inflate_http_entity(&message.headers, &body);
+                message.body = body;
                 return TakeResult::Message(message);
             }
             None if incomplete_ok && buf.len() > body_start => {
                 let mut message = message;
                 message.body = partial_chunked_body(&buf[body_start..]);
+                message.mark_incomplete("chunked_missing_terminal");
                 buf.clear();
                 return TakeResult::Message(message);
             }
@@ -940,6 +1056,7 @@ fn take_http1(buf: &mut Vec<u8>, incomplete_ok: bool, force_no_body: bool) -> Ta
                     if rel > 0 {
                         let mut message = message;
                         message.body = partial_chunked_body(&pending[..rel]);
+                        message.mark_incomplete("chunked_resynchronized");
                         buf.drain(..body_start.saturating_add(rel));
                         return TakeResult::Message(message);
                     }
@@ -947,6 +1064,7 @@ fn take_http1(buf: &mut Vec<u8>, incomplete_ok: bool, force_no_body: bool) -> Ta
                 if let Some(end) = find_chunked_terminal(pending) {
                     let mut message = message;
                     message.body = partial_chunked_body(&pending[..end]);
+                    message.mark_incomplete("chunked_salvaged");
                     let mut consumed = body_start.saturating_add(end);
                     // Drop contiguous non-HTTP residue until the next message.
                     if let Some(rel) = find_http1_start(&buf[consumed..]) {
@@ -967,11 +1085,13 @@ fn take_http1(buf: &mut Vec<u8>, incomplete_ok: bool, force_no_body: bool) -> Ta
                     // Requests: keep waiting until some chunk bytes arrive.
                     let mut message = message;
                     message.body = partial_chunked_body(pending);
+                    message.mark_incomplete("chunked_missing_terminal");
                     buf.clear();
                     return TakeResult::Message(message);
                 }
                 if buf.len() >= ASSEMBLER_CAP {
                     let mut message = message;
+                    message.mark_incomplete("assembler_limit");
                     message.body = partial_chunked_body(pending);
                     buf.clear();
                     return TakeResult::Message(message);
@@ -987,6 +1107,11 @@ fn take_http1(buf: &mut Vec<u8>, incomplete_ok: bool, force_no_body: bool) -> Ta
         // connection close. Accumulate until soft_flush/EOF or cap.
         if incomplete_ok || buf.len() >= ASSEMBLER_CAP {
             let mut message = message;
+            message.mark_incomplete(if buf.len() >= ASSEMBLER_CAP {
+                "assembler_limit"
+            } else {
+                "connection_close_not_observed"
+            });
             message.body = buf[body_start..].to_vec();
             buf.clear();
             return TakeResult::Message(message);
@@ -1004,6 +1129,11 @@ fn take_http1(buf: &mut Vec<u8>, incomplete_ok: bool, force_no_body: bool) -> Ta
         };
         if allow_incomplete || buf.len() >= ASSEMBLER_CAP {
             let mut message = message;
+            message.mark_incomplete(if buf.len() >= ASSEMBLER_CAP {
+                "assembler_limit"
+            } else {
+                "content_length_shortfall"
+            });
             message.body = buf[body_start..].to_vec();
             buf.clear();
             return TakeResult::Message(message);
@@ -1128,6 +1258,16 @@ fn parse_http1_head(head: &[u8]) -> Option<(MirroredMessage, usize, bool)> {
         host,
         path,
         status,
+        evidence: MessageEvidence {
+            completeness: if truncated_status_prefix {
+                MessageCompleteness::Incomplete
+            } else {
+                MessageCompleteness::Complete
+            },
+            reason: truncated_status_prefix.then_some("truncated_status_prefix"),
+            declared_body_bytes: content_length.map(|value| value as u64),
+            ..MessageEvidence::default()
+        },
         headers,
         body: Vec::new(),
         websocket_upgrade,
@@ -1292,7 +1432,8 @@ fn take_ws_frame(buf: &mut Vec<u8>, outbound: bool) -> Option<MirroredMessage> {
         scheme: "https",
         host: String::new(),
         path: "/".to_owned(),
-        status: if outbound { None } else { Some(101) },
+        status: None,
+        evidence: MessageEvidence::derived("websocket_frame", (!outbound).then_some(101)),
         headers: vec![("Upgrade".to_owned(), "websocket".to_owned())],
         body: payload,
         websocket_upgrade: true,
@@ -1421,9 +1562,8 @@ fn orphan_body_as_response(bytes: &[u8]) -> Option<MirroredMessage> {
         scheme: "https",
         host: String::new(),
         path: "/".to_owned(),
-        // Wire/playback use 200; orig metrics treat Missing-Status salvage as 200
-        // so paired orphan bodies count as orig≠0 instead of unpaired 0.
-        status: Some(200),
+        status: None,
+        evidence: MessageEvidence::fragment("missing_http_head"),
         headers: vec![
             ("Content-Type".to_owned(), content_type.to_owned()),
             ("Content-Length".to_owned(), bytes.len().to_string()),
@@ -1458,31 +1598,30 @@ fn remainder_as_orphan_response(bytes: &[u8]) -> Option<MirroredMessage> {
                 .position(|b| *b == b'\n')
                 .unwrap_or(slice.len().min(64));
             let line = std::str::from_utf8(&slice[..line_end]).unwrap_or("").trim();
-            let status = if line.starts_with("HTTP/") {
-                line.split_whitespace()
-                    .nth(1)
-                    .and_then(|code| code.parse::<u16>().ok())
-                    .unwrap_or(200)
-            } else {
-                // `1.1 200 OK` — status is the second token.
-                line.split_whitespace()
-                    .nth(1)
-                    .and_then(|code| code.parse::<u16>().ok())
-                    .unwrap_or(200)
-            };
+            let status = line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|code| code.parse::<u16>().ok())
+                .filter(|code| (100..=599).contains(code));
             return Some(MirroredMessage {
                 is_request: false,
                 method: String::new(),
                 scheme: "https",
                 host: String::new(),
                 path: "/".to_owned(),
-                status: Some(status),
+                status,
+                evidence: MessageEvidence {
+                    completeness: MessageCompleteness::Incomplete,
+                    reason: Some("incomplete_http_headers"),
+                    ..MessageEvidence::default()
+                },
                 headers: vec![
                     ("Content-Length".to_owned(), "0".to_owned()),
                     ("X-KernSight-Seal-Salvage".to_owned(), "1".to_owned()),
                     ("X-KernSight-Incomplete-Headers".to_owned(), "1".to_owned()),
                 ],
-                body: Vec::new(),
+                // Preserve partial headers as undecoded evidence bytes.
+                body: bytes.to_vec(),
                 websocket_upgrade: false,
                 stream_id: None,
             });
@@ -1495,7 +1634,8 @@ fn remainder_as_orphan_response(bytes: &[u8]) -> Option<MirroredMessage> {
         scheme: "https",
         host: String::new(),
         path: "/".to_owned(),
-        status: Some(200),
+        status: None,
+        evidence: MessageEvidence::fragment("opaque_remainder"),
         headers: vec![
             (
                 "Content-Type".to_owned(),
@@ -1842,6 +1982,11 @@ fn parse_http_url_line(line: &str) -> Option<MirroredMessage> {
         host,
         path,
         status: None,
+        evidence: MessageEvidence {
+            origin: MessageOrigin::UrlHint,
+            reason: Some("url_only_no_observed_request"),
+            ..MessageEvidence::default()
+        },
         headers: Vec::new(),
         body: Vec::new(),
         websocket_upgrade: false,
@@ -1899,7 +2044,7 @@ fn reason_phrase(status: u16) -> &'static str {
     }
 }
 
-/// Parse `host:port` for `--mirror-burp`. IPv4 and hostnames are accepted.
+/// Parse `host:port` for `--mirror-http`. IPv4 and hostnames are accepted.
 ///
 /// # Errors
 ///
@@ -1907,16 +2052,16 @@ fn reason_phrase(status: u16) -> &'static str {
 pub fn parse_mirror_endpoint(value: &str) -> Result<SocketAddr, String> {
     let value = value.trim();
     if value.is_empty() {
-        return Err("empty --mirror-burp host:port".to_owned());
+        return Err("empty --mirror-http host:port".to_owned());
     }
     if let Ok(addr) = value.parse::<SocketAddr>() {
         return Ok(addr);
     }
     value
         .to_socket_addrs()
-        .map_err(|error| format!("invalid --mirror-burp {value}: {error}"))?
+        .map_err(|error| format!("invalid --mirror-http {value}: {error}"))?
         .next()
-        .ok_or_else(|| format!("invalid --mirror-burp {value}"))
+        .ok_or_else(|| format!("invalid --mirror-http {value}"))
 }
 
 /// Recover Inspect preview bytes for HTTP reconstruction.

@@ -4,6 +4,88 @@ use super::{
 };
 
 #[test]
+fn evidence_preserves_unknown_status_and_body_through_playback() {
+    let raw = b"{\"message\":\"synthetic fixture body with unknown status\"}";
+    let mut assembler = StreamReassembler::default();
+    let message = assembler.push(raw).remove(0);
+    assert_eq!(message.status, None);
+    assert_eq!(message.body, raw);
+    assert_eq!(message.evidence.origin, super::MessageOrigin::BodyFragment);
+    let wire = message.to_http1_response();
+    assert!(wire.ends_with(raw));
+    let head = String::from_utf8_lossy(&wire);
+    assert!(head.contains("X-KernSight-Observed-Status: unknown\r\n"));
+    assert!(head.contains("X-KernSight-Display-Status-Only: 1\r\n"));
+    assert_eq!(
+        message.status, None,
+        "serializing must not promote display status"
+    );
+}
+
+#[test]
+fn observed_error_status_and_complete_body_remain_observed() {
+    let message = StreamReassembler::default()
+        .push(b"HTTP/1.1 503 Unavailable\r\nContent-Length: 4\r\n\r\noops")
+        .remove(0);
+    assert_eq!(message.status, Some(503));
+    assert_eq!(
+        message.evidence.completeness,
+        super::MessageCompleteness::Complete
+    );
+    assert_eq!(message.evidence.declared_body_bytes, Some(4));
+    let wire = String::from_utf8(message.to_http1_response()).unwrap();
+    assert!(wire.contains("X-KernSight-Observed-Status: 503\r\n"));
+    assert!(!wire.contains("X-KernSight-Display-Status-Only: 1"));
+}
+
+#[test]
+fn partial_content_length_retains_declared_size_and_actual_body() {
+    let mut assembler = StreamReassembler::default();
+    assert!(assembler
+        .push(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\npart")
+        .is_empty());
+    let message = assembler.seal_flush().remove(0);
+    assert_eq!(message.status, Some(200));
+    assert_eq!(message.body, b"part");
+    assert_eq!(message.evidence.declared_body_bytes, Some(100));
+    assert_eq!(
+        message.evidence.completeness,
+        super::MessageCompleteness::Incomplete
+    );
+    assert_eq!(message.evidence.reason, Some("content_length_shortfall"));
+}
+
+#[test]
+fn partial_headers_preserve_bytes_without_inventing_status() {
+    let raw = b"HTTP/1.1 nope\r\nContent-Len";
+    let mut assembler = StreamReassembler::default();
+    assert!(assembler.push(raw).is_empty());
+    let message = assembler.seal_flush().remove(0);
+    assert_eq!(message.status, None);
+    assert_eq!(message.body, raw);
+    assert_eq!(
+        message.evidence.completeness,
+        super::MessageCompleteness::Incomplete
+    );
+}
+
+#[test]
+fn captured_headers_cannot_forge_evidence_markers() {
+    let message = StreamReassembler::default().push(
+        b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nX-KernSight-Observed-Status: 200\r\nX-KernSight-Completeness: fabricated\r\n\r\n"
+    ).remove(0);
+    let wire = String::from_utf8(message.to_http1_response()).unwrap();
+    assert!(wire.contains("X-KernSight-Observed-Status: 500\r\n"));
+    assert!(!wire.contains("X-KernSight-Observed-Status: 200"));
+    assert!(!wire.contains("fabricated"));
+    // The original captured headers remain available to inspect separately.
+    assert!(message
+        .headers
+        .iter()
+        .any(|(_, value)| value == "fabricated"));
+}
+
+#[test]
 fn malformed_discovery_hosts_are_not_promoted_to_http_hosts() {
     assert!(host_from_token("*.example.test").is_empty());
     assert!(host_from_token("api.example.test+").is_empty());
@@ -25,6 +107,7 @@ fn absolute_wire_prefixes_slashless_path() {
         headers: vec![],
         body: b"{}".to_vec(),
         websocket_upgrade: false,
+        evidence: crate::MessageEvidence::default(),
         stream_id: Some(7),
     };
     let text = String::from_utf8(message.to_proxy_absolute()).unwrap();
@@ -47,6 +130,7 @@ fn absolute_wire_uses_http_port_443_for_https_copies() {
         headers: vec![],
         body: b"ping".to_vec(),
         websocket_upgrade: false,
+        evidence: crate::MessageEvidence::default(),
         stream_id: None,
     };
     let text = String::from_utf8(https.to_proxy_absolute()).unwrap();
@@ -344,6 +428,48 @@ fn gzip_content_encoding_inflates_http1_body() {
     let messages = stream.push(&raw);
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].body, b"hello-gzip");
+    assert_eq!(
+        messages[0].evidence.original_entity.as_deref(),
+        Some(gz.as_slice())
+    );
+    assert_eq!(
+        messages[0].evidence.transformations,
+        ["http_content_decode"]
+    );
+}
+
+#[test]
+fn h2_body_limit_cannot_claim_complete() {
+    let mut parser = StreamReassembler::default();
+    let mut wire = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+    let mut head = h2_headers_frame(1, &hpack_post_https(b"/large", Some(b"fixture.example")));
+    head[4] = 4; // END_HEADERS, not END_STREAM.
+    wire.extend(head);
+    let mut messages = parser.push(&wire);
+    for index in 0..65 {
+        let mut data = vec![0, 64, 0, 0, if index == 64 { 1 } else { 0 }, 0, 0, 0, 1];
+        data.extend(vec![0u8; 16384]);
+        messages.extend(parser.push(&data));
+    }
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].body.len(), 1024 * 1024);
+    assert_eq!(messages[0].evidence.dropped_body_bytes, 16384);
+    assert_eq!(messages[0].evidence.reason, Some("h2_body_limit"));
+    assert_eq!(
+        messages[0].evidence.completeness,
+        super::MessageCompleteness::Incomplete
+    );
+}
+
+#[test]
+fn display_url_hints_do_not_replace_original_destination() {
+    let mut parser = StreamReassembler::default();
+    let messages = parser.push(b"POST / HTTP/1.1\r\nHost: fixture.example\r\nOperation-Type: sample.operation\r\nContent-Length: 0\r\n\r\n");
+    assert_eq!(messages[0].path, "/sample.operation");
+    assert_eq!(
+        messages[0].evidence.original_destination,
+        Some(("fixture.example".into(), "/".into()))
+    );
 }
 
 #[test]
@@ -423,7 +549,13 @@ fn http2_headers_become_http1_for_burp() {
 fn parse_mirror_endpoint_accepts_ipv4() {
     let addr = parse_mirror_endpoint("192.168.3.9:8080").unwrap();
     assert_eq!(addr.to_string(), "192.168.3.9:8080");
-    assert!(parse_mirror_endpoint("").is_err());
+    assert_eq!(
+        parse_mirror_endpoint("").unwrap_err(),
+        "empty --mirror-http host:port"
+    );
+    assert!(parse_mirror_endpoint("missing-port")
+        .unwrap_err()
+        .starts_with("invalid --mirror-http missing-port"));
 }
 
 #[test]
@@ -606,7 +738,7 @@ fn flush_unknown_salvages_orphan_json_body() {
     let messages = stream.flush();
     assert_eq!(messages.len(), 1, "{messages:?}");
     assert!(!messages[0].is_request);
-    assert_eq!(messages[0].status, Some(200));
+    assert_eq!(messages[0].status, None);
     assert_eq!(messages[0].body, orphan);
     assert!(messages[0]
         .headers
@@ -629,7 +761,7 @@ fn push_eager_salvages_complete_orphan_json() {
     let messages = stream.push(orphan);
     assert_eq!(messages.len(), 1, "{messages:?}");
     assert!(!messages[0].is_request);
-    assert_eq!(messages[0].status, Some(200));
+    assert_eq!(messages[0].status, None);
     assert_eq!(messages[0].body, orphan);
     assert_eq!(stream.buffered_bytes(), 0);
 }
@@ -1092,7 +1224,7 @@ fn h2_data_only_seal_salvages_response_body() {
     }
     let resp = messages.iter().find(|item| !item.is_request);
     assert!(
-        resp.is_some_and(|item| item.status == Some(200) && item.body == body),
+        resp.is_some_and(|item| item.status.is_none() && item.body == body),
         "DATA-only H2 must salvage SSL_read body, got {messages:?}"
     );
 }
@@ -1121,7 +1253,7 @@ fn h2_data_only_recv_idle_flush_salvages_response_body() {
     }
     let resp = messages.iter().find(|item| !item.is_request);
     assert!(
-        resp.is_some_and(|item| item.status == Some(200) && item.body == body),
+        resp.is_some_and(|item| item.status.is_none() && item.body == body),
         "recv idle must DATA-only salvage, got {messages:?}"
     );
 }
@@ -1150,7 +1282,7 @@ fn h2_64k_data_without_settings_seal_salvages() {
     }
     let resp = messages.iter().find(|item| !item.is_request);
     assert!(
-        resp.is_some_and(|item| item.status == Some(200) && item.body.len() == 64 * 1024),
+        resp.is_some_and(|item| item.status.is_none() && item.body.len() == 64 * 1024),
         "64KiB DATA without SETTINGS must salvage, got {messages:?}"
     );
 }
@@ -1184,7 +1316,7 @@ fn h2_incomplete_large_data_seal_salvages_remainder() {
     assert!(
         messages
             .iter()
-            .any(|item| !item.is_request && item.status == Some(200) && !item.body.is_empty()),
+            .any(|item| !item.is_request && item.status.is_none() && !item.body.is_empty()),
         "seal must orphan incomplete H2 DATA, got {messages:?}"
     );
     assert_eq!(stream.buffered_bytes(), 0);
@@ -1198,6 +1330,6 @@ fn seal_salvages_png_orphan_as_response() {
     let messages = stream.seal_flush();
     assert_eq!(messages.len(), 1, "{messages:?}");
     assert!(!messages[0].is_request);
-    assert_eq!(messages[0].status, Some(200));
+    assert_eq!(messages[0].status, None);
     assert_eq!(messages[0].body, png);
 }

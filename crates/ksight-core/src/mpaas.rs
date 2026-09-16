@@ -174,6 +174,7 @@ pub fn parse_mpaas_request(bytes: &[u8]) -> Option<MirroredMessage> {
         host: String::new(),
         path,
         status: None,
+        evidence: crate::MessageEvidence::derived("mpaas_envelope", None),
         headers: vec![
             ("Content-Type".to_owned(), "application/json".to_owned()),
             ("X-MPaas-Envelope".to_owned(), "cltver-gateway".to_owned()),
@@ -205,7 +206,8 @@ pub fn parse_mpaas_response(bytes: &[u8]) -> Option<MirroredMessage> {
         scheme: "https",
         host: String::new(),
         path: String::new(),
-        status: Some(status),
+        status: None,
+        evidence: crate::MessageEvidence::derived("mpaas_envelope", Some(status)),
         headers: Vec::new(),
         body: json,
         websocket_upgrade: false,
@@ -237,7 +239,8 @@ mod tests {
         let frame = b"\x00\x01\x33\x00\x01\x00\x00\x01\x07{\"status\":1,\"errmsg\":\"SUCCESS\",\"requestid\":\"abc\",\"results\":{\"k\":1}}";
         let message = parse_mpaas_response(frame).expect("response decoded");
         assert!(!message.is_request);
-        assert_eq!(message.status, Some(200));
+        assert_eq!(message.status, None);
+        assert_eq!(message.evidence.display_status, Some(200));
         assert!(String::from_utf8(message.body).unwrap().contains("SUCCESS"));
     }
 
@@ -245,7 +248,8 @@ mod tests {
     fn failure_status_maps_to_500() {
         let frame = b"\x00\x01\x33\x00\x01{\"status\":0,\"errmsg\":\"SESSION_EXPIRED\"}";
         let message = parse_mpaas_response(frame).expect("decoded");
-        assert_eq!(message.status, Some(500));
+        assert_eq!(message.status, None);
+        assert_eq!(message.evidence.display_status, Some(500));
     }
 
     #[test]

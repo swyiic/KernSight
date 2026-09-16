@@ -1006,7 +1006,10 @@ fn pending_stale_timeout_is_incomplete_not_success() {
     stacks.age_all(Duration::from_secs(10));
     assert_eq!(stacks.drop_stale(PENDING_STALE), 1);
     assert_eq!(stacks.incomplete, 1);
-    assert!(stacks.pop(key).is_none(), "stale frame must not pop as success");
+    assert!(
+        stacks.pop(key).is_none(),
+        "stale frame must not pop as success"
+    );
     stacks.push(
         key,
         PendingSslRead {

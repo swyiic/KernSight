@@ -46,6 +46,8 @@ pub mod inspect_runtime;
 pub mod integrity;
 /// `JNIEnv` plaintext functions from exported `GetFunctionTable` + `jni.h` slots.
 pub mod jni_env;
+#[cfg(any(test, target_os = "android", target_os = "linux"))]
+mod keylog_identity;
 pub mod keylog_probe;
 /// Sensor loading and attachment lifecycle.
 pub mod loader;

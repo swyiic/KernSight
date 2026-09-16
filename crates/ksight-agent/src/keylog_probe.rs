@@ -17,30 +17,12 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::keylog_identity::{reject_unsafe_entries, KeylogEntry};
 use ksight_hwbp::UprobeSession;
 
 const KEYLOG_TABLE_PATH: &str = "/data/local/tmp/ksight/keylog_offsets.json";
 /// One `ssl_log_secret` argument set.
 const SECRET_MAX_BYTES: usize = 128;
-
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-struct KeylogEntry {
-    /// GNU build-id of the target library. Empty when the ELF ships none
-    /// (vendor forks often strip it); `lib_name` (+ size) is matched instead.
-    #[serde(default)]
-    build_id: String,
-    offset: u64,
-    /// Basename fallback for ELFs without a build-id.
-    #[serde(default)]
-    lib_name: Option<String>,
-    /// File size of the library, disambiguating same-name builds.
-    #[serde(default)]
-    size: Option<u64>,
-    #[serde(default)]
-    client_random_offset: Option<u64>,
-    #[serde(default)]
-    note: String,
-}
 
 /// One attached probe for a matched library build.
 struct KeylogHandle {
@@ -74,17 +56,15 @@ impl KeylogProbe {
                 let Some(library) = mapped_library_matching(pid, &entry) else {
                     continue;
                 };
-                match UprobeSession::start_program(
+                match UprobeSession::start_program_scoped(
                     uprobe_object,
                     "ksight_uprobe_regs",
                     Path::new(&library),
                     entry.offset,
-                    None,
+                    pids,
                     false,
                 ) {
-                    Ok(mut session) => {
-                        let tgids: Vec<u32> = pids.to_vec();
-                        let _ = session.apply_tgid_filter(Some(&tgids));
+                    Ok(session) => {
                         status.push(format!(
                             "keylog probe attached build={} offset={:#x} lib={library}",
                             entry.build_id, entry.offset
@@ -171,6 +151,12 @@ impl KeylogProbe {
                 ));
             }
         }
+        let rejected = reject_unsafe_entries(&mut entries);
+        if rejected > 0 {
+            status.push(format!(
+                "keylog probe: rejected {rejected} entries with missing/invalid build ID or conflicting pins; basename/size fallback is disabled"
+            ));
+        }
         let mut handles = Vec::new();
         let mut matched_builds = Vec::new();
         let mut pending = Vec::new();
@@ -182,24 +168,23 @@ impl KeylogProbe {
                 };
                 eprintln!("keylog scan: matched lib={library}");
                 eprintln!("keylog scan: attaching...");
-                let Ok(mut session) = UprobeSession::start_program(
+                let session = match UprobeSession::start_program_scoped(
                     uprobe_object,
                     "ksight_uprobe_regs",
                     Path::new(&library),
                     entry.offset,
-                    None,
+                    pids,
                     false,
-                ) else {
-                    status.push(format!(
-                        "keylog probe: attach failed build={} offset={:#x} lib={library}",
-                        entry.build_id, entry.offset
-                    ));
-                    continue;
+                ) {
+                    Ok(session) => session,
+                    Err(error) => {
+                        status.push(format!(
+                            "keylog probe: scoped attach rejected build={} offset={:#x} lib={library}: {error:#}",
+                            entry.build_id, entry.offset
+                        ));
+                        continue;
+                    }
                 };
-                let tgids: Vec<u32> = pids.to_vec();
-                if let Err(error) = session.apply_tgid_filter(Some(&tgids)) {
-                    status.push(format!("keylog probe: tgid filter failed: {error:#}"));
-                }
                 status.push(format!(
                     "keylog probe attached build={} offset={:#x} lib={library} random_offset={:?}",
                     entry.build_id, entry.offset, entry.client_random_offset
@@ -304,7 +289,7 @@ fn load_table(path: &Path) -> Result<Vec<KeylogEntry>, String> {
 
 /// Entries from the unified stack-rules table, converted to probe entries.
 #[must_use]
-pub fn rules_table_entries() -> Vec<KeylogEntry> {
+fn rules_table_entries() -> Vec<KeylogEntry> {
     ksight_core::keylog_entries()
         .into_iter()
         .map(|rule| KeylogEntry {
@@ -458,6 +443,7 @@ fn merge_keylog_entries(entries: &mut Vec<KeylogEntry>, extra: Vec<KeylogEntry>)
                 && entry.build_id == candidate.build_id
                 && entry.lib_name == candidate.lib_name
                 && entry.size == candidate.size
+                && entry.client_random_offset == candidate.client_random_offset
         });
         if !exists {
             entries.push(candidate);
@@ -465,9 +451,11 @@ fn merge_keylog_entries(entries: &mut Vec<KeylogEntry>, extra: Vec<KeylogEntry>)
     }
 }
 
-/// First mapped file matching the entry: build-id when given, otherwise the
-/// library basename plus optional file size (vendor ELFs often strip notes).
+/// All supplied constraints must match; name/size alone never authorizes a pin.
 fn mapped_library_matching(pid: u32, entry: &KeylogEntry) -> Option<String> {
+    if !entry.has_identity() {
+        return None;
+    }
     let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).ok()?;
     let mut checked: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for line in maps.lines() {
@@ -487,21 +475,20 @@ fn mapped_library_matching(pid: u32, entry: &KeylogEntry) -> Option<String> {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
-        if let Some(wanted) = entry.lib_name.as_deref() {
-            if basename != wanted {
-                continue;
-            }
-            if let Some(size) = entry.size {
-                match std::fs::metadata(path) {
-                    Ok(meta) if meta.len() == size => {}
-                    _ => continue,
-                }
-            }
-            return Some(path.to_owned());
+        let Ok(meta) = std::fs::metadata(path) else {
+            continue;
+        };
+        if entry
+            .lib_name
+            .as_deref()
+            .is_some_and(|name| name != basename)
+            || entry.size.is_some_and(|size| size != meta.len())
+        {
+            continue;
         }
         let elf = std::panic::catch_unwind(|| crate::elf::inspect_elf(path).ok());
         if let Ok(Some(elf)) = elf {
-            if !entry.build_id.is_empty() && elf.build_id.as_deref() == Some(&entry.build_id) {
+            if entry.matches(&basename, meta.len(), elf.build_id.as_deref()) {
                 return Some(path.to_owned());
             }
         }

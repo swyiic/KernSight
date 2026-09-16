@@ -240,9 +240,8 @@ impl InfosecProbe {
                                 Some((session, None, false))
                             }
                             Err(error) => {
-                                status.push(format!(
-                                    "infosec probe attach failed {name}: {error:#}"
-                                ));
+                                status
+                                    .push(format!("infosec probe attach failed {name}: {error:#}"));
                                 None
                             }
                         }
@@ -274,7 +273,9 @@ impl InfosecProbe {
                         connection_arg,
                         stream_arg: function.as_ref().and_then(|f| f.stream_arg),
                         capture_phase,
-                        return_semantics: function.as_ref().and_then(|f| f.return_semantics.clone()),
+                        return_semantics: function
+                            .as_ref()
+                            .and_then(|f| f.return_semantics.clone()),
                         is_header: function.as_ref().and_then(|f| f.is_header),
                         is_body: function.as_ref().and_then(|f| f.is_body),
                         confidence: function.as_ref().and_then(|f| f.confidence.clone()),
