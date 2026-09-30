@@ -13,6 +13,19 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// A copied `HTTP/1.1 200` on the same connection so a request-only fixture
+/// still has a real status. Empty or `ok` bodies pass the Burp body gate.
+fn observe_http_ok(mirror: &mut BurpMirror, pid: u32, tid: u32, connection: Option<u64>) {
+    mirror.observe_bytes_for_connection(
+        pid,
+        tid,
+        connection,
+        "tls_ssl_read",
+        "recv",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    );
+}
+
 #[test]
 fn missing_playback_id_never_consumes_another_transaction() {
     let queue = Mutex::new(PlaybackStore::default());
@@ -156,18 +169,18 @@ fn playback_receipt_checks_id_body_framing_and_large_responses() {
 fn consuming_repeated_body_chunks_are_kept() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
+    let queue = Arc::new(Mutex::new(PlaybackStore::default()));
+    let server_queue = Arc::clone(&queue);
     let server = thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(3)))
             .unwrap();
         let wire = read_http_message(&mut stream, 8192);
-        stream
-            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-            .unwrap();
+        super::serve_playback_plain(&mut stream, &wire, &server_queue, None).unwrap();
         wire
     });
-    let mut mirror = BurpMirror::start(&addr.to_string()).unwrap();
+    let mut mirror = BurpMirror::start_with_queue(&addr.to_string(), None, queue).unwrap();
     for bytes in [
         b"POST /repeat HTTP/1.1\r\nHost: fixture.example\r\nContent-Length: 8\r\n\r\n".as_slice(),
         b"aaaa",
@@ -177,6 +190,7 @@ fn consuming_repeated_body_chunks_are_kept() {
     }
     assert_eq!(mirror.diagnostic_metrics()["reconstructed_requests"], 1);
     assert_eq!(mirror.diagnostic_metrics()["duplicate_fragments"], 0);
+    observe_http_ok(&mut mirror, 123, 1, Some(0x9000));
     mirror.seal();
     assert!(server.join().unwrap().ends_with(b"aaaaaaaa"));
 }
@@ -477,6 +491,8 @@ fn rejects_wildcard_and_malformed_peer_hosts() {
 fn repeated_endpoint_requests_with_distinct_bodies_are_not_suppressed() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
+    let queue = Arc::new(Mutex::new(PlaybackStore::default()));
+    let server_queue = Arc::clone(&queue);
     let received = thread::spawn(move || {
         let mut wires = Vec::new();
         for _ in 0..2 {
@@ -484,16 +500,13 @@ fn repeated_endpoint_requests_with_distinct_bodies_are_not_suppressed() {
             stream
                 .set_read_timeout(Some(Duration::from_secs(3)))
                 .unwrap();
-            let mut buf = vec![0_u8; 4096];
-            let n = stream.read(&mut buf).unwrap_or(0);
-            wires.push(String::from_utf8_lossy(&buf[..n]).into_owned());
-            let _ = stream.write_all(
-                b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            );
+            let buf = read_http_message(&mut stream, 4096);
+            wires.push(String::from_utf8_lossy(&buf).into_owned());
+            super::serve_playback_plain(&mut stream, &buf, &server_queue, None).unwrap();
         }
         wires
     });
-    let mut mirror = BurpMirror::start(&addr.to_string()).expect("mirror");
+    let mut mirror = BurpMirror::start_with_queue(&addr.to_string(), None, queue).expect("mirror");
     mirror.observe_bytes_for_connection(
         21,
         101,
@@ -510,6 +523,8 @@ fn repeated_endpoint_requests_with_distinct_bodies_are_not_suppressed() {
         "send",
         b"POST /verify HTTP/1.1\r\nHost: api.example.test\r\nContent-Length: 3\r\n\r\ntwo",
     );
+    observe_http_ok(&mut mirror, 21, 101, Some(0x1111));
+    observe_http_ok(&mut mirror, 21, 102, Some(0x1111));
     drop(mirror);
     let wires = received.join().unwrap();
     assert_eq!(wires.len(), 2);
@@ -534,8 +549,29 @@ fn delivery_retries_after_listener_becomes_available() {
         "send",
         b"GET /retry HTTP/1.1\r\nHost: api.example.test\r\n\r\n",
     );
-    // Wait past PAIRING_GRACE (12s) so unpaired request is attempted first.
-    thread::sleep(Duration::from_millis(12_500));
+    // A copied 200 makes the row legal to send. The listener is not bound yet,
+    // so the first attempt fails and the retry queue is what must deliver it.
+    observe_http_ok(&mut mirror, 22, 201, Some(0x2222));
+    let failed_by = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < failed_by
+        && mirror
+            .diagnostic_metrics()
+            .get("delivery_attempt_failed")
+            .copied()
+            .unwrap_or(0)
+            == 0
+    {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        mirror
+            .diagnostic_metrics()
+            .get("delivery_attempt_failed")
+            .copied()
+            .unwrap_or(0)
+            >= 1,
+        "paired delivery must fail before the listener exists"
+    );
 
     let listener = TcpListener::bind(addr).unwrap();
     let received = thread::spawn(move || {
@@ -608,6 +644,8 @@ fn identical_complete_requests_are_not_content_deduplicated() {
     assert_eq!(metrics.get("network_connects"), Some(&1));
     assert_eq!(metrics.get("network_handshakes"), Some(&1));
     assert_eq!(metrics.get("standard_tls_fragments"), Some(&2));
+    observe_http_ok(&mut mirror, 22, 201, Some(0x2222));
+    observe_http_ok(&mut mirror, 22, 201, Some(0x2222));
     drop(mirror);
     assert_eq!(received.join().unwrap(), 2);
 }
@@ -661,6 +699,7 @@ fn progressive_truncated_prefix_is_coalesced_not_dropped() {
         "{metrics:?}"
     );
     assert_eq!(metrics.get("reconstructed_requests"), Some(&1));
+    observe_http_ok(&mut mirror, 9, 1, Some(0x3001));
     drop(mirror);
     let wires = received.join().unwrap();
     assert_eq!(wires.len(), 1, "{wires:?}");
@@ -711,6 +750,9 @@ fn identical_payload_after_stream_progress_is_kept() {
     assert_eq!(metrics.get("reconstructed_requests"), Some(&3));
     // Third fragment matches the first's bytes but stream_pos advanced via
     // the middle fragment, so it must not be eaten by probe debounce.
+    observe_http_ok(&mut mirror, 11, 1, Some(0x4001));
+    observe_http_ok(&mut mirror, 11, 1, Some(0x4001));
+    observe_http_ok(&mut mirror, 11, 1, Some(0x4001));
     drop(mirror);
     assert_eq!(received.join().unwrap(), 3);
 }
@@ -875,18 +917,19 @@ fn forwards_reconstructed_post_to_a_local_listener() {
 fn handshake_prefix_without_header_terminator_still_mirrors_browser_get() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
+    let queue = Arc::new(Mutex::new(PlaybackStore::default()));
+    let server_queue = Arc::clone(&queue);
     let received = thread::spawn(move || {
         listener.set_nonblocking(false).unwrap();
         let (mut stream, _) = listener.accept().unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(3)))
             .unwrap();
-        let mut buf = vec![0_u8; 4096];
-        let n = stream.read(&mut buf).unwrap_or(0);
-        let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
-        String::from_utf8_lossy(&buf[..n]).into_owned()
+        let buf = read_http_message(&mut stream, 4096);
+        super::serve_playback_plain(&mut stream, &buf, &server_queue, None).unwrap();
+        String::from_utf8_lossy(&buf).into_owned()
     });
-    let mut mirror = BurpMirror::start(&addr.to_string()).expect("mirror");
+    let mut mirror = BurpMirror::start_with_queue(&addr.to_string(), None, queue).expect("mirror");
     mirror.observe_bytes(
             9,
             9,
@@ -894,6 +937,7 @@ fn handshake_prefix_without_header_terminator_still_mirrors_browser_get() {
             "send",
             b"GET / HTTP/1.1\r\nHost: 221.6.56.123:7080\r\nUser-Agent: Mozilla/5.0\r\nAccept: text/html\r\nConnection: keep-alive",
         );
+    observe_http_ok(&mut mirror, 9, 9, None);
     drop(mirror);
     let body = received.join().unwrap();
     assert!(body.contains("Host: 221.6.56.123:7080"), "{body}");
@@ -910,6 +954,8 @@ fn handshake_prefix_without_header_terminator_still_mirrors_browser_get() {
 fn sni_stays_on_its_own_ssl_connection() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
+    let queue = Arc::new(Mutex::new(PlaybackStore::default()));
+    let server_queue = Arc::clone(&queue);
     let received = thread::spawn(move || {
         listener.set_nonblocking(false).unwrap();
         let mut bodies = Vec::new();
@@ -920,14 +966,13 @@ fn sni_stays_on_its_own_ssl_connection() {
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
-            let mut buf = vec![0_u8; 8192];
-            let n = stream.read(&mut buf).unwrap_or(0);
-            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
-            bodies.push(String::from_utf8_lossy(&buf[..n]).into_owned());
+            let buf = read_http_message(&mut stream, 8192);
+            let _ = super::serve_playback_plain(&mut stream, &buf, &server_queue, None);
+            bodies.push(String::from_utf8_lossy(&buf).into_owned());
         }
         bodies.join("\n---\n")
     });
-    let mut mirror = BurpMirror::start(&addr.to_string()).expect("mirror");
+    let mut mirror = BurpMirror::start_with_queue(&addr.to_string(), None, queue).expect("mirror");
     mirror.observe_peer_on_thread(7, 10, "cdn.example.com".into());
     mirror.observe_bytes_for_connection(
         7,
@@ -946,6 +991,8 @@ fn sni_stays_on_its_own_ssl_connection() {
         "send",
         b"POST /v1/session HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}",
     );
+    observe_http_ok(&mut mirror, 7, 10, Some(0x2000));
+    observe_http_ok(&mut mirror, 7, 11, Some(0x3000));
     drop(mirror);
     let body = received.join().unwrap();
     assert!(
@@ -974,18 +1021,19 @@ fn sni_stays_on_its_own_ssl_connection() {
 fn tid_stream_migrates_onto_ssl_object() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
+    let queue = Arc::new(Mutex::new(PlaybackStore::default()));
+    let server_queue = Arc::clone(&queue);
     let received = thread::spawn(move || {
         listener.set_nonblocking(false).unwrap();
         let (mut stream, _) = listener.accept().unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(3)))
             .unwrap();
-        let mut buf = vec![0_u8; 8192];
-        let n = stream.read(&mut buf).unwrap_or(0);
-        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
-        String::from_utf8_lossy(&buf[..n]).into_owned()
+        let buf = read_http_message(&mut stream, 8192);
+        super::serve_playback_plain(&mut stream, &buf, &server_queue, None).unwrap();
+        String::from_utf8_lossy(&buf).into_owned()
     });
-    let mut mirror = BurpMirror::start(&addr.to_string()).expect("mirror");
+    let mut mirror = BurpMirror::start_with_queue(&addr.to_string(), None, queue).expect("mirror");
     mirror.observe_peer_on_thread(5, 3, "api.app.example".into());
     mirror.observe_bytes(
         5,
@@ -1002,6 +1050,7 @@ fn tid_stream_migrates_onto_ssl_object() {
         "send",
         b"POST /v1/session HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}",
     );
+    observe_http_ok(&mut mirror, 5, 3, Some(0x9000));
     drop(mirror);
     let body = received.join().unwrap();
     assert!(
@@ -1295,6 +1344,7 @@ fn all_zero_entity_is_preserved() {
     }
     assert_eq!(mirror.diagnostic_metrics()["reconstructed_requests"], 1);
     assert_eq!(mirror.diagnostic_metrics()["rejected_fragments"], 0);
+    observe_http_ok(&mut mirror, 1, 1, Some(0x9000));
     mirror.seal();
     assert_eq!(mirror.delivery_count(), 1);
     assert!(server.join().unwrap().ends_with(&[0u8; 660]));
@@ -1312,6 +1362,59 @@ fn body_text_and_duplicate_headers_cannot_supply_a_playback_id() {
         "x-kernsight-playback-id"
     )
     .is_none());
+}
+
+#[test]
+fn vendor_sm4_block_does_not_desync_tls_http_stream() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    let queue = Arc::new(Mutex::new(PlaybackStore::default()));
+    let server_queue = Arc::clone(&queue);
+    let server = thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let request = read_http_message(&mut socket, 8192);
+        super::serve_playback_plain(&mut socket, &request, &server_queue, None).unwrap();
+        request
+    });
+    let mut mirror = BurpMirror::start_with_queue(&endpoint.to_string(), None, queue).unwrap();
+    let http = b"POST /v1 HTTP/1.1\r\nHost: api.example.test\r\nContent-Length: 4\r\n\r\nABCD";
+    // Same tid, no connection id: previously sticky-spliced into SSL_write.
+    mirror.observe_bytes_for_connection(
+        7,
+        9,
+        None,
+        "vendor_boundary:sm4_cbc_padding_encrypt",
+        "send",
+        br#"{"mobile":"13800138000"}"#,
+    );
+    mirror.observe_bytes_for_connection(7, 9, Some(0xAA01), "tls_ssl_write", "send", http);
+    assert_eq!(mirror.diagnostic_metrics()["reconstructed_requests"], 1);
+    observe_http_ok(&mut mirror, 7, 9, Some(0xAA01));
+    mirror.seal();
+    let wire = server.join().unwrap();
+    let text = String::from_utf8_lossy(&wire);
+    assert!(text.contains("/v1"), "{text}");
+    assert!(
+        text.contains("13800138000"),
+        "SM4 JSON stamps the existing HTTP row: {text}"
+    );
+    assert!(text.contains("X-KernSight-App-Plaintext: 1"), "{text}");
+    assert!(
+        text.contains("X-KernSight-Body-Source: pre_encrypt"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("ABCD"),
+        "ciphertext body is replaced, not concatenated: {text}"
+    );
+    assert_eq!(
+        text.matches("POST ").count(),
+        1,
+        "SM4 must not emit a second HTTP request: {text}"
+    );
 }
 
 #[test]
@@ -1503,24 +1606,15 @@ fn seal_soft_flush_salvages_incomplete_ssl_read_before_unpaired() {
     );
 }
 
-/// Incomplete SSL_read headers (no CRLFCRLF) buffered at seal — bare flush
-/// used to leave them stranded and Stop unpaired with orig=0.
+/// Incomplete SSL_read headers (no CRLFCRLF) are still reconstructed at seal.
+/// The salvage body is the header block itself (`HTTP/...`), so Burp must not
+/// receive it.
 #[test]
 fn seal_salvages_incomplete_response_headers_before_unpaired() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    let queue = Arc::new(Mutex::new(PlaybackStore::default()));
-    let server_queue = Arc::clone(&queue);
-    let received = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(8)))
-            .unwrap();
-        let request = read_http_message(&mut stream, 8192);
-        super::serve_playback_plain(&mut stream, &request, &server_queue, None).unwrap();
-        String::from_utf8_lossy(&request).into_owned()
-    });
-    let mut mirror = BurpMirror::start_with_queue(&addr.to_string(), None, queue).expect("mirror");
+    drop(listener);
+    let mut mirror = BurpMirror::start(&addr.to_string()).expect("mirror");
     mirror.observe_bytes_for_connection(
         90,
         1,
@@ -1549,29 +1643,25 @@ fn seal_salvages_incomplete_response_headers_before_unpaired() {
         after.get("reconstructed_responses").copied().unwrap_or(0) >= 1,
         "incomplete headers must seal-salvage: {after:?}"
     );
-    assert!(mirror.delivery_count() >= 1);
-    let wire = received.join().expect("burp wire");
-    assert!(wire.contains("/notice"), "{wire}");
+    assert_eq!(
+        mirror.delivery_count(),
+        0,
+        "header block stuffed into the body is not a Burp row"
+    );
+    assert_eq!(
+        after.get("delivery_attempt_failed").copied().unwrap_or(0),
+        0
+    );
 }
 
-/// Orphan SSL_read body (missed status-line) still buffered at seal — must
-/// emit response-side reconstruct before unpaired Stop.
+/// Orphan SSL_read body (missed status-line) is reconstructed, but it has no
+/// copied status, so it must not become a Burp 204 row.
 #[test]
 fn seal_orphan_recv_salvages_before_unpaired() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    let queue = Arc::new(Mutex::new(PlaybackStore::default()));
-    let server_queue = Arc::clone(&queue);
-    let received = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(8)))
-            .unwrap();
-        let request = read_http_message(&mut stream, 8192);
-        super::serve_playback_plain(&mut stream, &request, &server_queue, None).unwrap();
-        String::from_utf8_lossy(&request).into_owned()
-    });
-    let mut mirror = BurpMirror::start_with_queue(&addr.to_string(), None, queue).expect("mirror");
+    drop(listener);
+    let mut mirror = BurpMirror::start(&addr.to_string()).expect("mirror");
     mirror.observe_bytes_for_connection(
         89,
         1,
@@ -1580,20 +1670,25 @@ fn seal_orphan_recv_salvages_before_unpaired() {
         "send",
         b"POST /v1/layout HTTP/1.1\r\nHost: openapi.app.example\r\nContent-Length: 2\r\n\r\n{}",
     );
-    // Status-line missed; JSON body alone (BOC uretprobe gap).
+    // Status-line missed; JSON body alone.
     let orphan = br#"{"indexName":"SSE","upDownRate":"0.20%","indexCode":"000001"}"#;
     mirror.observe_bytes_for_connection(89, 2, Some(0xB0C2), "tls_ssl_read", "recv", orphan);
     let mid = mirror.diagnostic_metrics();
-    // Complete-looking orphan may eager-emit; either way seal must not unpaired-only.
     mirror.seal();
     let after = mirror.diagnostic_metrics();
     assert!(
         after.get("reconstructed_responses").copied().unwrap_or(0) >= 1,
         "seal/orphan salvage must reconstruct a response: {after:?} (mid={mid:?})"
     );
-    assert!(mirror.delivery_count() >= 1);
-    let wire = received.join().expect("burp wire");
-    assert!(wire.contains("/v1/layout"), "{wire}");
+    assert_eq!(
+        mirror.delivery_count(),
+        0,
+        "status-less orphan body is not a Burp row"
+    );
+    assert_eq!(
+        after.get("delivery_attempt_failed").copied().unwrap_or(0),
+        0
+    );
 }
 
 #[test]
@@ -1622,6 +1717,7 @@ fn seal_before_final_counts_session_end_delivery() {
         b"POST /seal-count HTTP/1.1\r\nHost: api.example\r\nContent-Length: 4\r\n\r\nping",
     );
     assert_eq!(mirror.delivery_count(), 0, "still inside pairing grace");
+    observe_http_ok(&mut mirror, 77, 1, Some(0x6101));
     mirror.seal();
     assert!(
         mirror.delivery_count() >= 1,
@@ -1730,4 +1826,190 @@ fn peek_promoted_then_matching_read_does_not_double() {
         "matching read after promote must not re-inject"
     );
     assert!(mirror.promoted_peeks.is_empty());
+}
+
+fn gate_request(body: &[u8]) -> ksight_core::MirroredMessage {
+    ksight_core::MirroredMessage {
+        is_request: true,
+        method: "POST".into(),
+        scheme: "https",
+        host: "api.example.test".into(),
+        path: "/v1".into(),
+        status: None,
+        headers: vec![("Content-Type".into(), "application/json".into())],
+        body: body.to_vec(),
+        websocket_upgrade: false,
+        evidence: ksight_core::MessageEvidence::default(),
+        stream_id: None,
+    }
+}
+
+fn gate_response(status: Option<u16>, body: &[u8]) -> ksight_core::MirroredMessage {
+    ksight_core::MirroredMessage {
+        is_request: false,
+        method: String::new(),
+        scheme: "https",
+        host: String::new(),
+        path: "/".into(),
+        status,
+        headers: Vec::new(),
+        body: body.to_vec(),
+        websocket_upgrade: false,
+        evidence: ksight_core::MessageEvidence::default(),
+        stream_id: None,
+    }
+}
+
+#[test]
+fn reject_burp_delivery_requires_status_and_clean_bytes() {
+    let request = gate_request(b"{}");
+    let ok = gate_response(Some(200), b"{}");
+    assert_eq!(super::reject_burp_delivery(&request, Some(&ok)), None);
+    assert_eq!(
+        super::reject_burp_delivery(&request, None),
+        Some("no_observed_status")
+    );
+    assert_eq!(
+        super::reject_burp_delivery(&request, Some(&gate_response(None, b"{}"))),
+        Some("no_observed_status")
+    );
+    // gRPC display status is a copied protocol status, not a manufactured 204.
+    let mut grpc = gate_response(None, b"{}");
+    grpc.evidence.display_status = Some(200);
+    assert_eq!(super::reject_burp_delivery(&request, Some(&grpc)), None);
+    // A real HTTP/1.1 204 that was parsed is still a status.
+    assert_eq!(
+        super::reject_burp_delivery(&gate_request(b""), Some(&gate_response(Some(204), b""))),
+        None
+    );
+
+    let mut newline = ok.clone();
+    newline.headers.push(("X-Note".into(), "line\nmore".into()));
+    assert_eq!(
+        super::reject_burp_delivery(&request, Some(&newline)),
+        Some("header_contains_newline")
+    );
+    let mut cr = request.clone();
+    cr.headers.push(("X-Note".into(), "line\rmore".into()));
+    assert_eq!(
+        super::reject_burp_delivery(&cr, Some(&ok)),
+        Some("header_contains_newline")
+    );
+
+    for body in [
+        b"GET /x HTTP/1.1\r\n".as_slice(),
+        b"POST /x HTTP/1.1\r\n".as_slice(),
+        b"HTTP/1.1 200 OK\r\n".as_slice(),
+    ] {
+        assert_eq!(
+            super::reject_burp_delivery(&gate_request(body), Some(&ok)),
+            Some("body_looks_like_another_http_message"),
+            "{body:?}"
+        );
+        assert_eq!(
+            super::reject_burp_delivery(&request, Some(&gate_response(Some(200), body))),
+            Some("body_looks_like_another_http_message"),
+            "{body:?}"
+        );
+    }
+    assert_eq!(
+        super::reject_burp_delivery(&request, Some(&gate_response(Some(200), b"\x1f\x8b\x08"))),
+        Some("body_still_gzip")
+    );
+    assert_eq!(
+        super::reject_burp_delivery(&gate_request(b"\x1f\x8b"), Some(&ok)),
+        Some("body_still_gzip")
+    );
+    assert_eq!(
+        super::reject_burp_delivery(&request, Some(&gate_response(Some(200), b"xx\x1f\x8b"))),
+        None
+    );
+}
+
+#[test]
+fn reject_burp_history_skips_unpaired_and_desynced_bodies() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let queue = Arc::new(Mutex::new(PlaybackStore::default()));
+    let server_queue = Arc::clone(&queue);
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_bg = Arc::clone(&stop);
+    let received = thread::spawn(move || {
+        listener.set_nonblocking(true).unwrap();
+        let mut wires = Vec::new();
+        while !stop_bg.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let buf = read_http_message(&mut stream, 8192);
+                    let _ = super::serve_playback_plain(&mut stream, &buf, &server_queue, None);
+                    wires.push(String::from_utf8_lossy(&buf).into_owned());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("accept failed: {error}"),
+            }
+        }
+        wires
+    });
+    let mut mirror = BurpMirror::start_with_queue(&addr.to_string(), None, queue).unwrap();
+    let post = |path: &str| {
+        format!("POST {path} HTTP/1.1\r\nHost: api.example.test\r\nContent-Length: 2\r\n\r\n{{}}")
+            .into_bytes()
+    };
+    mirror.observe_bytes_for_connection(
+        31,
+        1,
+        Some(0x1101),
+        "tls_ssl_write",
+        "send",
+        &post("/unpaired"),
+    );
+    let cases: &[(&str, u64, &[u8])] = &[
+        ("/nested-post", 0x1102, b"POST /inner HTTP/1.1\r\n"),
+        ("/nested-get", 0x1103, b"GET /inner HTTP/1.1\r\n"),
+        ("/nested-http", 0x1104, b"HTTP/1.1 200 OK\r\n"),
+        ("/still-gzip", 0x1105, b"\x1f\x8b\x08\x00"),
+    ];
+    for (path, connection, body) in cases {
+        mirror.observe_bytes_for_connection(
+            31,
+            1,
+            Some(*connection),
+            "tls_ssl_write",
+            "send",
+            &post(path),
+        );
+        let mut response =
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
+        response.extend_from_slice(body);
+        mirror.observe_bytes_for_connection(
+            31,
+            1,
+            Some(*connection),
+            "tls_ssl_read",
+            "recv",
+            &response,
+        );
+    }
+    mirror.observe_bytes_for_connection(
+        31,
+        1,
+        Some(0x1106),
+        "tls_ssl_write",
+        "send",
+        &post("/clean"),
+    );
+    observe_http_ok(&mut mirror, 31, 1, Some(0x1106));
+    mirror.seal();
+    thread::sleep(Duration::from_millis(200));
+    stop.store(true, Ordering::SeqCst);
+    let wires = received.join().unwrap();
+    assert_eq!(wires.len(), 1, "{wires:?}");
+    assert!(wires[0].contains("/clean"), "{wires:?}");
+    assert_eq!(mirror.delivery_count(), 1);
 }

@@ -20,6 +20,31 @@ fn evidence_preserves_unknown_status_and_body_through_playback() {
         message.status, None,
         "serializing must not promote display status"
     );
+    assert!(
+        head.contains("HTTP/1.1 204 "),
+        "missing status must not invent 200: {head}"
+    );
+}
+
+#[test]
+fn empty_statusless_playback_is_204_not_invented_200() {
+    let message = MirroredMessage {
+        is_request: false,
+        method: String::new(),
+        scheme: "https",
+        host: String::new(),
+        path: "/".into(),
+        status: None,
+        headers: Vec::new(),
+        body: Vec::new(),
+        websocket_upgrade: false,
+        evidence: crate::MessageEvidence::default(),
+        stream_id: None,
+    };
+    assert!(message.is_statusless_placeholder());
+    let wire = String::from_utf8(message.to_http1_response()).unwrap();
+    assert!(wire.starts_with("HTTP/1.1 204 "), "{wire}");
+    assert!(wire.contains("X-KernSight-Observed-Status: unknown"));
 }
 
 #[test]
@@ -83,6 +108,17 @@ fn captured_headers_cannot_forge_evidence_markers() {
         .headers
         .iter()
         .any(|(_, value)| value == "fabricated"));
+}
+
+#[test]
+fn stream_reassembler_promotes_http3_static_get() {
+    let mut stream = StreamReassembler::default();
+    stream.set_outbound(true);
+    let messages = stream.push(&[0x01, 0x04, 0x00, 0x00, 0xd1, 0xc1]);
+    assert_eq!(stream.protocol(), "http3");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].method, "GET");
+    assert_eq!(messages[0].path, "/");
 }
 
 #[test]
@@ -731,8 +767,8 @@ fn flush_does_not_emit_post_headers_before_body() {
 #[test]
 fn flush_unknown_salvages_orphan_json_body() {
     let mut stream = StreamReassembler::default();
-    // Mid-body SSL_read like BOC; unbalanced trailing `}` must not eager-emit.
-    let orphan = r#"ndexName":"上证指数","upDownRate":"0.20%","indexCode":"000001"}"#.as_bytes();
+    // Mid-body SSL_read; unbalanced trailing `}` must not eager-emit.
+    let orphan = r#"name":"fixture","rate":"0.20%","code":"FX"}"#.as_bytes();
     assert!(stream.push(orphan).is_empty());
     assert_eq!(stream.protocol(), "unknown");
     let messages = stream.flush();
@@ -751,7 +787,10 @@ fn flush_unknown_salvages_orphan_json_body() {
     assert_eq!(stream.buffered_bytes(), 0);
     let wire_bytes = messages[0].to_http1_response();
     let wire = String::from_utf8_lossy(&wire_bytes);
-    assert!(wire.starts_with("HTTP/1.1 200 "), "{wire}");
+    assert!(
+        wire.starts_with("HTTP/1.1 204 "),
+        "orphan body without status must not invent 200: {wire}"
+    );
 }
 
 #[test]

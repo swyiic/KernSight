@@ -618,19 +618,19 @@ fn per_adapter_budget_when_max_hits_unspecified() {
     .expect("hex");
     assert!(!keep_jni_elements(&noise_hex));
     assert!(keep_jni_plaintext(
-        br#"{"url":"https://cdn.example/cd/acrossBar_v1.8.zip"}"#
+        br#"{"url":"https://cdn.example/cd/widget_v1.zip"}"#
     ));
-    assert!(keep_jni_plaintext(
-        b"https://api.example/eq/open/api/homepage_v2/v3/homepage_data"
-    ));
-    assert!(!keep_jni_plaintext(
-        b"dth\",\"height\",\"render\"];a(3110),a(8335);var o=a(8817)"
-    ));
+    assert!(keep_jni_plaintext(b"https://api.example/v1/home"));
+    assert!(!keep_jni_plaintext(b"var fixture=1;];a(1);"));
     assert!(!keep_jni_plaintext(
         b"ComponentInfo{com.example.app/com.example.app.push.InitService}"
     ));
+    // Phone / mobile field buffers must be kept for critical-field classify.
+    assert!(keep_jni_plaintext(b"13800138000"));
+    assert!(keep_jni_plaintext(b"+86 138-0013-8000"));
+    assert!(keep_jni_plaintext(br#"{"mobile":"13800138000"}"#));
     assert!(!keep_jni_plaintext(
-        b"/data/app/~~42Ti3pHV53fUYgIpxOEbtA==/com.example.app/base.apk"
+        b"/data/app/~~AAAAAAAAAAAAAAAAAAAAAA==/com.example.app/base.apk"
     ));
     let mut lens = HashMap::new();
     lens.insert(

@@ -1879,6 +1879,96 @@ fn evaluate_plaintext_probe_plans(
     plans
 }
 
+fn note_exported_stream_api(elf: &crate::elf::ElfIdentity) {
+    let file = elf.path.rsplit('/').next().unwrap_or(elf.path.as_str());
+    if !(file.contains("quic") || file.contains("cronet") || file.contains("tnet")) {
+        return;
+    }
+    let mut names = Vec::new();
+    names.extend_from_slice(ksight_core::QUIC_STREAM_SEND_EXPORTS);
+    names.extend_from_slice(ksight_core::QUIC_STREAM_RECV_EXPORTS);
+    let found = matching_symbols_exact(elf, &names);
+    if found.is_empty() {
+        eprintln!(
+            "quic STREAM coverage gap lib={} (no quic_stream_write/xqc_stream_send dynsym; not inventing RVA)",
+            elf.path
+        );
+        return;
+    }
+    for (name, offset) in found {
+        eprintln!(
+            "quic STREAM export lib={} symbol={name} offset={offset:#x} (name attach, no size pin)",
+            elf.path
+        );
+    }
+}
+
+fn quic_stream_export_plans(
+    policy: &InspectPolicy,
+    adapter: InspectAdapterKind,
+    uprobe_object: &Path,
+    elf_path: &str,
+    elf: &crate::elf::ElfIdentity,
+) -> Vec<InspectPlan> {
+    let names: &[&str] = match adapter {
+        InspectAdapterKind::TlsSslWrite => ksight_core::QUIC_STREAM_SEND_EXPORTS,
+        InspectAdapterKind::TlsSslRead => ksight_core::QUIC_STREAM_RECV_EXPORTS,
+        _ => return Vec::new(),
+    };
+    let mut plans = Vec::new();
+    for (name, offset) in matching_symbols_exact(elf, names).into_iter().take(8) {
+        let abi = ksight_core::TlsAbiKind::from_exported_symbol(name);
+        if !abi.is_auto_attachable() {
+            continue;
+        }
+        let mut observation = InspectObservation {
+            adapter: adapter.as_str().to_owned(),
+            library: elf_path.to_owned(),
+            build_id: elf.build_id.clone(),
+            offset: Some(offset),
+            detectability_notice: policy.detectability_notice.clone(),
+            ..InspectObservation::default()
+        };
+        observation.detail = format!(
+            "ready to attach {} uprobe symbol={name} offset={offset:#x} (quic STREAM export)",
+            adapter.as_str()
+        );
+        plans.push(InspectPlan {
+            policy: policy.clone(),
+            adapter,
+            uprobe_object: uprobe_object.to_path_buf(),
+            elf_path: Some(elf_path.to_owned()),
+            offset: Some(offset),
+            build_id: elf.build_id.clone(),
+            symbol: Some(name.to_owned()),
+            abi: Some(abi),
+            layout_hint: ProbeLayoutHint::default(),
+            pointer_width: (elf.bits / 8).max(4),
+            observation,
+        });
+    }
+    plans
+}
+
+fn note_exported_keylog_api(elf: &crate::elf::ElfIdentity) {
+    let file = elf.path.rsplit('/').next().unwrap_or(elf.path.as_str());
+    let interesting = file.contains("quic") || file.contains("flutter") || file.contains("tnet");
+    if !interesting {
+        return;
+    }
+    const NAMES: [&str; 3] = [
+        "SSL_CTX_set_keylog_callback",
+        "quic_conn_set_keylog",
+        "quic_conn_set_keylog_fd",
+    ];
+    for (name, offset) in matching_symbols_exact(elf, &NAMES) {
+        eprintln!(
+            "keylog API exported lib={} symbol={name} offset={offset:#x} (not wrapped; secrets from haystack or pinned keylog)",
+            elf.path
+        );
+    }
+}
+
 fn evaluate_tls_symbol_exports(
     policy: &InspectPolicy,
     adapter: InspectAdapterKind,
@@ -1886,14 +1976,20 @@ fn evaluate_tls_symbol_exports(
     elf_path: &str,
 ) -> Option<Vec<InspectPlan>> {
     let size = std::fs::metadata(elf_path).ok().map(|meta| meta.len());
-    if !ksight_core::ssl_write_attach_allowed(elf_path, size, None) {
-        // Size/build-id gap pins (stripped libssl, Flutter generic, XQUIC)
-        // must not fall through to evaluate_one / invented offsets.
-        return Some(Vec::new());
-    }
     let elf = inspect_elf(elf_path).ok()?;
-    if !ksight_core::ssl_write_attach_allowed(elf_path, size, elf.build_id.as_deref()) {
-        return Some(Vec::new());
+    note_exported_keylog_api(&elf);
+    note_exported_stream_api(&elf);
+    let ssl_allowed = ksight_core::ssl_write_attach_allowed(elf_path, size, None)
+        && ksight_core::ssl_write_attach_allowed(elf_path, size, elf.build_id.as_deref());
+    if !ssl_allowed {
+        // Stripped libssl / Flutter / XQUIC: no invented SSL_write RVA.
+        // STREAM C exports still attach by DEFINED dynsym name only.
+        let stream_plans = quic_stream_export_plans(policy, adapter, uprobe_object, elf_path, &elf);
+        return if stream_plans.is_empty() {
+            Some(Vec::new())
+        } else {
+            Some(stream_plans)
+        };
     }
     if let Some(required) = policy.build_id.as_deref() {
         match elf.build_id.as_deref() {
@@ -2755,22 +2851,47 @@ fn refresh_tgid_filter(runtime: &mut InspectRuntime) {
     let Some(policy) = runtime.plans.first().map(|plan| &plan.policy) else {
         return;
     };
-    let Some(mut next) = active_tgid_filter(policy) else {
-        return;
+    let package_scoped = !policy.whole_device
+        && policy
+            .package
+            .as_deref()
+            .is_some_and(|name| !name.is_empty());
+    let mut next = match active_tgid_filter(policy) {
+        Some(pids) => pids,
+        None if package_scoped => Vec::new(), // deny-all until package PIDs reappear
+        None => return,
     };
-    // Keep TGIDs already in this capture; short-lived children vanish from
-    // /proc between scans (CCB 11468 dropped while SSL_read still buffered).
+    // Keep only prior TGIDs that are still alive in /proc. Permanently retaining
+    // dead PIDs after app restart bloated tgid_allow and caused apply_tgid_filter
+    // to detach every uprobe session (decoded=0 until capture restart).
     for pid in &runtime.scoped_tgids {
-        if !next.contains(pid) {
+        if next.contains(pid) {
+            continue;
+        }
+        if std::path::Path::new(&format!("/proc/{pid}")).exists() {
             next.push(*pid);
         }
     }
     next.sort_unstable();
     next.dedup();
+    // Cap allowlist: BPF map overflow + failed apply detaches the whole session.
+    const TGID_ALLOW_CAP: usize = 32;
+    if next.len() > TGID_ALLOW_CAP {
+        // Prefer newest (highest) PIDs — typically the live app processes.
+        next.sort_unstable_by(|a, b| b.cmp(a));
+        next.truncate(TGID_ALLOW_CAP);
+        next.sort_unstable();
+    }
     if next == runtime.scoped_tgids {
         return;
     }
+    let prev = runtime.scoped_tgids.clone();
     runtime.scoped_tgids.clone_from(&next);
+    eprintln!(
+        "inspect tgid filter refresh prev={} next={}",
+        join_tgids(&prev),
+        join_tgids(&next)
+    );
     for probe in &mut runtime.sessions {
         if let Err(error) = probe.session.apply_tgid_filter(Some(&next)) {
             eprintln!(
@@ -3009,13 +3130,25 @@ fn attach_all(runtime: &mut InspectRuntime) -> Vec<InspectObservation> {
         .filter(|plan| plan.should_attach() && adapter_is_live(&selected, plan.adapter))
         .cloned()
         .collect::<Vec<_>>();
-    let tgids = runtime
-        .plans
-        .first()
-        .and_then(|plan| active_tgid_filter(&plan.policy));
+    let policy = runtime.plans.first().map(|plan| &plan.policy);
+    let package_scoped = policy.is_some_and(|policy| {
+        !policy.whole_device
+            && policy
+                .package
+                .as_deref()
+                .is_some_and(|name| !name.is_empty())
+    });
+    let tgids = policy.and_then(active_tgid_filter);
     if let Some(tgids) = tgids.as_ref() {
         runtime.scoped_tgids.clone_from(tgids);
     }
+    // Package capture must never attach with filter disabled (None = all apps).
+    // Empty allowlist denies until refresh_tgid_filter learns live PIDs.
+    let tgids_attach: Option<Vec<u32>> = if package_scoped {
+        Some(tgids.unwrap_or_default())
+    } else {
+        tgids
+    };
     for plan in plans {
         // Kernel uprobe `pid` is a thread id. Attach globally and drop other TGIDs
         // in BPF before perf_output so busy Binder apps are not drowned.
@@ -3041,7 +3174,11 @@ fn attach_all(runtime: &mut InspectRuntime) -> Vec<InspectObservation> {
             "unscoped".to_owned()
         };
         let tgid_note = if runtime.scoped_tgids.is_empty() {
-            " tgid_filter=pending".to_owned()
+            if package_scoped {
+                " tgid_filter=pending-deny".to_owned()
+            } else {
+                " tgid_filter=pending".to_owned()
+            }
         } else {
             format!(" tgid_filter={}", join_tgids(&runtime.scoped_tgids))
         };
@@ -3089,10 +3226,10 @@ fn attach_all(runtime: &mut InspectRuntime) -> Vec<InspectObservation> {
                 offset,
                 hit_once,
                 plan.pointer_width,
-                tgids.as_deref(),
+                tgids_attach.as_deref(),
             ) {
                 Ok(mut session) => {
-                    let filter_status = if let Some(tgids) = tgids.as_deref() {
+                    let filter_status = if let Some(tgids) = tgids_attach.as_deref() {
                         match session.apply_tgid_filter(Some(tgids)) {
                             Ok(()) => String::new(),
                             Err(error) => format!(" tgid_filter_error={error:#}"),
@@ -3167,10 +3304,10 @@ fn attach_all(runtime: &mut InspectRuntime) -> Vec<InspectObservation> {
                 offset,
                 hit_once,
                 plan.pointer_width,
-                tgids.as_deref(),
+                tgids_attach.as_deref(),
             ) {
                 Ok(mut session) => {
-                    let filter_status = if let Some(tgids) = tgids.as_deref() {
+                    let filter_status = if let Some(tgids) = tgids_attach.as_deref() {
                         match session.apply_tgid_filter(Some(tgids)) {
                             Ok(()) => String::new(),
                             Err(error) => format!(" tgid_filter_error={error:#}"),
@@ -3423,6 +3560,11 @@ fn decode_hit(
             let key = probe_call_key(plan, pid, hit.tid);
             let direction = layout.direction.fragment_label(layout.consumes);
             if retprobe {
+                let signed = hit.regs[0] as i32;
+                if signed <= 0 {
+                    let _ = tls_pending.pop(key);
+                    return None;
+                }
                 let return_snapshot: &[u8] = if hit.snapshot_at_return {
                     let n = usize::try_from(hit.aux_bytes)
                         .unwrap_or(0)
@@ -3432,7 +3574,6 @@ fn decode_hit(
                     &[]
                 };
                 let snap_usable = return_snapshot.iter().any(|b| *b != 0);
-                let signed = hit.regs[0] as i32;
                 if let Some(pending) = tls_pending.pop(key) {
                     let captured = match ssl_read_captured(&pending, hit) {
                         Some(n) => n,
@@ -4688,6 +4829,10 @@ fn bytes_contains(haystack: &[u8], needle: &[u8]) -> bool {
     allow(dead_code)
 )]
 fn keep_jni_plaintext(bytes: &[u8]) -> bool {
+    // Critical-field chase: phone numbers are short and must not be dropped before classify.
+    if crate::crypto_watch::looks_like_phone_field(bytes) {
+        return true;
+    }
     if bytes.len() < 8 {
         return false;
     }
@@ -4721,6 +4866,14 @@ fn keep_jni_plaintext(bytes: &[u8]) -> bool {
         || bytes_contains(bytes, b"function(")
     {
         return false;
+    }
+    // Tiny JSON field wrappers naming phone-ish keys (pre-encrypt).
+    if bytes.len() <= 48
+        && (bytes_contains(bytes, b"mobile")
+            || bytes_contains(bytes, b"phone")
+            || bytes_contains(bytes, b"\"tel\""))
+    {
+        return true;
     }
     bytes_contains(bytes, b"\"url\"")
         || bytes_contains(bytes, b"\"host\"")

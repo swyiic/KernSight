@@ -684,7 +684,7 @@ fn stitches_ssl_read_text_and_extracts_split_urls() {
             captured_bytes: 64,
             truncated: true,
             sha256: "aa".to_owned(),
-            preview: r#"{"type":"hummer","url":"https://cdn.example/cd/acrossBar.zip""#.to_owned(),
+            preview: r#"{"type":"bundle","url":"https://cdn.example/cd/widget.zip""#.to_owned(),
             preview_encoding: "utf8_lossy".to_owned(),
             content_class: "text".to_owned(),
             ..Default::default()
@@ -714,7 +714,7 @@ fn stitches_ssl_read_text_and_extracts_split_urls() {
     assert!(preview.contains("cdn.example"));
     assert!(preview.contains("static.example"));
     assert!(report.http_calls.iter().any(|call| {
-        call.host.as_deref() == Some("cdn.example") && call.path.contains("acrossBar.zip")
+        call.host.as_deref() == Some("cdn.example") && call.path.contains("widget.zip")
     }));
     assert!(report
         .http_calls
@@ -738,7 +738,7 @@ fn utf8_inspect_preview_does_not_panic_on_content_class() {
             captured_bytes: 32,
             truncated: false,
             sha256: "cc".to_owned(),
-            preview: "证指数".to_owned(),
+            preview: "甲乙丙".to_owned(),
             preview_encoding: "utf8_lossy".to_owned(),
             content_class: String::new(),
 
@@ -746,14 +746,14 @@ fn utf8_inspect_preview_does_not_panic_on_content_class() {
         }),
     });
     let report = builder.finish();
-    assert_eq!(report.plaintext[0].preview.as_deref(), Some("证指数"));
+    assert_eq!(report.plaintext[0].preview.as_deref(), Some("甲乙丙"));
 }
 
 #[test]
 fn keeps_url_json_over_longer_jni_javascript() {
     let session = Uuid::new_v4();
     let mut builder = SessionReportBuilder::default();
-    let urls = r#"{"type":"hummer","url":"https://cdn.example/cd/acrossBar_v1.8.zip"}"#;
+    let urls = r#"{"type":"bundle","url":"https://cdn.example/cd/widget_v1.zip"}"#;
     builder.record(&Event {
         header: header(session, 30, SensorKind::Integrity),
         payload: EventPayload::InspectPlaintext(ksight_model::InspectPlaintext {
@@ -773,7 +773,7 @@ fn keeps_url_json_over_longer_jni_javascript() {
             ..Default::default()
         }),
     });
-    let long_js = "dth\",\"height\",\"render\"];".repeat(80);
+    let long_js = "var fixture=1;".repeat(80);
     builder.record(&Event {
         header: header(session, 30, SensorKind::Integrity),
         payload: EventPayload::InspectPlaintext(ksight_model::InspectPlaintext {
@@ -796,7 +796,7 @@ fn keeps_url_json_over_longer_jni_javascript() {
     let report = builder.finish();
     let preview = report.plaintext[0].preview.as_deref().unwrap_or("");
     assert!(
-        preview.contains("cdn.example/cd/acrossBar_v1.8.zip"),
+        preview.contains("cdn.example/cd/widget_v1.zip"),
         "longer JS must not replace URL JSON: {preview}"
     );
     assert!(report.plaintext[0]
@@ -828,7 +828,7 @@ fn tls_hex_does_not_hide_later_zip_urls() {
             ..Default::default()
         }),
     });
-    let json = r#"{"url":"https://cdn.example/cd/mobileweb-eq-homepage-v2-front-container/acrossBar_v1.8.zip"}"#;
+    let json = r#"{"url":"https://cdn.example/cd/pkg/widget_v1.zip"}"#;
     builder.record(&Event {
         header: header(session, 31, SensorKind::Integrity),
         payload: EventPayload::InspectPlaintext(ksight_model::InspectPlaintext {
@@ -851,7 +851,7 @@ fn tls_hex_does_not_hide_later_zip_urls() {
     let report = builder.finish();
     let preview = report.plaintext[0].preview.as_deref().unwrap_or("");
     assert!(
-        preview.contains("acrossBar_v1.8.zip"),
+        preview.contains("widget_v1.zip"),
         "HTTP/2 hex must not hide zip URL JSON: {preview}"
     );
     assert!(!preview.starts_with("00000000"), "{preview}");
@@ -1304,8 +1304,8 @@ fn parses_http_calls_from_inspect_plaintext_and_redacts_tokens() {
     let session = Uuid::new_v4();
     let mut builder = SessionReportBuilder::default();
     let preview = concat!(
-        "POST /v6/feed/createFeed HTTP/1.1\r\n",
-        "Host: api.coolapk.com\r\n",
+        "POST /v1/feed HTTP/1.1\r\n",
+        "Host: api.example.com\r\n",
         "Cookie: session=secret\r\n",
         "X-App-Token: abc\r\n",
         "Content-Type: application/x-www-form-urlencoded\r\n",
@@ -1343,7 +1343,7 @@ fn parses_http_calls_from_inspect_plaintext_and_redacts_tokens() {
             captured_bytes: 80,
             truncated: false,
             sha256: "tracker1".to_owned(),
-            preview: "GET /v6/main/indexV8?page=1 HTTP/1.1\r\nHost: log-api.pangle.io\r\n\r\n"
+            preview: "GET /v1/index?page=1 HTTP/1.1\r\nHost: log-api.pangle.io\r\n\r\n"
                 .to_owned(),
             preview_encoding: "utf8_lossy".to_owned(),
             content_class: "text".to_owned(),
@@ -1356,10 +1356,10 @@ fn parses_http_calls_from_inspect_plaintext_and_redacts_tokens() {
     let create = report
         .http_calls
         .iter()
-        .find(|row| row.path == "/v6/feed/createFeed")
-        .expect("createFeed");
+        .find(|row| row.path == "/v1/feed")
+        .expect("feed");
     assert_eq!(create.method, "POST");
-    assert_eq!(create.host.as_deref(), Some("api.coolapk.com"));
+    assert_eq!(create.host.as_deref(), Some("api.example.com"));
     assert_eq!(create.count, 1);
     assert!(!create.third_party);
     assert!(create
@@ -1389,7 +1389,7 @@ fn parses_http_calls_from_inspect_plaintext_and_redacts_tokens() {
         report
             .http_calls
             .iter()
-            .find(|row| row.path == "/v6/feed/createFeed")
+            .find(|row| row.path == "/v1/feed")
             .map(|row| row.origin.as_str()),
         Some("inspect")
     );
@@ -1481,8 +1481,8 @@ fn correlates_http_path_to_dex_string_and_method() {
         direction: "send".to_owned(),
         kind: "http1_request".to_owned(),
         method: "POST".to_owned(),
-        host: Some("api.coolapk.com".to_owned()),
-        path: "/v6/feed/createFeed".to_owned(),
+        host: Some("api.example.com".to_owned()),
+        path: "/v1/feed".to_owned(),
         status: None,
         query_keys: Vec::new(),
         header_names: Vec::new(),
@@ -1495,8 +1495,8 @@ fn correlates_http_path_to_dex_string_and_method() {
         origin: "inspect".to_owned(),
     }];
     let semantic = crate::DexSemanticSummary {
-        api_strings: vec!["https://api.coolapk.com/v6/feed/createFeed".to_owned()],
-        method_names: vec!["Lcom/coolapk/Market;->createFeed".to_owned()],
+        api_strings: vec!["https://api.example.com/v1/feed".to_owned()],
+        method_names: vec!["Lcom/example/Market;->postFeed".to_owned()],
         ..crate::DexSemanticSummary::default()
     };
     let set = crate::DexArtifactSet {
@@ -1509,7 +1509,7 @@ fn correlates_http_path_to_dex_string_and_method() {
     };
     let refs = correlate_http_calls_to_dex(&calls, &[set]);
     assert_eq!(refs.len(), 1);
-    assert!(refs[0].matches.iter().any(|row| row.contains("createFeed")));
+    assert!(refs[0].matches.iter().any(|row| row.contains("/v1/feed")));
     assert_eq!(refs[0].relative_path.as_deref(), Some("readable-dex/x.dex"));
 }
 

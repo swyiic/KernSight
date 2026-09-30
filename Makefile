@@ -62,6 +62,8 @@ device-target:
 NATIVE_CC ?= $(firstword $(wildcard /opt/homebrew/opt/llvm/bin/clang) $(shell command -v clang))
 NATIVE_LLD ?= $(RUST_LLD)
 
+# native/keylog_xref.c is offline diagnostics only — not linked into ksightd
+# and never used as a default attach source.
 build/native/libksight_tls.so: native/tls_hook.c
 	@mkdir -p $(dir $@)
 	$(NATIVE_CC) -target aarch64-linux-android21 -c -fPIC -nostdlib -ffreestanding -fno-builtin -fno-stack-protector -fomit-frame-pointer -fno-asynchronous-unwind-tables -fvisibility=hidden -Os $< -o build/native/tls_hook.o

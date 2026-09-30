@@ -36,9 +36,9 @@ pub(super) fn take_orphan_response(
     request: &MirroredMessage,
 ) -> Option<MirroredMessage> {
     let slot = orphans.get_mut(&(pid, connection))?;
-    let index = slot
-        .iter()
-        .position(|(response, _)| compatible(request, response))?;
+    let index = slot.iter().position(|(response, _)| {
+        response.is_pairable_response() && compatible(request, response)
+    })?;
     let (mut response, _) = slot.remove(index)?;
     response.evidence.pairing = basis(&response);
     if slot.is_empty() {
@@ -54,6 +54,9 @@ pub(super) fn take_pending_for_response(
     response: &MirroredMessage,
 ) -> Option<MirroredMessage> {
     let slot = pending.get_mut(&(pid, connection))?;
+    if !response.is_pairable_response() {
+        return None;
+    }
     let index = slot
         .iter()
         .position(|(request, paired, _)| paired.is_none() && compatible(request, response))?;
@@ -100,6 +103,48 @@ mod tests {
             matched.evidence.pairing,
             PairingBasis::ConnectionAndH2Stream
         );
+    }
+
+    #[test]
+    fn empty_statusless_response_does_not_consume_pending_request() {
+        let mut pending = PendingRequests::new();
+        pending
+            .entry((7, 0x1000))
+            .or_default()
+            .push_back((request(None), None, Instant::now()));
+        let placeholder = {
+            let mut message = response(None);
+            message.status = None;
+            message.body.clear();
+            message.evidence.display_status = None;
+            message
+        };
+        assert!(placeholder.is_statusless_placeholder());
+        assert!(take_pending_for_response(&mut pending, 7, 0x1000, &placeholder).is_none());
+        assert_eq!(pending[&(7, 0x1000)].len(), 1);
+        let matched = take_pending_for_response(&mut pending, 7, 0x1000, &response(None)).unwrap();
+        assert_eq!(matched.path, "/test");
+    }
+
+    #[test]
+    fn body_without_status_does_not_consume_pending_request() {
+        let mut pending = PendingRequests::new();
+        pending
+            .entry((7, 0x1000))
+            .or_default()
+            .push_back((request(None), None, Instant::now()));
+        let salvage = {
+            let mut message = response(None);
+            message.status = None;
+            message.evidence.display_status = None;
+            message.body = br#"{"ok":true,"fixture":"no-status"}"#.to_vec();
+            message
+        };
+        assert!(!salvage.is_pairable_response());
+        assert!(take_pending_for_response(&mut pending, 7, 0x1000, &salvage).is_none());
+        assert_eq!(pending[&(7, 0x1000)].len(), 1);
+        let matched = take_pending_for_response(&mut pending, 7, 0x1000, &response(None)).unwrap();
+        assert_eq!(matched.path, "/test");
     }
 
     #[test]

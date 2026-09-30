@@ -130,12 +130,36 @@ const NEEDLES: &[Needle] = &[
         family: "cipher",
     },
     Needle {
+        bytes: b"SM4/ECB",
+        family: "cipher",
+    },
+    Needle {
+        bytes: b"SM4/CBC",
+        family: "cipher",
+    },
+    Needle {
         bytes: b"SM4_decrypt",
         family: "cipher",
     },
     Needle {
         bytes: b"encryptSM4",
         family: "cipher",
+    },
+    Needle {
+        bytes: b"getSM4SecretKey",
+        family: "cipher",
+    },
+    Needle {
+        bytes: b"getSM4IV",
+        family: "cipher",
+    },
+    Needle {
+        bytes: b"NativeManager",
+        family: "cipher",
+    },
+    Needle {
+        bytes: b"bocsafe",
+        family: "platform_api",
     },
     Needle {
         bytes: b"EncryptionAesUtils",
@@ -195,6 +219,29 @@ const NEEDLES: &[Needle] = &[
         bytes: b"readSSLDataNative",
         family: "platform_api",
     },
+    // BOC GmSSL JNI crypto SDK (libgmssl.so build_id a89971d3… size=783320).
+    // String presence only — correlates --inspect-jni / boundary dump with
+    // pre-encrypt buffers; no invented register offsets.
+    Needle {
+        bytes: b"org.gmssl.GmSSL",
+        family: "platform_api",
+    },
+    Needle {
+        bytes: b"Java_org_gmssl_GmSSL_symmetricEncrypt",
+        family: "platform_api",
+    },
+    Needle {
+        bytes: b"symmetricEncrypt",
+        family: "platform_api",
+    },
+    Needle {
+        bytes: b"sm4_cbc_encrypt",
+        family: "cipher",
+    },
+    Needle {
+        bytes: b"sm4_encrypt",
+        family: "cipher",
+    },
     // JNI registration corridor (string presence): helps correlate --inspect-jni
     // RegisterNatives previews into versioned rules before encrypt seals headers.
     Needle {
@@ -222,21 +269,16 @@ const NEEDLES: &[Needle] = &[
     },
     // Java Cipher.init sits on the pre-encrypt path.
     Needle {
+        bytes: b"JavascriptInterface",
+        family: "webview_js",
+    },
+    Needle {
+        bytes: b"evaluateJavascript",
+        family: "webview_js",
+    },
+    Needle {
         bytes: b"Cipher.init",
         family: "platform_api",
-    },
-    // App-specific markers retained from prior captures
-    Needle {
-        bytes: b"getScanItWhiteList",
-        family: "app_marker",
-    },
-    Needle {
-        bytes: b"sysLogin",
-        family: "app_marker",
-    },
-    Needle {
-        bytes: b"BHtQRepXEBWle7CJ",
-        family: "app_marker",
     },
 ];
 
@@ -406,7 +448,147 @@ pub fn classify_plaintext_bytes(bytes: &[u8]) -> Option<(&'static str, &'static 
             ));
         }
     }
+    // Phone-number field in a short buffer (pre-encrypt, not full HTTP).
+    // Covers CN mobile/landline and common international forms — not only 11-digit CN mobile.
+    if looks_like_phone_field(bytes) {
+        return Some(("critical_field", "phone"));
+    }
     None
+}
+
+/// True when `bytes` is (or tightly wraps) a phone number field value.
+///
+/// Accepts more than mainland 11-digit mobiles: landlines, `+CC…`, and numbers with
+/// common separators. Kept tight to short field buffers to avoid HTTP-body false positives.
+pub(crate) fn looks_like_phone_field(bytes: &[u8]) -> bool {
+    let text = std::str::from_utf8(bytes).unwrap_or("");
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.len() > 48 {
+        return false;
+    }
+    // Bare / quoted sole value.
+    if is_phone_number_token(trimmed) {
+        return true;
+    }
+    if trimmed.len() >= 3
+        && trimmed.starts_with('"')
+        && trimmed.ends_with('"')
+        && is_phone_number_token(&trimmed[1..trimmed.len() - 1])
+    {
+        return true;
+    }
+    // Tiny JSON naming a phone-ish key: {"mobile":"…"} / {"phone":"…"} / {"tel":"…"}.
+    if trimmed.starts_with('{') && trimmed.ends_with('}') && phone_field_key_present(trimmed) {
+        if let Some(token) = json_string_value_near_phone_key(trimmed) {
+            return is_phone_number_token(token);
+        }
+        // Fallback: single digit-run in a tiny phone-keyed object.
+        let digits: String = trimmed.chars().filter(|c| c.is_ascii_digit()).collect();
+        return is_phone_digit_run(&digits);
+    }
+    false
+}
+
+fn phone_field_key_present(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "mobile",
+        "phone",
+        "tel",
+        "cellphone",
+        "telephone",
+        "msisdn",
+        "phonenumber",
+        "phone_number",
+        "mobilephone",
+        "手机",
+        "电话",
+    ]
+    .iter()
+    .any(|k| lower.contains(k) || text.contains(k))
+}
+
+/// Best-effort extract of a JSON string value next to a phone-ish key in a tiny object.
+fn json_string_value_near_phone_key(text: &str) -> Option<&str> {
+    let lower = text.to_ascii_lowercase();
+    for key in [
+        "mobile",
+        "phone",
+        "tel",
+        "cellphone",
+        "telephone",
+        "msisdn",
+        "phonenumber",
+        "phone_number",
+        "mobilephone",
+    ] {
+        if let Some(pos) = lower.find(key) {
+            let after = &text[pos + key.len()..];
+            if let Some(colon) = after.find(':') {
+                let v = after[colon + 1..].trim_start();
+                if let Some(rest) = v.strip_prefix('"') {
+                    if let Some(end) = rest.find('"') {
+                        return Some(&rest[..end]);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// A single phone token: optional `+`, digits, and common separators only.
+fn is_phone_number_token(token: &str) -> bool {
+    let t = token.trim();
+    if t.is_empty() || t.len() > 24 {
+        return false;
+    }
+    // Must look like a phone glyph set: digits, spaces, dashes, dots, parens, leading +.
+    let mut chars = t.chars().peekable();
+    if chars.peek() == Some(&'+') {
+        chars.next();
+    }
+    let mut digit_count = 0usize;
+    let mut saw_separator = false;
+    for c in chars {
+        if c.is_ascii_digit() {
+            digit_count += 1;
+        } else if matches!(c, ' ' | '-' | '.' | '(' | ')') {
+            saw_separator = true;
+        } else {
+            return false;
+        }
+    }
+    if !is_phone_digit_run_len(digit_count) {
+        return false;
+    }
+    // Pure digit run, or separator-formatted with enough digits.
+    // Bare short runs (7–9) are too ambiguous (IDs / truncated JNI); require phone-keyed JSON for those.
+    if !saw_separator {
+        let digits = t.trim_start_matches('+');
+        if !(10..=15).contains(&digits.len()) {
+            return false;
+        }
+        // Mainland-shaped 11-digit mobiles start with 1; other 10–15 still ok (intl without '+').
+        if digits.len() == 11 && !digits.starts_with('1') {
+            return false;
+        }
+        return is_phone_digit_run(digits);
+    }
+    true
+}
+
+/// Digit-only (no `+`) phone run: 7–15 digits (E.164 national/international span).
+fn is_phone_digit_run(digits: &str) -> bool {
+    if !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    is_phone_digit_run_len(digits.len())
+}
+
+fn is_phone_digit_run_len(len: usize) -> bool {
+    // ITU E.164 max 15; local shorts rarely <7. Reject 13-digit unix-ms-shaped alone? still allow 7–15.
+    (7..=15).contains(&len)
 }
 
 /// Path hint stamped on InspectObservation / logs for Burp correlation only.
@@ -484,6 +666,12 @@ pub fn ingest_inspect_plaintext(
     };
     // Tag source in the JSONL by extending the manual line (schema stays v1).
     append_ingest_event_jsonl(&paths.events, &finding, source, adapter);
+    if family == "critical_field" {
+        eprintln!(
+            "critical-field kind={needle} pkg={package} adapter={adapter} preview={}",
+            redacted.chars().take(48).collect::<String>()
+        );
+    }
     let mut family_hits = BTreeMap::new();
     family_hits.insert(family, 1usize);
     merge_versioned_rules_ex(&paths.rules, package, &family_hits, source, needle, &digest);
@@ -883,7 +1071,6 @@ fn redact_long_tokens(input: &str) -> String {
                     | "MessageDigest"
                     | "SecretKeySpec"
                     | "EncryptionAesUtils"
-                    | "getScanItWhiteList"
                     | "SM4_decrypt"
                     | "encryptSM4"
                     | "Cipher.getInstance"
@@ -1034,7 +1221,6 @@ mod tests {
             "platform_api",
             "key_label",
             "cipher",
-            "app_marker",
             "jni_registration",
         ] {
             assert!(families.contains(required), "missing family {required}");
@@ -1107,6 +1293,53 @@ mod tests {
         let hit = classify_plaintext_preview("call OpenPlatformEncrypt(buf) before TLS");
         assert_eq!(hit, Some(("platform_api", "OpenPlatformEncrypt")));
         assert!(classify_plaintext_preview("hello world").is_none());
+    }
+
+    #[test]
+    fn classify_phone_field() {
+        // CN mobile (still covered).
+        assert_eq!(
+            classify_plaintext_preview("13800138000"),
+            Some(("critical_field", "phone"))
+        );
+        assert!(
+            !looks_like_phone_field(b"\t123456789"),
+            "truncated 9-digit JNI false positive must not classify as phone"
+        );
+        assert!(
+            !looks_like_phone_field(b"123456789"),
+            "bare 9-digit run is too ambiguous"
+        );
+        // Separators / international.
+        assert_eq!(
+            classify_plaintext_preview("+86 138-0013-8000"),
+            Some(("critical_field", "phone"))
+        );
+        assert_eq!(
+            classify_plaintext_preview("010-12345678"),
+            Some(("critical_field", "phone"))
+        );
+        assert_eq!(
+            classify_plaintext_preview("+12025550123"),
+            Some(("critical_field", "phone"))
+        );
+        // JSON wrappers with phone-ish keys.
+        assert_eq!(
+            classify_plaintext_preview(r#"{"mobile":"13800138000"}"#),
+            Some(("critical_field", "phone"))
+        );
+        assert_eq!(
+            classify_plaintext_preview(r#"{"phone":"+44 20 7946 0958"}"#),
+            Some(("critical_field", "phone"))
+        );
+        // Long buffers are not treated as a field (avoid false positives in HTTP bodies).
+        assert!(classify_plaintext_preview(
+            "hello 13800138000 world and more text that is long enough"
+        )
+        .is_none());
+        // Too short / not a phone.
+        assert!(classify_plaintext_preview("12345").is_none());
+        assert!(classify_plaintext_preview("not-a-phone").is_none());
     }
 
     #[test]

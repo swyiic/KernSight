@@ -903,21 +903,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_coolapk_create_feed() {
+    fn parses_form_post_and_redacts_token_fields() {
         let preview = concat!(
-            "POST /v6/feed/createFeed HTTP/1.1\r\n",
-            "Host: api.coolapk.com\r\n",
+            "POST /v1/feed HTTP/1.1\r\n",
+            "Host: api.example.com\r\n",
             "Cookie: session=secret\r\n",
             "X-App-Token: abc\r\n",
             "Content-Type: application/x-www-form-urlencoded\r\n",
             "\r\n",
-            "message=hello&status=1&_v2_post_token=xyz&disallow_reply=0"
+            "message=hello&status=1&_v2_post_token=xyz&reply=0"
         );
         let parsed = parse_http_plain(preview, "text").expect("http");
         assert_eq!(parsed.kind, "http1_request");
         assert_eq!(parsed.method, "POST");
-        assert_eq!(parsed.host.as_deref(), Some("api.coolapk.com"));
-        assert_eq!(parsed.path, "/v6/feed/createFeed");
+        assert_eq!(parsed.host.as_deref(), Some("api.example.com"));
+        assert_eq!(parsed.path, "/v1/feed");
         assert!(parsed
             .redacted_headers
             .iter()
@@ -937,13 +937,13 @@ mod tests {
     #[test]
     fn parses_get_query_and_flags_tracker_host() {
         let preview = concat!(
-            "GET /v6/main/indexV8?page=1&installTime=1 HTTP/1.1\r\n",
+            "GET /v1/index?page=1&installTime=1 HTTP/1.1\r\n",
             "Host: log-api.pangle.io\r\n",
             "\r\n"
         );
         let parsed = parse_http_plain(preview, "text").expect("http");
         assert_eq!(parsed.method, "GET");
-        assert_eq!(parsed.path, "/v6/main/indexV8");
+        assert_eq!(parsed.path, "/v1/index");
         assert_eq!(parsed.query_keys, vec!["page", "installTime"]);
         assert!(parsed.third_party);
     }
@@ -1036,7 +1036,7 @@ mod tests {
             "https://www.app.example/english/insurance/pdf/terms.pdf"
         ));
         assert!(!is_kept_inspect_url("https://khms0.google.com/*"));
-        assert!(sanitize_host("app.kylinbridge").is_none());
+        assert!(sanitize_host("app.toolongtlds").is_none());
     }
 
     #[test]
@@ -1050,13 +1050,13 @@ mod tests {
     #[test]
     fn extracts_urls_from_truncated_json() {
         let preview = concat!(
-            r#"9fa5b256894d4a31","esType":-1,"url":"https://cdn.example/cd/acrossBar_v1.8.zip","status":1}"#,
+            r#"aaaaaaaaaaaaaaaa","kind":1,"url":"https://cdn.example/cd/widget_v1.zip","status":1}"#,
             r#",{"url":"https://static.example/pkg/e5db.zip"}"#
         );
         let parsed = parse_http_plain_all(preview, "mixed");
         assert!(
             parsed.iter().any(|row| {
-                row.host.as_deref() == Some("cdn.example") && row.path == "/cd/acrossBar_v1.8.zip"
+                row.host.as_deref() == Some("cdn.example") && row.path == "/cd/widget_v1.zip"
             }),
             "{parsed:?}"
         );

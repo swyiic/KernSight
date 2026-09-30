@@ -1112,7 +1112,7 @@ fn decode_string(buf: &[u8], offset: usize) -> Option<(String, usize)> {
     Some((text, used.saturating_add(len)))
 }
 
-fn decode_huffman(src: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn decode_huffman(src: &[u8]) -> Option<Vec<u8>> {
     if src.is_empty() {
         return Some(Vec::new());
     }

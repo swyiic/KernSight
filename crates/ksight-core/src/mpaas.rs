@@ -6,8 +6,7 @@
 //! gzip-deflated (`000133..` header then `1f 8b` or bare `{`). The frames are
 //! not HTTP, so the HTTP reassembler drops them; this module lifts the JSON
 //! envelope into `MirroredMessage`s so the Burp feed shows one structured
-//! request/response per RPC call with tokenId, phone numbers and business
-//! bodies visible, exactly like a MITM capture.
+//! request/response per RPC call.
 
 use crate::http_mirror::MirroredMessage;
 
@@ -219,7 +218,7 @@ pub fn parse_mpaas_response(bytes: &[u8]) -> Option<MirroredMessage> {
 mod tests {
     use super::*;
 
-    const REQUEST_FRAME: &[u8] = b"\x20\x2f\x0e\x62\xc2\xa1\x23\x11\x9d\x77\x31{\"cltver\":\"10.7.1.0\",\"tokenId\":\"N_02B3C41765985EB8\",\"appName\":\"AYLCAPP\",\"body\":{\"position\":\"personal_center\"},\"version\":\"2.0\",\"sid\":\"130150002\",\"requestId\":\"ff0aa9b1d1255ebf\"}\x9a\x17";
+    const REQUEST_FRAME: &[u8] = b"\x20\x01{\"cltver\":\"1.0.0\",\"tokenId\":\"fixture-token\",\"appName\":\"fixture\",\"body\":{\"position\":\"home\"},\"version\":\"2.0\",\"sid\":\"1\",\"requestId\":\"fixture01\"}";
 
     #[test]
     fn request_envelope_becomes_structured_post() {
@@ -228,10 +227,10 @@ mod tests {
         assert_eq!(message.method, "POST");
         assert!(message
             .path
-            .starts_with("/mpaas/AYLCAPP?requestId=ff0aa9b1"));
+            .starts_with("/mpaas/fixture?requestId=fixture01"));
         let body = String::from_utf8(message.body.clone()).expect("json");
-        assert!(body.contains("N_02B3C41765985EB8"));
-        assert!(body.contains("personal_center"));
+        assert!(body.contains("fixture-token"));
+        assert!(body.contains("home"));
     }
 
     #[test]

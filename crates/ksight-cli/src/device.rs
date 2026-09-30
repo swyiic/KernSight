@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeSet,
     io::{Read as _, Write as _},
+    net::SocketAddr,
     path::Path,
     process::{Child, ChildStdin, ChildStdout, Command as ProcessCommand, ExitStatus, Stdio},
     time::{Duration, Instant},
@@ -883,6 +884,77 @@ fn adb_forward_tcp(serial: Option<&str>, port: u16) -> Result<()> {
         .status()
         .context("adb forward")?;
     ensure_success(status)
+}
+
+/// Phone `tcp:PORT` → computer `tcp:PORT` so ksightd can reach Burp on localhost.
+pub(crate) fn adb_reverse_tcp(serial: Option<&str>, port: u16) -> Result<()> {
+    let spec = format!("tcp:{port}");
+    let mut adb = adb_command(serial)?;
+    let status = adb
+        .args(["reverse", &spec, &spec])
+        .status()
+        .context("adb reverse")?;
+    ensure_success(status)
+}
+
+/// When the phone cannot open `configured` on the LAN, ksightd must use
+/// `127.0.0.1:port` so `adb reverse` carries the connection to host Burp.
+#[must_use]
+pub(crate) fn mirror_http_for_device(configured: &str, phone_reached_lan: bool) -> String {
+    let Ok(addr) = ksight_core::parse_mirror_endpoint(configured) else {
+        return configured.to_owned();
+    };
+    let port = addr.port();
+    if addr.ip().is_loopback() || !phone_reached_lan {
+        format!("127.0.0.1:{port}")
+    } else {
+        configured.to_owned()
+    }
+}
+
+fn device_can_connect_tcp(serial: Option<&str>, addr: SocketAddr) -> bool {
+    let std::net::IpAddr::V4(ip) = addr.ip() else {
+        return false;
+    };
+    let host = ip.to_string();
+    if host.split('.').any(|octet| octet.parse::<u8>().is_err()) {
+        return false;
+    }
+    let port = addr.port();
+    let remote = format!("toybox nc -w 1 {host} {port} </dev/null >/dev/null 2>/dev/null; echo $?");
+    let mut adb = match adb_command(serial) {
+        Ok(command) => command,
+        Err(_) => return false,
+    };
+    let Ok(output) = adb.args(["shell", &remote]).output() else {
+        return false;
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next_back()
+        .is_some_and(|line| line.trim() == "0")
+}
+
+/// Install `adb reverse` and, if the phone cannot reach the LAN Burp address,
+/// rewrite the agent endpoint to `127.0.0.1:port`.
+pub(crate) fn ensure_mirror_http_on_device(
+    serial: Option<&str>,
+    configured: &str,
+) -> Result<String> {
+    let addr = ksight_core::parse_mirror_endpoint(configured)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let port = addr.port();
+    adb_reverse_tcp(serial, port).context("adb reverse for Burp HTTP proxy")?;
+    let reached = addr.ip().is_loopback() || device_can_connect_tcp(serial, addr);
+    let device_endpoint = mirror_http_for_device(configured, reached);
+    if reached && !addr.ip().is_loopback() {
+        eprintln!("phone reached Burp at {configured}; adb reverse tcp:{port} kept as fallback");
+    } else {
+        eprintln!(
+            "phone uses 127.0.0.1:{port} via adb reverse tcp:{port} (LAN {configured} unreachable or loopback)"
+        );
+    }
+    Ok(device_endpoint)
 }
 
 fn adb_command(serial: Option<&str>) -> Result<ProcessCommand> {

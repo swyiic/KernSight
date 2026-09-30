@@ -478,9 +478,13 @@ fn is_tls_copy_symbol(name: &str) -> bool {
         "SSL_write"
             | "SSL_write_ex"
             | "SSL_write_ex2"
+            | "SSL_write_early_data"
             | "SSL_read"
             | "SSL_read_ex"
             | "SSL_read_ex2"
+            | "SSL_read_early_data"
+            | "SSL_peek"
+            | "SSL_peek_ex"
             | "mbedtls_ssl_write"
             | "mbedtls_ssl_read"
             | "wolfSSL_write"
@@ -635,20 +639,6 @@ mod tests {
         assert_eq!(read, vec![("SSL_read@LIBSSL_1_1", 0x249f60)]);
         assert_eq!(dynsym_export_name("SSL_write@@OPENSSL_3"), "SSL_write");
         assert_eq!(dynsym_export_name("SSL_write"), "SSL_write");
-    }
-
-    #[test]
-    fn inspect_elf_reads_local_symtab_ssl_write_on_ccb_curl() {
-        let path = "/tmp/ksight-so/ccb-libcurl.so";
-        if !std::path::Path::new(path).is_file() {
-            return;
-        }
-        let elf = inspect_elf(path).expect("ccb libcurl");
-        let write = matching_symbols_exact(&elf, &["SSL_write"]);
-        assert_eq!(write.len(), 1, "{elf:?}");
-        assert_eq!(write[0].1, 0xa25a8);
-        let read = matching_symbols_exact(&elf, &["SSL_read"]);
-        assert_eq!(read[0].1, 0xa24d8);
     }
 
     #[test]

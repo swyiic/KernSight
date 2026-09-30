@@ -133,6 +133,22 @@ pub fn is_tls_application_data_export(name: &str) -> bool {
     )
 }
 
+/// QUIC STREAM send C exports. Attach only when dynsym DEFINES the name.
+pub const QUIC_STREAM_SEND_EXPORTS: &[&str] = &[
+    "quic_stream_write",
+    "quic_stream_send",
+    "xqc_stream_send",
+    "lsquic_stream_write",
+];
+
+/// QUIC STREAM recv C exports.
+pub const QUIC_STREAM_RECV_EXPORTS: &[&str] = &[
+    "quic_stream_read",
+    "quic_stream_recv",
+    "xqc_stream_recv",
+    "lsquic_stream_read",
+];
+
 impl TlsAbiKind {
     /// Classify an exported symbol by exact name. `_ex2` is checked before `_ex`.
     #[must_use]
@@ -164,6 +180,15 @@ impl TlsAbiKind {
             // Known vendor exact names with the plain SSL_write/read layout.
             "sslWrite" | "SLIGHT_SSL_write" => Self::VendorWrite,
             "sslRead" | "SLIGHT_SSL_read" => Self::VendorRead,
+            // QUIC STREAM C APIs: x0=stream, x1=buf, x2=len (same as SSL_write).
+            // Attach only when dynsym DEFINES the name — never by size/RVA.
+            "quic_stream_write"
+            | "quic_stream_send"
+            | "xqc_stream_send"
+            | "lsquic_stream_write" => Self::VendorWrite,
+            "quic_stream_read" | "quic_stream_recv" | "xqc_stream_recv" | "lsquic_stream_read" => {
+                Self::VendorRead
+            }
             // Non-standard / vendor-custom: candidate only until ProbeSpec.abi pins it.
             _ => Self::VendorCustom,
         }
@@ -450,6 +475,28 @@ mod tests {
         assert_ne!(
             TlsAbiKind::from_exported_symbol("SSL_quic_write_level"),
             TlsAbiKind::VendorWrite
+        );
+    }
+
+    #[test]
+    fn quic_stream_exports_use_plain_write_layout_without_inventing_offsets() {
+        for name in QUIC_STREAM_SEND_EXPORTS {
+            assert!(is_tls_application_data_export(name));
+            let abi = TlsAbiKind::from_exported_symbol(name);
+            assert_eq!(abi, TlsAbiKind::VendorWrite);
+            assert!(abi.is_auto_attachable());
+            assert_eq!(abi.layout().buffer_arg, 1);
+            assert_eq!(abi.layout().requested_len_arg, 2);
+        }
+        for name in QUIC_STREAM_RECV_EXPORTS {
+            assert_eq!(
+                TlsAbiKind::from_exported_symbol(name),
+                TlsAbiKind::VendorRead
+            );
+        }
+        assert_eq!(
+            TlsAbiKind::from_exported_symbol("quic_conn_write_pkt"),
+            TlsAbiKind::VendorCustom
         );
     }
 

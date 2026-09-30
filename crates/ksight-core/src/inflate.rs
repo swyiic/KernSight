@@ -161,13 +161,14 @@ mod tests {
 
     #[test]
     fn inflates_truncated_gzip_prefix() {
-        let plain = br#"{"url":"https://cdn.example/cd/acrossBar_v1.8.zip","more":"padding-padding-padding"}"#;
+        let plain =
+            br#"{"url":"https://cdn.example/cd/widget_v1.zip","more":"padding-padding-padding"}"#;
         let gz = gzip_of(plain);
         let cut = gz.len().saturating_sub(8).max(16);
         let inflated = inflate_gzip_bounded(&gz[..cut]).expect("truncated gzip");
         let text = String::from_utf8_lossy(&inflated);
         assert!(
-            text.contains("cdn.example") || text.contains("acrossBar"),
+            text.contains("cdn.example") || text.contains("widget_v1.zip"),
             "{text:?}"
         );
     }

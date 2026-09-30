@@ -200,8 +200,8 @@ impl UprobeSession {
         )
         .context("打开 hwbp_events perf array")?;
         // Alipay warm attach can burst SSL_read/write across BabaSSL+Cronet+Conscrypt;
-        // 128 pages/CPU overflowed (perf_lost≈1.6k / 90s). 512 pages ≈ 2MiB/CPU @4KiB.
-        const PERF_RING_PAGES: usize = 512;
+        // 128 pages/CPU overflowed (perf_lost≈1.6k / 90s). Lean JNI slots + 1024 pages ≈ 4MiB/CPU @4KiB.
+        const PERF_RING_PAGES: usize = 1024;
         let mut buffers = Vec::new();
         for cpu in crate::cpu_list::online_cpu_ids() {
             if let Ok(buffer) = events.open(cpu, Some(PERF_RING_PAGES)) {

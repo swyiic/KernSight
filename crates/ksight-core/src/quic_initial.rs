@@ -531,6 +531,146 @@ fn aes128_gcm_decrypt(
     Some(out)
 }
 
+fn aes128_gcm_encrypt(key: &[u8; 16], nonce: &[u8; 12], aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
+    let aes = Aes128::new(key);
+    let mut h = [0u8; 16];
+    aes.encrypt_block(&mut h);
+    let mut j0 = [0u8; 16];
+    j0[..12].copy_from_slice(nonce);
+    j0[15] = 1;
+    let mut counter = j0;
+    let mut ciphertext = Vec::with_capacity(plaintext.len());
+    for chunk in plaintext.chunks(16) {
+        for byte in counter.iter_mut().rev() {
+            let (next, carry) = byte.overflowing_add(1);
+            *byte = next;
+            if !carry {
+                break;
+            }
+        }
+        let mut keystream = counter;
+        aes.encrypt_block(&mut keystream);
+        for (plain_byte, key_byte) in chunk.iter().zip(keystream.iter()) {
+            ciphertext.push(plain_byte ^ key_byte);
+        }
+    }
+    let mut y = [0u8; 16];
+    ghash_bytes(&h, aad, &mut y);
+    ghash_bytes(&h, &ciphertext, &mut y);
+    let mut length_block = [0u8; 16];
+    length_block[..8].copy_from_slice(&((aad.len() as u64) * 8).to_be_bytes());
+    length_block[8..].copy_from_slice(&((ciphertext.len() as u64) * 8).to_be_bytes());
+    ghash_block(&h, &mut y, &length_block);
+    let mut tag = j0;
+    aes.encrypt_block(&mut tag);
+    for (tag_byte, y_byte) in tag.iter_mut().zip(y.iter()) {
+        *tag_byte ^= y_byte;
+    }
+    ciphertext.extend_from_slice(&tag);
+    ciphertext
+}
+
+/// 1-RTT keys from a TLS 1.3 traffic secret (AES-128-GCM / SHA-256).
+pub struct QuicApplicationKeys {
+    /// AEAD key.
+    pub key: [u8; 16],
+    /// AEAD IV.
+    pub iv: [u8; 12],
+    /// Header-protection key.
+    pub hp: [u8; 16],
+}
+
+/// Derive 1-RTT AES-128-GCM keys (`quic key` / `quic iv` / `quic hp`).
+#[must_use]
+pub fn quic_application_keys(traffic_secret: &[u8]) -> Option<QuicApplicationKeys> {
+    let secret: [u8; 32] = traffic_secret.try_into().ok()?;
+    let key: [u8; 16] = hkdf_expand_label(&secret, b"quic key", 16)
+        .try_into()
+        .ok()?;
+    let iv: [u8; 12] = hkdf_expand_label(&secret, b"quic iv", 12).try_into().ok()?;
+    let hp: [u8; 16] = hkdf_expand_label(&secret, b"quic hp", 16).try_into().ok()?;
+    Some(QuicApplicationKeys { key, iv, hp })
+}
+
+/// Open a QUIC v1 1-RTT short-header packet. `dcid_len` comes from the
+/// connection's Initial (short headers omit the length). No invented STREAM RVA.
+#[must_use]
+pub fn decrypt_quic_1rtt(packet: &[u8], traffic_secret: &[u8], dcid_len: usize) -> Option<Vec<u8>> {
+    if packet.len() < 1 + dcid_len + 20 || dcid_len > 20 {
+        return None;
+    }
+    if packet[0] & 0x80 != 0 || packet[0] & 0x40 == 0 {
+        return None;
+    }
+    let keys = quic_application_keys(traffic_secret)?;
+    let pn_offset = 1 + dcid_len;
+    let mut sample_block = [0u8; 16];
+    sample_block.copy_from_slice(packet.get(pn_offset + 4..pn_offset + 20)?);
+    let aes = Aes128::new(&keys.hp);
+    aes.encrypt_block(&mut sample_block);
+    let first = packet[0] ^ (sample_block[0] & 0x1f);
+    let pn_len = usize::from(first & 0x03) + 1;
+    let mut truncated = 0u64;
+    let mut pn_bytes = [0u8; 4];
+    for index in 0..pn_len {
+        pn_bytes[index] = packet[pn_offset + index] ^ sample_block[1 + index];
+        truncated = (truncated << 8) | u64::from(pn_bytes[index]);
+    }
+    let packet_number = decode_packet_number(truncated, pn_len, 0);
+    let mut header = Vec::with_capacity(pn_offset + pn_len);
+    header.extend_from_slice(&packet[..pn_offset]);
+    header[0] = first;
+    header.extend_from_slice(&pn_bytes[..pn_len]);
+    let mut nonce = keys.iv;
+    let encoded = packet_number.to_be_bytes();
+    for index in 0..8 {
+        nonce[4 + index] ^= encoded[index];
+    }
+    let body = packet.get(pn_offset + pn_len..)?.to_vec();
+    aes128_gcm_decrypt(&keys.key, &nonce, &header, &body)
+}
+
+/// Protect a 1-RTT short-header payload for tests (AES-128-GCM).
+#[must_use]
+pub fn encrypt_quic_1rtt_for_test(
+    dcid: &[u8],
+    packet_number: u64,
+    payload: &[u8],
+    traffic_secret: &[u8],
+) -> Option<Vec<u8>> {
+    if dcid.len() > 20 {
+        return None;
+    }
+    let keys = quic_application_keys(traffic_secret)?;
+    let pn_len = 1usize;
+    let pn_bytes = [(packet_number & 0xff) as u8];
+    let first = 0x40u8 | (pn_len as u8 - 1);
+    let mut header = Vec::with_capacity(1 + dcid.len() + pn_len);
+    header.push(first);
+    header.extend_from_slice(dcid);
+    header.extend_from_slice(&pn_bytes);
+    let mut nonce = keys.iv;
+    let encoded = packet_number.to_be_bytes();
+    for index in 0..8 {
+        nonce[4 + index] ^= encoded[index];
+    }
+    let body = aes128_gcm_encrypt(&keys.key, &nonce, &header, payload);
+    let pn_offset = 1 + dcid.len();
+    let mut packet = Vec::with_capacity(header.len() + body.len());
+    packet.extend_from_slice(&header);
+    packet.extend_from_slice(&body);
+    if packet.len() < pn_offset + 20 {
+        return None;
+    }
+    let mut sample_block = [0u8; 16];
+    sample_block.copy_from_slice(&packet[pn_offset + 4..pn_offset + 20]);
+    let aes = Aes128::new(&keys.hp);
+    aes.encrypt_block(&mut sample_block);
+    packet[0] ^= sample_block[0] & 0x1f;
+    packet[pn_offset] ^= sample_block[1];
+    Some(packet)
+}
+
 // ---------------------------------------------------------------- QUIC parsing
 
 /// QUIC variable-length integer (RFC 9000 §16): value and consumed bytes.
@@ -1062,5 +1202,17 @@ mod tests {
         assert!(table
             .feed(&[0xc0, 0, 0, 0, 0, 8, 1, 2, 3, 4, 5, 6, 7, 8, 0])
             .is_none());
+    }
+
+    #[test]
+    fn one_rtt_roundtrip_opens_short_header() {
+        let secret = [0x11u8; 32];
+        let dcid = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11];
+        let payload = b"\x00\x05hello";
+        let packet = encrypt_quic_1rtt_for_test(&dcid, 1, payload, &secret).expect("protect");
+        let opened = decrypt_quic_1rtt(&packet, &secret, dcid.len()).expect("open");
+        assert_eq!(opened, payload);
+        assert!(decrypt_quic_1rtt(&packet, &[0x22u8; 32], dcid.len()).is_none());
+        assert!(decrypt_quic_1rtt(&packet, &secret, 4).is_none());
     }
 }

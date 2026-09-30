@@ -302,6 +302,67 @@ pub struct KeylogSecret {
     pub secret: Vec<u8>,
 }
 
+const KEYLOG_LABELS: [&str; 8] = [
+    "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+    "SERVER_HANDSHAKE_TRAFFIC_SECRET",
+    "CLIENT_EARLY_TRAFFIC_SECRET",
+    "CLIENT_TRAFFIC_SECRET_0",
+    "SERVER_TRAFFIC_SECRET_0",
+    "EARLY_EXPORTER_SECRET",
+    "EXPORTER_SECRET",
+    "CLIENT_RANDOM",
+];
+
+/// Pull NSS keylog lines out of an arbitrary buffer (heap / Inspect copy).
+///
+/// No ELF offset. A line is kept only if [`parse_keylog`] accepts it.
+#[must_use]
+pub fn extract_keylog_haystack(bytes: &[u8]) -> Vec<String> {
+    if bytes.len() < 40 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for label in KEYLOG_LABELS {
+        let needle = label.as_bytes();
+        let mut from = 0_usize;
+        while let Some(rel) = find_slice(&bytes[from..], needle) {
+            let start = from + rel;
+            if start > 0 {
+                let prev = bytes[start - 1];
+                if prev != 0 && !prev.is_ascii_whitespace() {
+                    from = start + 1;
+                    continue;
+                }
+            }
+            let rest = &bytes[start..];
+            let end = rest
+                .iter()
+                .position(|byte| matches!(*byte, b'\n' | b'\r' | 0))
+                .unwrap_or(rest.len())
+                .min(512);
+            let line = String::from_utf8_lossy(&rest[..end]).trim().to_owned();
+            from = start + needle.len();
+            if line.len() < label.len() + 10 {
+                continue;
+            }
+            if parse_keylog(&line).is_empty() {
+                continue;
+            }
+            if seen.insert(line.clone()) {
+                out.push(line);
+            }
+        }
+    }
+    out
+}
+
+fn find_slice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
 /// Parse standard and probe-debug keylog lines.
 #[must_use]
 pub fn parse_keylog(text: &str) -> Vec<KeylogSecret> {
@@ -741,6 +802,27 @@ mod tests {
             .step_by(2)
             .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).expect("hex"))
             .collect()
+    }
+
+    #[test]
+    fn extract_keylog_haystack_ignores_http_and_keeps_nss_line() {
+        let line = "CLIENT_TRAFFIC_SECRET_0 8cb8976ba17b3731a40b2c126eaa36fbb487bb69759ac15674b10c8b882782e9 2ccf74feaecc588f0a542310279a7028dba5a616797290f0fb554bc7de884fdf";
+        let mut blob = b"POST / HTTP/1.1\r\nHost: api.example.test\r\n\r\n".to_vec();
+        blob.extend_from_slice(line.as_bytes());
+        blob.extend_from_slice(&[0, 1, 2, 3]);
+        let extracted = extract_keylog_haystack(&blob);
+        assert_eq!(extracted, vec![line.to_owned()]);
+        assert!(extract_keylog_haystack(b"GET / HTTP/1.1\r\n\r\n").is_empty());
+        assert!(extract_keylog_haystack(b"CLIENT_TRAFFIC_SECRET_0 not-a-secret").is_empty());
+        let early = "EARLY_EXPORTER_SECRET 8cb8976ba17b3731a40b2c126eaa36fbb487bb69759ac15674b10c8b882782e9 2ccf74feaecc588f0a542310279a7028dba5a616797290f0fb554bc7de884fdf";
+        let extracted_early = extract_keylog_haystack(early.as_bytes());
+        assert_eq!(extracted_early, vec![early.to_owned()]);
+        assert!(
+            extracted_early
+                .iter()
+                .all(|line| line.starts_with("EARLY_")),
+            "EXPORTER_SECRET must not match inside EARLY_EXPORTER_SECRET"
+        );
     }
 
     #[test]

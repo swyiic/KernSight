@@ -1,11 +1,13 @@
 //! Platform-independent `KernSight` logic.
 
 mod capability;
+mod critical_form;
 mod dex;
 mod dns;
 mod graph;
 mod handshake;
 mod http2;
+mod http3;
 mod http_mirror;
 mod http_plain;
 mod identity;
@@ -28,6 +30,7 @@ pub use capability::{
     current_capabilities, semantic_keypoints, CapabilityArea, CapabilityStage, ObservationTier,
     SemanticKeypoint, VisibilityRisk,
 };
+pub use critical_form::{classify_critical_form, CriticalFormHit};
 pub use dex::{
     decrypt_secneo_dexdata, extract_apk_dex, extract_apk_native_libs, extract_apk_packed_native,
     find_secneo_key, is_dex_magic, is_vdex_magic, key_unlocks_secneo, parse_dex_semantics,
@@ -42,6 +45,7 @@ pub use graph::{
 };
 pub use handshake::{parse_handshake, HandshakeMeta};
 pub use http2::{http2_sync_offset, looks_like_http2, unwrap_grpc_length_prefixed};
+pub use http3::{looks_like_http3, parse_http3_stream, QpackDecoder};
 pub use http_mirror::{
     fragment_bytes, looks_like_http_plain, parse_mirror_endpoint, request_from_http_url,
     requests_from_embedded_http_urls, MessageCompleteness, MessageEvidence, MessageOrigin,
@@ -64,8 +68,8 @@ pub use native_rules::{
     NativeFrameworkEvidence, NativeFrameworkMatch, TlsLibraryKind,
 };
 pub use pcap_decrypt::{
-    decrypt_flows, decrypt_tls_application_data, parse_keylog, parse_pcap_tcp_flows, DecryptedFlow,
-    KeylogSecret,
+    decrypt_flows, decrypt_tls_application_data, extract_keylog_haystack, parse_keylog,
+    parse_pcap_tcp_flows, DecryptedFlow, KeylogSecret,
 };
 pub use policy::{validate_policy, PolicyError};
 pub use provenance::{
@@ -74,7 +78,10 @@ pub use provenance::{
     DexOwnershipCategory, DexOwnershipContext, DexOwnershipEntry, DexOwnershipNamespaceSeed,
     DexOwnershipReport, DumpArtifact, PackageDexIndex, ProvenanceClass,
 };
-pub use quic_initial::{decrypt_initial, QuicInitialHello, QuicInitialTable};
+pub use quic_initial::{
+    decrypt_initial, decrypt_quic_1rtt, encrypt_quic_1rtt_for_test, quic_application_keys,
+    QuicApplicationKeys, QuicInitialHello, QuicInitialTable,
+};
 pub use report::{
     correlate_http_calls_to_dex, http_calls_from_plaintext_dir, http_calls_from_private_dir,
     rank_observed_mappings, sort_http_catalog, ArtifactActivity, BinderFdTransfer,
@@ -102,5 +109,5 @@ pub use stack_rules::{
 };
 pub use tls_abi::{
     is_tls_application_data_export, ActualLengthSource, CapturePhase, TlsAbiKind, TlsAbiLayout,
-    TlsDirection,
+    TlsDirection, QUIC_STREAM_RECV_EXPORTS, QUIC_STREAM_SEND_EXPORTS,
 };

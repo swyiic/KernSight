@@ -49,6 +49,8 @@ struct InfosecHandle {
     build_id: Option<String>,
     /// Entry frames waiting for return when capture_phase requires pairing.
     pending: std::collections::HashMap<(u32, u32), PendingBoundary>,
+    raw_hits: u64,
+    dumped_first: bool,
 }
 
 struct PendingBoundary {
@@ -152,6 +154,26 @@ impl InfosecProbe {
                         .into_iter()
                         .find(|(_, function)| function.symbol == name)
                         .map(|(_, function)| function);
+                    let state = function
+                        .as_ref()
+                        .map(|item| item.validation_state.to_ascii_lowercase())
+                        .unwrap_or_default();
+                    if state == "disabled" {
+                        continue;
+                    }
+                    if state == "experimental" && !allow_empirical {
+                        deferred_empirical.insert(format!("{}:{name}", stack.id));
+                        continue;
+                    }
+                    let pinned_abi = function
+                        .as_ref()
+                        .is_some_and(|item| item.buffer_arg.is_some() && item.length_arg.is_some());
+                    // Stack layout=pinned must not auto-attach write[] names that
+                    // have no buffer/length (sm4_cbc_encrypt nblocks, JNI jobject).
+                    if !pinned_abi && !allow_empirical {
+                        deferred_empirical.insert(format!("{}:{name}", stack.id));
+                        continue;
+                    }
                     let buffer_arg = function
                         .as_ref()
                         .and_then(|f| f.buffer_arg)
@@ -287,6 +309,8 @@ impl InfosecProbe {
                         last_inferred: None,
                         build_id: None,
                         pending: std::collections::HashMap::new(),
+                        raw_hits: 0,
+                        dumped_first: false,
                     });
                     status.push(format!(
                         "vendor boundary stack={} symbol={} layout={} buffer_arg={:?} length_arg={:?} phase={:?} header={:?} body={:?}",
@@ -389,6 +413,40 @@ impl InfosecProbe {
             } else {
                 (hits.into_iter().take(256).collect(), Vec::new())
             };
+            if !entry_hits.is_empty() {
+                handle.raw_hits = handle.raw_hits.saturating_add(entry_hits.len() as u64);
+                eprintln!(
+                    "vendor boundary hits symbol={} n={} total={} buffer_arg={:?} length_arg={:?}",
+                    handle.symbol,
+                    entry_hits.len(),
+                    handle.raw_hits,
+                    handle.buffer_arg,
+                    handle.length_arg
+                );
+                if !handle.dumped_first {
+                    handle.dumped_first = true;
+                    if let Some(hit) = entry_hits.first() {
+                        let mut regs = [0u64; 8];
+                        for (index, reg) in regs.iter_mut().enumerate() {
+                            *reg = hit.regs.get(index).copied().unwrap_or(0);
+                        }
+                        eprintln!(
+                            "vendor boundary first-hit symbol={} pid={} tid={} x0={:x} x1={:x} x2={:x} x3={:x} x4={:x} x5={:x} x6={:x} x7={:x}",
+                            handle.symbol,
+                            hit.pid,
+                            hit.tid,
+                            regs[0],
+                            regs[1],
+                            regs[2],
+                            regs[3],
+                            regs[4],
+                            regs[5],
+                            regs[6],
+                            regs[7]
+                        );
+                    }
+                }
+            }
             for hit in entry_hits {
                 let args = handle
                     .buffer_arg

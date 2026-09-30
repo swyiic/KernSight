@@ -718,6 +718,12 @@ pub fn tls_symbol_names() -> Vec<String> {
                 .filter(|name| crate::tls_abi::is_tls_application_data_export(name)),
         );
     }
+    out.extend(
+        crate::tls_abi::QUIC_STREAM_SEND_EXPORTS
+            .iter()
+            .chain(crate::tls_abi::QUIC_STREAM_RECV_EXPORTS)
+            .map(|name| (*name).to_owned()),
+    );
     out.sort();
     out.dedup();
     out
@@ -1525,6 +1531,10 @@ mod tests {
         let names = tls_symbol_names();
         assert!(names.iter().any(|name| name == "SSL_write"));
         assert!(names.iter().any(|name| name == "SSL_peek"));
+        assert!(
+            names.iter().any(|name| name == "quic_stream_write"),
+            "STREAM send names are export-only candidates, not size pins"
+        );
         for banned in [
             "BIO_write",
             "BIO_read",

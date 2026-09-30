@@ -18,8 +18,13 @@ NEEDLES = (
     "BIO_write",
     "BIO_read",
     "SSL_quic",
-    "quic",
+    "quic_stream",
+    "xqc_stream",
+    "lsquic_stream",
     "ssl_log_secret",
+    "SSL_CTX_set_keylog",
+    "quic_conn_set_keylog",
+    "OPENSSL_",
 )
 
 

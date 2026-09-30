@@ -115,7 +115,11 @@ pub struct JniEnvFunction {
 }
 
 /// Slots copied for `--inspect-adapter jni_plaintext`.
-pub const JNI_PLAINTEXT_SLOTS: [(&str, usize); 20] = [
+/// Lean JNIEnv slots for `--inspect-jni`: prefer string/`byte[]` corridors that
+/// can carry pre-encrypt field plaintext. DirectBuffer / Set*Region are
+/// intentionally omitted — they flood the uprobe ring with HTTP/ZIP traffic
+/// (`perf_lost` 100k+) and drown short phone fields.
+pub const JNI_PLAINTEXT_SLOTS: [(&str, usize); 12] = [
     ("NewString", SLOT_NEW_STRING),
     ("GetStringLength", SLOT_GET_STRING_LENGTH),
     ("GetStringChars", SLOT_GET_STRING_CHARS),
@@ -124,21 +128,10 @@ pub const JNI_PLAINTEXT_SLOTS: [(&str, usize); 20] = [
     ("GetStringUTFChars", SLOT_GET_STRING_UTF_CHARS),
     ("GetArrayLength", SLOT_GET_ARRAY_LENGTH),
     ("GetByteArrayElements", SLOT_GET_BYTE_ARRAY_ELEMENTS),
-    ("GetCharArrayElements", SLOT_GET_CHAR_ARRAY_ELEMENTS),
     ("GetByteArrayRegion", SLOT_GET_BYTE_ARRAY_REGION),
-    ("GetCharArrayRegion", SLOT_GET_CHAR_ARRAY_REGION),
-    ("SetByteArrayRegion", SLOT_SET_BYTE_ARRAY_REGION),
-    ("SetCharArrayRegion", SLOT_SET_CHAR_ARRAY_REGION),
     ("RegisterNatives", SLOT_REGISTER_NATIVES),
     ("GetStringRegion", SLOT_GET_STRING_REGION),
     ("GetStringUTFRegion", SLOT_GET_STRING_UTF_REGION),
-    (
-        "GetPrimitiveArrayCritical",
-        SLOT_GET_PRIMITIVE_ARRAY_CRITICAL,
-    ),
-    ("GetStringCritical", SLOT_GET_STRING_CRITICAL),
-    ("GetDirectBufferAddress", SLOT_GET_DIRECT_BUFFER_ADDRESS),
-    ("GetDirectBufferCapacity", SLOT_GET_DIRECT_BUFFER_CAPACITY),
 ];
 
 fn intern_jni_name(name: &str) -> Option<&'static str> {
@@ -453,7 +446,7 @@ mod tests {
         assert_eq!(SLOT_GET_STRING_CRITICAL, 224);
         assert_eq!(SLOT_GET_DIRECT_BUFFER_ADDRESS, 230);
         assert_eq!(SLOT_GET_DIRECT_BUFFER_CAPACITY, 231);
-        assert_eq!(super::JNI_PLAINTEXT_SLOTS.len(), 20);
+        assert_eq!(super::JNI_PLAINTEXT_SLOTS.len(), 12);
     }
 
     #[test]

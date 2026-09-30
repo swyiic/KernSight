@@ -111,6 +111,9 @@ pub struct BurpMirror {
     promoted_peeks: VecDeque<PendingPeek>,
     /// Live keylog secrets for decrypting Inspect `tls_record` copies.
     keylog_secrets: Vec<ksight_core::KeylogSecret>,
+    /// Pre-encrypt SM4/JSON copies waiting to stamp the next HTTP request on
+    /// the same pid (not spliced into the TLS assembler).
+    parked_app_plain: VecDeque<ParkedAppPlaintext>,
     /// Pids with buffered recv bytes; worker defers unpaired grace sweep.
     recv_busy_pids: Arc<Mutex<HashSet<u32>>>,
     stop: Arc<AtomicBool>,
@@ -331,14 +334,13 @@ impl PeerHostBook {
         // Last-resort placeholders (mobilegw/loggw) may still be replaced by
         // a later handshake SNI on this stream. Real Hosts stay put unless
         // last_url stamped a sibling that this path must not inherit
-        // (cycle-025223 SystemLogHandler ← jump.m.cmbchina.cn /pk.htm).
+        // (a log POST must not inherit a sibling page host on the same stream).
         if looks_like_mirror_host(&request.host) && !is_last_resort_host(&request.host) {
             let reject = (looks_like_cmb_mainpage_path(&request.path)
                 && !is_cmb_mainpage_host(&request.host))
                 || (looks_like_cmb_log_path(&request.path) && !is_cmb_log_host(&request.host))
                 || (is_alipay_dae_csv(request)
-                    && !request.host.to_ascii_lowercase().contains("datagw"))
-                || skip_inherited_cmb_avatar(&request.path, &request.host);
+                    && !request.host.to_ascii_lowercase().contains("datagw"));
             if !reject {
                 return;
             }
@@ -355,9 +357,7 @@ impl PeerHostBook {
                 // cycle-024809 D-AE 2048-byte CSV stamped mobilegw from the
                 // same SSL* as mgw. Diagnosis CSV only accepts datagw.
                 || (is_alipay_dae_csv(request)
-                    && !host.to_ascii_lowercase().contains("datagw"))
-                // cycle-035815 avatar COS path inherited mbmodule-mainopenapi.
-                || skip_inherited_cmb_avatar(&request.path, host);
+                    && !host.to_ascii_lowercase().contains("datagw"));
             if !skip {
                 request.host.clone_from(host);
                 return;
@@ -395,21 +395,8 @@ impl PeerHostBook {
             }
             return;
         }
-        if looks_like_ccb_touch_po(&request.path) {
-            "touch.ccb.com".clone_into(&mut request.host);
-            return;
-        }
         if looks_like_ccb_mbsmps(&request.path) {
             "xc.mp3.ccb.cn".clone_into(&mut request.host);
-            return;
-        }
-        if looks_like_cmb_avatar_path(&request.path) {
-            if let Some(host) = self.observed_cmb_avatar_host(pid) {
-                request.host = host;
-            } else {
-                // cycle-040511 GET s3gw.cmbimg.cn/…/lx3301-avatar orig=200.
-                "s3gw.cmbimg.cn".clone_into(&mut request.host);
-            }
             return;
         }
         // Path-constrained last-resort so pairing sees a Host mid-session
@@ -511,8 +498,7 @@ impl PeerHostBook {
                 && !is_cmb_mainpage_host(&request.host))
                 || (looks_like_cmb_log_path(&request.path) && !is_cmb_log_host(&request.host))
                 || (is_alipay_dae_csv(request)
-                    && !request.host.to_ascii_lowercase().contains("datagw"))
-                || skip_inherited_cmb_avatar(&request.path, &request.host);
+                    && !request.host.to_ascii_lowercase().contains("datagw"));
             if !reject {
                 return;
             }
@@ -537,14 +523,7 @@ impl PeerHostBook {
             // diagnosis CSV sealed as POST mobilegw. Only datagw may stamp these.
             let skip_for_dae =
                 is_alipay_dae_csv(request) && !host.to_ascii_lowercase().contains("datagw");
-            let skip_for_avatar = skip_inherited_cmb_avatar(&request.path, host);
-            if !(skip_for_mgw
-                || skip_for_cmb
-                || skip_for_cmb_log
-                || skip_wangdun
-                || skip_for_dae
-                || skip_for_avatar)
-            {
+            if !(skip_for_mgw || skip_for_cmb || skip_for_cmb_log || skip_wangdun || skip_for_dae) {
                 host.clone_into(&mut request.host);
                 return;
             }
@@ -583,20 +562,8 @@ impl PeerHostBook {
             }
             return;
         }
-        if looks_like_ccb_touch_po(&request.path) {
-            "touch.ccb.com".clone_into(&mut request.host);
-            return;
-        }
         if looks_like_ccb_mbsmps(&request.path) {
             "xc.mp3.ccb.cn".clone_into(&mut request.host);
-            return;
-        }
-        if looks_like_cmb_avatar_path(&request.path) {
-            if let Some(host) = self.observed_cmb_avatar_host(pid) {
-                request.host = host;
-            } else {
-                "s3gw.cmbimg.cn".clone_into(&mut request.host);
-            }
         }
     }
 
@@ -628,44 +595,6 @@ impl PeerHostBook {
         }
         pick
     }
-
-    fn observed_cmb_avatar_host(&self, pid: u32) -> Option<String> {
-        let mut pick = None;
-        let mut consider = |host: &str| {
-            if pick.is_some() {
-                return;
-            }
-            if is_cmb_avatar_host(host) && looks_like_mirror_host(host) {
-                pick = Some(host.to_owned());
-            }
-        };
-        for ((process, _), host) in &self.by_stream {
-            if *process == pid {
-                consider(host);
-            }
-        }
-        if let Some(list) = self.by_pid.get(&pid) {
-            for host in list {
-                consider(host);
-            }
-        }
-        if let Some(list) = self.unbound.get(&pid) {
-            for host in list {
-                consider(host);
-            }
-        }
-        pick
-    }
-}
-
-fn looks_like_cmb_avatar_path(path: &str) -> bool {
-    let path = path.to_ascii_lowercase();
-    path.contains("lx3301-avatar") || path.contains("avatar-prd-cos")
-}
-
-fn skip_inherited_cmb_avatar(path: &str, host: &str) -> bool {
-    // cycle-035815 GET /s/…/lx3301-avatar… inherited mbmodule-mainopenapi.
-    looks_like_cmb_avatar_path(path) && host.to_ascii_lowercase().contains("cmbchina")
 }
 
 fn looks_like_cmb_log_path(path: &str) -> bool {
@@ -781,17 +710,8 @@ fn is_last_resort_host(host: &str) -> bool {
 }
 
 fn is_cmb_avatar_host(host: &str) -> bool {
-    // cycle-040511 COS was s3gw.cmbimg.cn. cycle-054138 observed
-    // mbmodulecdn.cmbimg.cn for default.zip — must not stamp avatar.
     let lower = host.to_ascii_lowercase();
     lower.contains("s3gw") && lower.contains("cmbimg.cn")
-}
-
-fn looks_like_ccb_touch_po(path: &str) -> bool {
-    // cycle-024809 hostless POST /po?v=3.0.2&t=a&aid=ccvcrg3werfpisbk
-    // sealed missing-sni; every hosted copy of this RPC is touch.ccb.com.
-    let path = path.to_ascii_lowercase();
-    path.contains("/po?") && path.contains("aid=ccvcrg")
 }
 
 fn looks_like_ccb_mbsmps(path: &str) -> bool {
@@ -883,10 +803,6 @@ fn is_mgw_request(request: &MirroredMessage) -> bool {
         // cycle-021923 hostless POST / with content-encoding and zstd magic
         // (0x28 0xB5 0x2F 0xFD) sealed missing-sni; D-AE CSV is ASCII.
         b"\x28\xb5\x2f\xfd",
-        // cycle-004347 POST /mgw.htm application/protobuf carried this
-        // stable 64-hex token; cycle-045950 lost path/headers and sealed
-        // missing-sni. D-AE CSV does not contain it.
-        b"@928566fe2744232d",
     ]
     .into_iter()
     .any(|needle| body.windows(needle.len()).any(|window| window == needle))
@@ -939,12 +855,13 @@ enum MirrorJob {
     Stop,
 }
 
-/// How long a completed request waits for its response copy before it is
-/// delivered alone so Burp history keeps filling during a live session.
+/// How long a completed request waits for its response copy. After this the
+/// request is still recorded, but Burp history is skipped until a status was
+/// copied from `HTTP/1.1 <code>` or HTTP/2 `:status` (no manufactured 204).
 /// Mirror mode often sees SSL_read bodies arrive hundreds of ms to a few
-/// seconds after SSL_write; 2s was flushing unpaired (Burp 204) too early.
+/// seconds after SSL_write; 2s was flushing unpaired too early.
 const PAIRING_GRACE: Duration = Duration::from_secs(12);
-/// POSTs (mgw / GetQrpay / ccbNewClient) often see SSL_read hundreds of ms
+/// POSTs often see SSL_read hundreds of ms
 /// to tens of seconds later; 30s was still flushing orig=0 before seal.
 const POST_PAIRING_GRACE: Duration = Duration::from_secs(50);
 /// Tid-only stream_key when SSL* is not yet known. High bit so it cannot
@@ -973,6 +890,54 @@ const RECV_SOFT_FLUSH_IDLE: Duration = Duration::from_millis(500);
 const SEND_SOFT_FLUSH_IDLE: Duration = Duration::from_millis(800);
 /// How long a tid→connection_id sticky entry remains usable.
 const TID_CONNECTION_STICKY: Duration = Duration::from_secs(90);
+/// How long a pre-encrypt SM4/JSON copy may wait for the matching HTTP request.
+const APP_PLAIN_TTL: Duration = Duration::from_secs(3);
+const APP_PLAIN_CAP: usize = 16;
+
+struct ParkedAppPlaintext {
+    pid: u32,
+    tid: u32,
+    adapter: String,
+    bytes: Vec<u8>,
+    seen: Instant,
+}
+
+fn looks_like_app_plaintext(bytes: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    let text = text.trim();
+    if text.len() < 2 {
+        return false;
+    }
+    text.starts_with('{')
+        || text.starts_with('[')
+        || (text.contains('=') && (text.contains('&') || text.contains("mobile")))
+}
+
+fn apply_app_plaintext(request: &mut MirroredMessage, adapter: &str, bytes: &[u8]) {
+    let symbol = adapter.rsplit(':').next().unwrap_or(adapter);
+    request
+        .headers
+        .push(("X-KernSight-App-Plaintext".to_owned(), "1".to_owned()));
+    request.headers.push((
+        "X-KernSight-App-Plaintext-Adapter".to_owned(),
+        symbol.to_owned(),
+    ));
+    if request.body.is_empty() || looks_like_app_plaintext(&request.body) {
+        let take = bytes.len().min(256);
+        let preview = String::from_utf8_lossy(&bytes[..take]).replace(['\r', '\n'], " ");
+        request
+            .headers
+            .push(("X-KernSight-App-Plaintext-Preview".to_owned(), preview));
+        return;
+    }
+    request.headers.push((
+        "X-KernSight-Body-Source".to_owned(),
+        "pre_encrypt".to_owned(),
+    ));
+    request.body = bytes.to_vec();
+}
 /// Maximum requests held per process before the oldest flushes unpaired.
 const PENDING_CAP: usize = 32;
 const STREAM_CAP: usize = 256;
@@ -1126,6 +1091,7 @@ impl BurpMirror {
             pending_peeks: VecDeque::new(),
             promoted_peeks: VecDeque::new(),
             keylog_secrets: Vec::new(),
+            parked_app_plain: VecDeque::new(),
             recv_busy_pids,
             stop,
             worker,
@@ -1401,6 +1367,10 @@ impl BurpMirror {
         if bytes.is_empty() {
             return;
         }
+        let keylog_lines = ksight_core::extract_keylog_haystack(bytes);
+        if !keylog_lines.is_empty() {
+            self.ingest_keylog_lines(&keylog_lines);
+        }
         // SSL_peek / consumes=false: preview evidence only — do not advance
         // the stream cursor. A later recv that shares a prefix is canonical.
         if direction == "peek" {
@@ -1432,6 +1402,17 @@ impl BurpMirror {
             || adapter == "handshake_http")
         {
             self.rejected_fragments = self.rejected_fragments.saturating_add(1);
+            return;
+        }
+        // SM4/GmSSL (and other crypto-SDK) copies are application blocks, not
+        // TLS records. Same-tid sticky stream_key would splice them into the
+        // SSL_write HTTP assembler and drop large request volume.
+        if adapter.starts_with("vendor_boundary:") && !ksight_core::looks_like_http_plain(bytes) {
+            let stream_key = self.stream_key_for(pid, tid, connection_id);
+            let _ = self.absorb_copy_hosts(pid, tid, stream_key, adapter, bytes);
+            if looks_like_app_plaintext(bytes) {
+                self.park_app_plaintext(pid, tid, adapter, bytes);
+            }
             return;
         }
         let owned;
@@ -1797,6 +1778,9 @@ impl BurpMirror {
             self.emit_request(pid, stream_id, message);
             return;
         }
+        if message.is_statusless_placeholder() {
+            return;
+        }
         self.stamp_source(pid, stream_id, &mut message);
         // Pairing happens on the worker thread; the fallback GET keeps an
         // SSL_read-only response visible when no request is in flight.
@@ -1862,8 +1846,43 @@ impl BurpMirror {
         waiting
     }
 
+    fn park_app_plaintext(&mut self, pid: u32, tid: u32, adapter: &str, bytes: &[u8]) {
+        let now = Instant::now();
+        self.parked_app_plain
+            .retain(|item| now.duration_since(item.seen) <= APP_PLAIN_TTL);
+        while self.parked_app_plain.len() >= APP_PLAIN_CAP {
+            let _ = self.parked_app_plain.pop_front();
+        }
+        self.parked_app_plain.push_back(ParkedAppPlaintext {
+            pid,
+            tid,
+            adapter: adapter.to_owned(),
+            bytes: bytes.to_vec(),
+            seen: now,
+        });
+    }
+
+    fn stamp_app_plaintext(&mut self, pid: u32, request: &mut MirroredMessage) {
+        let now = Instant::now();
+        self.parked_app_plain
+            .retain(|item| now.duration_since(item.seen) <= APP_PLAIN_TTL);
+        let Some(index) = self
+            .parked_app_plain
+            .iter()
+            .rposition(|item| item.pid == pid)
+        else {
+            return;
+        };
+        let Some(parked) = self.parked_app_plain.remove(index) else {
+            return;
+        };
+        apply_app_plaintext(request, &parked.adapter, &parked.bytes);
+        let _ = parked.tid;
+    }
+
     fn emit_request(&mut self, pid: u32, stream_id: u64, mut request: MirroredMessage) {
         request.preserve_destination();
+        self.stamp_app_plaintext(pid, &mut request);
         self.stamp_source(pid, stream_id, &mut request);
         request.apply_gateway_rpc_hints();
         self.finish_request(pid, stream_id, &mut request);
@@ -1897,6 +1916,23 @@ impl BurpMirror {
             self.pending_hostless
                 .push_back((pid, stream_id, request.clone()));
         }
+        // Tag critical forms on TLS reconstruct — do not wait for burp-mirror ok
+        // (absolute delivery can fail while plaintext was already captured).
+        if let Some(hit) = ksight_core::classify_critical_form(
+            &request.method,
+            &request.host,
+            &request.path,
+            &request.body,
+        ) {
+            let rpc = hit.method_rpc.as_deref().unwrap_or("-");
+            log_mirror(
+                &self.session_id,
+                &format!(
+                    "critical-form kind={} rpc={} detail={}",
+                    hit.kind, rpc, hit.detail
+                ),
+            );
+        }
         // Queue hostless immediately so SSL_read orphans can pair across
         // stream_key instead of waiting until seal (orig=0).
         self.queue_request(pid, stream_id, request);
@@ -1918,12 +1954,10 @@ impl BurpMirror {
     fn finish_request(&mut self, pid: u32, stream_id: u64, request: &mut MirroredMessage) {
         if request.host.is_empty() {
             if let Some((host, path)) = self.last_url.get(&(pid, stream_id)) {
-                // cycle-025223: GET jump.m.cmbchina.cn/pk.htm then POST
-                // SystemLogHandler on the same stream inherited jump.m.
-                // cycle-024809: D-AE CSV inherited same-stream mobilegw.
+                // A log POST or diagnosis CSV must not inherit a sibling host
+                // on the same stream.
                 let skip = (looks_like_cmb_log_path(&request.path) && !is_cmb_log_host(host))
                     || (looks_like_cmb_mainpage_path(&request.path) && !is_cmb_mainpage_host(host))
-                    || skip_inherited_cmb_avatar(&request.path, host)
                     || (is_alipay_dae_csv(request)
                         && !host.to_ascii_lowercase().contains("datagw"));
                 if !skip {
@@ -2365,7 +2399,11 @@ fn take_ready_pairs(
     for slot in pending.values_mut() {
         let mut kept = VecDeque::new();
         while let Some((request, response, queued_at)) = slot.pop_front() {
-            if looks_like_mirror_host(&request.host) && response.is_some() {
+            if looks_like_mirror_host(&request.host)
+                && response
+                    .as_ref()
+                    .is_some_and(|item| item.observed_status().is_some())
+            {
                 ready.push((request, response));
             } else {
                 kept.push_back((request, response, queued_at));
@@ -2735,6 +2773,7 @@ fn enqueue_delivery(
     mut request: MirroredMessage,
     mut response: Option<MirroredMessage>,
 ) {
+    response = response.filter(MirroredMessage::is_pairable_response);
     let synthetic = matches!(
         request.evidence.origin,
         MessageOrigin::SyntheticRequest | MessageOrigin::UrlHint
@@ -2826,7 +2865,7 @@ fn enqueue_delivery(
         "schema_version": "kernsight.mirror-evidence/v1",
         "request": diagnostic_evidence(&request),
         "response": response.as_ref().map(diagnostic_evidence),
-        "observed_status": response.as_ref().and_then(|r| r.status),
+        "observed_status": response.as_ref().and_then(MirroredMessage::observed_status),
         "h2_stream_id": request.stream_id,
         "request_body_bytes": request.body.len(),
         "response_body_bytes": response.as_ref().map(|r| r.body.len()),
@@ -2835,6 +2874,20 @@ fn enqueue_delivery(
         runtime.session_id,
         &format!("burp-mirror evidence={evidence}"),
     );
+    // History rows are pairs with a copied status and a body that is not
+    // another message. Unpaired requests and status-less salvage stay in the
+    // evidence log above. Do not manufacture HTTP/1.1 204 for them, and do not
+    // queue a retry that would push the same row later.
+    if let Some(reason) = reject_burp_delivery(&request, response.as_ref()) {
+        log_mirror(
+            runtime.session_id,
+            &format!(
+                "burp-mirror skip-burp reason={reason} method={} host={} path={}",
+                request.method, request.host, request.path
+            ),
+        );
+        return;
+    }
     match deliver(
         runtime.endpoint,
         &request,
@@ -2874,6 +2927,48 @@ fn enqueue_delivery(
             );
         }
     }
+}
+
+/// `None` when this pair may be written into Burp history.
+///
+/// A missing or unparsed status is not turned into 204 here. Header values
+/// (and names) that contain CR/LF, and bodies that start with another HTTP
+/// message or gzip magic, are the desynced rows that used to land in history.
+fn reject_burp_delivery(
+    request: &MirroredMessage,
+    response: Option<&MirroredMessage>,
+) -> Option<&'static str> {
+    let Some(response) = response else {
+        return Some("no_observed_status");
+    };
+    if !response.is_pairable_response() {
+        return Some("no_observed_status");
+    }
+    for message in [request, response] {
+        for (name, value) in &message.headers {
+            if header_field_contains_newline(name) || header_field_contains_newline(value) {
+                return Some("header_contains_newline");
+            }
+        }
+        if let Some(reason) = burp_body_block_reason(&message.body) {
+            return Some(reason);
+        }
+    }
+    None
+}
+
+fn header_field_contains_newline(value: &str) -> bool {
+    value.bytes().any(|byte| byte == b'\n' || byte == b'\r')
+}
+
+fn burp_body_block_reason(body: &[u8]) -> Option<&'static str> {
+    if body.starts_with(b"GET ") || body.starts_with(b"POST ") || body.starts_with(b"HTTP/") {
+        return Some("body_looks_like_another_http_message");
+    }
+    if body.starts_with(b"\x1f\x8b") {
+        return Some("body_still_gzip");
+    }
+    None
 }
 
 fn diagnostic_evidence(message: &MirroredMessage) -> serde_json::Value {
@@ -2959,6 +3054,9 @@ fn store_orphan_response(
     stream_id: u64,
     response: MirroredMessage,
 ) -> Option<MirroredMessage> {
+    if response.is_statusless_placeholder() {
+        return None;
+    }
     let slot = orphans.entry((pid, stream_id)).or_default();
     let displaced = if slot.len() >= ORPHAN_RESPONSE_CAP {
         slot.pop_front().map(|(response, _)| response)
@@ -2974,9 +3072,28 @@ fn enqueue_unpaired_response(
     retries: &mut VecDeque<RetryDelivery>,
     response: MirroredMessage,
 ) {
-    let mut request = response.synthetic_request_for_response();
+    let request = response.synthetic_request_for_response();
     if !looks_like_mirror_host(&request.host) {
-        request.host = "unpaired-response.invalid".to_owned();
+        // Do NOT invent unpaired-response.invalid into Burp Proxy history.
+        // Hostless SSL_read orphans stay evidence-only until a real request pairs.
+        runtime
+            .metrics
+            .unpaired_responses
+            .fetch_add(1, Ordering::Relaxed);
+        if let Some(archive) = &runtime.archive {
+            let _ = archive.lock().map(|mut archive| {
+                let _ = archive.save(&request, Some(&response));
+            });
+        }
+        log_mirror(
+            runtime.session_id,
+            &format!(
+                "burp-mirror unpaired-response archive-only status={:?} body={} (no unpaired-response.invalid)",
+                response.status,
+                response.body.len()
+            ),
+        );
+        return;
     }
     enqueue_delivery(runtime, retries, request, Some(response));
 }
@@ -3000,7 +3117,8 @@ fn flush_orphan_responses(
     orphans.retain(|_, slot| !slot.is_empty());
 }
 
-/// Deliver requests whose pairing grace elapsed without a response copy.
+/// Pairing grace elapsed. enqueue records the request; without a copied status
+/// it is not sent to Burp.
 fn sweep_expired(
     pending: &mut HashMap<
         (u32, u64),
@@ -3039,8 +3157,9 @@ fn sweep_expired(
                 slot.push_front((request, response, queued_at));
                 break;
             }
-            let response =
-                response.or_else(|| take_orphan_response(orphans, *pid, *stream_id, &request));
+            let response = response
+                .filter(MirroredMessage::is_pairable_response)
+                .or_else(|| take_orphan_response(orphans, *pid, *stream_id, &request));
             if response.is_none()
                 && orphans
                     .iter()
@@ -3057,7 +3176,8 @@ fn sweep_expired(
     pending.retain(|_, slot| !slot.is_empty());
 }
 
-/// Deliver every still-pending request unpaired; used when the session ends.
+/// Session end: pair what is still held, then hand each row to enqueue.
+/// Rows without a copied status are logged there and not sent to Burp.
 fn flush_pending(
     pending: &mut HashMap<
         (u32, u64),
@@ -3071,8 +3191,9 @@ fn flush_pending(
     for ((pid, stream_id), slot) in pending.iter_mut() {
         while let Some((mut request, held, _)) = slot.pop_front() {
             fill_request_host_for_seal(&mut request, *pid, *stream_id, peer_book);
-            let response =
-                held.or_else(|| take_orphan_response(orphans, *pid, *stream_id, &request));
+            let response = held
+                .filter(MirroredMessage::is_pairable_response)
+                .or_else(|| take_orphan_response(orphans, *pid, *stream_id, &request));
             if let Some(ref response) = response {
                 if !looks_like_mirror_host(&request.host) && looks_like_mirror_host(&response.host)
                 {
@@ -3275,7 +3396,7 @@ fn deliver(
             request.method,
             request.host,
             request.path,
-            response.and_then(|item| item.status).unwrap_or(0),
+            response.and_then(MirroredMessage::observed_status).unwrap_or(0),
             reply_line.chars().take(80).collect::<String>(),
             absolute.len(),
             request.headers.len(),
@@ -3283,6 +3404,7 @@ fn deliver(
             upload
         ),
     );
+    // critical-form is logged on emit_request (TLS reconstruct), not only on burp ok.
     Ok(())
 }
 

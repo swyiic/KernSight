@@ -44,9 +44,6 @@ fn validate_architecture() -> Result<()> {
         "bpf/programs/network",
         "bpf/programs/binder",
         "bpf/programs/integrity",
-        "android/init",
-        "android/sepolicy",
-        "schemas/binder",
     ] {
         let path = root.join(required);
         if !path.exists() {

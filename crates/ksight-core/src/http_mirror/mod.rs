@@ -63,6 +63,27 @@ pub struct MirroredMessage {
     pub stream_id: Option<u32>,
 }
 
+impl MirroredMessage {
+    /// Status copied from the wire (`:status` / HTTP/1 status-line) or a
+    /// protocol-derived display status (gRPC). Missing stays `None`.
+    #[must_use]
+    pub fn observed_status(&self) -> Option<u16> {
+        self.status.or(self.evidence.display_status)
+    }
+
+    /// Empty salvage with no observed status — must not occupy a pairing slot.
+    #[must_use]
+    pub fn is_statusless_placeholder(&self) -> bool {
+        !self.is_request && self.observed_status().is_none() && self.body.is_empty()
+    }
+
+    /// True when this response copied a real HTTP status (`:status` / status-line / gRPC).
+    #[must_use]
+    pub fn is_pairable_response(&self) -> bool {
+        !self.is_request && self.observed_status().is_some()
+    }
+}
+
 fn evidence_token(value: &impl serde::Serialize) -> String {
     serde_json::to_value(value)
         .ok()
@@ -205,7 +226,7 @@ impl MirroredMessage {
     /// Origin-form HTTP/1.1 response for the playback listener to return to Burp.
     #[must_use]
     pub fn to_http1_response(&self) -> Vec<u8> {
-        let status = self.status.or(self.evidence.display_status).unwrap_or(200);
+        let status = self.observed_status().unwrap_or(204);
         let reason = reason_phrase(status);
         let start = format!("HTTP/1.1 {status} {reason}");
         self.write_http1_start(&start, None)
@@ -300,7 +321,7 @@ impl MirroredMessage {
             evidence_token(&metadata.origin), evidence_token(&metadata.completeness), evidence_token(&metadata.pairing)).as_bytes());
         if !self.is_request {
             let observed = self
-                .status
+                .observed_status()
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "unknown".to_owned());
             out.extend_from_slice(
@@ -318,7 +339,7 @@ impl MirroredMessage {
         out
     }
 
-    fn from_h2(
+    pub(crate) fn from_h2(
         headers: &[(String, String)],
         body: Vec<u8>,
         stream_id: Option<u32>,
@@ -617,6 +638,7 @@ enum StreamMode {
     Unknown,
     Http1,
     Http2,
+    Http3,
     Websocket,
 }
 
@@ -630,6 +652,7 @@ impl StreamReassembler {
             StreamMode::Unknown => "unknown",
             StreamMode::Http1 => "http1",
             StreamMode::Http2 => "http2",
+            StreamMode::Http3 => "http3",
             StreamMode::Websocket => "websocket",
         }
     }
@@ -658,6 +681,7 @@ impl StreamReassembler {
             StreamMode::Unknown => self.protocol_probe.len(),
             StreamMode::Http1 => self.http1.buf.len(),
             StreamMode::Http2 => self.http2.buffered_bytes(),
+            StreamMode::Http3 => self.protocol_probe.len(),
             StreamMode::Websocket => self.websocket.len(),
         }
     }
@@ -676,6 +700,7 @@ impl StreamReassembler {
             StreamMode::Unknown => self.protocol_probe.ends_with(bytes),
             StreamMode::Http1 => self.http1.buf.ends_with(bytes),
             StreamMode::Http2 => self.http2.ends_with(bytes),
+            StreamMode::Http3 => self.protocol_probe.ends_with(bytes),
             StreamMode::Websocket => self.websocket.ends_with(bytes),
         }
     }
@@ -708,6 +733,10 @@ impl StreamReassembler {
                     }
                     let buffered = std::mem::take(&mut self.protocol_probe);
                     self.push_h2(&buffered)
+                } else if crate::http3::looks_like_http3(&self.protocol_probe) {
+                    self.mode = StreamMode::Http3;
+                    let buffered = std::mem::take(&mut self.protocol_probe);
+                    self.push_h3(&buffered)
                 } else if orphan_body_looks_complete(&self.protocol_probe) {
                     // Missed SSL_read status-line: emit complete-looking orphan
                     // bodies immediately so Burp pairing happens before
@@ -723,8 +752,18 @@ impl StreamReassembler {
                 self.promote_websocket(messages)
             }
             StreamMode::Http2 => self.push_h2(bytes),
+            StreamMode::Http3 => self.push_h3(bytes),
             StreamMode::Websocket => self.push_ws(bytes),
         }
+    }
+
+    fn push_h3(&mut self, bytes: &[u8]) -> Vec<MirroredMessage> {
+        self.protocol_probe.extend_from_slice(bytes);
+        let messages = crate::http3::parse_http3_stream(&self.protocol_probe, self.outbound);
+        if !messages.is_empty() {
+            self.protocol_probe.clear();
+        }
+        messages
     }
 
     fn promote_websocket(&mut self, messages: Vec<MirroredMessage>) -> Vec<MirroredMessage> {
@@ -768,6 +807,7 @@ impl StreamReassembler {
                 self.promote_websocket(messages)
             }
             StreamMode::Http2 => self.push_h2(&[]),
+            StreamMode::Http3 => self.push_h3(&[]),
             StreamMode::Websocket => self.push_ws(&[]),
             StreamMode::Unknown => self.flush_unknown(true),
         }
@@ -784,6 +824,7 @@ impl StreamReassembler {
                 self.promote_websocket(messages)
             }
             StreamMode::Http2 => self.push_h2(&[]),
+            StreamMode::Http3 => self.push_h3(&[]),
             StreamMode::Websocket => self.push_ws(&[]),
             StreamMode::Unknown => self.flush_unknown(false),
         }
@@ -846,6 +887,7 @@ impl StreamReassembler {
             StreamMode::Unknown => self.protocol_probe.clone(),
             StreamMode::Http1 => self.http1.buf.clone(),
             StreamMode::Http2 => Vec::new(),
+            StreamMode::Http3 => self.protocol_probe.clone(),
             StreamMode::Websocket => self.websocket.clone(),
         }
     }
@@ -884,6 +926,11 @@ impl StreamReassembler {
             let mut out = self.push_h2(&buffered);
             out.extend(self.push_h2(&[]));
             return out;
+        }
+        if crate::http3::looks_like_http3(&self.protocol_probe) {
+            self.mode = StreamMode::Http3;
+            let buffered = std::mem::take(&mut self.protocol_probe);
+            return self.push_h3(&buffered);
         }
         if let Some(message) = orphan_body_as_response(&self.protocol_probe) {
             self.protocol_probe.clear();

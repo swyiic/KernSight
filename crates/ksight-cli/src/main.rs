@@ -12,10 +12,10 @@ use uuid::Uuid;
 use crate::{
     device::{
         adb_forward_burp_playback, adb_forward_burp_upstream, cleanup_package, daemon_start,
-        daemon_status, daemon_stop, deploy_agent, kill_stale_agents, protocol_acknowledge,
-        protocol_graph, protocol_replay, protocol_report, protocol_sessions, pull_forensics,
-        pull_package, pull_snapshot, read_last_session, recatalog_package, run_device,
-        run_device_tee, run_hide_debug_capture, validate_package, DEVICE_AGENT,
+        daemon_status, daemon_stop, deploy_agent, ensure_mirror_http_on_device, kill_stale_agents,
+        protocol_acknowledge, protocol_graph, protocol_replay, protocol_report, protocol_sessions,
+        pull_forensics, pull_package, pull_snapshot, read_last_session, recatalog_package,
+        run_device, run_device_tee, run_hide_debug_capture, validate_package, DEVICE_AGENT,
         DEVICE_BINDER_OBJECT, DEVICE_FILE_OBJECT, DEVICE_MEMORY_OBJECT, DEVICE_NETWORK_OBJECT,
         DEVICE_PROCESS_OBJECT, DEVICE_SCHED_OBJECT, DEVICE_SPOOL_ROOT, DEVICE_UPROBE_OBJECT,
     },
@@ -526,6 +526,8 @@ fn run_capture(serial: Option<&str>, mut options: CaptureOptions) -> Result<()> 
         if options.package.is_none() && options.pid.is_none() && options.uid.is_none() {
             bail!("--mirror-http requires --package, --pid, or --uid");
         }
+        let rewritten = ensure_mirror_http_on_device(serial, endpoint)?;
+        options.mirror_http = Some(rewritten);
     }
     if options.mitm_burp && (options.mirror_http.is_none() || options.package.is_none()) {
         bail!("--mitm-burp requires --mirror-http HOST:PORT and --package");
@@ -707,5 +709,21 @@ mod tests {
         assert_eq!(flag, " --mirror-http 127.0.0.1:8080");
         assert!(!flag.contains("mirror-burp"));
         assert!(format_mirror_http_flag(None).is_empty());
+    }
+
+    #[test]
+    fn mirror_http_rewrites_to_loopback_when_lan_is_unreachable() {
+        assert_eq!(
+            crate::device::mirror_http_for_device("192.168.73.236:8080", false),
+            "127.0.0.1:8080"
+        );
+        assert_eq!(
+            crate::device::mirror_http_for_device("192.168.73.236:8080", true),
+            "192.168.73.236:8080"
+        );
+        assert_eq!(
+            crate::device::mirror_http_for_device("127.0.0.1:8080", true),
+            "127.0.0.1:8080"
+        );
     }
 }

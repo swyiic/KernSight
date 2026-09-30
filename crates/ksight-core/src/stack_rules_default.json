@@ -903,6 +903,139 @@
       }
     },
     {
+      "id": "boc_gmssl_a89971d3",
+      "class": "framework-vendor",
+      "tier": 2,
+      "match_rules": {
+        "basename": "libgmssl.so",
+        "build_id": "a89971d3e6e4190899a95438a3309df6bbc4de08",
+        "size": 783320
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "boundary": {
+        "write": [
+          "sm4_cbc_padding_encrypt",
+          "sm4_cbc_encrypt_update"
+        ],
+        "read": [
+          "sm4_cbc_padding_decrypt",
+          "sm4_cbc_decrypt_update"
+        ],
+        "layout": "pinned",
+        "functions": [
+          {
+            "symbol": "sm4_cbc_padding_encrypt",
+            "direction": "send",
+            "capture_phase": "entry",
+            "buffer_arg": 2,
+            "length_arg": 3,
+            "layout": "pinned",
+            "is_body": true,
+            "confidence": "disasm libgmssl.so bid=a89971d3: x0=key x1=iv x2=in x3=inlen x4=out x5=outlen*",
+            "build_id": "a89971d3e6e4190899a95438a3309df6bbc4de08",
+            "max_bytes": 16384,
+            "validation_state": "enabled"
+          },
+          {
+            "symbol": "sm4_cbc_encrypt_update",
+            "direction": "send",
+            "capture_phase": "entry",
+            "buffer_arg": 1,
+            "length_arg": 2,
+            "layout": "pinned",
+            "is_body": true,
+            "confidence": "disasm: x0=ctx x1=in x2=inlen x3=out x4=outlen*",
+            "build_id": "a89971d3e6e4190899a95438a3309df6bbc4de08",
+            "max_bytes": 16384,
+            "validation_state": "enabled"
+          },
+          {
+            "symbol": "sm4_cbc_padding_decrypt",
+            "direction": "recv",
+            "capture_phase": "entry",
+            "buffer_arg": 2,
+            "length_arg": 3,
+            "layout": "pinned",
+            "is_body": true,
+            "confidence": "mirror of padding_encrypt ABI (same GmSSL family)",
+            "build_id": "a89971d3e6e4190899a95438a3309df6bbc4de08",
+            "max_bytes": 16384,
+            "validation_state": "experimental"
+          },
+          {
+            "symbol": "sm4_cbc_decrypt_update",
+            "direction": "recv",
+            "capture_phase": "entry",
+            "buffer_arg": 1,
+            "length_arg": 2,
+            "layout": "pinned",
+            "is_body": true,
+            "confidence": "mirror of encrypt_update ABI",
+            "build_id": "a89971d3e6e4190899a95438a3309df6bbc4de08",
+            "max_bytes": 16384,
+            "validation_state": "experimental"
+          }
+        ],
+        "max_bytes": 16384
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": false,
+        "boundary_dump": true
+      },
+      "notes": "libgmssl.so BuildID[sha1]=a89971d3e6e4190899a95438a3309df6bbc4de08 size=783320. NO SSL_*. Auto-attach only pinned C ABI: sm4_cbc_padding_encrypt x2=in/x3=inlen; sm4_cbc_encrypt_update x1=in/x2=inlen. sm4_cbc_encrypt (x3=nblocks) and JNI symmetricEncrypt (jobject) are not plaintext-copy targets. Decrypt rows stay experimental. SM4 blocks are not TLS records — do not splice into the HTTP assembler.",
+      "version": {
+        "kind": "pinned",
+        "product": "GmSSL JNI crypto SDK (libgmssl.so size=783320)",
+        "upgrade_note": "build_id+size pin; on APK upgrade re-pull ELF, confirm build_id/size + Java_org_gmssl_GmSSL_symmetricEncrypt dynsym; re-probe before promoting layout to pinned",
+        "engine_version": "GmSSL JNI org.gmssl.GmSSL",
+        "build_id": "a89971d3e6e4190899a95438a3309df6bbc4de08",
+        "size": 783320
+      }
+    },
+    {
+      "id": "boc_bocsafe_68d0d6be",
+      "class": "framework-vendor",
+      "tier": 2,
+      "match_rules": {
+        "basename": "libbocsafe.so",
+        "build_id": "68d0d6be53272f741e90a80d696533510da2c658",
+        "size": 18184
+      },
+      "symbols": {
+        "write": [],
+        "read": []
+      },
+      "boundary": {
+        "write": [
+          "Java_com_boc_bocsoft_mobile_biz_direct_natives_NativeManager_getSM4SecretKey",
+          "Java_com_boc_bocsoft_mobile_biz_direct_natives_NativeManager_getSM4IV",
+          "Java_com_boc_bocsoft_mobile_biz_direct_natives_NativeManager_getSM3SecretKey"
+        ],
+        "read": [],
+        "layout": "empirical",
+        "functions": [],
+        "max_bytes": 4096
+      },
+      "coverage": {
+        "plaintext_copy": false,
+        "keylog": false,
+        "boundary_dump": true
+      },
+      "notes": "libbocsafe.so BuildID[sha1]=68d0d6be53272f741e90a80d696533510da2c658 size=18184. JNI getSM4SecretKey/getSM4IV/getSM3SecretKey — no buffer ABI. layout=empirical so auto-attach does not infer jobject as a TLS copy. Register dump only with --inspect-jni.",
+      "version": {
+        "kind": "pinned",
+        "product": "libbocsafe.so NativeManager (size=18184)",
+        "upgrade_note": "re-pull ELF on APK upgrade; confirm build_id+size+JNI symbol names",
+        "engine_version": "NativeManager getSM4*",
+        "build_id": "68d0d6be53272f741e90a80d696533510da2c658",
+        "size": 18184
+      }
+    },
+    {
       "id": "gmssl_tassl",
       "class": "vendor-fork",
       "tier": 2,
@@ -930,7 +1063,7 @@
         "keylog": false,
         "boundary_dump": false
       },
-      "notes": "GmSSL/TASSL forks keeping standard SSL_* names when they are real TLS stacks. CAUTION: libgmssl.so bid a89971d3… size=783320 has NO SSL_write/SSL_read dynsym — JNI digest/cipher SDK only; name match is misleading. Attach still requires export proof at runtime. plaintext_copy=true only when SSL_write is actually exported.",
+      "notes": "国密 TASSL/GmSSL forks keeping standard SSL_* names when they are real TLS stacks. CAUTION: BOC libgmssl.so (build_id a89971d3e6e4190899a95438a3309df6bbc4de08 size=783320) has NO SSL_write/SSL_read dynsym — JNI digest/cipher SDK only; basename match is misleading. Prefer boc_gmssl_a89971d3 pin. Attach still requires export proof at runtime; plaintext_copy=true only when SSL_write is actually exported.",
       "version": {
         "kind": "stable",
         "product": "GmSSL / TASSL (国密) with SSL_* exports",
