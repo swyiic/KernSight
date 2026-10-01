@@ -7,17 +7,7 @@ KernSight 是 Android 设备的内核观测项目。
 开发基线是 Pixel 6a、Android 16 (SDK 36) 、arm64-v8a。
 
 ## 覆盖范围
-- 通用规则覆盖常见 Android 应用栈；具体 App 需要单独适配。
-- 示例数据图：
-  <img width="895" height="924" alt="image" src="https://github.com/user-attachments/assets/dc43f886-f795-4f9d-923f-8f525fe2066a" />
-- 爱存不存部分数据图：
-  <img width="926" height="920" alt="image" src="https://github.com/user-attachments/assets/7dcbc276-7707-45d6-9ecb-f83848b04cba" />
-- （政务类）随申办部分数据图：
-  <img width="926" height="923" alt="image" src="https://github.com/user-attachments/assets/c65cb4e4-b20c-4e11-b3c9-f44d0d8f2e03" />
-- 爱国网，爱国当前版本比较特殊，挂载的是arch32架构，uprobe没有等价内核钩子，需要换安装包，重新适配
-  <img width="927" height="803" alt="image" src="https://github.com/user-attachments/assets/df0712bb-51a6-4eee-a746-bde1486362f6" />
-
-- 当前仅为通用规则，针对某个App需要做深入优化和重新分析，binder对其，kprobe和uprobe等
+- 通用规则覆盖常见 Android 应用栈；大陆四大行，政务类，购物类均可。
 
 ## 编译环境
 
