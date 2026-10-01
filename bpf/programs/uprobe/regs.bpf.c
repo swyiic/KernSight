@@ -186,4 +186,56 @@ int ksight_uretprobe_regs(struct ksight_user_regs *ctx)
     return ksight_emit_user_regs(ctx, 1);
 }
 
+/* Registers only. Used for pointer-returning getters such as
+ * xqc_get_conn_user_data_by_stream. Does not read x1/x2 and does not touch
+ * entry_ptr, so an SSL_read already stashed on this tid keeps its buffer. */
+static __always_inline int ksight_emit_regs_only(struct ksight_user_regs *ctx,
+                                                 ksight_u32 at_return)
+{
+    ksight_u32 zero = 0;
+    struct ksight_hwbp_context *out = ksight_bpf_map_lookup_elem(&hwbp_ctx, &zero);
+    ksight_u64 pid_tgid;
+    ksight_u32 tgid;
+    ksight_u32 *mode;
+    int i;
+
+    if (!out)
+        return 0;
+
+    pid_tgid = ksight_bpf_get_current_pid_tgid();
+    tgid = (ksight_u32)(pid_tgid >> 32);
+    mode = ksight_bpf_map_lookup_elem(&tgid_filter, &zero);
+    if (mode && *mode != 0) {
+        if (!ksight_bpf_map_lookup_elem(&tgid_allow, &tgid))
+            return 0;
+    }
+    out->pid = tgid;
+    out->tid = (ksight_u32)pid_tgid;
+#pragma unroll
+    for (i = 0; i < 31; i++)
+        ksight_bpf_probe_read_kernel(&out->regs[i], sizeof(out->regs[i]),
+                                     &ctx->regs[i]);
+    ksight_bpf_probe_read_kernel(&out->sp, sizeof(out->sp), &ctx->sp);
+    ksight_bpf_probe_read_kernel(&out->pc, sizeof(out->pc), &ctx->pc);
+    ksight_bpf_probe_read_kernel(&out->pstate, sizeof(out->pstate), &ctx->pstate);
+    out->time_ns = ksight_bpf_ktime_get_ns();
+    out->aux_bytes = 0;
+    out->aux_pad = at_return ? 1 : 0;
+    ksight_bpf_perf_event_output(ctx, &hwbp_events,
+                                 KSIGHT_BPF_F_CURRENT_CPU, out, sizeof(*out));
+    return 0;
+}
+
+SEC("uprobe/ksight_regs_nocopy")
+int ksight_uprobe_regs_nocopy(struct ksight_user_regs *ctx)
+{
+    return ksight_emit_regs_only(ctx, 0);
+}
+
+SEC("uretprobe/ksight_ret_nocopy")
+int ksight_uretprobe_regs_nocopy(struct ksight_user_regs *ctx)
+{
+    return ksight_emit_regs_only(ctx, 1);
+}
+
 char LICENSE[] SEC("license") = "GPL";

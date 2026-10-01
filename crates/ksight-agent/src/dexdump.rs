@@ -250,6 +250,24 @@ pub fn pids_for_package(package: &str) -> Vec<u32> {
     pids
 }
 
+/// UID of a live process whose cmdline is `package`.
+///
+/// Virtual-app guests keep the inner package cmdline but run under the
+/// clone app's UID, which is not the `packages.list` UID.
+#[must_use]
+pub fn live_uid_for_package(package: &str) -> Option<u32> {
+    pids_for_package(package).into_iter().find_map(|pid| {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        status
+            .lines()
+            .find(|line| line.starts_with("Uid:"))?
+            .split_whitespace()
+            .nth(1)?
+            .parse()
+            .ok()
+    })
+}
+
 const PLAINTEXT_NEEDLES: [&[u8]; 18] = [
     b"https://",
     b"HTTP/1.",

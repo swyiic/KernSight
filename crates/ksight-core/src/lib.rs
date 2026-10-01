@@ -18,6 +18,7 @@ mod native_rules;
 mod pcap_decrypt;
 mod policy;
 mod provenance;
+mod quic_connkey;
 mod quic_initial;
 mod report;
 mod sequence;
@@ -78,6 +79,7 @@ pub use provenance::{
     DexOwnershipCategory, DexOwnershipContext, DexOwnershipEntry, DexOwnershipNamespaceSeed,
     DexOwnershipReport, DumpArtifact, PackageDexIndex, ProvenanceClass,
 };
+pub use quic_connkey::{ConnUserDataBook, ConnUserDataStats};
 pub use quic_initial::{
     decrypt_initial, decrypt_quic_1rtt, encrypt_quic_1rtt_for_test, quic_application_keys,
     QuicApplicationKeys, QuicInitialHello, QuicInitialTable,

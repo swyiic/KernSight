@@ -860,6 +860,9 @@ pub struct InspectRuntime {
     binder_pending: BinderPending,
     #[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
     binder_dex_cache: crate::binder_dex::ProcessDexAidlCache,
+    /// Tid → stream pointers waiting for a getter's return value.
+    connkey_pending: HashMap<u32, Vec<u64>>,
+    connkey: ksight_core::ConnUserDataBook,
     #[cfg(any(target_os = "android", target_os = "linux"))]
     scoped_tgids: Vec<u32>,
     #[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
@@ -1328,6 +1331,8 @@ impl InspectRuntime {
             jni_pair: JniPairPending::default(),
             binder_pending: BinderPending::default(),
             binder_dex_cache: crate::binder_dex::ProcessDexAidlCache::default(),
+            connkey_pending: HashMap::new(),
+            connkey: ksight_core::ConnUserDataBook::default(),
             #[cfg(any(target_os = "android", target_os = "linux"))]
             scoped_tgids: Vec::new(),
             delay_notice_emitted: false,
@@ -1466,6 +1471,9 @@ impl InspectRuntime {
             if self.expired {
                 return Vec::new();
             }
+            // Push a newly visible package TGID before the map walk. Sessions
+            // attached while /proc had no cmdline stay deny-all until this runs.
+            sync_live_tgid_allowlist(self);
             let mut observations = self.rescan_tls_exports_maybe();
             if !self.sessions.is_empty() {
                 // Successful probes are skipped by identity; failed probes are
@@ -1530,6 +1538,13 @@ impl InspectRuntime {
     }
 
     /// TlsSslRead funnel: (entry, uret, plaintext_ok, uret_fail, want_read_or_neg).
+    /// Observed getter returns: stream pointers, distinct keys, keys shared by 2+.
+    #[must_use]
+    pub fn connkey_stats(&self) -> (u64, u64, u64) {
+        let stats = self.connkey.stats();
+        (stats.streams, stats.returns, stats.shared)
+    }
+
     pub fn ssl_read_funnel(&self) -> (u64, u64, u64, u64, u64) {
         (
             self.ssl_read_entry,
@@ -1903,6 +1918,47 @@ fn note_exported_stream_api(elf: &crate::elf::ElfIdentity) {
     }
 }
 
+fn quic_connkey_plans(
+    policy: &InspectPolicy,
+    adapter: InspectAdapterKind,
+    uprobe_object: &Path,
+    elf_path: &str,
+    elf: &crate::elf::ElfIdentity,
+) -> Vec<InspectPlan> {
+    const NAMES: &[&str] = &[
+        "xqc_get_conn_user_data_by_stream",
+        "xqc_get_conn_alp_user_data_by_stream",
+    ];
+    let mut plans = Vec::new();
+    for (name, offset) in matching_symbols_exact(elf, NAMES) {
+        let mut observation = InspectObservation {
+            adapter: adapter.as_str().to_owned(),
+            library: elf_path.to_owned(),
+            build_id: elf.build_id.clone(),
+            offset: Some(offset),
+            detectability_notice: policy.detectability_notice.clone(),
+            ..InspectObservation::default()
+        };
+        observation.detail = format!(
+            "ready to attach regs-only uprobe symbol={name} offset={offset:#x} (conn user-data export, no buffer copy)"
+        );
+        plans.push(InspectPlan {
+            policy: policy.clone(),
+            adapter,
+            uprobe_object: uprobe_object.to_path_buf(),
+            elf_path: Some(elf_path.to_owned()),
+            offset: Some(offset),
+            build_id: elf.build_id.clone(),
+            symbol: Some(name.to_owned()),
+            abi: None,
+            layout_hint: ProbeLayoutHint::default(),
+            pointer_width: (elf.bits / 8).max(4),
+            observation,
+        });
+    }
+    plans
+}
+
 fn quic_stream_export_plans(
     policy: &InspectPolicy,
     adapter: InspectAdapterKind,
@@ -1984,12 +2040,18 @@ fn evaluate_tls_symbol_exports(
     if !ssl_allowed {
         // Stripped libssl / Flutter / XQUIC: no invented SSL_write RVA.
         // STREAM C exports still attach by DEFINED dynsym name only.
-        let stream_plans = quic_stream_export_plans(policy, adapter, uprobe_object, elf_path, &elf);
-        return if stream_plans.is_empty() {
-            Some(Vec::new())
-        } else {
-            Some(stream_plans)
-        };
+        let mut stream_plans =
+            quic_stream_export_plans(policy, adapter, uprobe_object, elf_path, &elf);
+        if adapter == InspectAdapterKind::TlsSslRead {
+            stream_plans.extend(quic_connkey_plans(
+                policy,
+                adapter,
+                uprobe_object,
+                elf_path,
+                &elf,
+            ));
+        }
+        return Some(stream_plans);
     }
     if let Some(required) = policy.build_id.as_deref() {
         match elf.build_id.as_deref() {
@@ -2070,6 +2132,16 @@ fn evaluate_tls_symbol_exports(
             pointer_width: (elf.bits / 8).max(4),
             observation,
         });
+    }
+
+    if adapter == InspectAdapterKind::TlsSslRead {
+        plans.extend(quic_connkey_plans(
+            policy,
+            adapter,
+            uprobe_object,
+            elf_path,
+            &elf,
+        ));
     }
 
     if plans.is_empty() {
@@ -2441,7 +2513,45 @@ fn adapter_is_live(selected: &[InspectAdapterKind], adapter: InspectAdapterKind)
 
 #[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
 #[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
+fn plan_is_connkey(plan: &InspectPlan) -> bool {
+    matches!(
+        plan.symbol.as_deref(),
+        Some("xqc_get_conn_user_data_by_stream") | Some("xqc_get_conn_alp_user_data_by_stream")
+    )
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn note_connkey(runtime: &mut InspectRuntime, retprobe: bool, hit: &ksight_hwbp::RegisterContext) {
+    let tid = hit.tid;
+    if !retprobe {
+        let stream = hit.regs[0];
+        if stream >= 0x1000 {
+            let stack = runtime.connkey_pending.entry(tid).or_default();
+            if stack.len() >= 8 {
+                stack.remove(0);
+            }
+            stack.push(stream);
+        }
+        return;
+    }
+    let stream = runtime
+        .connkey_pending
+        .get_mut(&tid)
+        .and_then(|stack| stack.pop());
+    let Some(stream) = stream else {
+        return;
+    };
+    if runtime.connkey_pending.get(&tid).is_some_and(Vec::is_empty) {
+        runtime.connkey_pending.remove(&tid);
+    }
+    runtime.connkey.observe(stream, hit.regs[0]);
+}
+
 fn adapter_probe_programs_for_plan(plan: &InspectPlan) -> &'static [&'static str] {
+    // Pointer-returning getters: registers only. The TLS program would copy x1.
+    if plan_is_connkey(plan) {
+        return &["ksight_uprobe_regs_nocopy", "ksight_uretprobe_regs_nocopy"];
+    }
     // Plain SSL_write must stay entry-only on Pixel GKI — dual uretprobe
     // correlated with raw_uprobe=0 (2026-09-10). Only *_ex needs return length.
     if plan.adapter == InspectAdapterKind::TlsSslWrite {
@@ -2692,6 +2802,32 @@ fn rank_inspect_pids(pids: &[u32]) -> Vec<u32> {
     scored.into_iter().map(|(_, pid)| pid).collect()
 }
 
+/// Basename rank for the mapped-ELF cap. `0` is parsed first.
+///
+/// The cap counts plausible ELFs, not every file-backed mapping. QUIC and SSL
+/// basenames go first so `libxquic.so` is not dropped behind unrelated app
+/// libraries. `libiquickjs` stays in the normal bucket (`quic` is not a needle).
+#[cfg_attr(
+    not(any(test, target_os = "android", target_os = "linux")),
+    allow(dead_code)
+)]
+fn tls_map_scan_rank(path: &str) -> u8 {
+    let file = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
+    const EARLY: [&str; 10] = [
+        "xquic",
+        "tquic",
+        "lsquic",
+        "ngtcp",
+        "cronet",
+        "tnet",
+        "libssl",
+        "openssl",
+        "boringssl",
+        "conscrypt",
+    ];
+    u8::from(!EARLY.iter().any(|needle| file.contains(needle)))
+}
+
 #[cfg(any(target_os = "android", target_os = "linux"))]
 #[allow(clippy::too_many_lines)]
 fn discover_mapped_libraries_by_tls_symbol(
@@ -2700,11 +2836,11 @@ fn discover_mapped_libraries_by_tls_symbol(
 ) -> Vec<String> {
     let names = tls_exact_names(adapter);
     let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut exporters: Vec<String> = Vec::new();
+    let mut early: Vec<String> = Vec::new();
+    let mut rest: Vec<String> = Vec::new();
     let ranked = rank_inspect_pids(pids);
     let pid_cap = 16;
     let skipped_pids = ranked.len().saturating_sub(pid_cap);
-    let mut skipped_maps = 0_u32;
     for pid in ranked.iter().copied().take(pid_cap) {
         let Ok(maps) = std::fs::read_to_string(format!("/proc/{pid}/maps")) else {
             continue;
@@ -2716,43 +2852,48 @@ fn discover_mapped_libraries_by_tls_symbol(
             if !path.starts_with('/') || path.contains(" (deleted)") {
                 continue;
             }
-            if !seen.insert(path.to_owned()) {
+            let owned = path.to_owned();
+            if !seen.insert(owned.clone()) {
                 continue;
             }
-            if !crate::elf::plausible_elf_file(path) {
-                continue;
+            if tls_map_scan_rank(&owned) == 0 {
+                early.push(owned);
+            } else {
+                rest.push(owned);
             }
-            if seen.len() > 256 {
-                skipped_maps = skipped_maps.saturating_add(1);
-                eprintln!(
-                    "tls scan skip maps cap=256 scanned={} exporters={} skipped_pids={} skipped_maps={}",
-                    seen.len(),
-                    exporters.len(),
-                    skipped_pids,
-                    skipped_maps
-                );
-                return exporters;
-            }
-            if exporters.len() >= TLS_EXPORTER_CAP {
-                eprintln!(
-                    "tls scan skip exporters cap={} scanned_maps={} skipped_pids={}",
-                    TLS_EXPORTER_CAP,
-                    seen.len(),
-                    skipped_pids
-                );
-                return exporters;
-            }
-            // Hardened/obfuscated ELFs carry hostile section tables; parsing
-            // must never take the whole agent down.
-            let scanned = std::panic::catch_unwind(|| {
-                crate::elf::inspect_elf(path)
-                    .ok()
-                    .filter(|elf| !matching_symbols_exact(elf, &names).is_empty())
-            });
-            if let Ok(Some(elf)) = scanned {
-                exporters.push(path.to_owned());
-                drop(elf);
-            }
+        }
+    }
+    let mut exporters: Vec<String> = Vec::new();
+    let mut scanned = 0_u32;
+    for path in early.into_iter().chain(rest) {
+        if !crate::elf::plausible_elf_file(&path) {
+            continue;
+        }
+        scanned = scanned.saturating_add(1);
+        if scanned > 256 {
+            eprintln!(
+                "tls scan skip maps cap=256 scanned={scanned} exporters={} skipped_pids={skipped_pids} skipped_maps=1",
+                exporters.len()
+            );
+            return exporters;
+        }
+        if exporters.len() >= TLS_EXPORTER_CAP {
+            eprintln!(
+                "tls scan skip exporters cap={} scanned_maps={scanned} skipped_pids={skipped_pids}",
+                TLS_EXPORTER_CAP
+            );
+            return exporters;
+        }
+        // Hardened/obfuscated ELFs carry hostile section tables; parsing
+        // must never take the whole agent down.
+        let scanned_elf = std::panic::catch_unwind(|| {
+            crate::elf::inspect_elf(&path)
+                .ok()
+                .filter(|elf| !matching_symbols_exact(elf, &names).is_empty())
+        });
+        if let Ok(Some(elf)) = scanned_elf {
+            exporters.push(path);
+            drop(elf);
         }
     }
     exporters
@@ -2834,6 +2975,66 @@ fn pids_for_uid(uid: u32) -> Vec<u32> {
         }
     }
     pids
+}
+
+/// Allowlist to push when it differs from `current`.
+///
+/// Package scope with no live PID is an empty deny-all, not an unrestricted
+/// probe. `None` means whole-device scope, or the sorted list is unchanged.
+/// Writing `scoped_tgids` without pushing this list leaves sessions that
+/// attached as deny-all stuck there: later refreshes see no diff.
+#[cfg_attr(
+    not(any(test, target_os = "android", target_os = "linux")),
+    allow(dead_code)
+)]
+fn tgid_allowlist_transition(
+    current: &[u32],
+    package_scoped: bool,
+    scanned: Option<&[u32]>,
+) -> Option<Vec<u32>> {
+    let next_slice = if package_scoped {
+        scanned.unwrap_or(&[])
+    } else {
+        scanned?
+    };
+    let mut next = next_slice.to_vec();
+    next.sort_unstable();
+    next.dedup();
+    (next != current).then_some(next)
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn sync_live_tgid_allowlist(runtime: &mut InspectRuntime) {
+    let package_scoped = runtime.plans.first().is_some_and(|plan| {
+        !plan.policy.whole_device
+            && plan
+                .policy
+                .package
+                .as_deref()
+                .is_some_and(|name| !name.is_empty())
+    });
+    let scanned = runtime
+        .plans
+        .first()
+        .and_then(|plan| active_tgid_filter(&plan.policy));
+    let Some(next) =
+        tgid_allowlist_transition(&runtime.scoped_tgids, package_scoped, scanned.as_deref())
+    else {
+        return;
+    };
+    if !runtime.sessions.is_empty() {
+        eprintln!(
+            "inspect tgid_filter refresh {} -> {}",
+            join_tgids(&runtime.scoped_tgids),
+            join_tgids(&next)
+        );
+        for live in &mut runtime.sessions {
+            if let Err(error) = live.session.apply_tgid_filter(Some(&next)) {
+                eprintln!("inspect tgid_filter update failed: {error:#}");
+            }
+        }
+    }
+    runtime.scoped_tgids = next;
 }
 
 #[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
@@ -3130,24 +3331,25 @@ fn attach_all(runtime: &mut InspectRuntime) -> Vec<InspectObservation> {
         .filter(|plan| plan.should_attach() && adapter_is_live(&selected, plan.adapter))
         .cloned()
         .collect::<Vec<_>>();
-    let policy = runtime.plans.first().map(|plan| &plan.policy);
-    let package_scoped = policy.is_some_and(|policy| {
-        !policy.whole_device
-            && policy
+    let package_scoped = runtime.plans.first().is_some_and(|plan| {
+        !plan.policy.whole_device
+            && plan
+                .policy
                 .package
                 .as_deref()
                 .is_some_and(|name| !name.is_empty())
     });
-    let tgids = policy.and_then(active_tgid_filter);
-    if let Some(tgids) = tgids.as_ref() {
-        runtime.scoped_tgids.clone_from(tgids);
-    }
-    // Package capture must never attach with filter disabled (None = all apps).
-    // Empty allowlist denies until refresh_tgid_filter learns live PIDs.
+    // Existing sessions keep the BPF map they were created with. A later
+    // cmdline match has to be applied here; copying the Vec alone makes
+    // refresh_package_tgids treat the allowlist as unchanged.
+    sync_live_tgid_allowlist(runtime);
     let tgids_attach: Option<Vec<u32>> = if package_scoped {
-        Some(tgids.unwrap_or_default())
+        Some(runtime.scoped_tgids.clone())
     } else {
-        tgids
+        runtime
+            .plans
+            .first()
+            .and_then(|plan| active_tgid_filter(&plan.policy))
     };
     for plan in plans {
         // Kernel uprobe `pid` is a thread id. Attach globally and drop other TGIDs
@@ -3269,7 +3471,8 @@ fn attach_all(runtime: &mut InspectRuntime) -> Vec<InspectObservation> {
         }
 
         for program in programs {
-            let retprobe = *program == "ksight_uretprobe_regs";
+            let retprobe =
+                *program == "ksight_uretprobe_regs" || *program == "ksight_uretprobe_regs_nocopy";
             let already_live = runtime.sessions.iter().any(|live| {
                 !live.paired_entry_return
                     && live.retprobe == retprobe
@@ -3383,6 +3586,10 @@ fn poll_all(runtime: &mut InspectRuntime) -> Vec<InspectOutput> {
     }
     batch.sort_by_key(|(_, _, hit)| hit.time_ns);
     for (plan, retprobe, hit) in batch {
+        if plan_is_connkey(&plan) {
+            note_connkey(runtime, retprobe, &hit);
+            continue;
+        }
         if adapter_hits(runtime, plan.adapter) >= adapter_hit_cap(runtime, plan.adapter) {
             continue;
         }
@@ -4525,6 +4732,10 @@ fn looks_like_code_path(value: &str) -> bool {
     allow(dead_code)
 )]
 fn plausible_user_ptr(value: u64) -> bool {
+    // Top byte is the ARM64 TBI/MTE tag. Vendor heap pointers arrive
+    // tagged; rejecting them dropped the SSL_read entry frame, so the return
+    // probe had nothing to pair with and the plaintext copy was lost.
+    let value = value & 0x00ff_ffff_ffff_ffff;
     (0x1000..=0x0000_7fff_ffff_ffff).contains(&value)
 }
 
@@ -4830,6 +5041,8 @@ fn bytes_contains(haystack: &[u8], needle: &[u8]) -> bool {
 )]
 fn keep_jni_plaintext(bytes: &[u8]) -> bool {
     // Critical-field chase: phone numbers are short and must not be dropped before classify.
+    // crypto_watch is host-testable and present on device; macOS release builds omit it.
+    #[cfg(any(test, target_os = "android", target_os = "linux"))]
     if crate::crypto_watch::looks_like_phone_field(bytes) {
         return true;
     }
@@ -5058,7 +5271,14 @@ pub fn read_remote_cstring(pid: u32, address: u64, max_bytes: usize) -> Option<S
 
 /// Read bounded bytes from another process address space.
 pub fn read_remote_bytes(pid: u32, address: u64, max_bytes: usize) -> Option<Vec<u8>> {
-    if address == 0 || max_bytes == 0 || pid == 0 {
+    if max_bytes == 0 || pid == 0 {
+        return None;
+    }
+    // ARM64 user pointers carry TBI/MTE tags in the top byte. `/proc/pid/mem`
+    // seeks the raw address, so a tagged `size_t *written` (SSL_read_ex on
+    // tagged vendor heap pointer) fails the read and the whole plaintext copy is dropped.
+    let address = address & 0x00ff_ffff_ffff_ffff;
+    if address < 0x1000 {
         return None;
     }
     let mut file = File::open(format!("/proc/{pid}/mem")).ok()?;

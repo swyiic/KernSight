@@ -464,6 +464,22 @@ fn format_mirror_http_flag(endpoint: Option<&str>) -> String {
     endpoint.map_or_else(String::new, |value| format!(" --mirror-http {value}"))
 }
 
+fn validate_mirror_profile(options: &CaptureOptions) -> anyhow::Result<()> {
+    if options.all
+        || options.network_io
+        || options.memory_all
+        || options.binder
+        || options.sched
+        || options.inspect_jni
+        || options.inspect_linker
+        || options.inspect_all_apps
+        || options.inspect_adapter.is_some()
+    {
+        anyhow::bail!("--mirror-http uses the minimal profile (--package + --network + --inspect-tls); retry without --all/--network-io/--memory-all/--binder/--sched/--inspect-jni/--inspect-linker/--inspect-all-apps/--inspect-adapter");
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 fn run_capture(serial: Option<&str>, mut options: CaptureOptions) -> Result<()> {
     let json_flag = if options.json { " --json" } else { "" };
@@ -521,6 +537,7 @@ fn run_capture(serial: Option<&str>, mut options: CaptureOptions) -> Result<()> 
         if let Err(error) = ksight_core::parse_mirror_endpoint(endpoint) {
             bail!("{error}");
         }
+        validate_mirror_profile(&options)?;
         options.inspect_tls = true;
         options.network = true;
         if options.package.is_none() && options.pid.is_none() && options.uid.is_none() {
@@ -709,6 +726,35 @@ mod tests {
         assert_eq!(flag, " --mirror-http 127.0.0.1:8080");
         assert!(!flag.contains("mirror-burp"));
         assert!(format_mirror_http_flag(None).is_empty());
+    }
+
+    #[test]
+    fn mirror_profile_rejects_high_volume_sensors() {
+        let base = Args::try_parse_from([
+            "ksightctl",
+            "device",
+            "capture",
+            "--package",
+            "com.example.app",
+            "--mirror-http",
+            "127.0.0.1:8080",
+        ])
+        .unwrap();
+        let Command::Device { command, .. } = base.command else {
+            panic!("expected device command");
+        };
+        let DeviceCommand::Capture(mut minimal) = *command else {
+            panic!("expected capture command");
+        };
+        assert!(validate_mirror_profile(&minimal).is_ok());
+        minimal.all = true;
+        assert!(validate_mirror_profile(&minimal).is_err());
+        minimal.all = false;
+        minimal.network_io = true;
+        assert!(validate_mirror_profile(&minimal).is_err());
+        minimal.network_io = false;
+        minimal.binder = true;
+        assert!(validate_mirror_profile(&minimal).is_err());
     }
 
     #[test]

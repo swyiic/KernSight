@@ -630,6 +630,8 @@ pub struct StreamReassembler {
     outbound: bool,
     /// Next HTTP/1 response is body-less (response to HEAD).
     next_response_no_body: bool,
+    /// Last HTTP/3 parse reason. `Yielded` stays once a message was produced.
+    http3_outcome: Option<crate::http3::Http3ParseOutcome>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -660,6 +662,14 @@ impl StreamReassembler {
     /// Mark this assembler as the send (true) or recv (false) half.
     pub fn set_outbound(&mut self, outbound: bool) {
         self.outbound = outbound;
+    }
+
+    /// Last HTTP/3 parse reason. `none` until this direction enters HTTP/3.
+    #[must_use]
+    pub fn http3_outcome(&self) -> &'static str {
+        self.http3_outcome
+            .map(crate::http3::Http3ParseOutcome::as_str)
+            .unwrap_or("none")
     }
 
     /// Mark the next HTTP/1 response as body-less (RFC: response to HEAD).
@@ -717,34 +727,7 @@ impl StreamReassembler {
                     let discard = self.protocol_probe.len().saturating_sub(PROTOCOL_PROBE_CAP);
                     self.protocol_probe.drain(..discard);
                 }
-                if looks_like_http1(&self.protocol_probe) {
-                    self.mode = StreamMode::Http1;
-                    let buffered = std::mem::take(&mut self.protocol_probe);
-                    self.apply_no_body_hint();
-                    let messages = self.http1.push(&buffered);
-                    self.promote_websocket(messages)
-                } else if let Some(message) = take_mpaas_message(&self.protocol_probe) {
-                    self.protocol_probe.clear();
-                    vec![message]
-                } else if let Some(offset) = http2_sync_offset(&self.protocol_probe) {
-                    self.mode = StreamMode::Http2;
-                    if offset > 0 {
-                        self.protocol_probe.drain(..offset);
-                    }
-                    let buffered = std::mem::take(&mut self.protocol_probe);
-                    self.push_h2(&buffered)
-                } else if crate::http3::looks_like_http3(&self.protocol_probe) {
-                    self.mode = StreamMode::Http3;
-                    let buffered = std::mem::take(&mut self.protocol_probe);
-                    self.push_h3(&buffered)
-                } else if orphan_body_looks_complete(&self.protocol_probe) {
-                    // Missed SSL_read status-line: emit complete-looking orphan
-                    // bodies immediately so Burp pairing happens before
-                    // PAIRING_GRACE sweeps the matching request unpaired.
-                    self.flush_unknown(false)
-                } else {
-                    Vec::new()
-                }
+                self.classify_unknown_probe()
             }
             StreamMode::Http1 => {
                 self.apply_no_body_hint();
@@ -757,13 +740,86 @@ impl StreamReassembler {
         }
     }
 
+    /// Pick HTTP/1, HTTP/2, or HTTP/3 from bytes still in `protocol_probe`.
+    ///
+    /// HTTP/3 is entered only after QPACK yields headers or a DATA frame
+    /// carries bytes. An empty DATA/HEADERS prefix stays unknown, and is
+    /// dropped only when the bytes behind it are already HTTP/1 or HTTP/2.
+    fn classify_unknown_probe(&mut self) -> Vec<MirroredMessage> {
+        for _ in 0..4 {
+            if self.protocol_probe.is_empty() {
+                return Vec::new();
+            }
+            if looks_like_http1(&self.protocol_probe) {
+                self.mode = StreamMode::Http1;
+                let buffered = std::mem::take(&mut self.protocol_probe);
+                self.apply_no_body_hint();
+                let messages = self.http1.push(&buffered);
+                return self.promote_websocket(messages);
+            } else if let Some(message) = take_mpaas_message(&self.protocol_probe) {
+                self.protocol_probe.clear();
+                return vec![message];
+            } else if let Some(offset) = http2_sync_offset(&self.protocol_probe) {
+                self.mode = StreamMode::Http2;
+                if offset > 0 {
+                    self.protocol_probe.drain(..offset);
+                }
+                let buffered = std::mem::take(&mut self.protocol_probe);
+                return self.push_h2(&buffered);
+            } else if crate::http3::looks_like_http3(&self.protocol_probe) {
+                if crate::http3::http3_confirmed(&self.protocol_probe) {
+                    self.mode = StreamMode::Http3;
+                    let buffered = std::mem::take(&mut self.protocol_probe);
+                    return self.push_h3(&buffered);
+                }
+                if self.strip_empty_http3_prefix() {
+                    continue;
+                }
+                return Vec::new();
+            } else if orphan_body_looks_complete(&self.protocol_probe) {
+                // Missed SSL_read status-line: emit complete-looking orphan
+                // bodies immediately so Burp pairing happens before
+                // PAIRING_GRACE sweeps the matching request unpaired.
+                return self.flush_unknown(false);
+            } else {
+                return Vec::new();
+            }
+        }
+        Vec::new()
+    }
+
+    /// Drop a leading empty HTTP/3 frame when the remainder is another protocol.
+    fn strip_empty_http3_prefix(&mut self) -> bool {
+        let skip = crate::http3::leading_empty_http3_prefix(&self.protocol_probe);
+        if skip == 0 || skip >= self.protocol_probe.len() {
+            return false;
+        }
+        let rest = &self.protocol_probe[skip..];
+        let preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+        let other = rest.starts_with(preface)
+            || find_http1_start(rest) == Some(0)
+            || (rest.len() >= 9
+                && http2_sync_offset(rest) == Some(0)
+                && !preface.starts_with(rest));
+        if !other {
+            return false;
+        }
+        self.protocol_probe.drain(..skip);
+        true
+    }
+
     fn push_h3(&mut self, bytes: &[u8]) -> Vec<MirroredMessage> {
         self.protocol_probe.extend_from_slice(bytes);
-        let messages = crate::http3::parse_http3_stream(&self.protocol_probe, self.outbound);
-        if !messages.is_empty() {
+        let explained = crate::http3::explain_http3_stream(&self.protocol_probe, self.outbound);
+        if explained.outcome == crate::http3::Http3ParseOutcome::Yielded
+            || self.http3_outcome != Some(crate::http3::Http3ParseOutcome::Yielded)
+        {
+            self.http3_outcome = Some(explained.outcome);
+        }
+        if !explained.messages.is_empty() {
             self.protocol_probe.clear();
         }
-        messages
+        explained.messages
     }
 
     fn promote_websocket(&mut self, messages: Vec<MirroredMessage>) -> Vec<MirroredMessage> {
@@ -902,42 +958,53 @@ impl StreamReassembler {
     }
 
     fn flush_unknown(&mut self, discard_remainder: bool) -> Vec<MirroredMessage> {
-        if self.protocol_probe.is_empty() {
-            return Vec::new();
-        }
-        if looks_like_http1(&self.protocol_probe) {
-            self.mode = StreamMode::Http1;
-            let buffered = std::mem::take(&mut self.protocol_probe);
-            self.apply_no_body_hint();
-            let mut out = self.http1.push(&buffered);
-            out.extend(self.http1.flush());
-            return out;
-        }
-        if let Some(message) = take_mpaas_message(&self.protocol_probe) {
-            self.protocol_probe.clear();
-            return vec![message];
-        }
-        if let Some(offset) = http2_sync_offset(&self.protocol_probe) {
-            self.mode = StreamMode::Http2;
-            if offset > 0 {
-                self.protocol_probe.drain(..offset);
+        for _ in 0..4 {
+            if self.protocol_probe.is_empty() {
+                return Vec::new();
             }
-            let buffered = std::mem::take(&mut self.protocol_probe);
-            let mut out = self.push_h2(&buffered);
-            out.extend(self.push_h2(&[]));
-            return out;
-        }
-        if crate::http3::looks_like_http3(&self.protocol_probe) {
-            self.mode = StreamMode::Http3;
-            let buffered = std::mem::take(&mut self.protocol_probe);
-            return self.push_h3(&buffered);
-        }
-        if let Some(message) = orphan_body_as_response(&self.protocol_probe) {
-            self.protocol_probe.clear();
-            return vec![message];
-        }
-        if discard_remainder {
-            self.protocol_probe.clear();
+            if looks_like_http1(&self.protocol_probe) {
+                self.mode = StreamMode::Http1;
+                let buffered = std::mem::take(&mut self.protocol_probe);
+                self.apply_no_body_hint();
+                let mut out = self.http1.push(&buffered);
+                out.extend(self.http1.flush());
+                return out;
+            }
+            if let Some(message) = take_mpaas_message(&self.protocol_probe) {
+                self.protocol_probe.clear();
+                return vec![message];
+            }
+            if let Some(offset) = http2_sync_offset(&self.protocol_probe) {
+                self.mode = StreamMode::Http2;
+                if offset > 0 {
+                    self.protocol_probe.drain(..offset);
+                }
+                let buffered = std::mem::take(&mut self.protocol_probe);
+                let mut out = self.push_h2(&buffered);
+                out.extend(self.push_h2(&[]));
+                return out;
+            }
+            if crate::http3::looks_like_http3(&self.protocol_probe) {
+                if crate::http3::http3_confirmed(&self.protocol_probe) {
+                    self.mode = StreamMode::Http3;
+                    let buffered = std::mem::take(&mut self.protocol_probe);
+                    return self.push_h3(&buffered);
+                }
+                if self.strip_empty_http3_prefix() {
+                    continue;
+                }
+                if !discard_remainder {
+                    return Vec::new();
+                }
+            }
+            if let Some(message) = orphan_body_as_response(&self.protocol_probe) {
+                self.protocol_probe.clear();
+                return vec![message];
+            }
+            if discard_remainder {
+                self.protocol_probe.clear();
+            }
+            return Vec::new();
         }
         Vec::new()
     }

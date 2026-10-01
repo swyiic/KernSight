@@ -1343,8 +1343,7 @@ fn parses_http_calls_from_inspect_plaintext_and_redacts_tokens() {
             captured_bytes: 80,
             truncated: false,
             sha256: "tracker1".to_owned(),
-            preview: "GET /v1/index?page=1 HTTP/1.1\r\nHost: log-api.pangle.io\r\n\r\n"
-                .to_owned(),
+            preview: "GET /v1/index?page=1 HTTP/1.1\r\nHost: log-api.pangle.io\r\n\r\n".to_owned(),
             preview_encoding: "utf8_lossy".to_owned(),
             content_class: "text".to_owned(),
 

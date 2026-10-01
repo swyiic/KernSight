@@ -1372,3 +1372,46 @@ fn seal_salvages_png_orphan_as_response() {
     assert_eq!(messages[0].status, None);
     assert_eq!(messages[0].body, png);
 }
+
+#[test]
+fn empty_http3_prefix_stays_unknown_until_headers_or_other_http() {
+    let mut stream = StreamReassembler::default();
+    assert!(stream.push(&[0x00, 0x00]).is_empty());
+    assert_eq!(stream.protocol(), "unknown");
+
+    let mut combined = vec![0x00, 0x00];
+    combined.extend_from_slice(b"GET /locked HTTP/1.1\r\nHost: a.example\r\n\r\n");
+    let mut once = StreamReassembler::default();
+    let messages = once.push(&combined);
+    assert_eq!(once.protocol(), "http1");
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    assert_eq!(messages[0].path, "/locked");
+
+    let messages = stream.push(b"GET /later HTTP/1.1\r\nHost: a.example\r\n\r\n");
+    assert_eq!(stream.protocol(), "http1");
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    assert_eq!(messages[0].path, "/later");
+
+    let mut h2 = StreamReassembler::default();
+    assert!(h2.push(&[0x00, 0x00]).is_empty());
+    assert_eq!(h2.protocol(), "unknown");
+    h2.push(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    assert_eq!(h2.protocol(), "http2");
+
+    let mut h3 = StreamReassembler::default();
+    h3.set_outbound(true);
+    let messages = h3.push(&[0x01, 0x04, 0x00, 0x00, 0xd1, 0xc1]);
+    assert_eq!(h3.protocol(), "http3");
+    assert_eq!(h3.http3_outcome(), "yielded");
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    assert_eq!(messages[0].method, "GET");
+    assert!(messages[0].evidence.transformations.contains(&"http3"));
+    assert!(h3.push(&[]).is_empty());
+    assert_eq!(h3.http3_outcome(), "yielded");
+
+    let mut data_only = StreamReassembler::default();
+    data_only.set_outbound(true);
+    assert!(data_only.push(&[0x00, 0x01, b'x']).is_empty());
+    assert_eq!(data_only.protocol(), "http3");
+    assert_eq!(data_only.http3_outcome(), "outbound_data_only");
+}

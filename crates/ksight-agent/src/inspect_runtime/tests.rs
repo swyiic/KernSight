@@ -4,6 +4,54 @@ use super::*;
 use std::time::Duration;
 
 #[test]
+fn tls_map_scan_rank_reads_quic_and_ssl_before_other_elfs() {
+    assert_eq!(
+        tls_map_scan_rank("/data/app/com.example.app/lib/arm64/libxquic.so"),
+        0
+    );
+    assert_eq!(tls_map_scan_rank("/data/app/x/lib/arm64/libtnet.so"), 0);
+    assert_eq!(
+        tls_map_scan_rank("/apex/com.android.tethering/lib64/stable_cronet_libssl.so"),
+        0
+    );
+    assert_eq!(
+        tls_map_scan_rank("/data/app/com.example.app/lib/arm64/libiquickjs.so"),
+        1
+    );
+    assert!(
+        tls_map_scan_rank("/data/app/x/lib/arm64/libxquic.so")
+            < tls_map_scan_rank("/data/app/x/lib/arm64/libfoo.so")
+    );
+}
+
+#[test]
+fn package_allowlist_transitions_from_deny_all_to_live_tgid() {
+    assert_eq!(
+        tgid_allowlist_transition(&[], true, None).as_deref(),
+        None,
+        "empty deny-all is already the package default"
+    );
+    assert_eq!(
+        tgid_allowlist_transition(&[], true, Some(&[7904])).as_deref(),
+        Some(&[7904][..])
+    );
+    assert_eq!(
+        tgid_allowlist_transition(&[7904], true, Some(&[7904, 7904])).as_deref(),
+        None
+    );
+    assert_eq!(
+        tgid_allowlist_transition(&[7904], true, None).as_deref(),
+        Some(&[][..]),
+        "a gone package process must return to deny-all"
+    );
+    assert_eq!(
+        tgid_allowlist_transition(&[], false, None).as_deref(),
+        None,
+        "whole-device scope is not a TGID filter"
+    );
+}
+
+#[test]
 fn parse_stat_start_ticks_skips_comm_in_parentheses() {
     let mut fields = vec!["S".to_owned()];
     fields.extend(std::iter::repeat_n("0".to_owned(), 18));

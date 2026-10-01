@@ -263,8 +263,6 @@ impl Drop for PlaybackLease<'_> {
 /// Ranked SNI / Host observations for filling authority-less H2.
 #[derive(Debug, Default)]
 struct PeerHostBook {
-    by_pid: HashMap<u32, Vec<String>>,
-    session: Vec<String>,
     by_stream: HashMap<(u32, u64), String>,
     /// Handshake/connect SNI that has not yet bound to an SSL* stream_key.
     /// Seal-time fill may use this only when the pid has exactly one leftover
@@ -273,14 +271,6 @@ struct PeerHostBook {
 }
 
 impl PeerHostBook {
-    fn remember(&mut self, pid: u32, host: &str) {
-        if !looks_like_mirror_host(host) {
-            return;
-        }
-        remember_host_list(&mut self.session, host);
-        remember_host_list(self.by_pid.entry(pid).or_default(), host);
-    }
-
     fn bind_stream(&mut self, pid: u32, stream: u64, host: &str) {
         if looks_like_mirror_host(host) {
             self.by_stream.insert((pid, stream), host.to_owned());
@@ -305,22 +295,6 @@ impl PeerHostBook {
         }
     }
 
-    fn unique_unbound(&self, pid: u32) -> Option<&str> {
-        let list = self.unbound.get(&pid)?;
-        let mut only: Option<&str> = None;
-        for host in list {
-            if is_cdn_steal_host(host) {
-                continue;
-            }
-            match only {
-                None => only = Some(host.as_str()),
-                Some(existing) if existing.eq_ignore_ascii_case(host) => {}
-                Some(_) => return None,
-            }
-        }
-        only
-    }
-
     fn rebind_stream(&mut self, pid: u32, from: u64, to: u64) {
         if from == to {
             return;
@@ -331,270 +305,35 @@ impl PeerHostBook {
     }
 
     fn fill(&self, request: &mut MirroredMessage, pid: u32, stream: u64) {
-        // Last-resort placeholders (mobilegw/loggw) may still be replaced by
-        // a later handshake SNI on this stream. Real Hosts stay put unless
-        // last_url stamped a sibling that this path must not inherit
-        // (a log POST must not inherit a sibling page host on the same stream).
-        if looks_like_mirror_host(&request.host) && !is_last_resort_host(&request.host) {
-            let reject = (looks_like_cmb_mainpage_path(&request.path)
-                && !is_cmb_mainpage_host(&request.host))
-                || (looks_like_cmb_log_path(&request.path) && !is_cmb_log_host(&request.host))
-                || (is_alipay_dae_csv(request)
-                    && !request.host.to_ascii_lowercase().contains("datagw"));
-            if !reject {
-                return;
-            }
-            request.host.clear();
-        }
-        // Only the same TLS connection. Pid/session-wide SNI is how turkey-sls,
-        // datagw, ACS, and bank CDNs stamp the wrong host onto a sibling RPC.
-        if let Some(host) = self.by_stream.get(&(pid, stream)) {
-            // Same-SSL* SNI is usually right, but CMB multiplex leftovers
-            // (wangdun/log) must not stamp /mainpage/ or SystemLogHandler.
-            let skip = (looks_like_cmb_mainpage_path(&request.path)
-                && !is_cmb_mainpage_host(host))
-                || (looks_like_cmb_log_path(&request.path) && !is_cmb_log_host(host))
-                // cycle-024809 D-AE 2048-byte CSV stamped mobilegw from the
-                // same SSL* as mgw. Diagnosis CSV only accepts datagw.
-                || (is_alipay_dae_csv(request)
-                    && !host.to_ascii_lowercase().contains("datagw"));
-            if !skip {
-                request.host.clone_from(host);
-                return;
-            }
-        }
-        // Path/header-constrained: /mgw.htm may use an observed mobilegw SNI
-        // on this pid. Not a pid-wide steal of datagw/CDN.
-        if let Some(host) = self.match_observed_host(request, pid) {
-            request.host = host;
-            return;
-        }
-        if request.path.to_ascii_lowercase().contains("/loggw") {
-            "loggw.alipay.com".clone_into(&mut request.host);
-            return;
-        }
-        if is_alipay_dae_csv(request) {
-            if let Some(host) = self.observed_datagw_host(pid) {
-                request.host = host;
-            } else {
-                "datagw-edge.alipay.com".clone_into(&mut request.host);
-            }
-            return;
-        }
-        if looks_like_cmb_log_path(&request.path) {
-            if let Some(host) = self.cmb_host_for_path(pid, &request.path) {
-                request.host = host;
-            }
-            return;
-        }
-        if looks_like_cmb_mainpage_path(&request.path) {
-            if let Some(host) = self.cmb_host_for_path(pid, &request.path) {
-                request.host = host;
-            } else {
-                "mbmodule-mainopenapi.paas.cmbchina.com".clone_into(&mut request.host);
-            }
-            return;
-        }
-        if looks_like_ccb_mbsmps(&request.path) {
-            "xc.mp3.ccb.cn".clone_into(&mut request.host);
-            return;
-        }
-        // Path-constrained last-resort so pairing sees a Host mid-session
-        // (same-stream companions inherit via last_url). Unique unbound SNI
-        // still wins first via match_observed_host / by_stream above.
-        if is_mgw_request(request) {
-            "mobilegw.alipay.com".clone_into(&mut request.host);
-        }
-    }
-
-    fn match_observed_host(&self, request: &MirroredMessage, pid: u32) -> Option<String> {
-        if !is_mgw_request(request) {
-            return None;
-        }
-        let mut pick: Option<String> = None;
-        let mut conflict = false;
-        let mut consider = |host: &str| {
-            if conflict || !is_gateway_host(host) {
-                return;
-            }
-            match pick.as_deref() {
-                None => pick = Some(host.to_owned()),
-                Some(existing) if existing.eq_ignore_ascii_case(host) => {}
-                Some(_) => {
-                    pick = None;
-                    conflict = true;
-                }
-            }
-        };
-        for ((process, _), host) in &self.by_stream {
-            if *process == pid {
-                consider(host);
-            }
-        }
-        if let Some(list) = self.unbound.get(&pid) {
-            for host in list {
-                consider(host);
-            }
-        }
-        if let Some(list) = self.by_pid.get(&pid) {
-            for host in list {
-                consider(host);
-            }
-        }
-        pick
-    }
-
-    fn cmb_host_for_path(&self, pid: u32, path: &str) -> Option<String> {
-        let mut module = None;
-        let mut api = None;
-        let mut log = None;
-        let mut consider = |host: &str| {
-            let lower = host.to_ascii_lowercase();
-            if !lower.contains("cmbchina.com") || !looks_like_mirror_host(host) {
-                return;
-            }
-            if lower.starts_with("log.") {
-                if log.is_none() {
-                    log = Some(host.to_owned());
-                }
-            } else if lower.contains("mbmodule") || lower.contains("mainopenapi") {
-                if module.is_none() {
-                    module = Some(host.to_owned());
-                }
-            } else if is_cmb_mainpage_host(host) && api.is_none() {
-                api = Some(host.to_owned());
-            }
-        };
-        for ((process, _), host) in &self.by_stream {
-            if *process == pid {
-                consider(host);
-            }
-        }
-        if let Some(list) = self.by_pid.get(&pid) {
-            for host in list {
-                consider(host);
-            }
-        }
-        if let Some(list) = self.unbound.get(&pid) {
-            for host in list {
-                consider(host);
-            }
-        }
-        if looks_like_cmb_log_path(path) {
-            // SystemLogHandler → log.cmbchina.com only; never mobile/wangdun.
-            log
-        } else {
-            module.or(api)
-        }
+        let seen = self.by_stream.get(&(pid, stream)).map(String::as_str);
+        apply_connection_host(request, seen);
     }
 
     fn fill_seal(&self, request: &mut MirroredMessage, pid: u32, stream: u64) {
-        // Seal still only accepts API hosts. Session-wide non-telemetry
-        // (acs.m.taobao.com, render.alipay.com) used to stamp hostless mgw
-        // POSTs and hide them in Burp under the wrong site.
         self.fill(request, pid, stream);
-        if looks_like_mirror_host(&request.host) {
-            let reject = (looks_like_cmb_mainpage_path(&request.path)
-                && !is_cmb_mainpage_host(&request.host))
-                || (looks_like_cmb_log_path(&request.path) && !is_cmb_log_host(&request.host))
-                || (is_alipay_dae_csv(request)
-                    && !request.host.to_ascii_lowercase().contains("datagw"));
-            if !reject {
-                return;
-            }
-            request.host.clear();
-        }
-        // Handshake SNI on a tid that never saw this SSL*: use it only when
-        // this pid has exactly one leftover unbound name. Two leftovers stay
-        // missing-sni.invalid rather than guessing CDN vs API.
-        if let Some(host) = self.unique_unbound(pid) {
-            // Non-gateway leftover (render.alipay.com, …) must not stamp mgw
-            // and must not skip the mobilegw last resort below.
-            let skip_for_mgw = is_mgw_request(request) && !is_gateway_host(host);
-            let skip_for_cmb =
-                looks_like_cmb_mainpage_path(&request.path) && !is_cmb_mainpage_host(host);
-            // SystemLogHandler must not inherit wangdungateway leftover
-            // (cycle-233657 orig=0 on log POSTs stamped as wangdun).
-            let skip_for_cmb_log = looks_like_cmb_log_path(&request.path) && !is_cmb_log_host(host);
-            // Never invent wangdungateway onto a sibling RPC (cycle-235515
-            // /mainpage/ + avatar sealed as wangdun leftover).
-            let skip_wangdun = is_wangdun_host(host);
-            // cycle-021444 D-VM/D-AE unique leftover was mobilegw → 2048-byte
-            // diagnosis CSV sealed as POST mobilegw. Only datagw may stamp these.
-            let skip_for_dae =
-                is_alipay_dae_csv(request) && !host.to_ascii_lowercase().contains("datagw");
-            if !(skip_for_mgw || skip_for_cmb || skip_for_cmb_log || skip_wangdun || skip_for_dae) {
-                host.clone_into(&mut request.host);
-                return;
-            }
-        }
-        // Last resort for Alipay gateway RPCs whose handshake SNI was never
-        // copied. Prefer this over missing-sni.invalid on /mgw.htm.
-        if is_mgw_request(request) {
-            "mobilegw.alipay.com".clone_into(&mut request.host);
-            return;
-        }
-        if request.path.to_ascii_lowercase().contains("/loggw") {
-            "loggw.alipay.com".clone_into(&mut request.host);
-            return;
-        }
-        if looks_like_cmb_log_path(&request.path) {
-            if let Some(host) = self.cmb_host_for_path(pid, &request.path) {
-                request.host = host;
-            } else {
-                "log.cmbchina.com".clone_into(&mut request.host);
-            }
-            return;
-        }
-        if looks_like_cmb_mainpage_path(&request.path) {
-            if let Some(host) = self.cmb_host_for_path(pid, &request.path) {
-                request.host = host;
-            } else {
-                "mbmodule-mainopenapi.paas.cmbchina.com".clone_into(&mut request.host);
-            }
-            return;
-        }
-        if is_alipay_dae_csv(request) {
-            if let Some(host) = self.observed_datagw_host(pid) {
-                request.host = host;
-            } else {
-                "datagw-edge.alipay.com".clone_into(&mut request.host);
-            }
-            return;
-        }
-        if looks_like_ccb_mbsmps(&request.path) {
-            "xc.mp3.ccb.cn".clone_into(&mut request.host);
-        }
     }
+}
 
-    fn observed_datagw_host(&self, pid: u32) -> Option<String> {
-        let mut pick = None;
-        let mut consider = |host: &str| {
-            if pick.is_some() {
-                return;
-            }
-            let lower = host.to_ascii_lowercase();
-            if lower.contains("datagw") && looks_like_mirror_host(host) {
-                pick = Some(host.to_owned());
-            }
-        };
-        for ((process, _), host) in &self.by_stream {
-            if *process == pid {
-                consider(host);
-            }
-        }
-        if let Some(list) = self.by_pid.get(&pid) {
-            for host in list {
-                consider(host);
-            }
-        }
-        if let Some(list) = self.unbound.get(&pid) {
-            for host in list {
-                consider(host);
-            }
-        }
-        pick
+/// Host comes from this connection's already-seen name, or stays empty.
+///
+/// A path that cannot use that name (log vs mainpage, diagnosis CSV vs a
+/// non-datagw host) is left empty. No domain is written in as a fallback.
+fn apply_connection_host(request: &mut MirroredMessage, seen: Option<&str>) {
+    if looks_like_mirror_host(&request.host) && !connection_host_conflicts(&request.host, request) {
+        return;
     }
+    request.host.clear();
+    if let Some(host) = seen {
+        if looks_like_mirror_host(host) && !connection_host_conflicts(host, request) {
+            host.clone_into(&mut request.host);
+        }
+    }
+}
+
+fn connection_host_conflicts(host: &str, request: &MirroredMessage) -> bool {
+    (looks_like_cmb_mainpage_path(&request.path) && !is_cmb_mainpage_host(host))
+        || (looks_like_cmb_log_path(&request.path) && !is_cmb_log_host(host))
+        || (is_alipay_dae_csv(request) && !host.to_ascii_lowercase().contains("datagw"))
 }
 
 fn looks_like_cmb_log_path(path: &str) -> bool {
@@ -700,23 +439,9 @@ fn is_gateway_host(host: &str) -> bool {
         || host.contains("mgs.alipay")
 }
 
-fn is_last_resort_host(host: &str) -> bool {
-    host.eq_ignore_ascii_case("mobilegw.alipay.com")
-        || host.eq_ignore_ascii_case("loggw.alipay.com")
-        || host.eq_ignore_ascii_case("datagw-edge.alipay.com")
-        || host.eq_ignore_ascii_case("log.cmbchina.com")
-        || host.eq_ignore_ascii_case("s3gw.cmbimg.cn")
-        || host.eq_ignore_ascii_case("mbmodule-mainopenapi.paas.cmbchina.com")
-}
-
 fn is_cmb_avatar_host(host: &str) -> bool {
     let lower = host.to_ascii_lowercase();
     lower.contains("s3gw") && lower.contains("cmbimg.cn")
-}
-
-fn looks_like_ccb_mbsmps(path: &str) -> bool {
-    // cycle-025652 hostless POST /mbsmps/V2/txCtrl — hosted copies are xc.mp3.ccb.cn.
-    path.to_ascii_lowercase().contains("/mbsmps/")
 }
 
 fn is_alipay_dae_csv(request: &MirroredMessage) -> bool {
@@ -903,16 +628,30 @@ struct ParkedAppPlaintext {
 }
 
 fn looks_like_app_plaintext(bytes: &[u8]) -> bool {
-    let Ok(text) = std::str::from_utf8(bytes) else {
-        return false;
-    };
+    let window = &bytes[..bytes.len().min(512)];
+    let text = std::str::from_utf8(window).unwrap_or("");
     let text = text.trim();
-    if text.len() < 2 {
-        return false;
+    if text.len() >= 2
+        && (text.starts_with('{')
+            || text.starts_with('[')
+            || (text.contains('=') && (text.contains('&') || text.contains("mobile"))))
+    {
+        return true;
     }
-    text.starts_with('{')
-        || text.starts_with('[')
-        || (text.contains('=') && (text.contains('&') || text.contains("mobile")))
+    // GmSSL encrypt input often has a short length prefix before the JSON.
+    window
+        .iter()
+        .position(|byte| *byte == b'{' || *byte == b'[')
+        .is_some_and(|start| {
+            std::str::from_utf8(&window[start..]).is_ok_and(|rest| rest.len() >= 2)
+        })
+}
+
+fn request_is_app_plaintext(request: &MirroredMessage) -> bool {
+    request
+        .headers
+        .iter()
+        .any(|(name, value)| name.eq_ignore_ascii_case("x-kernsight-app-plaintext") && value == "1")
 }
 
 fn apply_app_plaintext(request: &mut MirroredMessage, adapter: &str, bytes: &[u8]) {
@@ -1123,12 +862,35 @@ impl BurpMirror {
         let mut unknown_streams = 0_u64;
         let mut http1_streams = 0_u64;
         let mut http2_streams = 0_u64;
+        let mut http3_streams = 0_u64;
+        let mut http3_yielded = 0_u64;
+        let mut http3_outbound_data_only = 0_u64;
+        let mut http3_qpack_rejected = 0_u64;
+        let mut http3_trailing_partial = 0_u64;
+        let mut http3_unclassified = 0_u64;
         let mut buffered_bytes = 0_u64;
         for streams in self.streams.values() {
             for assembler in [&streams.send, &streams.recv] {
                 match assembler.protocol() {
                     "http1" => http1_streams = http1_streams.saturating_add(1),
                     "http2" => http2_streams = http2_streams.saturating_add(1),
+                    "http3" => {
+                        http3_streams = http3_streams.saturating_add(1);
+                        match assembler.http3_outcome() {
+                            "yielded" => http3_yielded = http3_yielded.saturating_add(1),
+                            "outbound_data_only" => {
+                                http3_outbound_data_only =
+                                    http3_outbound_data_only.saturating_add(1);
+                            }
+                            "qpack_rejected" => {
+                                http3_qpack_rejected = http3_qpack_rejected.saturating_add(1);
+                            }
+                            "trailing_partial" => {
+                                http3_trailing_partial = http3_trailing_partial.saturating_add(1);
+                            }
+                            _ => http3_unclassified = http3_unclassified.saturating_add(1),
+                        }
+                    }
                     _ => unknown_streams = unknown_streams.saturating_add(1),
                 }
                 buffered_bytes = buffered_bytes
@@ -1260,6 +1022,15 @@ impl BurpMirror {
         metrics.insert("unknown_directions".to_owned(), unknown_streams);
         metrics.insert("http1_directions".to_owned(), http1_streams);
         metrics.insert("http2_directions".to_owned(), http2_streams);
+        metrics.insert("http3_directions".to_owned(), http3_streams);
+        metrics.insert("http3_yielded".to_owned(), http3_yielded);
+        metrics.insert(
+            "http3_outbound_data_only".to_owned(),
+            http3_outbound_data_only,
+        );
+        metrics.insert("http3_qpack_rejected".to_owned(), http3_qpack_rejected);
+        metrics.insert("http3_trailing_partial".to_owned(), http3_trailing_partial);
+        metrics.insert("http3_unclassified".to_owned(), http3_unclassified);
         metrics.insert("buffered_bytes".to_owned(), buffered_bytes);
         metrics
     }
@@ -1299,7 +1070,6 @@ impl BurpMirror {
             self.recent_peer.entry(pid).or_insert_with(|| host.clone());
         }
         let bound_cid = if let Ok(mut book) = self.peer_book.lock() {
-            book.remember(pid, &host);
             if tid != 0 {
                 if let Some((cid, _)) = self.tid_connection.get(&(pid, tid)).copied() {
                     book.bind_stream(pid, cid, &host);
@@ -1828,7 +1598,6 @@ impl BurpMirror {
                 if !url_host_is_api_fill(&url.host) {
                     continue;
                 }
-                book.remember(pid, &url.host);
                 book.bind_stream(pid, stream, &url.host);
                 remembered = true;
             }
@@ -1844,6 +1613,52 @@ impl BurpMirror {
             });
         self.retry_pending_hostless(pid);
         waiting
+    }
+
+    fn flush_parked_app_plaintext(&mut self) {
+        let parked = std::mem::take(&mut self.parked_app_plain);
+        for item in parked {
+            if !looks_like_app_plaintext(&item.bytes) {
+                continue;
+            }
+            let Some(host) = self
+                .recent_peer
+                .get(&item.pid)
+                .cloned()
+                .filter(|host| looks_like_mirror_host(host))
+            else {
+                log_mirror(
+                    &self.session_id,
+                    &format!(
+                        "burp-mirror app-plain seal hostless pid={} adapter={} bytes={}",
+                        item.pid,
+                        item.adapter,
+                        item.bytes.len()
+                    ),
+                );
+                continue;
+            };
+            let mut request = MirroredMessage {
+                is_request: true,
+                method: "POST".to_owned(),
+                scheme: "https",
+                host,
+                path: "/".to_owned(),
+                status: None,
+                headers: Vec::new(),
+                body: Vec::new(),
+                websocket_upgrade: false,
+                evidence: ksight_core::MessageEvidence::default(),
+                stream_id: None,
+            };
+            apply_app_plaintext(&mut request, &item.adapter, &item.bytes);
+            request.body = item.bytes;
+            request.headers.push((
+                "X-KernSight-Body-Source".to_owned(),
+                "pre_encrypt".to_owned(),
+            ));
+            self.queue_request(item.pid, 0, request);
+        }
     }
 
     fn park_app_plaintext(&mut self, pid: u32, tid: u32, adapter: &str, bytes: &[u8]) {
@@ -1889,7 +1704,6 @@ impl BurpMirror {
         let mut hosted = looks_like_mirror_host(&request.host);
         if let Ok(mut book) = self.peer_book.lock() {
             if looks_like_mirror_host(&request.host) {
-                book.remember(pid, &request.host);
                 book.bind_stream(pid, stream_id, &request.host);
                 hosted = true;
             } else {
@@ -1952,23 +1766,17 @@ impl BurpMirror {
     }
 
     fn finish_request(&mut self, pid: u32, stream_id: u64, request: &mut MirroredMessage) {
-        if request.host.is_empty() {
+        if !looks_like_mirror_host(&request.host) {
             if let Some((host, path)) = self.last_url.get(&(pid, stream_id)) {
-                // A log POST or diagnosis CSV must not inherit a sibling host
-                // on the same stream.
-                let skip = (looks_like_cmb_log_path(&request.path) && !is_cmb_log_host(host))
-                    || (looks_like_cmb_mainpage_path(&request.path) && !is_cmb_mainpage_host(host))
-                    || (is_alipay_dae_csv(request)
-                        && !host.to_ascii_lowercase().contains("datagw"));
-                if !skip {
-                    host.clone_into(&mut request.host);
-                    if request.path == "/" {
-                        path.clone_into(&mut request.path);
-                    }
+                let host = host.clone();
+                let path = path.clone();
+                apply_connection_host(request, Some(&host));
+                if looks_like_mirror_host(&request.host) && request.path == "/" {
+                    request.path = path;
                 }
             }
         }
-        if request.host.is_empty() {
+        if !looks_like_mirror_host(&request.host) {
             if let Ok(book) = self.peer_book.lock() {
                 book.fill(request, pid, stream_id);
             }
@@ -2538,6 +2346,7 @@ impl BurpMirror {
         }
         // Hostless requests were already queued for pairing; do not re-send.
         self.pending_hostless.clear();
+        self.flush_parked_app_plaintext();
         // Stop the worker first while playback :18081 is still accepting. Setting
         // `stop` earlier made Burp's fetch to 127.0.0.1:18081 fail at session-end
         // (upstream error / abandoned_retries) even when mid-run pairing worked.
@@ -2627,6 +2436,10 @@ fn worker_loop(
             Ok(MirrorJob::Request(request, pid, stream_id)) => {
                 let mut request = *request;
                 fill_request_host_from_peers(&mut request, pid, stream_id, peer_book);
+                if request_is_app_plaintext(&request) && looks_like_mirror_host(&request.host) {
+                    enqueue_delivery(&runtime, &mut retries, request, None);
+                    continue;
+                }
                 if let Some(response) =
                     take_orphan_response(&mut orphan_responses, pid, stream_id, &request)
                 {
@@ -2821,7 +2634,9 @@ fn enqueue_delivery(
             .fetch_add(1, Ordering::Relaxed);
     }
     for message in std::iter::once(&request).chain(response.as_ref()) {
-        if message.evidence.completeness != MessageCompleteness::Complete {
+        // Unknown means framing never decided; only a positive Incomplete
+        // mark (idle shortfall, size cap) counts as an incomplete message.
+        if message.evidence.completeness == MessageCompleteness::Incomplete {
             runtime
                 .metrics
                 .incomplete_messages
@@ -2939,12 +2754,31 @@ fn reject_burp_delivery(
     response: Option<&MirroredMessage>,
 ) -> Option<&'static str> {
     let Some(response) = response else {
+        // Copied SM4/GmSSL plaintext has no HTTP status of its own. Deliver it
+        // as a labeled request; playback uses 204 + Observed-Status: unknown,
+        // not an invented 200.
+        if request_is_app_plaintext(request)
+            && looks_like_mirror_host(&request.host)
+            && !request.body.is_empty()
+        {
+            return None;
+        }
         return Some("no_observed_status");
     };
     if !response.is_pairable_response() {
         return Some("no_observed_status");
     }
+    if !looks_like_mirror_host(&request.host) {
+        return Some("no_observed_host");
+    }
     for message in [request, response] {
+        // Hard cap truncation destroyed bytes mid-body (H2 per-stream 1 MiB).
+        // Seal-salvaged shortfalls stay deliverable: the wire reframes
+        // Content-Length to actual bytes and labels Completeness, so the Burp
+        // row is self-consistent, not a fabricated complete response.
+        if message.evidence.dropped_body_bytes > 0 {
+            return Some("incomplete_body");
+        }
         for (name, value) in &message.headers {
             if header_field_contains_newline(name) || header_field_contains_newline(value) {
                 return Some("header_contains_newline");
@@ -3201,7 +3035,13 @@ fn flush_pending(
                 }
             }
             if !looks_like_mirror_host(&request.host) {
-                "missing-sni.invalid".clone_into(&mut request.host);
+                log_mirror(
+                    runtime.session_id,
+                    &format!(
+                        "burp-mirror seal-hostless method={} path={}",
+                        request.method, request.path
+                    ),
+                );
             }
             enqueue_delivery(runtime, retries, request, response);
         }

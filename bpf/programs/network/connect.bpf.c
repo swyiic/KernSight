@@ -28,6 +28,7 @@ struct ksight_pending_connect {
     ksight_u32 address_length;
     ksight_u16 address_family;
     ksight_u16 submitted_address_length;
+    ksight_u64 address_pointer;
     ksight_u8 address[KSIGHT_SOCKET_ADDRESS_LEN];
 };
 
@@ -138,6 +139,7 @@ int ksight_network_connect_enter(struct ksight_raw_sys_enter *context)
 {
     struct ksight_pending_connect pending = {};
     const void *address;
+    ksight_u64 addrlen;
     ksight_u64 pid_tgid;
     ksight_u64 uid_gid;
 
@@ -151,11 +153,17 @@ int ksight_network_connect_enter(struct ksight_raw_sys_enter *context)
 
     pending.fd = (ksight_s32)context->arguments[0];
     pending.submitted_address_length =
-        context->arguments[2] > 0xffffU ? 0xffffU :
+        context->arguments[2] > 0xffffU ? 28 :
         (ksight_u16)context->arguments[2];
-    address = (const void *)(context->arguments[1] &
-                             KSIGHT_ARM64_USER_POINTER_MASK);
-    if (context->arguments[2] < KSIGHT_SOCKADDR_FAMILY_LEN ||
+    pending.address_pointer = context->arguments[1] &
+                              KSIGHT_ARM64_USER_POINTER_MASK;
+    address = (const void *)pending.address_pointer;
+    /* bionic passes addrlen == SIZE_MAX ("unknown"). Clamp the recorded
+     * length so the family/address reads below see a real sockaddr size.
+     * probe_read_user does not fault a page in; if this read fails the
+     * exit probe retries once connect has touched the buffer. */
+    addrlen = pending.submitted_address_length;
+    if (addrlen < KSIGHT_SOCKADDR_FAMILY_LEN ||
         ksight_bpf_probe_read_user(&pending.address_family,
                                    sizeof(pending.address_family),
                                    address) != 0) {
@@ -165,36 +173,36 @@ int ksight_network_connect_enter(struct ksight_raw_sys_enter *context)
         pending.address[0] = (ksight_u8)pending.address_family;
         pending.address[1] = (ksight_u8)(pending.address_family >> 8);
         if (pending.address_family == KSIGHT_AF_INET &&
-            context->arguments[2] >= KSIGHT_SOCKADDR_INET_LEN &&
+            addrlen >= KSIGHT_SOCKADDR_INET_LEN &&
             ksight_bpf_probe_read_user(pending.address,
                                        KSIGHT_SOCKADDR_INET_LEN,
                                        address) == 0) {
             pending.address_length = KSIGHT_SOCKADDR_INET_LEN;
         } else if (pending.address_family == KSIGHT_AF_INET6 &&
-                   context->arguments[2] >= KSIGHT_SOCKADDR_INET6_LEN &&
+                   addrlen >= KSIGHT_SOCKADDR_INET6_LEN &&
                    ksight_bpf_probe_read_user(pending.address,
                                               KSIGHT_SOCKADDR_INET6_LEN,
                                               address) == 0) {
             pending.address_length = KSIGHT_SOCKADDR_INET6_LEN;
         } else if (pending.address_family == KSIGHT_AF_UNIX &&
-                   context->arguments[2] > KSIGHT_SOCKADDR_FAMILY_LEN) {
+                   addrlen > KSIGHT_SOCKADDR_FAMILY_LEN) {
             /* Abstract Unix names start with NUL; do not use probe_read_str. */
             if (ksight_bpf_probe_read_user(pending.address,
                                            KSIGHT_SOCKADDR_UNIX_LEN,
                                            address) == 0) {
-                pending.address_length = context->arguments[2] >
+                pending.address_length = addrlen >
                                          KSIGHT_SOCKADDR_UNIX_LEN
                     ? KSIGHT_SOCKADDR_UNIX_LEN
-                    : (ksight_u32)context->arguments[2];
+                    : (ksight_u32)addrlen;
             }
-        } else if (context->arguments[2] >= 12 &&
+        } else if (addrlen >= 12 &&
                    ksight_bpf_probe_read_user(pending.address,
                                               KSIGHT_SOCKADDR_GENERIC_LEN,
                                               address) == 0) {
-            pending.address_length = context->arguments[2] >
+            pending.address_length = addrlen >
                                      KSIGHT_SOCKADDR_GENERIC_LEN
                 ? KSIGHT_SOCKADDR_GENERIC_LEN
-                : (ksight_u32)context->arguments[2];
+                : (ksight_u32)addrlen;
         }
     }
 
@@ -219,6 +227,23 @@ int ksight_network_connect_exit(struct ksight_raw_sys_exit *context)
     if (!pending)
         return 0;
 
+    /* Entry probe_read does not fault the page in. connect has touched the
+     * sockaddr by the time we get here, so a failed entry read is retried. */
+    if (pending->address_length == 0 && pending->address_pointer >= 0x10000ULL) {
+        const void *address = (const void *)pending->address_pointer;
+
+        if (ksight_bpf_probe_read_user(&pending->address_family, 2, address) == 0) {
+            pending->address_length = 2;
+            pending->address[0] = (ksight_u8)pending->address_family;
+            pending->address[1] = (ksight_u8)(pending->address_family >> 8);
+            if (pending->address_family == KSIGHT_AF_INET &&
+                ksight_bpf_probe_read_user(pending->address, 16, address) == 0)
+                pending->address_length = 16;
+            else if (pending->address_family == KSIGHT_AF_INET6 &&
+                     ksight_bpf_probe_read_user(pending->address, 28, address) == 0)
+                pending->address_length = 28;
+        }
+    }
     event = ksight_bpf_ringbuf_reserve(&network_events, sizeof(*event), 0);
     if (!event) {
         ksight_record_drop();

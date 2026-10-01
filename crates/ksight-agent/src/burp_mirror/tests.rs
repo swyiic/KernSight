@@ -1418,6 +1418,39 @@ fn vendor_sm4_block_does_not_desync_tls_http_stream() {
 }
 
 #[test]
+fn parked_sm4_without_http_is_delivered_on_seal() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    let queue = Arc::new(Mutex::new(PlaybackStore::default()));
+    let server_queue = Arc::clone(&queue);
+    let server = thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let request = read_http_message(&mut socket, 8192);
+        super::serve_playback_plain(&mut socket, &request, &server_queue, None).unwrap();
+        request
+    });
+    let mut mirror = BurpMirror::start_with_queue(&endpoint.to_string(), None, queue).unwrap();
+    mirror.observe_peer(7, "gw.example.test".to_owned());
+    mirror.observe_bytes_for_connection(
+        7,
+        9,
+        None,
+        "vendor_boundary:sm4_cbc_padding_encrypt",
+        "send",
+        br#"{"smsCode":"123456","captcha":"slide"}"#,
+    );
+    mirror.seal();
+    let wire = server.join().unwrap();
+    let text = String::from_utf8_lossy(&wire);
+    assert!(text.contains("smsCode"), "{text}");
+    assert!(text.contains("X-KernSight-App-Plaintext: 1"), "{text}");
+    assert!(mirror.delivery_count() >= 1);
+}
+
+#[test]
 fn outbound_copy_trusts_tls_ssl_read_adapter() {
     // Even if direction is wrongly tagged "send", SSL_read is inbound.
     assert!(!super::outbound_copy(
@@ -1924,6 +1957,80 @@ fn reject_burp_delivery_requires_status_and_clean_bytes() {
         super::reject_burp_delivery(&request, Some(&gate_response(Some(200), b"xx\x1f\x8b"))),
         None
     );
+    let mut hostless = request.clone();
+    hostless.host.clear();
+    assert_eq!(
+        super::reject_burp_delivery(&hostless, Some(&ok)),
+        Some("no_observed_host")
+    );
+}
+
+#[test]
+fn truncated_body_never_counts_as_delivered() {
+    // H2 per-stream 1 MiB cap path marks the survivor Incomplete with a
+    // dropped tail (see ksight-core `h2_body_limit_cannot_claim_complete`);
+    // the Burp gate must refuse it even though status and Host are fine.
+    let request = gate_request(b"{}");
+    let ok = gate_response(Some(200), b"{}");
+    let mut cut_response = ok.clone();
+    cut_response.evidence.completeness = ksight_core::MessageCompleteness::Incomplete;
+    cut_response.evidence.dropped_body_bytes = 16384;
+    assert_eq!(
+        super::reject_burp_delivery(&request, Some(&cut_response)),
+        Some("incomplete_body")
+    );
+    let mut cut_request = request.clone();
+    cut_request.evidence.dropped_body_bytes = 7;
+    assert_eq!(
+        super::reject_burp_delivery(&cut_request, Some(&ok)),
+        Some("incomplete_body")
+    );
+    // A seal-salvaged shortfall (Incomplete mark, no destroyed bytes) stays
+    // deliverable: the wire reframes Content-Length to actual bytes and the
+    // row carries X-KernSight-Completeness, so nothing is fabricated.
+    let mut shortfall = ok.clone();
+    shortfall.evidence.completeness = ksight_core::MessageCompleteness::Incomplete;
+    assert_eq!(
+        super::reject_burp_delivery(&request, Some(&shortfall)),
+        None
+    );
+}
+
+#[test]
+fn connection_host_comes_only_from_the_bound_stream() {
+    let mut book = super::PeerHostBook::default();
+    let mut request = gate_request(b"{}");
+    request.host.clear();
+    request.path = "/mgw.htm".into();
+    book.fill(&mut request, 7, 11);
+    assert!(
+        request.host.is_empty(),
+        "unobserved /mgw.htm must stay hostless, got {}",
+        request.host
+    );
+    book.bind_stream(7, 11, "gw.app.example");
+    book.fill(&mut request, 7, 11);
+    assert_eq!(request.host, "gw.app.example");
+
+    let mut other = gate_request(b"{}");
+    other.host.clear();
+    book.fill(&mut other, 7, 99);
+    assert!(
+        other.host.is_empty(),
+        "another stream inherited {}",
+        other.host
+    );
+    book.fill_seal(&mut other, 7, 99);
+    assert!(
+        other.host.is_empty(),
+        "seal invented a host: {}",
+        other.host
+    );
+
+    let mut kept = gate_request(b"{}");
+    kept.host = "api.example.test".into();
+    book.fill_seal(&mut kept, 7, 99);
+    assert_eq!(kept.host, "api.example.test");
 }
 
 #[test]
@@ -2012,4 +2119,29 @@ fn reject_burp_history_skips_unpaired_and_desynced_bodies() {
     assert_eq!(wires.len(), 1, "{wires:?}");
     assert!(wires[0].contains("/clean"), "{wires:?}");
     assert_eq!(mirror.delivery_count(), 1);
+}
+
+#[test]
+fn http3_direction_outcome_is_counted_without_a_message() {
+    let mut mirror = BurpMirror::start("127.0.0.1:9").expect("mirror");
+    mirror.observe_bytes(7, 7, "tls_ssl_write", "send", &[0x00, 0x01, b'x']);
+    mirror.observe_bytes(
+        8,
+        8,
+        "tls_ssl_write",
+        "send",
+        &[0x01, 0x04, 0x00, 0x00, 0xd1, 0xc1],
+    );
+    let metrics = mirror.diagnostic_metrics();
+    assert_eq!(metrics["http3_directions"], 2);
+    assert_eq!(metrics["http3_outbound_data_only"], 1);
+    assert_eq!(metrics["http3_yielded"], 1);
+    assert_eq!(metrics["http3_qpack_rejected"], 0);
+    assert_eq!(metrics["http3_trailing_partial"], 0);
+    let accounted = metrics["http3_yielded"]
+        + metrics["http3_outbound_data_only"]
+        + metrics["http3_qpack_rejected"]
+        + metrics["http3_trailing_partial"]
+        + metrics["http3_unclassified"];
+    assert_eq!(accounted, metrics["http3_directions"]);
 }

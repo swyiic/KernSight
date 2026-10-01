@@ -335,12 +335,20 @@ fn resolve_scope(
                 .with_context(|| format!("package {name} is not installed"))
         })
         .transpose()?;
+    let live_uid = package.and_then(crate::dexdump::live_uid_for_package);
+    if let (Some(listed), Some(live)) = (package_uid, live_uid) {
+        if listed != live {
+            eprintln!(
+                "package uid {listed} differs from live process uid {live}; scoping capture to the live process"
+            );
+        }
+    }
     if let (Some(requested_uid), Some(resolved_uid)) = (uid, package_uid) {
         if requested_uid != resolved_uid {
             bail!("requested UID {requested_uid} conflicts with package UID {resolved_uid}");
         }
     }
-    let target_uid = uid.or(package_uid);
+    let target_uid = uid.or(live_uid).or(package_uid);
     Ok((
         identity_resolver,
         crate::ebpf::CaptureFilter {
@@ -930,6 +938,7 @@ fn stream_events(
             let (ssl_re, ssl_rr, ssl_rok, ssl_rf, ssl_rw) = inspect.ssl_read_funnel();
             let (ssl_gt0, ssl_dgt0, ssl_wo, ssl_wc, ssl_oko, ssl_okc, ssl_gto, ssl_gtc) =
                 inspect.ssl_read_funnel_ex();
+            let (conn_streams, conn_returns, conn_shared) = inspect.connkey_stats();
             let mirror_diagnostics = pipeline
                 .burp_mirror
                 .as_ref()
@@ -940,9 +949,36 @@ fn stream_events(
                 .map(crate::burp_mirror::BurpMirror::diagnostic_metrics)
                 .unwrap_or_default();
             eprintln!(
-                "inspect layers: raw_uprobe={raw} decoded={decoded} perf_lost={lost} ssl_read_entry={ssl_re} ssl_read_ret={ssl_rr} ssl_read_ok={ssl_rok} ssl_read_fail={ssl_rf} ssl_read_want={ssl_rw} ssl_read_ret_gt0={ssl_gt0} ssl_read_drop_gt0={ssl_dgt0} ssl_read_want_openssl={ssl_wo} ssl_read_want_conscrypt={ssl_wc} ssl_read_ok_openssl={ssl_oko} ssl_read_ok_conscrypt={ssl_okc} ssl_read_gt0_openssl={ssl_gto} ssl_read_gt0_conscrypt={ssl_gtc} {}",
+                "inspect layers: raw_uprobe={raw} decoded={decoded} perf_lost={lost} ssl_read_entry={ssl_re} ssl_read_ret={ssl_rr} ssl_read_ok={ssl_rok} ssl_read_fail={ssl_rf} ssl_read_want={ssl_rw} ssl_read_ret_gt0={ssl_gt0} ssl_read_drop_gt0={ssl_dgt0} ssl_read_want_openssl={ssl_wo} ssl_read_want_conscrypt={ssl_wc} ssl_read_ok_openssl={ssl_oko} ssl_read_ok_conscrypt={ssl_okc} ssl_read_gt0_openssl={ssl_gto} ssl_read_gt0_conscrypt={ssl_gtc} quic_connkey_streams={conn_streams} quic_connkey_returns={conn_returns} quic_connkey_shared={conn_shared} {}",
                 mirror_diagnostics.as_deref().unwrap_or("mirror=disabled")
             );
+            if pipeline.burp_mirror.is_some() {
+                let get = |name: &str| mirror_metrics.get(name).copied().unwrap_or(0);
+                eprintln!(
+                    "mirror rates: coverage candidates={} export={} pinned={} empirical={} keylog={} uncovered={} | retention raw={} decoded={} perf_lost={} drop_gt0={} | delivery delivered={} reconstructed={} ok_paired={} no_status={} no_host={} unpaired_req={} unpaired_resp={} orphan_overflow={} incomplete={} http3_dirs={} http3_yielded={}",
+                    get("stack_candidates"),
+                    get("stack_export_candidates"),
+                    get("stack_pinned_boundaries"),
+                    get("stack_empirical_boundaries"),
+                    get("stack_keylog_candidates"),
+                    get("stack_uncovered"),
+                    raw,
+                    decoded,
+                    lost,
+                    ssl_dgt0,
+                    get("delivered"),
+                    get("reconstructed_messages"),
+                    get("paired_responses"),
+                    get("unknown_status_responses"),
+                    get("hostless_requests"),
+                    get("unpaired_requests"),
+                    get("unpaired_responses"),
+                    get("orphan_overflow_preserved"),
+                    get("incomplete_messages"),
+                    get("http3_directions"),
+                    get("http3_yielded"),
+                );
+            }
             if let Some(detail) = mirror_diagnostics {
                 pipeline.emit_inspect(ksight_model::InspectObservation {
                     adapter: "burp_mirror_diagnostics".to_owned(),
@@ -1032,13 +1068,37 @@ fn stream_events(
         let (ssl_re, ssl_rr, ssl_rok, ssl_rf, ssl_rw) = inspect.ssl_read_funnel();
         let (ssl_gt0, ssl_dgt0, ssl_wo, ssl_wc, ssl_oko, ssl_okc, ssl_gto, ssl_gtc) =
             inspect.ssl_read_funnel_ex();
+        let (conn_streams, conn_returns, conn_shared) = inspect.connkey_stats();
         eprintln!(
-            "inspect final: raw_uprobe={raw} decoded={decoded} perf_lost={lost} ssl_read_entry={ssl_re} ssl_read_ret={ssl_rr} ssl_read_ok={ssl_rok} ssl_read_fail={ssl_rf} ssl_read_want={ssl_rw} ssl_read_ret_gt0={ssl_gt0} ssl_read_drop_gt0={ssl_dgt0} ssl_read_want_openssl={ssl_wo} ssl_read_want_conscrypt={ssl_wc} ssl_read_ok_openssl={ssl_oko} ssl_read_ok_conscrypt={ssl_okc} ssl_read_gt0_openssl={ssl_gto} ssl_read_gt0_conscrypt={ssl_gtc} mirror_deliveries={}",
+            "inspect final: raw_uprobe={raw} decoded={decoded} perf_lost={lost} ssl_read_entry={ssl_re} ssl_read_ret={ssl_rr} ssl_read_ok={ssl_rok} ssl_read_fail={ssl_rf} ssl_read_want={ssl_rw} ssl_read_ret_gt0={ssl_gt0} ssl_read_drop_gt0={ssl_dgt0} ssl_read_want_openssl={ssl_wo} ssl_read_want_conscrypt={ssl_wc} ssl_read_ok_openssl={ssl_oko} ssl_read_ok_conscrypt={ssl_okc} ssl_read_gt0_openssl={ssl_gto} ssl_read_gt0_conscrypt={ssl_gtc} quic_connkey_streams={conn_streams} quic_connkey_returns={conn_returns} quic_connkey_shared={conn_shared} mirror_deliveries={}",
             pipeline
                 .burp_mirror
                 .as_ref()
                 .map_or(0, |mirror| mirror.delivery_count())
         );
+        // Single machine-readable line for MobileE: read-only rollup, no
+        // pairing or assembler logic lives here.
+        if let Some(mirror) = pipeline.burp_mirror.as_ref() {
+            let metrics = mirror.diagnostic_metrics();
+            let get = |name: &str| metrics.get(name).copied().unwrap_or(0);
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "schema": "kernsight.mirror-final/v1",
+                    "session": pipeline.normalizer.session_id().to_string(),
+                    "delivered": mirror.delivery_count(),
+                    "ok": get("paired_responses"),
+                    "no_observed_status": get("unknown_status_responses"),
+                    "no_observed_host": get("hostless_requests"),
+                    "unpaired_requests": get("unpaired_requests"),
+                    "unpaired_responses": get("unpaired_responses"),
+                    "orphan_overflow_preserved": get("orphan_overflow_preserved"),
+                    "incomplete_messages": get("incomplete_messages"),
+                    "perf_lost": lost,
+                    "ssl_read_drop_gt0": ssl_dgt0,
+                })
+            );
+        }
     }
     if let Some(mut child) = pcap_child.take() {
         stop_pcap_watchdog(&mut child);
