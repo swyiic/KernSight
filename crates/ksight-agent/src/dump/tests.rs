@@ -745,61 +745,132 @@ fn one_scudo_region_keeps_each_later_unpacked_dex() {
     );
 }
 
-fn anon_identity(pid: u32, birth_ns: u64, exec_id: u64) -> AnonReadIdentity {
-    AnonReadIdentity {
-        package: "com.example.app".to_owned(),
-        pid,
-        uid: 10001,
-        birth_ns,
-        exec_id,
-        boot_id: "boot".to_owned(),
+struct CountRead {
+    inner: std::io::Cursor<Vec<u8>>,
+    reads: u32,
+}
+impl std::io::Read for CountRead {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.reads = self.reads.saturating_add(1);
+        self.inner.read(buf)
+    }
+}
+impl std::io::Seek for CountRead {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+struct CountWrite {
+    writes: u32,
+}
+impl std::io::Write for CountWrite {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.writes = self.writes.saturating_add(1);
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
-fn anon_request(
-    expected: AnonReadIdentity,
-    observed: AnonReadIdentity,
-    deadline_reached: bool,
-    budget_closed: bool,
-) -> AnonReadRequest {
-    AnonReadRequest {
-        expected,
-        observed,
-        deadline_reached,
-        budget_closed,
-    }
+fn open_gate() -> LiveReadGate {
+    LiveReadGate::Open
+}
+
+fn count_window(
+    mut gate: impl FnMut() -> LiveReadGate,
+) -> (u32, u32, crate::qualified_code::RangeResult) {
+    let mut reader = CountRead {
+        inner: std::io::Cursor::new(vec![7_u8; 200_000]),
+        reads: 0,
+    };
+    let mut writer = CountWrite { writes: 0 };
+    let receipt = read_anchored_window(&mut reader, &mut writer, 0, 200_000, &mut gate);
+    (reader.reads, writer.writes, receipt)
 }
 
 #[test]
-fn anonymous_read_refusals_do_not_read_or_write_payload() {
-    let expected = anon_identity(10, 100, 7);
-    let restart = anon_request(expected.clone(), anon_identity(11, 200, 7), false, false);
-    assert_eq!(
-        admit_anonymous_read(&restart),
-        Err(AnonReadRefusal::RestartedInstance)
-    );
-    assert_eq!(anonymous_payload_effect(&restart), (0, 0));
-    let exec = anon_request(expected.clone(), anon_identity(10, 100, 8), false, false);
-    assert_eq!(
-        admit_anonymous_read(&exec),
-        Err(AnonReadRefusal::ExecChanged)
-    );
-    assert_eq!(anonymous_payload_effect(&exec), (0, 0));
-    let budget = anon_request(expected.clone(), expected.clone(), false, true);
-    assert_eq!(
-        admit_anonymous_read(&budget),
-        Err(AnonReadRefusal::BudgetExhausted)
-    );
-    assert_eq!(anonymous_payload_effect(&budget), (0, 0));
-    let deadline = anon_request(expected.clone(), expected.clone(), true, false);
-    assert_eq!(
-        admit_anonymous_read(&deadline),
-        Err(AnonReadRefusal::DeadlineReached)
-    );
-    assert_eq!(anonymous_payload_effect(&deadline), (0, 0));
-    let admitted = anon_request(expected.clone(), expected, false, false);
-    assert!(admit_anonymous_read(&admitted).is_ok());
-    assert_eq!(anonymous_payload_effect(&admitted), (1, 1));
+fn anchored_reader_refusals_stop_real_read_and_write_calls() {
+    let (reads, writes, receipt) = count_window(|| LiveReadGate::NotAllowed);
+    assert_eq!((reads, writes, receipt.actual_length), (0, 0, 0));
+    assert_eq!(receipt.read_status, "not_attempted");
+    let (reads, writes, receipt) = count_window(|| LiveReadGate::Restarted);
+    assert_eq!((reads, writes, receipt.actual_length), (0, 0, 0));
+    let (reads, writes, receipt) = count_window(|| LiveReadGate::ExecChanged);
+    assert_eq!((reads, writes, receipt.actual_length), (0, 0, 0));
+    let (reads, writes, receipt) = count_window(|| LiveReadGate::Budget);
+    assert_eq!((reads, writes, receipt.actual_length), (0, 0, 0));
+    let (reads, writes, receipt) = count_window(|| LiveReadGate::Deadline);
+    assert_eq!((reads, writes, receipt.actual_length), (0, 0, 0));
+    let mut seen = 0_u32;
+    let (reads, writes, receipt) = count_window(|| {
+        seen = seen.saturating_add(1);
+        if seen > 2 {
+            LiveReadGate::Restarted
+        } else {
+            LiveReadGate::Open
+        }
+    });
+    assert_eq!(reads, 1);
+    assert_eq!(writes, 1);
+    assert!(receipt.actual_length < 200_000);
+    assert!(receipt.torn);
+    assert!(!receipt.paused);
+    let mut seen = 0_u32;
+    let (reads, writes, _) = count_window(|| {
+        seen = seen.saturating_add(1);
+        if seen > 2 {
+            LiveReadGate::ExecChanged
+        } else {
+            LiveReadGate::Open
+        }
+    });
+    assert_eq!(reads, 1);
+    assert_eq!(writes, 1);
+    let mut seen = 0_u32;
+    let (reads, writes, _) = count_window(|| {
+        seen = seen.saturating_add(1);
+        if seen > 2 {
+            LiveReadGate::Budget
+        } else {
+            LiveReadGate::Open
+        }
+    });
+    assert_eq!(reads, 1);
+    assert_eq!(writes, 1);
+    let mut seen = 0_u32;
+    let (reads, writes, receipt) = count_window(|| {
+        seen = seen.saturating_add(1);
+        if seen > 2 {
+            LiveReadGate::Deadline
+        } else {
+            LiveReadGate::Open
+        }
+    });
+    assert_eq!(reads, 1);
+    assert_eq!(writes, 1);
+    let source = crate::qualified_code::SourceIdentity {
+        package: "com.example.app".to_owned(),
+        pid: 10,
+        uid: 10001,
+        birth_ns: 100,
+        exec_id: 7,
+        boot_id: "boot".to_owned(),
+    };
+    let note = anchored_source_note(&source, &receipt);
+    assert_eq!(note["source"]["pid"], 10);
+    assert_eq!(note["source"]["exec_id"], 7);
+    assert_eq!(note["requested_start"], 0);
+    assert_eq!(note["requested_length"], 200_000);
+    assert_eq!(note["torn"], true);
+    assert_eq!(note["paused"], false);
+    assert!(note["read_status"].is_string());
+    assert!(note.get("short_read").is_some());
+    let (reads, writes, receipt) = count_window(open_gate);
+    assert!(reads > 1);
+    assert_eq!(writes, reads);
+    assert_eq!(receipt.actual_length, 200_000);
+    assert_eq!(receipt.admission, "qualified_live_copy");
 }
 
 #[test]

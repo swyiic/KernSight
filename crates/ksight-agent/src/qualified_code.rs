@@ -308,7 +308,7 @@ pub struct RangeResult {
     pub torn: bool,
 }
 /// The same streaming function serves production and host short-read/identity/IO counterexamples.
-fn copy_range(
+pub(crate) fn copy_range(
     source: &mut (impl Read + Seek),
     target: &mut impl Write,
     start: u64,
@@ -785,6 +785,32 @@ mod physical {
         dir: File,
         maps: Option<File>,
         mem: Option<File>,
+    }
+    impl Target {
+        pub(crate) fn identity(&self) -> &SourceIdentity {
+            &self.identity
+        }
+        /// Maps text from the directory handle opened at qualification.
+        ///
+        /// # Errors
+        ///
+        /// Returns when that handle is missing or the text exceeds the bound.
+        /// This does not open `/proc/<pid>/maps` by a numeric pid.
+        pub(crate) fn maps_text(&mut self) -> Result<String> {
+            use std::io::{Read, Seek, SeekFrom};
+            let maps = self.maps.as_mut().context("bound maps handle missing")?;
+            maps.seek(SeekFrom::Start(0))?;
+            let mut text = String::new();
+            maps.take(2 * 1024 * 1024 + 1).read_to_string(&mut text)?;
+            if text.len() > 2 * 1024 * 1024 {
+                bail!("bound maps bound");
+            }
+            Ok(text)
+        }
+        /// Memory handle opened beside qualification. Absent means no read.
+        pub(crate) fn anchored_mem(&mut self) -> Option<&mut File> {
+            self.mem.as_mut()
+        }
     }
     fn open_file(dir: &File, name: &str) -> Result<File> {
         Ok(openat(dir, name, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())?.into())

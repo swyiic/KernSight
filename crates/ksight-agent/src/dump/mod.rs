@@ -3,7 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
-    io::{Read as _, Seek as _, SeekFrom, Write as _},
+    io::{Read as _, Seek as _, SeekFrom},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -13,7 +13,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use crate::dexdump::{keep_heap_blob_map_path, pids_for_package, poll_followed_keys, read_region};
+use crate::dexdump::{keep_heap_blob_map_path, pids_for_package, poll_followed_keys};
 
 const MAX_APK_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_TREE_FILE_BYTES: u64 = 128 * 1024 * 1024;
@@ -1045,15 +1045,27 @@ pub fn dump_package_with(
     }
     report.readable_dex = ksight_core::publish_readable_dex(dest).unwrap_or(0);
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    if !budget_closed {
-        harvest_admitted_anonymous_dex(
-            dest,
-            qualified_backend.as_ref(),
-            options.expected_code_sources.as_deref(),
-            deadline,
-        );
+    {
+        let allow_memory = options.collect_memory_windows && !options.code_only && !budget_closed;
+        if allow_memory {
+            harvest_admitted_anonymous_dex(
+                dest,
+                qualified_backend.as_ref(),
+                options.expected_code_sources.as_deref(),
+                deadline,
+            );
+        }
+        let allow_keys = options.collect_keys && !options.code_only && !budget_closed;
+        if allow_keys {
+            recover_secneo_payload(
+                dest,
+                &report.pids,
+                qualified_backend.as_ref(),
+                options.expected_code_sources.as_deref(),
+                deadline,
+            );
+        }
     }
-    recover_secneo_payload(dest, package, &report.pids);
     deduplicate_code_evidence(dest)?;
     if runtime_only {
         prune_install_trees(dest);
@@ -2365,17 +2377,25 @@ fn blob_ok_end(dest: &Path, pid: u32, start: u64) -> Option<u64> {
     (bytes > 0).then_some(start.saturating_add(bytes))
 }
 
-fn recover_secneo_payload(dest: &Path, package: &str, recorded: &[u32]) {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    recover_secneo_payload_live(dest, package, recorded);
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    {
-        let _ = (dest, package, recorded);
-    }
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn recover_secneo_payload(
+    dest: &Path,
+    recorded: &[u32],
+    backend: Option<&crate::qualified_code::Backend>,
+    sources: Option<&[crate::qualified_code::SourceIdentity]>,
+    deadline: Instant,
+) {
+    recover_secneo_payload_live(dest, recorded, backend, sources, deadline);
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn recover_secneo_payload_live(dest: &Path, package: &str, recorded: &[u32]) {
+fn recover_secneo_payload_live(
+    dest: &Path,
+    recorded: &[u32],
+    backend: Option<&crate::qualified_code::Backend>,
+    sources: Option<&[crate::qualified_code::SourceIdentity]>,
+    deadline: Instant,
+) {
     let Some((path, spot)) = first_dexdata_file(dest) else {
         return;
     };
@@ -2386,14 +2406,51 @@ fn recover_secneo_payload_live(dest: &Path, package: &str, recorded: &[u32]) {
     if probes.is_empty() {
         return;
     }
-    let Some(pid) = secneo_probe_pid(package, recorded) else {
+    let Some(backend) = backend else {
         write_live_note(
             dest,
-            format!("dexdata0 payload has no live {package} process; DexHelper BSS was not read"),
+            "dexdata0 payload has no qualified backend; DexHelper BSS was not read".to_owned(),
         );
         return;
     };
-    let Some(key) = scan_dexhelper_bss(pid, &probes) else {
+    let Some(expected) =
+        sources.and_then(|sources| sources.iter().find(|source| recorded.contains(&source.pid)))
+    else {
+        write_live_note(
+            dest,
+            "dexdata0 payload has no anchored qualified instance; package pid search was not used"
+                .to_owned(),
+        );
+        return;
+    };
+    if Instant::now() >= deadline || ksight_core::output_budget::should_stop(dest) {
+        return;
+    }
+    let Ok(mut target) = backend.qualify(&expected.package, expected.pid, true) else {
+        write_live_note(
+            dest,
+            "dexdata0 payload qualification failed; DexHelper BSS was not read".to_owned(),
+        );
+        return;
+    };
+    if target.identity() != expected {
+        write_live_note(
+            dest,
+            "dexdata0 payload instance changed before the anchored read; DexHelper BSS was not read"
+                .to_owned(),
+        );
+        return;
+    }
+    let Ok(text) = target.maps_text() else {
+        return;
+    };
+    let Some(mem) = target.anchored_mem() else {
+        return;
+    };
+    let rows = crate::dexdump::parse_maps(&text);
+    let pid = expected.pid;
+    let Some(key) = scan_dexhelper_bss(dest, expected, mem, &rows, &probes, backend, deadline)
+    else {
         write_live_note(
             dest,
             format!(
@@ -2501,96 +2558,74 @@ fn decrypt_retained_dexdata(
     Some(plain)
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn secneo_probe_pid(package: &str, recorded: &[u32]) -> Option<u32> {
-    for pid in recorded.iter().copied().take(4) {
-        if cmdline_is_package(pid, package) {
-            return Some(pid);
-        }
-    }
-    pids_for_package(package)
-        .into_iter()
-        .find(|pid| cmdline_is_package(*pid, package) && maps_have_dexhelper(*pid))
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveReadGate {
+    Open,
+    NotAllowed,
+    Deadline,
+    Budget,
+    Restarted,
+    ExecChanged,
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn cmdline_is_package(pid: u32, package: &str) -> bool {
-    let Ok(bytes) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+fn live_read_block(gate: LiveReadGate) -> Result<()> {
+    match gate {
+        LiveReadGate::Open => Ok(()),
+        LiveReadGate::NotAllowed => bail!("collection_not_allowed"),
+        LiveReadGate::Deadline => bail!("deadline_reached"),
+        LiveReadGate::Budget => bail!("budget_exhausted"),
+        LiveReadGate::Restarted => bail!("restarted_instance"),
+        LiveReadGate::ExecChanged => bail!("exec_changed"),
+    }
+}
+
+/// One window through `qualified_code::copy_range`. The gate runs before the
+/// first byte and between chunks. A refusal seeks and reads nothing further.
+fn read_anchored_window<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    start: u64,
+    len: u64,
+    mut gate: impl FnMut() -> LiveReadGate,
+) -> crate::qualified_code::RangeResult
+where
+    R: std::io::Read + std::io::Seek,
+    W: std::io::Write,
+{
+    crate::qualified_code::copy_range(reader, writer, start, len, || live_read_block(gate()))
+}
+
+fn anchored_source_note(
+    source: &crate::qualified_code::SourceIdentity,
+    receipt: &crate::qualified_code::RangeResult,
+) -> serde_json::Value {
+    serde_json::json!({
+        "source": source,
+        "requested_start": receipt.requested_start,
+        "requested_length": receipt.requested_length,
+        "actual_start": receipt.actual_start,
+        "actual_length": receipt.actual_length,
+        "read_status": receipt.read_status,
+        "short_read": receipt.read_status == "short_read",
+        "torn": receipt.torn,
+        "paused": receipt.paused,
+        "admission": receipt.admission,
+        "read_error": receipt.read_error,
+        "write_status": receipt.write_status,
+    })
+}
+
+fn store_anchored_note(dest: &Path, note: &serde_json::Value) -> bool {
+    let path = dest.join("runtime").join("anchored-live-reads.json");
+    let mut notes = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Vec<serde_json::Value>>(&text).ok())
+        .unwrap_or_default();
+    notes.push(note.clone());
+    let Ok(body) = serde_json::to_vec(&notes) else {
         return false;
     };
-    bytes.split(|byte| *byte == 0).next() == Some(package.as_bytes())
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn maps_have_dexhelper(pid: u32) -> bool {
-    std::fs::read_to_string(format!("/proc/{pid}/maps"))
-        .is_ok_and(|text| text.to_ascii_lowercase().contains("dexhelper"))
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct AnonReadIdentity {
-    package: String,
-    pid: u32,
-    uid: u32,
-    birth_ns: u64,
-    exec_id: u64,
-    boot_id: String,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AnonReadRefusal {
-    RestartedInstance,
-    ExecChanged,
-    BudgetExhausted,
-    DeadlineReached,
-}
-
-struct AnonReadRequest {
-    expected: AnonReadIdentity,
-    observed: AnonReadIdentity,
-    deadline_reached: bool,
-    budget_closed: bool,
-}
-
-fn admit_anonymous_read(request: &AnonReadRequest) -> Result<(), AnonReadRefusal> {
-    if request.deadline_reached {
-        return Err(AnonReadRefusal::DeadlineReached);
-    }
-    if request.budget_closed {
-        return Err(AnonReadRefusal::BudgetExhausted);
-    }
-    let same_process = request.expected.package == request.observed.package
-        && request.expected.pid == request.observed.pid
-        && request.expected.uid == request.observed.uid
-        && request.expected.birth_ns == request.observed.birth_ns
-        && request.expected.boot_id == request.observed.boot_id;
-    if !same_process {
-        return Err(AnonReadRefusal::RestartedInstance);
-    }
-    if request.expected.exec_id != request.observed.exec_id {
-        return Err(AnonReadRefusal::ExecChanged);
-    }
-    Ok(())
-}
-
-/// Payload reads and writes happen only after admission. A refusal does neither.
-fn anonymous_payload_effect(request: &AnonReadRequest) -> (u32, u32) {
-    if admit_anonymous_read(request).is_err() {
-        return (0, 0);
-    }
-    (1, 1)
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn anon_identity(source: &crate::qualified_code::SourceIdentity) -> AnonReadIdentity {
-    AnonReadIdentity {
-        package: source.package.clone(),
-        pid: source.pid,
-        uid: source.uid,
-        birth_ns: source.birth_ns,
-        exec_id: source.exec_id,
-        boot_id: source.boot_id.clone(),
-    }
+    ksight_core::output_budget::write(&path, &body).is_ok()
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -2607,43 +2642,50 @@ fn harvest_admitted_anonymous_dex(
         if Instant::now() >= deadline || ksight_core::output_budget::should_stop(dest) {
             return;
         }
-        let Ok(current) = backend.qualify(&expected.package, expected.pid, false) else {
+        let Ok(mut target) = backend.qualify(&expected.package, expected.pid, true) else {
             return;
         };
-        let request = AnonReadRequest {
-            expected: anon_identity(expected),
-            observed: anon_identity(&current.identity),
-            deadline_reached: Instant::now() >= deadline,
-            budget_closed: ksight_core::output_budget::should_stop(dest),
-        };
-        if admit_anonymous_read(&request).is_err() {
+        if target.identity() != expected {
             return;
         }
-        let _ = harvest_anonymous_dex(dest, expected.pid, deadline);
+        let Ok(text) = target.maps_text() else {
+            return;
+        };
+        let Some(mem) = target.anchored_mem() else {
+            return;
+        };
+        if !harvest_anonymous_dex(dest, expected, &text, mem, backend, deadline) {
+            return;
+        }
     }
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn harvest_anonymous_dex(dest: &Path, pid: u32, deadline: Instant) -> Option<String> {
-    let text = std::fs::read_to_string(format!("/proc/{pid}/maps")).ok()?;
-    if text.len() > 2 * 1024 * 1024 {
-        return None;
+fn harvest_anonymous_dex<R>(
+    dest: &Path,
+    expected: &crate::qualified_code::SourceIdentity,
+    maps: &str,
+    mem: &mut R,
+    backend: &crate::qualified_code::Backend,
+    deadline: Instant,
+) -> bool
+where
+    R: std::io::Read + std::io::Seek,
+{
+    if maps.len() > 2 * 1024 * 1024 {
+        return false;
     }
-    let mut rows = crate::dexdump::parse_maps(&text);
+    let mut rows = crate::dexdump::parse_maps(maps);
     rows.retain(|row| {
         anonymous_dex_region(&row.path, &row.perms, row.end.saturating_sub(row.start))
     });
     rows.sort_by_key(|row| std::cmp::Reverse(row.end.saturating_sub(row.start)));
-    let mut mem = File::open(format!("/proc/{pid}/mem")).ok()?;
     let mut saved = Vec::new();
     let mut read_total = 0_u64;
     let mut largest = 0_u64;
+    let pid = expected.pid;
     for row in rows {
-        if saved.len() >= 4
-            || read_total >= ANON_DEX_READ_CAP
-            || Instant::now() >= deadline
-            || ksight_core::output_budget::should_stop(dest)
-        {
+        if saved.len() >= 4 || read_total >= ANON_DEX_READ_CAP {
             break;
         }
         let len = row.end.saturating_sub(row.start);
@@ -2652,18 +2694,35 @@ fn harvest_anonymous_dex(dest: &Path, pid: u32, deadline: Instant) -> Option<Str
         if want < 0x70 {
             continue;
         }
-        if Instant::now() >= deadline || ksight_core::output_budget::should_stop(dest) {
-            break;
-        }
-        let Some(bytes) = read_region(&mut mem, row.start, want) else {
-            continue;
+        let Ok(current) = backend.qualify(&expected.package, expected.pid, false) else {
+            return false;
         };
-        read_total = read_total.saturating_add(want);
+        if current.identity != *expected {
+            return false;
+        }
+        let Ok(binding) = current.qualified.into_bound() else {
+            return false;
+        };
+        let mut bytes = Vec::new();
+        let receipt = read_anchored_window(mem, &mut bytes, row.start, want, || {
+            if Instant::now() >= deadline {
+                return LiveReadGate::Deadline;
+            }
+            if ksight_core::output_budget::should_stop(dest) {
+                return LiveReadGate::Budget;
+            }
+            if binding.check_current().is_err() {
+                return LiveReadGate::Restarted;
+            }
+            LiveReadGate::Open
+        });
+        let note = anchored_source_note(expected, &receipt);
+        if !store_anchored_note(dest, &note) || receipt.admission != "qualified_live_copy" {
+            return false;
+        }
+        read_total = read_total.saturating_add(receipt.actual_length);
         for (offset, declared) in unpacked_dex_ranges(&bytes, 4_usize.saturating_sub(saved.len())) {
-            if saved.len() >= 4
-                || Instant::now() >= deadline
-                || ksight_core::output_budget::should_stop(dest)
-            {
+            if saved.len() >= 4 || ksight_core::output_budget::should_stop(dest) {
                 break;
             }
             let end = offset.saturating_add(declared);
@@ -2676,7 +2735,7 @@ fn harvest_anonymous_dex(dest: &Path, pid: u32, deadline: Instant) -> Option<Str
             }
             let _ = std::fs::create_dir_all(dest.join("apk-dex"));
             if write_catalog_bytes(&out, slice).is_err() {
-                break;
+                return false;
             }
             let classes = slice
                 .get(96..100)
@@ -2684,18 +2743,20 @@ fn harvest_anonymous_dex(dest: &Path, pid: u32, deadline: Instant) -> Option<Str
                 .map(u32::from_le_bytes)
                 .unwrap_or(0);
             saved.push(format!("{name} ({declared} bytes, class_defs {classes})"));
-            eprintln!("anonymous dex pid={pid} vma={vma:#x} bytes={declared} class_defs={classes}");
         }
     }
-    if saved.is_empty() {
-        return Some(format!(
+    let note = if saved.is_empty() {
+        format!(
             "anonymous DEX scan pid {pid}: read {read_total} bytes, largest region {largest} bytes, writable anon/scudo {ANON_DEX_REGION_MIN}..={ANON_DEX_REGION_MAX}, cap {ANON_DEX_READ_CAP}; no dex image with class_defs>=200 whose declared length fit the read"
-        ));
-    }
-    Some(format!(
-        "unpacked DEX from pid {pid} anonymous memory: {}",
-        saved.join("; ")
-    ))
+        )
+    } else {
+        format!(
+            "unpacked DEX from pid {pid} anonymous memory: {}",
+            saved.join("; ")
+        )
+    };
+    write_live_note(dest, note);
+    true
 }
 
 /// One scudo secondary can hold a SecNeo payload larger than 32MiB.
@@ -2773,18 +2834,23 @@ fn find_unpacked_dex(bytes: &[u8]) -> Option<(usize, usize)> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn scan_dexhelper_bss(pid: u32, probes: &[Vec<u8>]) -> Option<[u8; 16]> {
-    let text = std::fs::read_to_string(format!("/proc/{pid}/maps")).ok()?;
-    if text.len() > 2 * 1024 * 1024 {
-        return None;
-    }
-    let rows = crate::dexdump::parse_maps(&text);
-    let mut mem = File::open(format!("/proc/{pid}/mem")).ok()?;
-    let mut read_total = 0_u64;
+fn scan_dexhelper_bss<R>(
+    dest: &Path,
+    expected: &crate::qualified_code::SourceIdentity,
+    mem: &mut R,
+    rows: &[crate::dexdump::MapRow],
+    probes: &[Vec<u8>],
+    backend: &crate::qualified_code::Backend,
+    deadline: Instant,
+) -> Option<[u8; 16]>
+where
+    R: std::io::Read + std::io::Seek,
+{
     const TOTAL_CAP: u64 = 16 * 1024 * 1024;
     const REGION_CAP: u64 = 12 * 1024 * 1024;
-    for row in &rows {
-        if read_total >= TOTAL_CAP || !dexhelper_key_region(&row.path, &row.perms, row.start, &rows)
+    let mut read_total = 0_u64;
+    for row in rows {
+        if read_total >= TOTAL_CAP || !dexhelper_key_region(&row.path, &row.perms, row.start, rows)
         {
             continue;
         }
@@ -2792,14 +2858,49 @@ fn scan_dexhelper_bss(pid: u32, probes: &[Vec<u8>]) -> Option<[u8; 16]> {
         if len < 16 || read_total.saturating_add(len) > TOTAL_CAP {
             continue;
         }
-        let Some(bytes) = read_region(&mut mem, row.start, len) else {
-            continue;
+        let Ok(current) = backend.qualify(&expected.package, expected.pid, false) else {
+            return None;
         };
-        read_total = read_total.saturating_add(len);
+        if current.identity != *expected {
+            return None;
+        }
+        let Ok(binding) = current.qualified.into_bound() else {
+            return None;
+        };
+        let mut bytes = Vec::new();
+        let receipt = read_anchored_window(mem, &mut bytes, row.start, len, || {
+            if Instant::now() >= deadline {
+                return LiveReadGate::Deadline;
+            }
+            if ksight_core::output_budget::should_stop(dest) {
+                return LiveReadGate::Budget;
+            }
+            if binding.check_current().is_err() {
+                return LiveReadGate::Restarted;
+            }
+            LiveReadGate::Open
+        });
+        if !store_anchored_note(dest, &anchored_source_note(expected, &receipt))
+            || receipt.admission != "qualified_live_copy"
+        {
+            return None;
+        }
+        read_total = read_total.saturating_add(receipt.actual_length);
         if let Some(key) = ksight_core::scan_sm4_haystack(&bytes, probes, 8, 2_000_000) {
             return Some(key);
         }
-        if let Some(key) = scan_pointer_windows(&mut mem, &rows, &bytes, probes) {
+        if let Some(key) = scan_pointer_windows(
+            &AnchoredProbe {
+                dest,
+                expected,
+                backend,
+                deadline,
+            },
+            mem,
+            rows,
+            &bytes,
+            probes,
+        ) {
             return Some(key);
         }
     }
@@ -2807,12 +2908,24 @@ fn scan_dexhelper_bss(pid: u32, probes: &[Vec<u8>]) -> Option<[u8; 16]> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn scan_pointer_windows(
-    mem: &mut File,
+struct AnchoredProbe<'a> {
+    dest: &'a Path,
+    expected: &'a crate::qualified_code::SourceIdentity,
+    backend: &'a crate::qualified_code::Backend,
+    deadline: Instant,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn scan_pointer_windows<R>(
+    probe: &AnchoredProbe<'_>,
+    mem: &mut R,
     rows: &[crate::dexdump::MapRow],
     bytes: &[u8],
     probes: &[Vec<u8>],
-) -> Option<[u8; 16]> {
+) -> Option<[u8; 16]>
+where
+    R: std::io::Read + std::io::Seek,
+{
     let mut seen = Vec::<u64>::new();
     let mut offset = 0_usize;
     while offset.saturating_add(8) <= bytes.len() && seen.len() < 8 {
@@ -2837,9 +2950,36 @@ fn scan_pointer_windows(
         seen.push(ptr);
         let at = ptr.saturating_sub(128 * 1024).max(row.start);
         let want = row.end.saturating_sub(at).min(256 * 1024);
-        let Some(window) = read_region(mem, at, want) else {
-            continue;
+        let Ok(current) = probe
+            .backend
+            .qualify(&probe.expected.package, probe.expected.pid, false)
+        else {
+            return None;
         };
+        if current.identity != *probe.expected {
+            return None;
+        }
+        let Ok(binding) = current.qualified.into_bound() else {
+            return None;
+        };
+        let mut window = Vec::new();
+        let receipt = read_anchored_window(mem, &mut window, at, want, || {
+            if Instant::now() >= probe.deadline {
+                return LiveReadGate::Deadline;
+            }
+            if ksight_core::output_budget::should_stop(probe.dest) {
+                return LiveReadGate::Budget;
+            }
+            if binding.check_current().is_err() {
+                return LiveReadGate::Restarted;
+            }
+            LiveReadGate::Open
+        });
+        if !store_anchored_note(probe.dest, &anchored_source_note(probe.expected, &receipt))
+            || receipt.admission != "qualified_live_copy"
+        {
+            return None;
+        }
         if let Some(key) = ksight_core::scan_sm4_haystack(&window, probes, 8, 2_000_000) {
             return Some(key);
         }
