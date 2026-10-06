@@ -15,8 +15,6 @@ pub(crate) struct MetadataObject {
     pub object: Object,
     pub program_key: (usize, u64),
     pub attach_btf_id: u32,
-    #[cfg(test)]
-    pub changed_instructions: usize,
 }
 #[allow(
     clippy::too_many_lines,
@@ -99,33 +97,7 @@ pub(crate) fn parse(bytes: &[u8], target_bytes: &[u8]) -> Result<MetadataObject>
     if !matches!(map, Map::Btf(_)) {
         bail!("metadata BTF map required");
     }
-    #[cfg(test)]
-    let before: Vec<_> = object
-        .functions
-        .values()
-        .flat_map(|f| {
-            f.instructions
-                .iter()
-                .map(|i| (i.code, i.dst_reg(), i.src_reg(), i.off, i.imm))
-        })
-        .collect();
     object.relocate_btf(&target)?;
-    #[cfg(test)]
-    let after: Vec<_> = object
-        .functions
-        .values()
-        .flat_map(|f| {
-            f.instructions
-                .iter()
-                .map(|i| (i.code, i.dst_reg(), i.src_reg(), i.off, i.imm))
-        })
-        .collect();
-    #[cfg(test)]
-    let changed_instructions = before
-        .iter()
-        .zip(after.iter())
-        .filter(|(a, b)| a != b)
-        .count();
     object.fixup_and_sanitize_btf(&BtfFeatures::new(true, true, true, true, true, true, true))?;
     for f in object.functions.values() {
         for i in &f.instructions {
@@ -138,7 +110,5 @@ pub(crate) fn parse(bytes: &[u8], target_bytes: &[u8]) -> Result<MetadataObject>
         object,
         program_key,
         attach_btf_id,
-        #[cfg(test)]
-        changed_instructions,
     })
 }
