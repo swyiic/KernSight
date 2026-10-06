@@ -786,10 +786,10 @@ pub struct InspectPlaintext {
     /// Monotonic fragment sequence in this process capture.
     #[serde(default)]
     pub sequence: u64,
-    /// Exported symbol or plaintext_probe id when known.
+    /// Exported symbol or `plaintext_probe` id when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub symbol: Option<String>,
-    /// False for SSL_peek (copy without consuming the TLS stream).
+    /// False for `SSL_peek` (copy without consuming the TLS stream).
     #[serde(default = "default_true")]
     pub consumes: bool,
 }

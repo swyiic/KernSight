@@ -691,27 +691,127 @@ fn unpacked_dex_requires_a_real_class_table_inside_the_buffer() {
     bytes[at + 32..at + 36].copy_from_slice(&512_u32.to_le_bytes());
     bytes[at + 40..at + 44].copy_from_slice(&0x1234_5678_u32.to_le_bytes());
     bytes[at + 96..at + 100].copy_from_slice(&8781_u32.to_le_bytes());
-    assert_eq!(find_unpacked_dex(&bytes), Some((8192, 512)));
+    bytes[at + 100..at + 104].copy_from_slice(&112_u32.to_le_bytes());
+    assert_eq!(find_unpacked_dex(&bytes), None);
     bytes[at + 96..at + 100].copy_from_slice(&7_u32.to_le_bytes());
     assert_eq!(find_unpacked_dex(&bytes), None);
 }
 
+fn put_structural_dex(bytes: &mut [u8], at: usize, classes: u32, declared: u32) {
+    bytes[at..at + 8].copy_from_slice(b"dex\n035\0");
+    bytes[at + 32..at + 36].copy_from_slice(&declared.to_le_bytes());
+    bytes[at + 36..at + 40].copy_from_slice(&112_u32.to_le_bytes());
+    bytes[at + 40..at + 44].copy_from_slice(&0x1234_5678_u32.to_le_bytes());
+    bytes[at + 96..at + 100].copy_from_slice(&classes.to_le_bytes());
+    bytes[at + 100..at + 104].copy_from_slice(&112_u32.to_le_bytes());
+}
+
 #[test]
-fn one_scudo_region_keeps_each_later_unpacked_dex() {
-    let mut bytes = vec![0_u8; 1536];
-    let write = |bytes: &mut [u8], at: usize, classes: u32| {
-        bytes[at..at + 8].copy_from_slice(b"dex\n035\0");
-        bytes[at + 32..at + 36].copy_from_slice(&512_u32.to_le_bytes());
-        bytes[at + 40..at + 44].copy_from_slice(&0x1234_5678_u32.to_le_bytes());
-        bytes[at + 96..at + 100].copy_from_slice(&classes.to_le_bytes());
-    };
-    write(&mut bytes, 0, 7);
-    write(&mut bytes, 512, 7800);
-    write(&mut bytes, 1024, 300);
+fn outer_class_count_over_200_does_not_hide_an_inner_dex() {
+    let inner_classes = 200_u32;
+    let inner_declared = 112 + inner_classes * 32;
+    let inner_at = 8_000_usize;
+    let total = inner_at + inner_declared as usize;
+    let mut bytes = vec![0_u8; total];
+    put_structural_dex(&mut bytes, 0, 201, total as u32);
+    put_structural_dex(&mut bytes, inner_at, inner_classes, inner_declared);
     assert_eq!(
         unpacked_dex_ranges(&bytes, 4),
-        vec![(512, 512), (1024, 512)]
+        vec![(0, total), (inner_at, inner_declared as usize)]
     );
+}
+
+#[test]
+fn forged_class_defs_and_out_of_range_class_table_are_not_structural() {
+    let mut forged = vec![0_u8; 512];
+    put_structural_dex(&mut forged, 0, 8781, 512);
+    assert_eq!(find_unpacked_dex(&forged), None);
+    let mut shifted = vec![0_u8; 512];
+    put_structural_dex(&mut shifted, 0, 2, 512);
+    shifted[100..104].copy_from_slice(&500_u32.to_le_bytes());
+    assert_eq!(find_unpacked_dex(&shifted), None);
+}
+
+#[test]
+fn one_scudo_region_keeps_each_later_unpacked_dex() {
+    let first = 112 + 200 * 32;
+    let second = 112 + 220 * 32;
+    let mut bytes = vec![0_u8; first + second];
+    put_structural_dex(&mut bytes, 0, 200, first as u32);
+    put_structural_dex(&mut bytes, first, 220, second as u32);
+    assert_eq!(
+        unpacked_dex_ranges(&bytes, 4),
+        vec![(0, first), (first, second)]
+    );
+}
+
+fn anon_identity(pid: u32, birth_ns: u64, exec_id: u64) -> AnonReadIdentity {
+    AnonReadIdentity {
+        package: "com.example.app".to_owned(),
+        pid,
+        uid: 10001,
+        birth_ns,
+        exec_id,
+        boot_id: "boot".to_owned(),
+    }
+}
+
+fn anon_request(
+    expected: AnonReadIdentity,
+    observed: AnonReadIdentity,
+    deadline_reached: bool,
+    budget_closed: bool,
+) -> AnonReadRequest {
+    AnonReadRequest {
+        expected,
+        observed,
+        deadline_reached,
+        budget_closed,
+    }
+}
+
+#[test]
+fn anonymous_read_refusals_do_not_read_or_write_payload() {
+    let expected = anon_identity(10, 100, 7);
+    let restart = anon_request(expected.clone(), anon_identity(11, 200, 7), false, false);
+    assert_eq!(
+        admit_anonymous_read(&restart),
+        Err(AnonReadRefusal::RestartedInstance)
+    );
+    assert_eq!(anonymous_payload_effect(&restart), (0, 0));
+    let exec = anon_request(expected.clone(), anon_identity(10, 100, 8), false, false);
+    assert_eq!(
+        admit_anonymous_read(&exec),
+        Err(AnonReadRefusal::ExecChanged)
+    );
+    assert_eq!(anonymous_payload_effect(&exec), (0, 0));
+    let budget = anon_request(expected.clone(), expected.clone(), false, true);
+    assert_eq!(
+        admit_anonymous_read(&budget),
+        Err(AnonReadRefusal::BudgetExhausted)
+    );
+    assert_eq!(anonymous_payload_effect(&budget), (0, 0));
+    let deadline = anon_request(expected.clone(), expected.clone(), true, false);
+    assert_eq!(
+        admit_anonymous_read(&deadline),
+        Err(AnonReadRefusal::DeadlineReached)
+    );
+    assert_eq!(anonymous_payload_effect(&deadline), (0, 0));
+    let admitted = anon_request(expected.clone(), expected, false, false);
+    assert!(admit_anonymous_read(&admitted).is_ok());
+    assert_eq!(anonymous_payload_effect(&admitted), (1, 1));
+}
+
+#[test]
+fn closed_output_budget_does_not_fall_back_to_an_unbudgeted_payload_write() {
+    let root = std::env::temp_dir().join(format!("ksight-budget-close-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let _guard = ksight_core::output_budget::Guard::install(vec![root.clone()], 8, 60_000).unwrap();
+    let path = root.join("payload.bin");
+    assert!(write_catalog_bytes(&path, &[9_u8; 64]).is_err());
+    assert!(!path.exists());
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

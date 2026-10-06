@@ -1044,6 +1044,15 @@ pub fn dump_package_with(
         report.recovered_sm4_key = recovered_key.map(hex_key);
     }
     report.readable_dex = ksight_core::publish_readable_dex(dest).unwrap_or(0);
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if !budget_closed {
+        harvest_admitted_anonymous_dex(
+            dest,
+            qualified_backend.as_ref(),
+            options.expected_code_sources.as_deref(),
+            deadline,
+        );
+    }
     recover_secneo_payload(dest, package, &report.pids);
     deduplicate_code_evidence(dest)?;
     if runtime_only {
@@ -1064,6 +1073,9 @@ pub fn dump_package_with(
 }
 
 /// Rebuild artifacts and the correlated graph from files already on disk.
+///
+/// This path does not open a live process, does not harvest anonymous memory,
+/// and does not start a qualified copy.
 ///
 /// # Errors
 ///
@@ -1146,7 +1158,6 @@ pub fn recatalog_package(dest: &Path) -> Result<PackageDumpReport> {
     if report.dump_id.is_empty() {
         report.dump_id = uuid::Uuid::new_v4().to_string();
     }
-    recover_secneo_payload(dest, &report.package, &report.pids);
     deduplicate_code_evidence(dest)?;
     finalize_catalog(&mut report, dest)?;
     Ok(report)
@@ -1274,15 +1285,9 @@ fn finalize_catalog(report: &mut PackageDumpReport, dest: &Path) -> Result<()> {
     report.graph = graph;
     write_dump_howto(dest, &report.package);
     let report_path = dest.join("dump-report.json");
-    let mut body = serde_json::to_vec_pretty(&report)?;
-    if ksight_core::output_budget::write(&report_path, &body).is_err() {
-        report.warnings.push(
-            "terminal catalog written after the payload budget closed; no additional memory was read"
-                .to_owned(),
-        );
-        body = serde_json::to_vec_pretty(&report)?;
-        std::fs::write(&report_path, &body)?;
-    }
+    let body = serde_json::to_vec_pretty(&report)?;
+    // A closed budget refuses the catalog write. Do not fall back to an unbudgeted write.
+    ksight_core::output_budget::write(&report_path, &body)?;
     Ok(())
 }
 
@@ -1849,9 +1854,7 @@ fn deduplicate_code_evidence(dest: &Path) -> Result<(usize, u64)> {
 }
 
 fn write_catalog_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
-    if ksight_core::output_budget::write(path, bytes).is_err() {
-        std::fs::write(path, bytes)?;
-    }
+    ksight_core::output_budget::write(path, bytes)?;
     Ok(())
 }
 
@@ -2373,12 +2376,6 @@ fn recover_secneo_payload(dest: &Path, package: &str, recorded: &[u32]) {
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn recover_secneo_payload_live(dest: &Path, package: &str, recorded: &[u32]) {
-    // Unpacked DEX is a normal anonymous-memory read. It does not depend on a SecNeo container.
-    if let Some(pid) = live_package_pid(package, recorded) {
-        if let Some(note) = harvest_anonymous_dex(dest, pid) {
-            write_live_note(dest, note);
-        }
-    }
     let Some((path, spot)) = first_dexdata_file(dest) else {
         return;
     };
@@ -2505,18 +2502,6 @@ fn decrypt_retained_dexdata(
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn live_package_pid(package: &str, recorded: &[u32]) -> Option<u32> {
-    for pid in recorded.iter().copied().take(4) {
-        if cmdline_is_package(pid, package) {
-            return Some(pid);
-        }
-    }
-    pids_for_package(package)
-        .into_iter()
-        .find(|pid| cmdline_is_package(*pid, package))
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
 fn secneo_probe_pid(package: &str, recorded: &[u32]) -> Option<u32> {
     for pid in recorded.iter().copied().take(4) {
         if cmdline_is_package(pid, package) {
@@ -2542,8 +2527,104 @@ fn maps_have_dexhelper(pid: u32) -> bool {
         .is_ok_and(|text| text.to_ascii_lowercase().contains("dexhelper"))
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AnonReadIdentity {
+    package: String,
+    pid: u32,
+    uid: u32,
+    birth_ns: u64,
+    exec_id: u64,
+    boot_id: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AnonReadRefusal {
+    RestartedInstance,
+    ExecChanged,
+    BudgetExhausted,
+    DeadlineReached,
+}
+
+struct AnonReadRequest {
+    expected: AnonReadIdentity,
+    observed: AnonReadIdentity,
+    deadline_reached: bool,
+    budget_closed: bool,
+}
+
+fn admit_anonymous_read(request: &AnonReadRequest) -> Result<(), AnonReadRefusal> {
+    if request.deadline_reached {
+        return Err(AnonReadRefusal::DeadlineReached);
+    }
+    if request.budget_closed {
+        return Err(AnonReadRefusal::BudgetExhausted);
+    }
+    let same_process = request.expected.package == request.observed.package
+        && request.expected.pid == request.observed.pid
+        && request.expected.uid == request.observed.uid
+        && request.expected.birth_ns == request.observed.birth_ns
+        && request.expected.boot_id == request.observed.boot_id;
+    if !same_process {
+        return Err(AnonReadRefusal::RestartedInstance);
+    }
+    if request.expected.exec_id != request.observed.exec_id {
+        return Err(AnonReadRefusal::ExecChanged);
+    }
+    Ok(())
+}
+
+/// Payload reads and writes happen only after admission. A refusal does neither.
+fn anonymous_payload_effect(request: &AnonReadRequest) -> (u32, u32) {
+    if admit_anonymous_read(request).is_err() {
+        return (0, 0);
+    }
+    (1, 1)
+}
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn harvest_anonymous_dex(dest: &Path, pid: u32) -> Option<String> {
+fn anon_identity(source: &crate::qualified_code::SourceIdentity) -> AnonReadIdentity {
+    AnonReadIdentity {
+        package: source.package.clone(),
+        pid: source.pid,
+        uid: source.uid,
+        birth_ns: source.birth_ns,
+        exec_id: source.exec_id,
+        boot_id: source.boot_id.clone(),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn harvest_admitted_anonymous_dex(
+    dest: &Path,
+    backend: Option<&crate::qualified_code::Backend>,
+    sources: Option<&[crate::qualified_code::SourceIdentity]>,
+    deadline: Instant,
+) {
+    let (Some(backend), Some(sources)) = (backend, sources) else {
+        return;
+    };
+    for expected in sources.iter().take(4) {
+        if Instant::now() >= deadline || ksight_core::output_budget::should_stop(dest) {
+            return;
+        }
+        let Ok(current) = backend.qualify(&expected.package, expected.pid, false) else {
+            return;
+        };
+        let request = AnonReadRequest {
+            expected: anon_identity(expected),
+            observed: anon_identity(&current.identity),
+            deadline_reached: Instant::now() >= deadline,
+            budget_closed: ksight_core::output_budget::should_stop(dest),
+        };
+        if admit_anonymous_read(&request).is_err() {
+            return;
+        }
+        let _ = harvest_anonymous_dex(dest, expected.pid, deadline);
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn harvest_anonymous_dex(dest: &Path, pid: u32, deadline: Instant) -> Option<String> {
     let text = std::fs::read_to_string(format!("/proc/{pid}/maps")).ok()?;
     if text.len() > 2 * 1024 * 1024 {
         return None;
@@ -2558,7 +2639,11 @@ fn harvest_anonymous_dex(dest: &Path, pid: u32) -> Option<String> {
     let mut read_total = 0_u64;
     let mut largest = 0_u64;
     for row in rows {
-        if saved.len() >= 4 || read_total >= ANON_DEX_READ_CAP {
+        if saved.len() >= 4
+            || read_total >= ANON_DEX_READ_CAP
+            || Instant::now() >= deadline
+            || ksight_core::output_budget::should_stop(dest)
+        {
             break;
         }
         let len = row.end.saturating_sub(row.start);
@@ -2567,12 +2652,18 @@ fn harvest_anonymous_dex(dest: &Path, pid: u32) -> Option<String> {
         if want < 0x70 {
             continue;
         }
+        if Instant::now() >= deadline || ksight_core::output_budget::should_stop(dest) {
+            break;
+        }
         let Some(bytes) = read_region(&mut mem, row.start, want) else {
             continue;
         };
         read_total = read_total.saturating_add(want);
         for (offset, declared) in unpacked_dex_ranges(&bytes, 4_usize.saturating_sub(saved.len())) {
-            if saved.len() >= 4 {
+            if saved.len() >= 4
+                || Instant::now() >= deadline
+                || ksight_core::output_budget::should_stop(dest)
+            {
                 break;
             }
             let end = offset.saturating_add(declared);
@@ -2585,7 +2676,7 @@ fn harvest_anonymous_dex(dest: &Path, pid: u32) -> Option<String> {
             }
             let _ = std::fs::create_dir_all(dest.join("apk-dex"));
             if write_catalog_bytes(&out, slice).is_err() {
-                continue;
+                break;
             }
             let classes = slice
                 .get(96..100)
@@ -2639,47 +2730,46 @@ fn anonymous_dex_region(path: &str, perms: &str, len: u64) -> bool {
         || lower.contains("partition_alloc")
 }
 
-fn unpacked_dex_ranges(bytes: &[u8], limit: usize) -> Vec<(usize, usize)> {
-    let mut found = Vec::new();
-    let mut from = 0_usize;
-    while found.len() < limit && from.saturating_add(0x70) <= bytes.len() {
-        let Some((offset, declared)) = find_unpacked_dex(&bytes[from..]) else {
-            break;
-        };
-        let at = from.saturating_add(offset);
-        let end = at.saturating_add(declared);
-        if end > bytes.len() {
-            break;
-        }
-        found.push((at, declared));
-        from = end;
+fn unpacked_class_table_fits(image: &[u8], declared: usize) -> bool {
+    if image.len() < 112 || declared < 112 || declared > image.len() {
+        return false;
     }
-    found
+    let Ok(classes_raw) = image[96..100].try_into() else {
+        return false;
+    };
+    let Ok(off_raw) = image[100..104].try_into() else {
+        return false;
+    };
+    let classes = u32::from_le_bytes(classes_raw);
+    let off = u32::from_le_bytes(off_raw) as usize;
+    if !(200..=100_000).contains(&classes) || off < 0x70 {
+        return false;
+    }
+    let Some(table_bytes) = (classes as usize).checked_mul(32) else {
+        return false;
+    };
+    let Some(end) = off.checked_add(table_bytes) else {
+        return false;
+    };
+    end <= declared
+}
+
+fn unpacked_dex_ranges(bytes: &[u8], limit: usize) -> Vec<(usize, usize)> {
+    // Same step-by-4 nested walk as embedded_dex_images. Do not jump to the
+    // outer declared end, or a shell with class_defs>=200 hides the inner image.
+    embedded_dex_images(bytes)
+        .into_iter()
+        .filter_map(|(offset, declared)| {
+            let at = usize::try_from(offset).ok()?;
+            let image = bytes.get(at..at.saturating_add(declared))?;
+            unpacked_class_table_fits(image, declared).then_some((at, declared))
+        })
+        .take(limit)
+        .collect()
 }
 
 fn find_unpacked_dex(bytes: &[u8]) -> Option<(usize, usize)> {
-    let mut from = 0_usize;
-    while from.saturating_add(0x70) <= bytes.len() {
-        let Some(rel) = bytes[from..]
-            .windows(4)
-            .position(|window| window == b"dex\n")
-        else {
-            break;
-        };
-        let at = from.saturating_add(rel);
-        if let Some(declared) = ksight_core::peek_declared_dex_len(&bytes[at..]) {
-            let classes = bytes
-                .get(at + 96..at + 100)
-                .and_then(|b| b.try_into().ok())
-                .map(u32::from_le_bytes)
-                .unwrap_or(0);
-            if classes >= 200 && at.saturating_add(declared) <= bytes.len() {
-                return Some((at, declared));
-            }
-        }
-        from = at.saturating_add(4);
-    }
-    None
+    unpacked_dex_ranges(bytes, 1).into_iter().next()
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -2779,6 +2869,7 @@ fn dexhelper_key_region(
     })
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn write_live_note(dest: &Path, note: String) {
     let path = dest.join("runtime").join("dexdata-live.json");
     let mut notes = std::fs::read_to_string(&path)
