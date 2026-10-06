@@ -813,8 +813,11 @@ mod tests {
         blob.extend_from_slice(&[0, 1, 2, 3]);
         let extracted = extract_keylog_haystack(&blob);
         assert_eq!(extracted, vec![line.to_owned()]);
-        assert!(extract_keylog_haystack(b"GET / HTTP/1.1\r\n\r\n").is_empty());
-        assert!(extract_keylog_haystack(b"CLIENT_TRAFFIC_SECRET_0 not-a-secret").is_empty());
+        assert_eq!(extract_keylog_haystack(b"GET / HTTP/1.1\r\n\r\n").len(), 0);
+        assert_eq!(
+            extract_keylog_haystack(b"CLIENT_TRAFFIC_SECRET_0 not-a-secret").len(),
+            0
+        );
         let early = "EARLY_EXPORTER_SECRET 8cb8976ba17b3731a40b2c126eaa36fbb487bb69759ac15674b10c8b882782e9 2ccf74feaecc588f0a542310279a7028dba5a616797290f0fb554bc7de884fdf";
         let extracted_early = extract_keylog_haystack(early.as_bytes());
         assert_eq!(extracted_early, vec![early.to_owned()]);

@@ -29,7 +29,7 @@ fn rejects_oversized_outbound_frame_before_writing() {
         codec.write(&mut bytes, &hello("too-large")),
         Err(FrameError::FrameTooLarge { .. })
     ));
-    assert!(bytes.is_empty());
+    assert_eq!(bytes.len(), 0);
 }
 
 #[test]

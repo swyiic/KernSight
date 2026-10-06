@@ -1525,7 +1525,7 @@ mod tests {
         let mut bytes = header_with(92_319_172, 0x70, 0, 0x70);
         bytes.truncate(0x70);
         assert_eq!(peek_declared_dex_len(&bytes), Some(92_319_172));
-        assert!(split_concatenated_dex(&bytes).is_empty());
+        assert_eq!(split_concatenated_dex(&bytes).len(), 0);
         let mut over = header_with(0x70, 0x70, 0, 0x70);
         over[32..36].copy_from_slice(
             &u32::try_from(DEX_IMAGE_LIMIT)
@@ -1565,7 +1565,7 @@ mod tests {
         assert_eq!(summary.version, "035");
         assert_eq!(summary.declared_file_size, 0x70);
         assert_eq!(summary.class_defs, 0);
-        assert!(summary.class_descriptors.is_empty());
+        assert_eq!(summary.class_descriptors.len(), 0);
         assert!(parse_dex_semantics(b"cdex001\0").is_none());
     }
 
@@ -1670,7 +1670,7 @@ mod tests {
         assert!(dir.join("lib/arm64/libfoo.so").is_file());
         assert!(!dir.join("lib/arm64-v8a/libfoo.so").exists());
         let again = extract_apk_native_libs(&apk, &dir.join("lib")).expect("skip existing");
-        assert!(again.is_empty());
+        assert_eq!(again.len(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1783,7 +1783,7 @@ mod tests {
         assert_eq!(found, key);
         assert!(find_secneo_key(&blob, &[0x22; 64]).is_none());
         let probes = secneo_cipher_probes(&blob);
-        assert!(!probes.is_empty());
+        assert_ne!(probes.len(), 0);
         assert!(key_unlocks_secneo(&key, &probes));
         assert_eq!(scan_sm4_haystack(&haystack, &probes, 8, 64_000), Some(key));
     }

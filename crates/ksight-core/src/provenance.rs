@@ -512,11 +512,7 @@ fn classify_dex_set(
 }
 
 fn percent(value: usize, total: usize) -> usize {
-    if total == 0 {
-        0
-    } else {
-        value.saturating_mul(100) / total
-    }
+    value.saturating_mul(100).checked_div(total).unwrap_or(0)
 }
 
 fn class_namespace(path: &str) -> String {
@@ -902,7 +898,7 @@ mod tests {
             ],
         };
         let report = classify_dex_ownership_with_context("com.example.app", &[vendor], &context);
-        assert!(report.inferred_internal_namespaces.is_empty());
+        assert_eq!(report.inferred_internal_namespaces.len(), 0);
         assert_eq!(report.third_party_sdks, 1);
     }
 }

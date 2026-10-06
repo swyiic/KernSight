@@ -1347,7 +1347,7 @@ mod tests {
                 .is_some_and(|k| k.anchors.iter().any(|a| a == "CLIENT_RANDOM")),
             "anchors recorded for future on-device derivation"
         );
-        assert!(pinned.symbols.write.is_empty());
+        assert_eq!(pinned.symbols.write.len(), 0);
         // Attach gate: keylog_entries() must skip demoted pins even when offset present.
         assert!(
             !keylog_entries().iter().any(|e| {
@@ -1439,7 +1439,7 @@ mod tests {
         let rules: StackRulesFile =
             serde_json::from_str(EMBEDDED_RULES).expect("embedded JSON must deserialize");
         assert_eq!(rules.schema_version, SCHEMA_VERSION);
-        assert!(!rules.stacks.is_empty());
+        assert_ne!(rules.stacks.len(), 0);
         for stack in &rules.stacks {
             assert!(
                 !stack.version.kind.trim().is_empty(),
@@ -1612,7 +1612,7 @@ mod tests {
         assert_eq!(cronet.id, "cronet_0dceef13");
         assert!(cronet.coverage.plaintext_copy);
         assert!(cronet.symbols.write.iter().any(|name| name == "SSL_write"));
-        assert!(cronet.plaintext_probes.is_empty());
+        assert_eq!(cronet.plaintext_probes.len(), 0);
         assert!(ssl_write_attach_allowed(
             "/apex/com.android.tethering/lib64/stable_cronet_libssl.so",
             Some(456_088),
@@ -1627,8 +1627,8 @@ mod tests {
         .expect("flutter e263");
         assert_eq!(flutter.id, "flutter_e263a16a");
         assert!(!flutter.coverage.plaintext_copy);
-        assert!(flutter.symbols.write.is_empty());
-        assert!(flutter.plaintext_probes.is_empty());
+        assert_eq!(flutter.symbols.write.len(), 0);
+        assert_eq!(flutter.plaintext_probes.len(), 0);
         assert_eq!(
             flutter.keylog.as_ref().and_then(|rule| rule.offset),
             Some(7_081_800),
@@ -1648,8 +1648,8 @@ mod tests {
         .expect("webview");
         assert_eq!(webview.id, "webview_chromium");
         assert!(!webview.coverage.plaintext_copy);
-        assert!(webview.symbols.write.is_empty());
-        assert!(webview.plaintext_probes.is_empty());
+        assert_eq!(webview.symbols.write.len(), 0);
+        assert_eq!(webview.plaintext_probes.len(), 0);
         assert!(!ssl_write_attach_allowed(
             "/data/app/~~x/com.google.android.webview-y/lib/arm64/libmonochrome.so",
             Some(124_193_136),
@@ -1664,7 +1664,7 @@ mod tests {
         .expect("xquic");
         assert_eq!(xquic.id, "xquic_ff5f8bff");
         assert!(!xquic.coverage.plaintext_copy);
-        assert!(xquic.plaintext_probes.is_empty());
+        assert_eq!(xquic.plaintext_probes.len(), 0);
 
         let tquic = stack_for_path(
             "/data/app/~~x/com.example.app-y/lib/arm64/libtquic.so",
@@ -1674,6 +1674,6 @@ mod tests {
         .expect("tquic");
         assert_eq!(tquic.id, "tquic_dlxx");
         assert!(!tquic.coverage.plaintext_copy);
-        assert!(tquic.plaintext_probes.is_empty());
+        assert_eq!(tquic.plaintext_probes.len(), 0);
     }
 }

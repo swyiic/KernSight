@@ -32,7 +32,7 @@ fn groups_binder_and_artifact_activity_without_claiming_semantics() {
         limit: 8,
         ..crate::GraphQuery::default()
     });
-    assert!(!binder_graph.edges.is_empty());
+    assert_ne!(binder_graph.edges.len(), 0);
     assert!(report.graph.edges.iter().any(|edge| {
         edge.relation == "binder" && edge.from.contains(":10") && edge.to.contains(":20")
     }));
@@ -242,7 +242,7 @@ fn one_way_binder_is_not_a_reply_pair() {
     assert_eq!(report.binder_lifecycle.one_way_submitted, 1);
     assert_eq!(report.binder_lifecycle.two_way_submitted, 0);
     assert_eq!(report.binder_lifecycle.paired_replies, 0);
-    assert!(report.binder_reply_pairs.is_empty());
+    assert_eq!(report.binder_reply_pairs.len(), 0);
 }
 
 #[test]

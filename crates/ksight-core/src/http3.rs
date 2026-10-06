@@ -458,11 +458,7 @@ pub fn http3_confirmed(bytes: &[u8]) -> bool {
                     return true;
                 }
             }
-            FRAME_DATA => {
-                if !payload.is_empty() {
-                    return true;
-                }
-            }
+            FRAME_DATA if !payload.is_empty() => return true,
             _ => {}
         }
         offset += used;
@@ -607,7 +603,7 @@ mod tests {
     #[test]
     fn explain_names_outbound_data_only_and_qpack_rejection() {
         let data_only = explain_http3_stream(&[0x00, 0x01, b'x'], true);
-        assert!(data_only.messages.is_empty());
+        assert_eq!(data_only.messages.len(), 0);
         assert_eq!(data_only.outcome, Http3ParseOutcome::OutboundDataOnly);
 
         let yielded = explain_http3_stream(&headers_get_slash(), true);
@@ -618,7 +614,7 @@ mod tests {
         // post-base prefix (`0001`), which decode rejects.
         let mut rejected = vec![0x00, 0x01, b'x', 0x01, 0x03, 0x00, 0x00, 0x10];
         let explained = explain_http3_stream(&rejected, true);
-        assert!(explained.messages.is_empty());
+        assert_eq!(explained.messages.len(), 0);
         assert_eq!(explained.outcome, Http3ParseOutcome::QpackRejected);
 
         rejected.truncate(3);

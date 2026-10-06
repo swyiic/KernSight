@@ -84,7 +84,7 @@ fn partial_content_length_retains_declared_size_and_actual_body() {
 fn partial_headers_preserve_bytes_without_inventing_status() {
     let raw = b"HTTP/1.1 nope\r\nContent-Len";
     let mut assembler = StreamReassembler::default();
-    assert!(assembler.push(raw).is_empty());
+    assert_eq!(assembler.push(raw).len(), 0);
     let message = assembler.seal_flush().remove(0);
     assert_eq!(message.status, None);
     assert_eq!(message.body, raw);
@@ -123,11 +123,11 @@ fn stream_reassembler_promotes_http3_static_get() {
 
 #[test]
 fn malformed_discovery_hosts_are_not_promoted_to_http_hosts() {
-    assert!(host_from_token("*.example.test").is_empty());
-    assert!(host_from_token("api.example.test+").is_empty());
-    assert!(host_from_token("empty-sockaddr").is_empty());
-    assert!(host_from_token("dirn:-2:-2").is_empty());
-    assert!(host_from_token("content://media/external").is_empty());
+    assert_eq!(host_from_token("*.example.test").len(), 0);
+    assert_eq!(host_from_token("api.example.test+").len(), 0);
+    assert_eq!(host_from_token("empty-sockaddr").len(), 0);
+    assert_eq!(host_from_token("dirn:-2:-2").len(), 0);
+    assert_eq!(host_from_token("content://media/external").len(), 0);
     assert_eq!(host_from_token("api.example.test"), "api.example.test");
 }
 
@@ -390,7 +390,7 @@ fn splits_headers_then_body_across_ssl_writes() {
 #[test]
 fn protocol_detection_survives_a_split_start_line() {
     let mut stream = StreamReassembler::default();
-    assert!(stream.push(b"PO").is_empty());
+    assert_eq!(stream.push(b"PO").len(), 0);
     assert_eq!(stream.buffered_bytes(), 2);
     let messages = stream
         .push(b"ST /submit HTTP/1.1\r\nHost: api.example.test\r\nContent-Length: 2\r\n\r\n{}");
@@ -596,7 +596,10 @@ fn parse_mirror_endpoint_accepts_ipv4() {
 
 #[test]
 fn tls_record_previews_are_dropped() {
-    assert!(fragment_bytes("TLS handshake", "tls_record", "tls_record").is_empty());
+    assert_eq!(
+        fragment_bytes("TLS handshake", "tls_record", "tls_record").len(),
+        0
+    );
     assert_eq!(fragment_bytes("504f5354", "hex", "binary"), b"POST");
 }
 
@@ -749,7 +752,7 @@ fn get_without_host_parses_so_sni_can_fill_later() {
     assert_eq!(messages.len(), 1);
     assert!(messages[0].is_request);
     assert_eq!(messages[0].path, "/v1/ping");
-    assert!(messages[0].host.is_empty());
+    assert_eq!(messages[0].host.len(), 0);
 }
 
 #[test]
@@ -758,7 +761,7 @@ fn flush_does_not_emit_post_headers_before_body() {
     assert!(stream
         .push(b"POST /pay HTTP/1.1\r\nHost: pay.example\r\nContent-Length: 4\r\n\r\n")
         .is_empty());
-    assert!(stream.flush().is_empty());
+    assert_eq!(stream.flush().len(), 0);
     let messages = stream.push(b"ABCD");
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].body, b"ABCD");
@@ -769,7 +772,7 @@ fn flush_unknown_salvages_orphan_json_body() {
     let mut stream = StreamReassembler::default();
     // Mid-body SSL_read; unbalanced trailing `}` must not eager-emit.
     let orphan = r#"name":"fixture","rate":"0.20%","code":"FX"}"#.as_bytes();
-    assert!(stream.push(orphan).is_empty());
+    assert_eq!(stream.push(orphan).len(), 0);
     assert_eq!(stream.protocol(), "unknown");
     let messages = stream.flush();
     assert_eq!(messages.len(), 1, "{messages:?}");
@@ -841,7 +844,7 @@ fn http2_multi_push_preface_headers_data_reconstructs_request() {
     data_frame.extend_from_slice(data);
 
     let mut stream = StreamReassembler::default();
-    assert!(stream.push(&preface[..10]).is_empty());
+    assert_eq!(stream.push(&preface[..10]).len(), 0);
     assert!(stream.push(&preface[10..]).is_empty() || stream.protocol() == "http2");
     let mid = headers.len() / 2;
     assert!(
@@ -870,12 +873,12 @@ fn http2_multi_push_preface_headers_data_reconstructs_request() {
 #[test]
 fn soft_flush_keeps_short_unknown_prefix() {
     let mut stream = StreamReassembler::default();
-    assert!(stream.push(b"HT").is_empty());
-    assert!(stream.soft_flush().is_empty());
+    assert_eq!(stream.push(b"HT").len(), 0);
+    assert_eq!(stream.soft_flush().len(), 0);
     assert_eq!(stream.buffered_bytes(), 2);
     assert_eq!(stream.protocol(), "unknown");
     // Hard flush without salvageable body still clears.
-    assert!(stream.flush().is_empty());
+    assert_eq!(stream.flush().len(), 0);
     assert_eq!(stream.buffered_bytes(), 0);
 }
 
@@ -927,7 +930,7 @@ fn soft_flush_emits_headers_only_incomplete_content_length() {
     let messages = stream.soft_flush();
     assert_eq!(messages.len(), 1, "{messages:?}");
     assert_eq!(messages[0].status, Some(202));
-    assert!(messages[0].body.is_empty());
+    assert_eq!(messages[0].body.len(), 0);
 }
 
 #[test]
@@ -961,7 +964,7 @@ fn status_100_continue_has_empty_body_and_does_not_eat_following() {
     let messages = stream.push(raw);
     assert!(messages.len() >= 2, "{messages:?}");
     assert_eq!(messages[0].status, Some(100));
-    assert!(messages[0].body.is_empty());
+    assert_eq!(messages[0].body.len(), 0);
     assert_eq!(messages[1].status, Some(200));
     assert_eq!(messages[1].body, b"ping");
 }
@@ -1159,7 +1162,7 @@ fn head_response_hint_forces_no_body_despite_content_length() {
     let messages = stream.push(raw);
     assert_eq!(messages.len(), 1, "{messages:?}");
     assert_eq!(messages[0].status, Some(200));
-    assert!(messages[0].body.is_empty());
+    assert_eq!(messages[0].body.len(), 0);
 }
 
 #[test]
@@ -1168,11 +1171,11 @@ fn chunked_partial_under_8k_waits_for_terminal_or_flush() {
     let mut msg = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n64\r\n".to_vec();
     msg.extend(std::iter::repeat_n(b'x', 100));
     assert!(stream.push(&msg).is_empty(), "incomplete chunked must wait");
-    assert!(stream.push(b"more").is_empty());
+    assert_eq!(stream.push(b"more").len(), 0);
     let messages = stream.flush();
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].status, Some(200));
-    assert!(!messages[0].body.is_empty());
+    assert_ne!(messages[0].body.len(), 0);
 }
 
 // PRUNED 2026-09-10: status_304_ignores_content_length_body — covered by status_204_and_304_ignore_content_length_body.
@@ -1184,7 +1187,7 @@ fn head_request_ignores_content_length() {
     let messages = stream.push(raw);
     assert_eq!(messages.len(), 1, "{messages:?}");
     assert_eq!(messages[0].method, "HEAD");
-    assert!(messages[0].body.is_empty());
+    assert_eq!(messages[0].body.len(), 0);
 }
 
 #[test]
@@ -1365,7 +1368,7 @@ fn h2_incomplete_large_data_seal_salvages_remainder() {
 fn seal_salvages_png_orphan_as_response() {
     let mut stream = StreamReassembler::default();
     let png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR";
-    assert!(stream.push(png).is_empty());
+    assert_eq!(stream.push(png).len(), 0);
     let messages = stream.seal_flush();
     assert_eq!(messages.len(), 1, "{messages:?}");
     assert!(!messages[0].is_request);
@@ -1376,7 +1379,7 @@ fn seal_salvages_png_orphan_as_response() {
 #[test]
 fn empty_http3_prefix_stays_unknown_until_headers_or_other_http() {
     let mut stream = StreamReassembler::default();
-    assert!(stream.push(&[0x00, 0x00]).is_empty());
+    assert_eq!(stream.push(&[0x00, 0x00]).len(), 0);
     assert_eq!(stream.protocol(), "unknown");
 
     let mut combined = vec![0x00, 0x00];
@@ -1393,7 +1396,7 @@ fn empty_http3_prefix_stays_unknown_until_headers_or_other_http() {
     assert_eq!(messages[0].path, "/later");
 
     let mut h2 = StreamReassembler::default();
-    assert!(h2.push(&[0x00, 0x00]).is_empty());
+    assert_eq!(h2.push(&[0x00, 0x00]).len(), 0);
     assert_eq!(h2.protocol(), "unknown");
     h2.push(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
     assert_eq!(h2.protocol(), "http2");
@@ -1406,12 +1409,12 @@ fn empty_http3_prefix_stays_unknown_until_headers_or_other_http() {
     assert_eq!(messages.len(), 1, "{messages:?}");
     assert_eq!(messages[0].method, "GET");
     assert!(messages[0].evidence.transformations.contains(&"http3"));
-    assert!(h3.push(&[]).is_empty());
+    assert_eq!(h3.push(&[]).len(), 0);
     assert_eq!(h3.http3_outcome(), "yielded");
 
     let mut data_only = StreamReassembler::default();
     data_only.set_outbound(true);
-    assert!(data_only.push(&[0x00, 0x01, b'x']).is_empty());
+    assert_eq!(data_only.push(&[0x00, 0x01, b'x']).len(), 0);
     assert_eq!(data_only.protocol(), "http3");
     assert_eq!(data_only.http3_outcome(), "outbound_data_only");
 }

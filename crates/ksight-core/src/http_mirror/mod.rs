@@ -1333,10 +1333,8 @@ fn collect_http1_headers<'a>(lines: impl Iterator<Item = &'a str>) -> Http1Heade
                     .split(',')
                     .any(|item| item.trim() == "chunked");
             }
-            "upgrade" => {
-                if value.to_ascii_lowercase().contains("websocket") {
-                    websocket_upgrade = true;
-                }
+            "upgrade" if value.to_ascii_lowercase().contains("websocket") => {
+                websocket_upgrade = true;
             }
             _ => {}
         }
@@ -1484,10 +1482,9 @@ fn absolute_target(start_line: &str) -> Option<AbsoluteTarget> {
     let target = parts.next()?;
     let (scheme, rest) = if let Some(rest) = target.strip_prefix("https://") {
         ("https", rest)
-    } else if let Some(rest) = target.strip_prefix("http://") {
-        ("http", rest)
     } else {
-        return None;
+        let rest = target.strip_prefix("http://")?;
+        ("http", rest)
     };
     let (host, path) = rest
         .split_once('/')
@@ -2150,10 +2147,9 @@ fn parse_http_url_line(line: &str) -> Option<MirroredMessage> {
     }
     let (scheme, rest) = if let Some(rest) = line.strip_prefix("https://") {
         ("https", rest)
-    } else if let Some(rest) = line.strip_prefix("http://") {
-        ("http", rest)
     } else {
-        return None;
+        let rest = line.strip_prefix("http://")?;
+        ("http", rest)
     };
     if rest.is_empty() || rest.contains(' ') || rest.contains('<') || rest.contains('{') {
         return None;
