@@ -2609,27 +2609,6 @@ fn decrypt_retained_dexdata(
     Some(plain)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LiveReadGate {
-    Open,
-    Deadline,
-    Budget,
-    Restarted,
-    ExecChanged,
-    Cancelled,
-}
-
-fn live_read_block(gate: LiveReadGate) -> Result<()> {
-    match gate {
-        LiveReadGate::Open => Ok(()),
-        LiveReadGate::Deadline => bail!("deadline_reached"),
-        LiveReadGate::Budget => bail!("budget_exhausted"),
-        LiveReadGate::Restarted => bail!("restarted_instance"),
-        LiveReadGate::ExecChanged => bail!("exec_changed"),
-        LiveReadGate::Cancelled => bail!("cancelled"),
-    }
-}
-
 /// Bytes already copied are trusted only when the check before the read, between
 /// chunks, and after the read all passed.
 fn trusted_anchored(
@@ -2650,13 +2629,13 @@ fn read_anchored_window<R, W>(
     writer: &mut W,
     start: u64,
     len: u64,
-    mut gate: impl FnMut() -> LiveReadGate,
+    gate: impl FnMut() -> Result<()>,
 ) -> crate::qualified_code::RangeResult
 where
     R: std::io::Read + std::io::Seek,
     W: std::io::Write,
 {
-    crate::qualified_code::copy_range(reader, writer, start, len, || live_read_block(gate()))
+    crate::qualified_code::copy_range(reader, writer, start, len, gate)
 }
 
 fn anchored_source_note(
@@ -2700,31 +2679,27 @@ fn observe_anchored_read(
     dest: &Path,
     deadline: Instant,
     cancelled: &std::sync::atomic::AtomicBool,
-) -> LiveReadGate {
+) -> Result<()> {
     use std::sync::atomic::Ordering;
     if cancelled.load(Ordering::SeqCst) {
-        return LiveReadGate::Cancelled;
+        bail!("cancelled");
     }
     if let Some(reason) = ksight_core::output_budget::stop_reason(dest) {
         if reason.contains("cancel") {
-            return LiveReadGate::Cancelled;
+            bail!("cancelled");
         }
         if reason.contains("deadline") || reason.contains("time") {
-            return LiveReadGate::Deadline;
+            bail!("deadline_reached");
         }
-        return LiveReadGate::Budget;
+        bail!("budget_exhausted");
     }
     if Instant::now() >= deadline {
-        return LiveReadGate::Deadline;
+        bail!("deadline_reached");
     }
     if ksight_core::output_budget::should_stop(dest) {
-        return LiveReadGate::Budget;
+        bail!("budget_exhausted");
     }
-    match bound.recheck_task_mark() {
-        Ok(()) => LiveReadGate::Open,
-        Err(err) if err.to_string().contains("task mark changed") => LiveReadGate::ExecChanged,
-        Err(_) => LiveReadGate::Restarted,
-    }
+    bound.recheck_task_mark()
 }
 
 fn store_anchored_note(dest: &Path, note: &serde_json::Value) -> bool {
@@ -4060,7 +4035,26 @@ fn package_cmdline(pid: u32) -> String {
 
 #[cfg(test)]
 mod anchored_read_stops {
-    use super::{read_anchored_window, trusted_anchored, LiveReadGate};
+    use super::{read_anchored_window, trusted_anchored};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum LiveReadGate {
+        Open,
+        Budget,
+        Restarted,
+        ExecChanged,
+        Cancelled,
+    }
+
+    fn live_read_block(gate: LiveReadGate) -> anyhow::Result<()> {
+        match gate {
+            LiveReadGate::Open => Ok(()),
+            LiveReadGate::Budget => anyhow::bail!("budget_exhausted"),
+            LiveReadGate::Restarted => anyhow::bail!("restarted_instance"),
+            LiveReadGate::ExecChanged => anyhow::bail!("exec_changed"),
+            LiveReadGate::Cancelled => anyhow::bail!("cancelled"),
+        }
+    }
     use std::io::{self, Read, Seek, SeekFrom, Write};
 
     struct CountRead {
@@ -4129,11 +4123,11 @@ mod anchored_read_stops {
         };
         let receipt = read_anchored_window(&mut reader, &mut writer, 0, len, || {
             seen += 1;
-            if seen > fail_after {
+            live_read_block(if seen > fail_after {
                 gate
             } else {
                 LiveReadGate::Open
-            }
+            })
         });
         let trusted = trusted_anchored(&receipt, writer.buf).is_some();
         (
@@ -4177,5 +4171,43 @@ mod anchored_read_stops {
         assert_eq!(actual, 65_536);
         assert!(!trusted);
         assert_ne!(admission, "qualified_live_copy");
+    }
+
+    #[test]
+    fn unchanged_token_exec_after_the_last_byte_drops_the_buffer() {
+        use ksight_hwbp::instance_scope::InstanceIdentity;
+        use ksight_hwbp::metadata_scope::{accept_live_identity, live_metadata_record};
+        let task = InstanceIdentity {
+            tgid: 7,
+            uid: 10_001,
+            birth_ns: 12_345_678_901,
+            exec_id: 2,
+        };
+        let stable = live_metadata_record(&task, 19, 2);
+        let mut exec = task;
+        exec.exec_id = 3;
+        let moved = live_metadata_record(&exec, 19, 2);
+        let mut seen = 0_usize;
+        let mut reader = CountRead {
+            data: vec![0x11; 65_536],
+            pos: 0,
+            reads: 0,
+        };
+        let mut writer = CountWrite {
+            writes: 0,
+            buf: Vec::new(),
+        };
+        let receipt = read_anchored_window(&mut reader, &mut writer, 0, 65_536, || {
+            seen += 1;
+            let record = if seen >= 3 { &moved } else { &stable };
+            accept_live_identity(&task, 19, 2, record)
+        });
+        assert_eq!(reader.reads, 1);
+        assert_eq!(writer.writes, 1);
+        assert_eq!(receipt.actual_length, 65_536);
+        assert!(trusted_anchored(&receipt, writer.buf).is_none());
+        let reason = receipt.read_error.expect("exec reason");
+        assert!(reason.contains("anchored exec_id changed"), "{reason}");
+        assert_ne!(receipt.admission, "qualified_live_copy");
     }
 }

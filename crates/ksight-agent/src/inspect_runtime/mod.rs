@@ -4136,19 +4136,23 @@ fn low_u32(value: u64) -> u32 {
     u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
+#[cfg(any(target_os = "android", target_os = "linux"))]
 fn low_i32(value: u64) -> i32 {
     i32::from_le_bytes(low_u32(value).to_le_bytes())
 }
 
+#[cfg(any(target_os = "android", target_os = "linux"))]
 fn low_i8(value: u64) -> i8 {
     i8::from_le_bytes([value.to_le_bytes()[0]])
 }
 
+#[cfg(any(target_os = "android", target_os = "linux"))]
 fn low_u16(value: u64) -> u16 {
     let bytes = value.to_le_bytes();
     u16::from_le_bytes([bytes[0], bytes[1]])
 }
 
+#[cfg(any(target_os = "android", target_os = "linux"))]
 #[allow(
     clippy::too_many_lines,
     clippy::too_many_arguments,

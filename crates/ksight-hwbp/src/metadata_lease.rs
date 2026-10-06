@@ -1,6 +1,7 @@
 #![cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
 //! Keep the physical task mark through sampler grant insertion. No map pin or
 //! map sharing with Aya is required: the metadata map remains separately owned.
+use crate::instance_scope::InstanceIdentity;
 use crate::metadata_scope::Token;
 use anyhow::Result;
 use std::os::fd::OwnedFd;
@@ -19,14 +20,28 @@ const _: () = assert!(std::mem::size_of::<TaskLookup>() == 32);
 #[derive(Debug)]
 pub(crate) struct MetadataLease {
     map: OwnedFd,
+    /// Kept after qualification so a later read can snapshot `self_exec_id`.
+    /// Dropping it leaves the task-storage token unchanged across exec.
+    program: OwnedFd,
+    btf: OwnedFd,
     token: Token,
+    identity: InstanceIdentity,
     deadline: std::time::Instant,
 }
 impl MetadataLease {
-    pub(crate) fn new(map: OwnedFd, token: Token) -> Self {
+    pub(crate) fn new(
+        map: OwnedFd,
+        program: OwnedFd,
+        btf: OwnedFd,
+        token: Token,
+        identity: InstanceIdentity,
+    ) -> Self {
         Self {
             map,
+            program,
+            btf,
             token,
+            identity,
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
         }
     }
@@ -40,7 +55,10 @@ impl MetadataLease {
     pub(crate) fn try_clone(&self) -> std::io::Result<Self> {
         Ok(Self {
             map: self.map.try_clone()?,
+            program: self.program.try_clone()?,
+            btf: self.btf.try_clone()?,
             token: self.token,
+            identity: self.identity,
             deadline: self.deadline,
         })
     }
@@ -59,7 +77,7 @@ impl MetadataLease {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     pub(crate) fn task_mark_matches(&self, pidfd: std::os::fd::BorrowedFd<'_>) -> Result<()> {
         use anyhow::{bail, Context};
-        use std::os::fd::AsRawFd;
+        use std::os::fd::{AsFd, AsRawFd};
         let key = pidfd.as_raw_fd();
         let mut token = Token { nonce: 0, round: 0 };
         let attr = TaskLookup {
@@ -80,6 +98,16 @@ impl MetadataLease {
         if token != self.token || token.nonce == 0 || token.round != 2 {
             bail!("qualification task mark changed");
         }
+        // The stored grant is not rewritten on exec. Read the iterator again and
+        // compare the live identity. An empty emission is a failed observation.
+        let live = crate::metadata_observer::read_granted_record(self.program.as_fd(), pidfd)
+            .context("live metadata observation failed")?;
+        crate::metadata_scope::accept_live_identity(
+            &self.identity,
+            self.token.nonce,
+            self.token.round,
+            &live,
+        )?;
         if !crate::task_storage::alive(pidfd)? {
             bail!("qualified task exited before sampler binding");
         }

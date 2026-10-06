@@ -12,7 +12,7 @@ use std::{
     collections::HashSet,
     fs::File,
     io::Read,
-    os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
+    os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
     path::Path,
 };
 
@@ -69,8 +69,9 @@ fn log_text(log: &[u8]) -> String {
 }
 /// Loads only an explicitly hash-pinned metadata iterator. Construction issues
 /// real BPF syscalls and therefore needs separate authorization on a device.
-/// Qualification consumes this observer; success transfers the mark/map lease,
-/// while BTF/program handles close. All resources close on error.
+/// Qualification consumes this observer. Success keeps the map, program, and
+/// BTF on the lease so a later read can snapshot `self_exec_id` without
+/// minting a new grant. All resources close on error.
 pub struct MetadataObserver {
     btf: OwnedFd,
     map: OwnedFd,
@@ -190,8 +191,9 @@ impl MetadataObserver {
     ///
     /// # Errors
     ///
-    /// Returns when qualification refuses the pidfd or policy witness. The
-    /// observer closes its BTF and program handles on both success and failure.
+    /// Returns when qualification refuses the pidfd or policy witness. Failure
+    /// drops the BTF and program with this observer. Success moves them onto
+    /// the qualification lease.
     pub fn qualify(
         mut self,
         policy: &QualificationPolicy,
@@ -206,12 +208,53 @@ impl MetadataObserver {
         let Self {
             map, btf, program, ..
         } = self;
-        drop(program);
-        drop(btf);
-        // Keep the map and immutable round-two grant until all sampler/runtime
-        // handles close. On any issue error self drops every resource instead.
-        Ok(qualified.attach_lease(map, Token { nonce, round: 2 }))
+        // The round-two grant stays immutable. The program stays so exec can
+        // be read again; dropping it would leave this token valid across exec.
+        Ok(qualified.attach_lease(map, program, btf, Token { nonce, round: 2 }))
     }
+}
+
+/// Read one pidfd-scoped metadata record without updating the task-storage grant.
+///
+/// # Errors
+///
+/// Returns when the pidfd is not a single retained task or the iterator cannot be read.
+pub(crate) fn read_granted_record(
+    program: BorrowedFd<'_>,
+    pidfd: BorrowedFd<'_>,
+) -> Result<Vec<u8>> {
+    let fd = pidfd.as_raw_fd();
+    if fd <= 0 {
+        bail!("positive retained pidfd required; all-task iteration forbidden");
+    }
+    let info = [0, 0, u32::try_from(fd).context("pidfd descriptor")?];
+    let link = link_program(program, info)?;
+    let iterator = iterator_file(link.as_fd())?;
+    read_iterator(iterator)
+}
+
+fn link_program(program: BorrowedFd<'_>, info: [u32; 3]) -> Result<OwnedFd> {
+    let mut attr: bpf_attr = unsafe { std::mem::zeroed() };
+    attr.link_create.__bindgen_anon_1.prog_fd = raw_u32(program.as_raw_fd())?;
+    attr.link_create.attach_type = 28;
+    attr.link_create.__bindgen_anon_3.__bindgen_anon_1.iter_info = info.as_ptr() as u64;
+    attr.link_create
+        .__bindgen_anon_3
+        .__bindgen_anon_1
+        .iter_info_len = 12;
+    new_fd(28, &attr).context("metadata pidfd-scoped iterator link")
+}
+
+fn iterator_file(link: BorrowedFd<'_>) -> Result<OwnedFd> {
+    let mut attr: bpf_attr = unsafe { std::mem::zeroed() };
+    attr.iter_create.link_fd = raw_u32(link.as_raw_fd())?;
+    new_fd(33, &attr).context("metadata iterator file")
+}
+
+fn read_iterator(iterator: OwnedFd) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    File::from(iterator).take(49).read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 impl Driver for MetadataObserver {
     type Handle = OwnedFd;
@@ -237,25 +280,13 @@ impl Driver for MetadataObserver {
         }
     }
     fn link(&mut self, info: [u32; 3]) -> Result<OwnedFd> {
-        let mut attr: bpf_attr = unsafe { std::mem::zeroed() };
-        attr.link_create.__bindgen_anon_1.prog_fd = raw_u32(self.program.as_raw_fd())?;
-        attr.link_create.attach_type = 28;
-        attr.link_create.__bindgen_anon_3.__bindgen_anon_1.iter_info = info.as_ptr() as u64;
-        attr.link_create
-            .__bindgen_anon_3
-            .__bindgen_anon_1
-            .iter_info_len = 12;
-        new_fd(28, &attr).context("metadata pidfd-scoped iterator link")
+        link_program(self.program.as_fd(), info)
     }
     fn iterator(&mut self, link: BorrowedFd<'_>) -> Result<OwnedFd> {
-        let mut attr: bpf_attr = unsafe { std::mem::zeroed() };
-        attr.iter_create.link_fd = raw_u32(link.as_raw_fd())?;
-        new_fd(33, &attr).context("metadata iterator file")
+        iterator_file(link)
     }
     fn read(&mut self, iterator: OwnedFd) -> Result<Vec<u8>> {
-        let mut bytes = Vec::new();
-        File::from(iterator).take(49).read_to_end(&mut bytes)?;
-        Ok(bytes)
+        read_iterator(iterator)
     }
     fn alive(&mut self, pidfd: BorrowedFd<'_>) -> Result<bool> {
         crate::task_storage::alive(pidfd)

@@ -50,6 +50,53 @@ pub(crate) fn decode(bytes: &[u8], token: Token) -> Result<ObservedIdentity> {
     }
     Ok(ObservedIdentity { identity, token })
 }
+
+/// Encode one 48-byte iterator record. The BPF program emits this layout; tests
+/// use it so a later `exec_id` can keep the same nonce and round.
+#[must_use]
+pub fn live_metadata_record(identity: &InstanceIdentity, nonce: u64, round: u64) -> [u8; 48] {
+    let mut bytes = [0_u8; 48];
+    bytes[0..4].copy_from_slice(&METADATA_ABI.to_le_bytes());
+    bytes[4..8].copy_from_slice(&48_u32.to_le_bytes());
+    bytes[8..16].copy_from_slice(&nonce.to_le_bytes());
+    bytes[16..24].copy_from_slice(&round.to_le_bytes());
+    bytes[24..28].copy_from_slice(&identity.tgid.to_le_bytes());
+    bytes[28..32].copy_from_slice(&identity.uid.to_le_bytes());
+    bytes[32..40].copy_from_slice(&identity.birth_ns.to_le_bytes());
+    bytes[40..48].copy_from_slice(&identity.exec_id.to_le_bytes());
+    bytes
+}
+
+/// Judge one fresh iterator record against the identity captured at qualification.
+/// An empty record is a failed observation. A matching token with a new `exec_id`
+/// is an exec, not a still-valid grant.
+///
+/// # Errors
+///
+/// Returns when the record is empty, does not decode for this token, or names a
+/// different task identity.
+pub fn accept_live_identity(
+    anchored: &InstanceIdentity,
+    nonce: u64,
+    round: u64,
+    live_bytes: &[u8],
+) -> Result<()> {
+    if live_bytes.is_empty() {
+        bail!("live metadata observation empty");
+    }
+    let observed = decode(live_bytes, Token { nonce, round })?;
+    if observed.identity.exec_id != anchored.exec_id {
+        bail!(
+            "anchored exec_id changed from {:#x} to {:#x}",
+            anchored.exec_id,
+            observed.identity.exec_id
+        );
+    }
+    if observed.identity != *anchored {
+        bail!("anchored identity changed");
+    }
+    Ok(())
+}
 /// Caller-owned package enrollment decision. Its source must already be
 /// qualified; matching a mutable cmdline alone is not Android attestation.
 #[derive(Debug)]
@@ -79,9 +126,17 @@ impl QualifiedInstance {
     pub fn identity(&self) -> InstanceIdentity {
         self.bound.identity
     }
-    pub(crate) fn attach_lease(mut self, map: OwnedFd, token: Token) -> Self {
+    pub(crate) fn attach_lease(
+        mut self,
+        map: OwnedFd,
+        program: OwnedFd,
+        btf: OwnedFd,
+        token: Token,
+    ) -> Self {
+        let identity = self.bound.identity;
         self.bound.metadata_lease = Some(
-            crate::metadata_lease::MetadataLease::new(map, token).with_deadline(self.deadline),
+            crate::metadata_lease::MetadataLease::new(map, program, btf, token, identity)
+                .with_deadline(self.deadline),
         );
         self
     }
@@ -157,4 +212,41 @@ pub(crate) fn qualify(
         bound: BoundInstance::trusted_candidate(after.identity, pidfd),
         deadline: Instant::now() + Duration::from_secs(5),
     })
+}
+
+#[cfg(test)]
+mod live_identity {
+    use super::{accept_live_identity, live_metadata_record};
+    use crate::instance_scope::InstanceIdentity;
+
+    fn anchored() -> InstanceIdentity {
+        InstanceIdentity {
+            tgid: 7,
+            uid: 10_001,
+            birth_ns: 12_345_678_901,
+            exec_id: 2,
+        }
+    }
+
+    #[test]
+    fn unchanged_token_with_new_exec_id_is_rejected() {
+        let task = anchored();
+        let stable = live_metadata_record(&task, 19, 2);
+        accept_live_identity(&task, 19, 2, &stable).expect("same exec stays admitted");
+        let mut exec = task;
+        exec.exec_id = 3;
+        let moved = live_metadata_record(&exec, 19, 2);
+        let error = accept_live_identity(&task, 19, 2, &moved).expect_err("new exec");
+        assert!(
+            error.to_string().contains("anchored exec_id changed"),
+            "{error}"
+        );
+        let empty = accept_live_identity(&task, 19, 2, &[]).expect_err("empty observation");
+        assert!(
+            empty
+                .to_string()
+                .contains("live metadata observation empty"),
+            "{empty}"
+        );
+    }
 }
