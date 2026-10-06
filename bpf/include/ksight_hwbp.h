@@ -19,9 +19,20 @@ struct ksight_hwbp_context {
     ksight_u32 aux_bytes;
     ksight_u32 aux_pad;
     ksight_u8 aux[4096];
+    ksight_u64 actual_len; /* valid only with aux_pad bit 2 */
+    ksight_u64 call_id; /* entry monotonic timestamp; shared at return */
+#if KSIGHT_INSTANCE_GATE
+    ksight_u32 scope_tgid, scope_uid, scope_epoch, scope_abi;
+    ksight_u64 scope_birth_ns, scope_exec_id, scope_thread_birth_ns;
+#endif
 };
 
-_Static_assert(sizeof(struct ksight_hwbp_context) == 4392,
+#if KSIGHT_INSTANCE_GATE
+_Static_assert(sizeof(struct ksight_hwbp_context) == 4448,
+               "instance hwbp context ABI changed");
+#else
+_Static_assert(sizeof(struct ksight_hwbp_context) == 4408,
                "ksight hwbp context ABI changed");
+#endif
 
 #endif /* KSIGHT_HWBP_H */

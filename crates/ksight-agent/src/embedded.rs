@@ -65,6 +65,57 @@ const ASSETS: &[(&str, &[u8], u32)] = &[
     ),
 ];
 
+/// Dedicated qualified objects; legacy objects and CLI selections are preserved.
+#[cfg(feature = "embedded-assets")]
+pub fn qualified_objects() -> anyhow::Result<(PathBuf, PathBuf)> {
+    let inputs: &[(&str, &[u8])] = &[
+        (
+            "code_metadata_v1",
+            include_bytes!("../../../build/bpf/code_metadata_v1.bpf.o"),
+        ),
+        (
+            "code_uprobe_v1",
+            include_bytes!("../../../build/bpf/code_uprobe_v1.bpf.o"),
+        ),
+    ];
+    let mut paths = Vec::new();
+    for (name, data) in inputs {
+        let digest = format!("{:x}", Sha256::digest(data));
+        let root = crate::runtime_paths::root()
+            .join("qualified-assets")
+            .join(&digest);
+        crate::runtime_paths::no_symlinks(&root)?;
+        fs::create_dir_all(&root)?;
+        let path = root.join(format!("{name}.bpf.o"));
+        crate::runtime_paths::no_symlinks(&path)?;
+        if path.exists() {
+            if fs::read(&path)? != *data {
+                anyhow::bail!("qualified asset identity conflict");
+            }
+        } else {
+            let mut f = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)?;
+            f.write_all(data)?;
+            f.sync_all()?;
+        }
+        paths.push(path);
+    }
+    Ok((paths.remove(0), paths.remove(0)))
+}
+#[cfg(not(feature = "embedded-assets"))]
+///
+/// # Errors
+/// Returns the validation or required operation error; no successful result is fabricated.
+/// Qualified objects retained by this evidence operation.
+pub fn qualified_objects() -> anyhow::Result<(std::path::PathBuf, std::path::PathBuf)> {
+    Ok((
+        crate::runtime_paths::root().join("qualified/code_metadata_v1.bpf.o"),
+        crate::runtime_paths::root().join("qualified/code_uprobe_v1.bpf.o"),
+    ))
+}
+
 /// Materialize the assets compiled into the device release.
 ///
 /// Existing custom `ksightd.json` is preserved. Immutable generated objects and
@@ -76,11 +127,53 @@ const ASSETS: &[(&str, &[u8], u32)] = &[
 /// installed with its expected content and permissions.
 #[cfg(feature = "embedded-assets")]
 pub fn prepare_default_layout() -> Result<()> {
-    let root = Path::new(DEVICE_ROOT);
+    prepare_layout_at(&crate::runtime_paths::root(), None)
+}
+
+/// Materialize only the capture plan's default assets; None retains legacy layout.
+///
+/// # Errors
+/// Rejects unknown assets and returns filesystem installation failures.
+#[cfg(feature = "embedded-assets")]
+pub fn prepare_capture_layout(selection: Option<&[&str]>) -> Result<()> {
+    prepare_layout_at(&crate::runtime_paths::root(), selection)
+}
+
+/// No I/O in a build without embedded assets.
+///
+/// # Errors
+/// This build variant always succeeds.
+#[cfg(not(feature = "embedded-assets"))]
+pub fn prepare_capture_layout(_selection: Option<&[&str]>) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(feature = "embedded-assets")]
+fn prepare_layout_at(root: &Path, selection: Option<&[&str]>) -> Result<()> {
+    if let Some(names) = selection {
+        anyhow::ensure!(
+            names
+                .iter()
+                .all(|n| ASSETS.iter().any(|(name, _, _)| name == n)),
+            "unknown capture asset"
+        );
+        if names.is_empty() {
+            return Ok(());
+        }
+    }
+    if root != Path::new(DEVICE_ROOT) {
+        crate::runtime_paths::no_symlinks(root)?;
+    }
     fs::create_dir_all(root).with_context(|| format!("create {}", root.display()))?;
     set_mode(root, 0o755)?;
-    for (name, bytes, mode) in ASSETS {
+    for (name, bytes, mode) in ASSETS
+        .iter()
+        .filter(|(name, _, _)| selection.is_none_or(|names| names.contains(name)))
+    {
         let destination = root.join(name);
+        if root != Path::new(DEVICE_ROOT) {
+            crate::runtime_paths::no_symlinks(&destination)?;
+        }
         if *name == "ksightd.json" && destination.is_file() {
             continue;
         }
@@ -152,7 +245,7 @@ fn set_mode(_path: &Path, _mode: u32) -> Result<()> {
 
 #[cfg(all(test, feature = "embedded-assets"))]
 mod tests {
-    use super::ASSETS;
+    use super::*;
 
     #[test]
     fn single_file_distribution_contains_every_runtime_asset() {
@@ -170,5 +263,98 @@ mod tests {
         let document: serde_json::Value =
             serde_json::from_slice(config).expect("valid config JSON");
         assert_eq!(document["schema_version"], 3);
+    }
+    #[test]
+    fn minimal_capture_layout_writes_only_selected_objects_and_preserves_other_files() {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("ksight-minimal-layout-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let selected = [
+            "process_lifecycle.bpf.o",
+            "network_connect.bpf.o",
+            "uprobe_regs.bpf.o",
+        ];
+        for (name, _, _) in ASSETS {
+            if !selected.contains(name) {
+                fs::write(root.join(name), b"unchanged sentinel").unwrap();
+            }
+        }
+        prepare_layout_at(&root, Some(&selected)).unwrap();
+        for (name, bytes, _) in ASSETS {
+            assert_eq!(
+                fs::read(root.join(name)).unwrap(),
+                if selected.contains(name) {
+                    bytes.to_vec()
+                } else {
+                    b"unchanged sentinel".to_vec()
+                }
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn empty_or_invalid_capture_layout_performs_no_writes() {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("ksight-empty-layout-{}", std::process::id()));
+        assert!(!root.exists());
+        prepare_layout_at(&root, Some(&[])).unwrap();
+        assert!(!root.exists());
+        assert!(prepare_layout_at(&root, Some(&["unknown"])).is_err());
+        assert!(!root.exists());
+    }
+    #[test]
+    fn legacy_layout_still_installs_all_assets_and_preserves_custom_config() {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("ksight-legacy-layout-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("ksightd.json"), b"custom config").unwrap();
+        prepare_layout_at(&root, None).unwrap();
+        for (name, bytes, _) in ASSETS {
+            assert_eq!(
+                fs::read(root.join(name)).unwrap(),
+                if *name == "ksightd.json" {
+                    b"custom config".to_vec()
+                } else {
+                    bytes.to_vec()
+                }
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn production_asset_root_rejects_symlinks_and_preserves_other_root() {
+        let base = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("ksight-isolation-{}", uuid::Uuid::new_v4()));
+        let isolated = base.join("candidate");
+        let legacy = base.join("legacy");
+        fs::create_dir_all(&isolated).unwrap();
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("file_open.bpf.o"), b"old BPF sentinel").unwrap();
+        prepare_layout_at(&isolated, None).unwrap();
+        assert_eq!(
+            fs::read(legacy.join("file_open.bpf.o")).unwrap(),
+            b"old BPF sentinel"
+        );
+        fs::remove_file(isolated.join("file_open.bpf.o")).unwrap();
+        std::os::unix::fs::symlink(
+            legacy.join("file_open.bpf.o"),
+            isolated.join("file_open.bpf.o"),
+        )
+        .unwrap();
+        assert!(prepare_layout_at(&isolated, None).is_err());
+        assert_eq!(
+            fs::read(legacy.join("file_open.bpf.o")).unwrap(),
+            b"old BPF sentinel"
+        );
+        fs::remove_dir_all(base).unwrap();
     }
 }

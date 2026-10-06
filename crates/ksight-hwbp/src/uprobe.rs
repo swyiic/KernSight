@@ -11,31 +11,93 @@
 //! `entry_ptr` map written on entry is visible when the return probe snapshots
 //! the filled buffer. Separate `load_file` sessions left return probes blind.
 
+use std::os::fd::AsFd;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use aya::{
     maps::{perf::PerfEventArray, Array, HashMap, MapData},
     programs::{uprobe::UProbeLinkId, UProbe},
-    Ebpf,
+    Btf, Ebpf, EbpfLoader,
 };
 
+use super::instance_scope::{
+    self, AllowValue, BoundInstance, InstanceIdentity, InstanceMaps, ScopeKey, ScopeState,
+};
 use super::registers::RegisterContext;
+// C map types are repr(C), entirely integer fields with no padding/uninitialized bytes.
+unsafe impl aya::Pod for ScopeKey {}
+unsafe impl aya::Pod for AllowValue {}
+struct BpfInstanceMaps<'a>(&'a mut Ebpf);
+impl InstanceMaps for BpfInstanceMaps<'_> {
+    fn unbind(&mut self, pidfd: std::os::fd::BorrowedFd<'_>) -> Result<()> {
+        crate::task_storage::remove(
+            crate::task_storage::checked_map(
+                self.0
+                    .map("scope_task_v1")
+                    .context("task-storage map missing")?,
+            )?,
+            pidfd,
+        )
+    }
+    fn bind(&mut self, target: &BoundInstance, value: AllowValue) -> Result<()> {
+        let map = crate::task_storage::checked_map(
+            self.0
+                .map("scope_task_v1")
+                .context("task-storage map missing")?,
+        )?;
+        let lease = target
+            .metadata_lease
+            .as_ref()
+            .context("physical metadata lease required before task bind")?;
+        let check = || lease.check(target.pidfd.as_fd());
+        crate::metadata_lease::guarded_bind(check, || {
+            crate::task_storage::insert(map, target.pidfd.as_fd(), value)
+        })
+    }
+    fn gate(&mut self, mode: u32) -> Result<()> {
+        BpfFilterMaps(self.0).gate(mode)
+    }
+    fn epoch(&mut self, epoch: u32) -> Result<()> {
+        let mut map: Array<&mut MapData, u32> = Array::try_from(
+            self.0
+                .map_mut("scope_epoch_v1")
+                .context("instance epoch map missing")?,
+        )?;
+        map.set(0, epoch, 0).context("write instance epoch")
+    }
+    fn remove(&mut self, key: ScopeKey) -> Result<()> {
+        let mut map: HashMap<&mut MapData, ScopeKey, AllowValue> = HashMap::try_from(
+            self.0
+                .map_mut("scope_allow_v1")
+                .context("instance allow map missing")?,
+        )?;
+        map.remove(&key).context("remove prior instance row")
+    }
+    fn insert(&mut self, key: ScopeKey, value: AllowValue) -> Result<()> {
+        let mut map: HashMap<&mut MapData, ScopeKey, AllowValue> = HashMap::try_from(
+            self.0
+                .map_mut("scope_allow_v1")
+                .context("instance allow map missing")?,
+        )?;
+        map.insert(key, value, 1)
+            .context("insert immutable instance row") // BPF_NOEXIST
+    }
+}
 use super::tgid_filter::{self, FilterMaps};
+use crate::perf_drain::{drain_reads, PerfDrainReport, PerfRead};
 
 struct BpfFilterMaps<'a>(&'a mut Ebpf);
 
 impl FilterMaps for BpfFilterMaps<'_> {
-    fn enable(&mut self, enabled: bool) -> Result<()> {
+    fn gate(&mut self, mode: u32) -> Result<()> {
         let map = self
             .0
-            .map_mut("tgid_filter")
-            .context("tgid_filter map 缺失")?;
+            .map_mut("tgid_filter_v2")
+            .context("tgid_filter_v2 missing; legacy object refused before attach")?;
         let mut filter: Array<&mut MapData, u32> =
-            Array::try_from(map).context("打开 tgid_filter")?;
-        filter
-            .set(0, u32::from(enabled), 0)
-            .context("写入 tgid_filter")
+            Array::try_from(map).context("打开 tgid_filter_v2")?;
+        filter.set(0, mode, 0).context("写入 tgid_filter_v2")
     }
 
     fn remove(&mut self, tgid: u32) -> Result<()> {
@@ -65,9 +127,12 @@ pub struct UprobeSession {
     /// (program name, link) pairs — one for entry-only, two for entry+return.
     links: Vec<(String, UProbeLinkId)>,
     buffers: Vec<aya::maps::perf::PerfEventArrayBuffer<MapData>>,
+    // Reused across read batches, CPUs and polls; no 8x8KiB allocation per read.
+    read_slots: [bytes::BytesMut; 8],
     hit_once: bool,
     finished: bool,
     tgid_keys: Vec<u32>,
+    instance_scope: Option<ScopeState>,
     /// True when this session owns both entry and uretprobe on the same object.
     pub paired_entry_return: bool,
     /// Total valid records drained from the perf buffers.
@@ -162,6 +227,23 @@ impl UprobeSession {
         )
     }
 
+    /// Load and configure a TLS ABI and TGID scope before attaching any link.
+    /// mode: 1 byte return, 2 output pointer, 3 attempted bytes only.
+    pub fn start_configured(
+        object: &Path,
+        programs: &[&str],
+        target: &Path,
+        offset: u64,
+        pid: Option<i32>,
+        hit_once: bool,
+        tgids: Option<&[u32]>,
+        snapshot: Option<[u64; 6]>,
+    ) -> Result<Self> {
+        Self::start_programs_configured(
+            object, programs, target, offset, pid, hit_once, tgids, snapshot, None,
+        )
+    }
+
     fn start_programs(
         object: &Path,
         programs: &[&str],
@@ -171,13 +253,163 @@ impl UprobeSession {
         hit_once: bool,
         tgids: Option<&[u32]>,
     ) -> Result<Self> {
-        let mut bpf = Ebpf::load_file(object).context("加载 uprobe BPF 对象")?;
+        Self::start_programs_configured(
+            object, programs, target, offset, pid, hit_once, tgids, None, None,
+        )
+    }
+
+    /// Low-level candidate backend. Requires trusted exact metadata and local
+    /// target BTF; does not bootstrap authorization or enable strict mirror.
+    /// Verify actual target BTF, task-storage ABI and every uprobe program without attaching or granting a task.
+    pub fn verify_instance_backend(object: &Path) -> Result<()> {
+        let btf = Btf::from_sys_fs().context("qualified backend requires real kernel BTF")?;
+        let bytes = std::fs::read(object)?;
+        let mut bpf = EbpfLoader::new()
+            .btf(Some(&btf))
+            .allow_unsupported_maps()
+            .load(&bytes)?;
+        crate::task_storage::checked_map(
+            bpf.map("scope_task_v1")
+                .context("qualified task-storage map absent")?,
+        )?;
+        let Some(aya::maps::Map::PerCpuArray(map)) = bpf.map("hwbp_ctx") else {
+            anyhow::bail!("qualified context map absent");
+        };
+        if map.info()?.value_size() != crate::registers::INSTANCE_CONTEXT_SIZE as u32 {
+            anyhow::bail!("qualified context ABI mismatch");
+        }
+        let mut loaded = 0usize;
+        for (_, program) in bpf.programs_mut() {
+            if let aya::programs::Program::UProbe(p) = program {
+                p.load()?;
+                loaded += 1;
+            }
+        }
+        if loaded == 0 {
+            anyhow::bail!("qualified uprobe programs absent");
+        }
+        Ok(()) // Local handles drop; no attach, pins, target grants or payload reads.
+    }
+    /// Missing BTF, old objects, relocation, verifier or map errors attach nothing.
+    pub fn start_instance_scoped(
+        object: &Path,
+        programs: &[&str],
+        target: &Path,
+        offset: u64,
+        identities: &[InstanceIdentity],
+        hit_once: bool,
+        snapshot: Option<[u64; 6]>,
+    ) -> Result<Self> {
+        let _ = (
+            object, programs, target, offset, identities, hit_once, snapshot,
+        );
+        anyhow::bail!("raw identity alone is insufficient; exact owned pidfd binding required")
+    }
+
+    /// Candidate backend with mandatory pidfd/task-storage binding. Caller must
+    /// supply sealed metadata leases retained from qualification against each
+    /// owned group-leader pidfd and package policy. This does not enable strict mirror by itself.
+    pub fn start_bound_instances(
+        object: &Path,
+        programs: &[&str],
+        target: &Path,
+        offset: u64,
+        instances: &[BoundInstance],
+        hit_once: bool,
+        snapshot: Option<[u64; 6]>,
+    ) -> Result<Self> {
+        Self::start_programs_configured(
+            object,
+            programs,
+            target,
+            offset,
+            None,
+            hit_once,
+            None,
+            snapshot,
+            Some(instances),
+        )
+    }
+
+    fn start_programs_configured(
+        object: &Path,
+        programs: &[&str],
+        target: &Path,
+        offset: u64,
+        pid: Option<i32>,
+        hit_once: bool,
+        tgids: Option<&[u32]>,
+        snapshot: Option<[u64; 6]>,
+        instances: Option<&[BoundInstance]>,
+    ) -> Result<Self> {
+        // Warm attaches can burst across TLS stacks; keep 4 MiB per CPU at 4 KiB/page.
+        const PERF_RING_PAGES: usize = 1024;
+
+        if let Some(targets) = instances {
+            instance_scope::require_metadata_leases(targets)?;
+        }
+        let mut bpf = if instances.is_some() {
+            // Aya's default .ok() BTF fallback is unsuitable for mandatory CO-RE.
+            let btf = Btf::from_sys_fs()
+                .context("instance gate requires target /sys/kernel/btf/vmlinux")?;
+            let bytes = std::fs::read(object).context("read instance BPF object")?;
+            EbpfLoader::new()
+                .btf(Some(&btf))
+                .allow_unsupported_maps() // Aya represents validated TASK_STORAGE as Unsupported.
+                .load(&bytes)
+                .context("load instance CO-RE object")?
+        } else {
+            Ebpf::load_file(object).context("加载 uprobe BPF 对象")?
+        };
+        if instances.is_some() {
+            for (name, map) in bpf.maps() {
+                if matches!(map, aya::maps::Map::Unsupported(_)) && name != "scope_task_v1" {
+                    anyhow::bail!("unexpected unsupported map {name}; instance attach refused");
+                }
+            }
+            let Some(aya::maps::Map::PerCpuArray(map)) = bpf.map("hwbp_ctx") else {
+                anyhow::bail!("instance context map missing; legacy object refused before attach");
+            };
+            if map.info()?.value_size() != crate::registers::INSTANCE_CONTEXT_SIZE as u32 {
+                anyhow::bail!("instance context ABI mismatch; legacy object refused before attach");
+            }
+            crate::task_storage::checked_map(
+                bpf.map("scope_task_v1")
+                    .context("exact pidfd task-storage map missing; raw-only object refused")?,
+            )?;
+            let _: Array<&MapData, u32> = Array::try_from(
+                bpf.map("scope_epoch_v1")
+                    .context("instance epoch map missing")?,
+            )?;
+            let _: HashMap<&MapData, ScopeKey, AllowValue> = HashMap::try_from(
+                bpf.map("scope_allow_v1")
+                    .context("instance allow map missing")?,
+            )?;
+        } else if bpf.map("scope_epoch_v1").is_some()
+            || bpf.map("scope_allow_v1").is_some()
+            || bpf.map("scope_task_v1").is_some()
+        {
+            anyhow::bail!("instance object requires exact instance API; numeric downgrade refused");
+        }
+        if snapshot.is_some() {
+            anyhow::bail!("TLS snapshot configuration is outside the memory candidate");
+        }
+
         let tgid_keys = if tgids.is_some() {
             tgid_filter::configure(&mut BpfFilterMaps(&mut bpf), &[], tgids)
                 .context("拒绝挂载：TGID 过滤配置失败")?
         } else {
             Vec::new()
         };
+        let instance_scope = instances
+            .map(|identities| {
+                instance_scope::configure(
+                    &mut BpfInstanceMaps(&mut bpf),
+                    &ScopeState::default(),
+                    identities,
+                )
+            })
+            .transpose()?;
         let mut links = Vec::with_capacity(programs.len());
         for program in programs {
             let link_id = {
@@ -201,7 +433,6 @@ impl UprobeSession {
         .context("打开 hwbp_events perf array")?;
         // Alipay warm attach can burst SSL_read/write across BabaSSL+Cronet+Conscrypt;
         // 128 pages/CPU overflowed (perf_lost≈1.6k / 90s). Lean JNI slots + 1024 pages ≈ 4MiB/CPU @4KiB.
-        const PERF_RING_PAGES: usize = 1024;
         let mut buffers = Vec::new();
         for cpu in crate::cpu_list::online_cpu_ids() {
             if let Ok(buffer) = events.open(cpu, Some(PERF_RING_PAGES)) {
@@ -219,9 +450,11 @@ impl UprobeSession {
             bpf,
             links,
             buffers,
+            read_slots: std::array::from_fn(|_| bytes::BytesMut::with_capacity(8192)),
             hit_once,
             finished: false,
             tgid_keys,
+            instance_scope,
             paired_entry_return,
             drained_total: 0,
             lost_total: 0,
@@ -241,6 +474,10 @@ impl UprobeSession {
         if self.finished {
             anyhow::bail!("cannot update a detached uprobe session");
         }
+        if self.instance_scope.is_some() {
+            self.detach();
+            anyhow::bail!("numeric filter cannot downgrade instance session; detached");
+        }
         match tgid_filter::configure(&mut BpfFilterMaps(&mut self.bpf), &self.tgid_keys, tgids) {
             Ok(keys) => {
                 self.tgid_keys = keys;
@@ -253,34 +490,149 @@ impl UprobeSession {
         }
     }
 
+    /// Advance an exact scope transaction. Every error detaches and discards
+    /// the object; retries need a fresh object, never a rolled-back generation.
+    pub fn apply_instance_scope(&mut self, identities: &[InstanceIdentity]) -> Result<()> {
+        let _ = identities;
+        self.detach();
+        anyhow::bail!("raw-only scope update refused; detached; owned pidfds required")
+    }
+
+    pub fn apply_bound_instances(&mut self, instances: &[BoundInstance]) -> Result<()> {
+        if self.finished {
+            anyhow::bail!("cannot update detached instance session");
+        }
+        if let Err(error) = instance_scope::require_metadata_leases(instances) {
+            self.detach();
+            return Err(error);
+        }
+        let Some(previous) = self.instance_scope.as_ref() else {
+            self.detach();
+            anyhow::bail!("numeric object has no instance capability; detached");
+        };
+        match instance_scope::configure(&mut BpfInstanceMaps(&mut self.bpf), previous, instances) {
+            Ok(next) => {
+                self.instance_scope = Some(next);
+                Ok(())
+            }
+            Err(error) => {
+                self.detach();
+                Err(error.context("instance transaction failed; detached"))
+            }
+        }
+    }
+
     /// 非阻塞排空当前可读命中。
     ///
     /// # Errors
     ///
     /// 保留底层采集接口的错误通道；当前无法读取的 perf buffer 会结束该次排空。
     pub fn poll_hits(&mut self) -> Result<Vec<RegisterContext>> {
-        if self.finished {
-            return Ok(Vec::new());
+        let report = self.poll_hits_report();
+        if let Some(error) = report.error {
+            anyhow::bail!("{error}");
         }
-        let mut hits = Vec::new();
+        Ok(report.records)
+    }
+
+    /// Preserve earlier records, individual loss-notification times and a later
+    /// read error. Inspect must revoke transport proof before routing records.
+    pub fn poll_hits_report(&mut self) -> PerfDrainReport<RegisterContext, String> {
+        let started = std::time::Instant::now();
+        let mut result = PerfDrainReport::default();
+        if self.finished {
+            return result;
+        }
+        if let Err(error) = self.check_instance_handles() {
+            self.detach();
+            result.error = Some(format!("instance handle invalidated: {error:#}"));
+            return result;
+        }
+        let instance_scope = self.instance_scope.as_ref();
         for buffer in &mut self.buffers {
-            for (raw, lost) in drain(buffer) {
-                self.lost_total += lost;
-                self.drained_total += u64::try_from(raw.len()).unwrap_or(u64::MAX);
-                for record in raw {
-                    if let Some(hit) = RegisterContext::decode(&record) {
-                        hits.push(hit);
-                    }
-                    if self.hit_once {
-                        self.detach();
-                        return Ok(hits);
-                    }
+            let slots = &mut self.read_slots;
+            let report = drain_reads(
+                || {
+                    let read = match buffer.read_events(slots) {
+                        Ok(read) => read,
+                        Err(error) => {
+                            return Err((
+                                format!("perf_buffer_read_error: {error}"),
+                                monotonic_ns(),
+                            ))
+                        }
+                    };
+                    // Capture the notification instant BEFORE record decoding.
+                    let observed = monotonic_ns();
+                    let records = slots
+                        .iter()
+                        .take(read.read)
+                        .filter_map(|slot| {
+                            if let Some(scope) = instance_scope {
+                                let hit = RegisterContext::decode_instance(slot)?;
+                                scope.accepts(hit.instance.as_ref()?).then_some(hit)
+                            } else {
+                                RegisterContext::decode(slot)
+                            }
+                        })
+                        .collect();
+                    Ok(PerfRead {
+                        samples: read.read as u64,
+                        records,
+                        lost_samples: read.lost as u64,
+                        notification_monotonic_ns: observed,
+                    })
+                },
+                |hit: &RegisterContext| hit.time_ns,
+            );
+            self.drained_total = self.drained_total.saturating_add(report.raw_samples);
+            self.lost_total = self.lost_total.saturating_add(report.lost_samples);
+            result.raw_samples = result.raw_samples.saturating_add(report.raw_samples);
+            result.lost_samples = result.lost_samples.saturating_add(report.lost_samples);
+            result.read_calls = result.read_calls.saturating_add(report.read_calls);
+            result.lost_only_reads = result
+                .lost_only_reads
+                .saturating_add(report.lost_only_reads);
+            result.records.extend(report.records);
+            result.notifications.extend(report.notifications);
+            if report.error.is_some() {
+                result.error = report.error;
+                result.error_notification_monotonic_ns = report.error_notification_monotonic_ns;
+                break;
+            }
+            if self.hit_once && !result.records.is_empty() {
+                break;
+            }
+        }
+        if let Err(error) = self.check_instance_handles() {
+            result.records.clear();
+            result.error = Some(format!(
+                "instance handle invalidated after drain: {error:#}"
+            ));
+            self.detach();
+        }
+        if self.hit_once && !result.records.is_empty() {
+            self.detach();
+        }
+        result.elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        result
+    }
+
+    fn check_instance_handles(&self) -> Result<()> {
+        if let Some(scope) = &self.instance_scope {
+            for target in &scope.bindings {
+                if !crate::task_storage::alive(target.pidfd.as_fd())? {
+                    anyhow::bail!("authorized task exited; discard drained generation");
                 }
             }
         }
-        Ok(hits)
+        Ok(())
     }
 
+    /// Current committed generation; returned records must not outlive it.
+    pub fn instance_epoch(&self) -> Option<u32> {
+        self.instance_scope.as_ref().map(|s| s.epoch)
+    }
     /// 非阻塞轮询一次命中。
     ///
     /// # Errors
@@ -298,6 +650,10 @@ impl UprobeSession {
     /// 解除 uprobe。
     fn detach(&mut self) {
         self.finished = true;
+        if self.instance_scope.is_some() {
+            let _ = BpfFilterMaps(&mut self.bpf).gate(2);
+        }
+        self.instance_scope = None;
         let links = std::mem::take(&mut self.links);
         for (program, link_id) in links {
             let Some(prog) = self.bpf.program_mut(&program) else {
@@ -317,33 +673,16 @@ impl Drop for UprobeSession {
     }
 }
 
-fn drain(buffer: &mut aya::maps::perf::PerfEventArrayBuffer<MapData>) -> Vec<(Vec<Vec<u8>>, u64)> {
-    let mut out = Vec::new();
-    loop {
-        let mut slots = [
-            bytes::BytesMut::with_capacity(8192),
-            bytes::BytesMut::with_capacity(8192),
-            bytes::BytesMut::with_capacity(8192),
-            bytes::BytesMut::with_capacity(8192),
-            bytes::BytesMut::with_capacity(8192),
-            bytes::BytesMut::with_capacity(8192),
-            bytes::BytesMut::with_capacity(8192),
-            bytes::BytesMut::with_capacity(8192),
-        ];
-        let Ok(read) = buffer.read_events(&mut slots) else {
-            break;
-        };
-        if read.read == 0 {
-            break;
-        }
-        let records: Vec<Vec<u8>> = slots
-            .into_iter()
-            .take(read.read)
-            .filter(|slot| !slot.is_empty())
-            .map(|slot| slot.to_vec())
-            .collect();
-        let lost = u64::try_from(read.lost).unwrap_or(u64::MAX);
-        out.push((records, lost));
+fn monotonic_ns() -> Option<u64> {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) } != 0 {
+        return None;
     }
-    out
+    u64::try_from(time.tv_sec)
+        .ok()?
+        .checked_mul(1_000_000_000)?
+        .checked_add(u64::try_from(time.tv_nsec).ok()?)
 }

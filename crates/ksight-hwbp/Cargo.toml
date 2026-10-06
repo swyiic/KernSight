@@ -9,6 +9,9 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+aya-obj = "=0.2.1"
+object = { version = "=0.36.7", default-features = false, features = ["read", "std"] }
+sha2.workspace = true
 
 [target.'cfg(any(target_os = "android", target_os = "linux"))'.dependencies]
 aya.workspace = true

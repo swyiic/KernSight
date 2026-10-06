@@ -2,7 +2,7 @@
 
 BPF_CLANG ?= $(firstword $(wildcard /opt/homebrew/opt/llvm/bin/clang) $(shell command -v clang))
 BPF_CFLAGS ?= -O2 -g -target bpfel -mcpu=v3 -Wall -Werror
-BPF_OBJECTS := build/bpf/process_lifecycle.bpf.o build/bpf/file_open.bpf.o build/bpf/network_connect.bpf.o build/bpf/memory_regions.bpf.o build/bpf/binder_transaction.bpf.o build/bpf/sched_wakeup.bpf.o build/bpf/uprobe_regs.bpf.o
+BPF_OBJECTS := build/bpf/process_lifecycle.bpf.o build/bpf/file_open.bpf.o build/bpf/network_connect.bpf.o build/bpf/memory_regions.bpf.o build/bpf/binder_transaction.bpf.o build/bpf/sched_wakeup.bpf.o build/bpf/uprobe_regs.bpf.o build/bpf/code_metadata_v1.bpf.o build/bpf/code_uprobe_v1.bpf.o
 BPF_HEADERS := $(wildcard bpf/include/*.h)
 DEVICE_TARGET := aarch64-unknown-linux-musl
 HOST_TARGET := $(shell rustc -vV | sed -n 's/^host: //p')
@@ -53,6 +53,15 @@ build/bpf/sched_wakeup.bpf.o: bpf/programs/sched/wakeup.bpf.c $(BPF_HEADERS)
 	$(BPF_CLANG) $(BPF_CFLAGS) -I bpf/include -c $< -o $@
 
 build/bpf/uprobe_regs.bpf.o: bpf/programs/uprobe/regs.bpf.c $(BPF_HEADERS)
+	@mkdir -p $(dir $@)
+	$(BPF_CLANG) $(BPF_CFLAGS) -I bpf/include -c $< -o $@
+
+# Physical qualification and instance-scoped code probes are embedded together.
+build/bpf/code_metadata_v1.bpf.o: bpf/programs/identity/metadata.bpf.c $(BPF_HEADERS)
+	@mkdir -p $(dir $@)
+	$(BPF_CLANG) $(BPF_CFLAGS) -I bpf/include -c $< -o $@
+
+build/bpf/code_uprobe_v1.bpf.o: bpf/programs/uprobe/instances.bpf.c bpf/programs/uprobe/regs.bpf.c $(BPF_HEADERS)
 	@mkdir -p $(dir $@)
 	$(BPF_CLANG) $(BPF_CFLAGS) -I bpf/include -c $< -o $@
 

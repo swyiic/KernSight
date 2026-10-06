@@ -604,3 +604,196 @@ fn art_memory_open_joins_containing_vma() {
         Some("apk-dex/split/blob.dex")
     );
 }
+
+#[test]
+fn bound_code_container_dex_is_catalogued_as_an_inner_slice() {
+    let dir = std::env::temp_dir().join(format!("ksight-bound-dex-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(dir.join("runtime")).unwrap();
+    let mut dex = vec![0_u8; 1024];
+    dex[..8].copy_from_slice(b"dex\n035\0");
+    dex[32..36].copy_from_slice(&1024_u32.to_le_bytes());
+    dex[40..44].copy_from_slice(&0x1234_5678_u32.to_le_bytes());
+    let mut container = b"vdex027\0........".to_vec();
+    let offset = container.len() as u64;
+    container.extend_from_slice(&dex);
+    let name = "bound-9-1a2b-11111111-2222-3333-4444-555555555555.code";
+    std::fs::write(dir.join("runtime").join(name), &container).unwrap();
+    let artifacts = catalog_dump(&dir);
+    let dex_rows: Vec<_> = artifacts
+        .iter()
+        .filter(|artifact| artifact.kind == "dex" && artifact.relative_path.ends_with(name))
+        .collect();
+    assert_eq!(dex_rows.len(), 1);
+    assert_eq!(dex_rows[0].dex_offset, Some(offset));
+    assert_eq!(dex_rows[0].bytes, 1024);
+    assert_eq!(dex_rows[0].source, "memory-dex");
+    let mut owned = dex_rows.into_iter().cloned().collect::<Vec<_>>();
+    attach_artifact_hashes(&dir, &mut owned);
+    let (sets, index) = build_dex_sets(&dir, &owned);
+    assert_eq!(sets.len(), 1);
+    assert_eq!(sets[0].bytes, 1024);
+    assert_eq!(sets[0].observations[0].dex_offset, Some(offset));
+    assert!(sets[0].semantic.is_some());
+    assert_eq!(index.unique_dex, 1);
+    assert_ne!(
+        sets[0].sha256.as_str(),
+        sha256_file(&dir.join("runtime").join(name)).unwrap()
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn shell_declared_size_does_not_hide_a_later_dex() {
+    let mut bytes = vec![0_u8; 400];
+    let write = |buf: &mut [u8], at: usize, declared: u32, classes: u32| {
+        buf[at..at + 8].copy_from_slice(b"dex\n035\0");
+        buf[at + 32..at + 36].copy_from_slice(&declared.to_le_bytes());
+        buf[at + 40..at + 44].copy_from_slice(&0x1234_5678_u32.to_le_bytes());
+        buf[at + 96..at + 100].copy_from_slice(&classes.to_le_bytes());
+    };
+    write(&mut bytes, 0, 400, 41);
+    write(&mut bytes, 200, 112, 8489);
+    let found = embedded_dex_images(&bytes);
+    assert!(found.contains(&(0, 400)));
+    assert!(found.contains(&(200, 112)));
+}
+
+#[test]
+fn unpacked_dex_requires_a_real_class_table_inside_the_buffer() {
+    assert!(!anonymous_dex_region("/system/lib64/libc.so", "rw-p", 2 * 1024 * 1024));
+    assert!(anonymous_dex_region("[anon:scudo:secondary]", "rw-p", 18 * 1024 * 1024));
+    assert!(anonymous_dex_region(
+        "[anon:scudo:secondary]",
+        "rw-p",
+        92_168_192
+    ));
+    assert!(!anonymous_dex_region(
+        "[anon:scudo:secondary]",
+        "rw-p",
+        128 * 1024 * 1024 + 1
+    ));
+    assert!(!anonymous_dex_region(
+        "[anon:dalvik-LinearAlloc]",
+        "rw-p",
+        92_168_192
+    ));
+    let mut bytes = vec![0_u8; 8192 + 512];
+    let at = 8192;
+    bytes[at..at + 8].copy_from_slice(b"dex\n035\0");
+    bytes[at + 32..at + 36].copy_from_slice(&512_u32.to_le_bytes());
+    bytes[at + 40..at + 44].copy_from_slice(&0x1234_5678_u32.to_le_bytes());
+    bytes[at + 96..at + 100].copy_from_slice(&8781_u32.to_le_bytes());
+    assert_eq!(find_unpacked_dex(&bytes), Some((8192, 512)));
+    bytes[at + 96..at + 100].copy_from_slice(&7_u32.to_le_bytes());
+    assert_eq!(find_unpacked_dex(&bytes), None);
+}
+
+#[test]
+fn one_scudo_region_keeps_each_later_unpacked_dex() {
+    let mut bytes = vec![0_u8; 1536];
+    let write = |bytes: &mut [u8], at: usize, classes: u32| {
+        bytes[at..at + 8].copy_from_slice(b"dex\n035\0");
+        bytes[at + 32..at + 36].copy_from_slice(&512_u32.to_le_bytes());
+        bytes[at + 40..at + 44].copy_from_slice(&0x1234_5678_u32.to_le_bytes());
+        bytes[at + 96..at + 100].copy_from_slice(&classes.to_le_bytes());
+    };
+    write(&mut bytes, 0, 7);
+    write(&mut bytes, 512, 7800);
+    write(&mut bytes, 1024, 300);
+    assert_eq!(
+        unpacked_dex_ranges(&bytes, 4),
+        vec![(512, 512), (1024, 512)]
+    );
+}
+
+#[test]
+fn dexhelper_bss_next_to_the_library_is_a_key_region() {
+    let helper = crate::dexdump::MapRow {
+        start: 0x2000_0000,
+        end: 0x2010_0000,
+        perms: "r-xp".to_owned(),
+        path: "/data/app/pkg/lib/arm64/libDexHelper.so".to_owned(),
+        inode: 1,
+    };
+    let bss = crate::dexdump::MapRow {
+        start: 0x2010_1000,
+        end: 0x2010_4000,
+        perms: "rw-p".to_owned(),
+        path: "[anon:.bss]".to_owned(),
+        inode: 0,
+    };
+    let far = crate::dexdump::MapRow {
+        start: 0x8000_0000,
+        end: 0x8000_1000,
+        perms: "rw-p".to_owned(),
+        path: "[anon:.bss]".to_owned(),
+        inode: 0,
+    };
+    let rows = [helper, bss, far];
+    assert!(dexhelper_key_region(&rows[1].path, &rows[1].perms, rows[1].start, &rows));
+    assert!(!dexhelper_key_region(
+        &rows[2].path,
+        &rows[2].perms,
+        rows[2].start,
+        &rows
+    ));
+    assert!(dexhelper_key_region(
+        "/data/app/pkg/lib/arm64/libDexHelper.so",
+        "rw-p",
+        0x3000,
+        &rows
+    ));
+}
+
+#[test]
+fn retained_dexdata0_is_named_in_the_catalog_notes() {
+    let dir = std::env::temp_dir().join(format!("ksight-dexdata-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(dir.join("runtime")).unwrap();
+    let mut bytes = vec![0_u8; 64];
+    bytes.extend_from_slice(&1_u32.to_le_bytes());
+    bytes.extend_from_slice(&92_192_788_u32.to_le_bytes());
+    bytes.extend_from_slice(&8_u32.to_le_bytes());
+    bytes.extend_from_slice(b"dexdata0");
+    bytes.extend_from_slice(&[1_u8; 32]);
+    std::fs::write(dir.join("runtime").join("bound-3-1000-aaaa.code"), &bytes).unwrap();
+    let _ = catalog_dump(&dir);
+    let notes: Vec<String> = serde_json::from_slice(
+        &std::fs::read(dir.join("runtime").join("truncated-dex.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(notes.iter().any(|note| {
+        note.contains("dexdata0") && note.contains("declared 92192788") && note.contains("offset 64")
+    }));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn truncated_vdex_prefix_is_named_and_not_catalogued_as_dex() {
+    let dir = std::env::temp_dir().join(format!("ksight-trunc-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(dir.join("runtime")).unwrap();
+    let mut dex = vec![0_u8; 0x70];
+    dex[..8].copy_from_slice(b"dex\n035\0");
+    dex[32..36].copy_from_slice(&92_319_172_u32.to_le_bytes());
+    dex[40..44].copy_from_slice(&0x1234_5678_u32.to_le_bytes());
+    let mut container = b"vdex027\0".to_vec();
+    container.resize(64, 0);
+    container.extend_from_slice(&dex);
+    std::fs::write(
+        dir.join("runtime")
+            .join("bound-9-73e0867000-11111111-2222-3333-4444-555555555555.code"),
+        &container,
+    )
+    .unwrap();
+    let artifacts = catalog_dump(&dir);
+    assert!(artifacts.iter().all(|artifact| {
+        artifact.source != "memory-dex" || !artifact.relative_path.contains("73e0867000")
+    }));
+    let notes: Vec<String> = serde_json::from_slice(
+        &std::fs::read(dir.join("runtime").join("truncated-dex.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(notes.iter().any(|note| {
+        note.contains("declared 92319172") && note.contains("retained 112") && note.contains("not a complete DEX")
+    }));
+    std::fs::remove_dir_all(dir).unwrap();
+}

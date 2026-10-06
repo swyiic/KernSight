@@ -327,7 +327,7 @@ pub fn classify_dex_ownership_with_context(
             .then(left.sha256.cmp(&right.sha256))
     });
     let mut report = DexOwnershipReport {
-        schema_version: "mobilee.kernsight-dex-ownership/v3".to_owned(),
+        schema_version: "mobilee.kernsight-dex-ownership/v4".to_owned(),
         package: package.to_owned(),
         inferred_internal_namespaces,
         entries,
@@ -353,6 +353,10 @@ pub fn classify_dex_ownership_with_context(
     report
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the admission or lifecycle transaction together for review."
+)]
 fn classify_dex_set(
     set: &DexArtifactSet,
     package_path: &str,
@@ -394,6 +398,13 @@ fn classify_dex_set(
         }
     }
     let total = descriptors.len();
+    let secneo_classes = descriptors
+        .iter()
+        .filter(|descriptor| {
+            normalize_class_name(descriptor).starts_with("com/secneo/apkwrapper/")
+        })
+        .count();
+    let packer_shell = total > 0 && total <= 512 && business == 0 && secneo_classes > 0;
     let classified = business + internal + sdk;
     let runtime_only = set
         .sources
@@ -405,12 +416,10 @@ fn classify_dex_set(
     let sdk_share = percent(sdk, total);
     let has_first_party = business + internal > 0;
     let has_non_first_party = sdk + unknown > 0;
-    let category = if total == 0 {
+    let category = if packer_shell {
+        DexOwnershipCategory::DynamicPayload
+    } else if total == 0 {
         DexOwnershipCategory::Unknown
-    } else if business_share >= 55 {
-        DexOwnershipCategory::Business
-    } else if internal_share >= 55 {
-        DexOwnershipCategory::InternalComponent
     } else if has_first_party && has_non_first_party {
         // A multidex file is a container, not an ownership boundary. Preserve even a
         // small exact package-namespace contribution instead of allowing a large SDK
@@ -422,8 +431,6 @@ fn classify_dex_set(
         DexOwnershipCategory::InternalComponent
     } else if sdk_share >= 60 {
         DexOwnershipCategory::ThirdPartySdk
-    } else if runtime_only {
-        DexOwnershipCategory::DynamicPayload
     } else if classified * 100 >= total * 65 {
         if business >= internal && business >= sdk {
             DexOwnershipCategory::Business
@@ -444,7 +451,7 @@ fn classify_dex_set(
         DexOwnershipCategory::Unknown => percent(unknown, total),
     };
     let coverage = percent(classified, total);
-    let confidence = if total == 0 {
+    let confidence = if total == 0 || category == DexOwnershipCategory::Unknown {
         0
     } else {
         u8::try_from((dominant * 2 + coverage) / 3)
@@ -461,6 +468,12 @@ fn classify_dex_set(
     let mut reasons = vec![format!(
         "类样本 {total}：业务 {business}、内部组件 {internal}、第三方 SDK {sdk}、未知 {unknown}"
     )];
+    if packer_shell {
+        reasons.push(
+            "SecNeo apkwrapper 壳；业务类不在这张 DEX 里，对应的脱壳镜像要另看匿名内存 DEX"
+                .to_owned(),
+        );
+    }
     if runtime_only {
         reasons.push("仅在内存/堆载荷中观察到，APK DEX 中没有相同 SHA-256".to_owned());
     }
@@ -752,7 +765,17 @@ mod tests {
         let dynamic = dex_set(&["La/b/c;", "Lx/y/z;"], &["memory-dex"]);
         let report = classify_dex_ownership("com.acme.mobile", &[sdk, dynamic]);
         assert_eq!(report.third_party_sdks, 1);
-        assert_eq!(report.dynamic_payloads, 1);
+        assert_eq!(report.dynamic_payloads, 0);
+        assert_eq!(report.unknown, 1);
+        assert_eq!(
+            report
+                .entries
+                .iter()
+                .find(|entry| entry.category == DexOwnershipCategory::Unknown)
+                .unwrap()
+                .confidence,
+            0
+        );
     }
 
     #[test]
@@ -772,6 +795,15 @@ mod tests {
     }
 
     #[test]
+    fn ownership_preserves_sdk_inside_business_heavy_multidex() {
+        let mut classes = vec!["Lcom/tencent/wework/Api;"];
+        classes.extend(std::iter::repeat_n("Lcom/example/app/MainActivity;", 99));
+        let report = classify_dex_ownership("com.example.app", &[dex_set(&classes, &["apk-dex"])]);
+        assert_eq!(report.entries[0].category, DexOwnershipCategory::Mixed);
+        assert_eq!(report.entries[0].third_party_classes, 1);
+    }
+
+    #[test]
     fn ownership_preserves_exact_app_classes_inside_sdk_heavy_multidex() {
         let mut classes = vec![
             "Lcom/example/app/MainActivity;",
@@ -786,6 +818,25 @@ mod tests {
         assert_eq!(report.business_class_samples, 2);
         assert_eq!(report.business_dex_sets, 1);
         assert_eq!(report.mixed, 1);
+    }
+
+    #[test]
+    fn secneo_wrapper_is_a_shell_not_the_business_image() {
+        let shell = dex_set(
+            &[
+                "Lcom/secneo/apkwrapper/AP;",
+                "Lcom/secneo/apkwrapper/H;",
+                "Lcom/secneo/apkwrapper/a;",
+            ],
+            &["memory-dex"],
+        );
+        let report = classify_dex_ownership("cn.gov.tax.its", &[shell]);
+        assert_eq!(report.entries[0].category, DexOwnershipCategory::DynamicPayload);
+        assert_eq!(report.business_class_samples, 0);
+        assert!(report.entries[0]
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("SecNeo")));
     }
 
     #[test]
@@ -819,7 +870,10 @@ mod tests {
             &[enterprise_modules.clone()],
             &context,
         );
-        assert_eq!(report.internal_components, 1);
+        assert_eq!(report.internal_components, 0);
+        assert_eq!(report.mixed, 1);
+        assert_eq!(report.entries[0].internal_classes, 3);
+        assert_eq!(report.entries[0].unknown_classes, 1);
         assert_eq!(
             report.inferred_internal_namespaces[0].namespace,
             "corp/grid"

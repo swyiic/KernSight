@@ -1,6 +1,7 @@
 //! Repair dumped DEX containers without merging unrelated files.
 
-use std::io::{Read as _, Write as _};
+use std::collections::BTreeSet;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -63,6 +64,7 @@ pub struct DexSemanticSummary {
 }
 
 const DEX_SEMANTIC_SAMPLE_LIMIT: usize = 1024;
+const DEX_CLASS_INDEX_LIMIT: usize = 16384;
 
 /// Parse a bounded semantic index from a standard little-endian DEX image.
 ///
@@ -120,7 +122,7 @@ pub fn parse_dex_semantics(bytes: &[u8]) -> Option<DexSemanticSummary> {
 
     let mut class_descriptors = Vec::new();
     for index in 0..class_defs {
-        if class_descriptors.len() >= DEX_SEMANTIC_SAMPLE_LIMIT {
+        if class_descriptors.len() >= DEX_CLASS_INDEX_LIMIT {
             break;
         }
         let entry = usize::try_from(class_defs_off)
@@ -154,7 +156,7 @@ pub fn parse_dex_semantics(bytes: &[u8]) -> Option<DexSemanticSummary> {
         class_defs,
         class_descriptors,
         class_descriptors_truncated: usize::try_from(class_defs).unwrap_or(usize::MAX)
-            > DEX_SEMANTIC_SAMPLE_LIMIT,
+            > DEX_CLASS_INDEX_LIMIT,
         method_names,
         method_names_truncated: usize::try_from(method_ids).unwrap_or(usize::MAX)
             > DEX_SEMANTIC_SAMPLE_LIMIT,
@@ -443,7 +445,7 @@ pub fn repair_dex_dir(dir: &std::path::Path) -> std::io::Result<usize> {
         let Some(repaired) = repair_dex(&bytes) else {
             continue;
         };
-        std::fs::write(repaired_dir.join(name), repaired.bytes)?;
+        crate::output_budget::write(repaired_dir.join(name), repaired.bytes)?;
         count += 1;
     }
     Ok(count)
@@ -457,13 +459,23 @@ pub fn repair_dex_dir(dir: &std::path::Path) -> std::io::Result<usize> {
 /// # Errors
 ///
 /// Returns filesystem or zip errors. Individual entries that are not DEX images are skipped.
+#[allow(
+    clippy::too_many_lines,
+    reason = "Raw and derived members share one admission transaction."
+)]
 pub fn extract_apk_dex(apk: &Path, dest: &Path) -> std::io::Result<Vec<DexExtract>> {
+    let apk_sha256 = crate::code_evidence::apk_hash(apk)?;
+    let evidence_root = dest.parent().unwrap_or(dest);
     let file = std::fs::File::open(apk)?;
     let mut archive = zip::ZipArchive::new(file)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     std::fs::create_dir_all(dest)?;
     let repaired_dir = dest.join("repaired");
     std::fs::create_dir_all(&repaired_dir)?;
+    let readable = dest.parent().map_or_else(
+        || dest.join("readable-dex"),
+        |parent| parent.join("readable-dex"),
+    );
     let mut extracted = Vec::new();
     for index in 0..archive.len() {
         let mut entry = archive
@@ -484,13 +496,29 @@ pub fn extract_apk_dex(apk: &Path, dest: &Path) -> std::io::Result<Vec<DexExtrac
             continue;
         }
         let mut bytes = Vec::new();
-        entry.read_to_end(&mut bytes)?;
+        entry
+            .by_ref()
+            .take(uncompressed.saturating_add(1))
+            .read_to_end(&mut bytes)?;
         drop(entry);
+        if bytes.len() as u64 != uncompressed {
+            return Err(std::io::Error::other("incomplete APK member"));
+        }
+        let raw_hash = crate::code_evidence::hash(&bytes);
+        let source = serde_json::json!({"apk_path":apk.to_string_lossy(), "apk_sha256":apk_sha256,
+            "zip_member":entry_name, "zip_index":index, "declared_bytes":uncompressed, "actual_bytes":bytes.len()});
         if !is_dex_magic(&bytes) {
             continue;
         }
         let output_name = unique_dex_name(dest, &entry_name);
-        std::fs::write(dest.join(&output_name), &bytes)?;
+        crate::code_evidence::retain(
+            evidence_root,
+            &dest.join(&output_name),
+            &bytes,
+            &source,
+            &raw_hash,
+            "identity",
+        )?;
         let mut kept_bytes = u64::try_from(bytes.len()).unwrap_or(0);
         let mut payload_bytes = 0_u64;
         if let Some(repaired) = repair_dex(&bytes) {
@@ -498,11 +526,25 @@ pub fn extract_apk_dex(apk: &Path, dest: &Path) -> std::io::Result<Vec<DexExtrac
             if repaired.truncated_extra > 4096 {
                 let payload = &bytes[repaired.bytes.len()..];
                 payload_bytes = u64::try_from(payload.len()).unwrap_or(0);
-                let mut payload_file =
-                    std::fs::File::create(dest.join(format!("{output_name}.payload")))?;
-                payload_file.write_all(payload)?;
+                let mut tail_source = source.clone();
+                tail_source["member_offset"] = serde_json::json!(repaired.bytes.len());
+                crate::code_evidence::retain(
+                    evidence_root,
+                    &dest.join(format!("{output_name}.payload")),
+                    payload,
+                    &tail_source,
+                    &raw_hash,
+                    "slice_tail/v1",
+                )?;
             }
-            std::fs::write(repaired_dir.join(&output_name), repaired.bytes)?;
+            crate::code_evidence::retain(
+                evidence_root,
+                &repaired_dir.join(&output_name),
+                &repaired.bytes,
+                &source,
+                &raw_hash,
+                "repair_dex/v1",
+            )?;
         }
         let slices = split_concatenated_dex(&bytes);
         if slices.len() > 1 {
@@ -510,11 +552,26 @@ pub fn extract_apk_dex(apk: &Path, dest: &Path) -> std::io::Result<Vec<DexExtrac
             std::fs::create_dir_all(&split_dir)?;
             for (index, slice) in slices.iter().enumerate() {
                 let part = format!("part{index:02}.dex");
-                std::fs::write(split_dir.join(&part), &slice.bytes)?;
+                let mut slice_source = source.clone();
+                slice_source["member_offset"] = serde_json::json!(slice.offset);
+                crate::code_evidence::retain(
+                    evidence_root,
+                    &split_dir.join(&part),
+                    &slice.bytes,
+                    &slice_source,
+                    &raw_hash,
+                    "split_concatenated_dex/v1",
+                )?;
                 if let Some(repaired) = repair_dex(&slice.bytes) {
-                    std::fs::write(
-                        repaired_dir.join(format!("{output_name}-part{index:02}.dex")),
-                        repaired.bytes,
+                    slice_source["parent_sha256"] =
+                        serde_json::json!(crate::code_evidence::hash(&slice.bytes));
+                    crate::code_evidence::retain(
+                        evidence_root,
+                        &repaired_dir.join(format!("{output_name}-part{index:02}.dex")),
+                        &repaired.bytes,
+                        &slice_source,
+                        &raw_hash,
+                        "repair_split_dex/v1",
                     )?;
                 }
             }
@@ -524,8 +581,25 @@ pub fn extract_apk_dex(apk: &Path, dest: &Path) -> std::io::Result<Vec<DexExtrac
                 .get(usize::try_from(kept_bytes).unwrap_or(0)..)
                 .unwrap_or(&[]),
         ) {
-            std::fs::write(dest.join(format!("{output_name}.dexdata0")), &dexdata.body)?;
+            let mut body_source = source.clone();
+            body_source["member_offset"] =
+                serde_json::json!(kept_bytes + 12 + dexdata.name.len() as u64);
+            crate::code_evidence::retain(
+                evidence_root,
+                &dest.join(format!("{output_name}.dexdata0")),
+                &dexdata.body,
+                &body_source,
+                &raw_hash,
+                "parse_secneo_dexdata_body/v1",
+            )?;
         }
+        write_split_parts(
+            &output_name,
+            &bytes,
+            &dest.join("split"),
+            &readable,
+            Some((evidence_root, &source, &raw_hash)),
+        )?;
         extracted.push(DexExtract {
             name: output_name,
             original_bytes: uncompressed,
@@ -533,11 +607,6 @@ pub fn extract_apk_dex(apk: &Path, dest: &Path) -> std::io::Result<Vec<DexExtrac
             payload_bytes,
         });
     }
-    let readable = dest.parent().map_or_else(
-        || dest.join("readable-dex"),
-        |parent| parent.join("readable-dex"),
-    );
-    let _ = publish_apk_dex_splits(dest, &readable);
     Ok(extracted)
 }
 
@@ -550,6 +619,8 @@ pub fn extract_apk_dex(apk: &Path, dest: &Path) -> std::io::Result<Vec<DexExtrac
 ///
 /// Returns filesystem or zip errors. Oversized or non-file entries are skipped.
 pub fn extract_apk_packed_native(apk: &Path, dest: &Path) -> std::io::Result<Vec<ApkPackedFile>> {
+    let apk_sha256 = crate::code_evidence::apk_hash(apk)?;
+    let evidence_root = dest.parent().unwrap_or(dest);
     let file = std::fs::File::open(apk)?;
     let mut archive = zip::ZipArchive::new(file)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
@@ -571,14 +642,31 @@ pub fn extract_apk_packed_native(apk: &Path, dest: &Path) -> std::io::Result<Vec
             continue;
         }
         let mut bytes = Vec::new();
-        entry.read_to_end(&mut bytes)?;
+        entry
+            .by_ref()
+            .take(uncompressed.saturating_add(1))
+            .read_to_end(&mut bytes)?;
         drop(entry);
+        if bytes.len() as u64 != uncompressed {
+            return Err(std::io::Error::other("incomplete APK member"));
+        }
+        let raw_hash = crate::code_evidence::hash(&bytes);
+        let source = serde_json::json!({"apk_path":apk.to_string_lossy(), "apk_sha256":apk_sha256,
+            "zip_member":entry_name, "zip_index":index, "declared_bytes":uncompressed, "actual_bytes":bytes.len()});
         let output_name = packed_output_name(&entry_name);
         let target = dest.join(&output_name);
-        if target.exists() {
+        let existed = target.exists();
+        crate::code_evidence::retain(
+            evidence_root,
+            &target,
+            &bytes,
+            &source,
+            &raw_hash,
+            "identity",
+        )?;
+        if existed {
             continue;
         }
-        std::fs::write(&target, &bytes)?;
         extracted.push(ApkPackedFile {
             zip_name: entry_name,
             output_name,
@@ -597,6 +685,8 @@ pub fn extract_apk_packed_native(apk: &Path, dest: &Path) -> std::io::Result<Vec
 ///
 /// Returns filesystem or zip errors. Existing files are left unchanged.
 pub fn extract_apk_native_libs(apk: &Path, dest: &Path) -> std::io::Result<Vec<ApkPackedFile>> {
+    let apk_sha256 = crate::code_evidence::apk_hash(apk)?;
+    let evidence_root = dest.parent().unwrap_or(dest);
     let file = std::fs::File::open(apk)?;
     let mut archive = zip::ZipArchive::new(file)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
@@ -625,16 +715,33 @@ pub fn extract_apk_native_libs(apk: &Path, dest: &Path) -> std::io::Result<Vec<A
             continue;
         };
         let target = dest.join(&relative);
-        if target.exists() {
-            continue;
-        }
         let mut bytes = Vec::new();
-        entry.read_to_end(&mut bytes)?;
+        entry
+            .by_ref()
+            .take(uncompressed.saturating_add(1))
+            .read_to_end(&mut bytes)?;
         drop(entry);
+        if bytes.len() as u64 != uncompressed {
+            return Err(std::io::Error::other("incomplete APK member"));
+        }
+        let raw_hash = crate::code_evidence::hash(&bytes);
+        let source = serde_json::json!({"apk_path":apk.to_string_lossy(), "apk_sha256":apk_sha256,
+            "zip_member":entry_name, "zip_index":index, "declared_bytes":uncompressed, "actual_bytes":bytes.len()});
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&target, &bytes)?;
+        let existed = target.exists();
+        crate::code_evidence::retain(
+            evidence_root,
+            &target,
+            &bytes,
+            &source,
+            &raw_hash,
+            "identity",
+        )?;
+        if existed {
+            continue;
+        }
         extracted.push(ApkPackedFile {
             zip_name: entry_name,
             output_name: relative,
@@ -715,14 +822,20 @@ fn packed_output_name(zip_name: &str) -> String {
 pub fn split_concatenated_dex(input: &[u8]) -> Vec<DexSlice> {
     let mut slices = Vec::new();
     let mut index = 0_usize;
-    while index.saturating_add(0x70) <= input.len() {
+    while index.saturating_add(0x70) <= input.len() && slices.len() < 64 {
         match next_dex_image(input, index) {
             Some((at, len)) => {
                 slices.push(DexSlice {
                     offset: u64::try_from(at).unwrap_or(0),
                     bytes: input[at..at.saturating_add(len)].to_vec(),
                 });
-                index = at.saturating_add(len);
+                // A shell can declare a length that covers a later plaintext DEX.
+                // Do not jump over that inner header.
+                let next = next_dex_image(input, at.saturating_add(4));
+                index = match next {
+                    Some((inner, _)) if inner < at.saturating_add(len) => inner,
+                    _ => at.saturating_add(len),
+                };
             }
             None => break,
         }
@@ -750,7 +863,142 @@ fn find_dex_magic(input: &[u8]) -> Option<usize> {
     input.windows(4).position(|window| window == b"dex\n")
 }
 
-fn valid_dex_len(bytes: &[u8]) -> Option<usize> {
+/// One retained DEX image. 128 MiB covers the 92,319,172-byte `base.vdex`
+/// image observed on device and still rejects an unbounded mapping.
+pub const DEX_IMAGE_LIMIT: usize = 128 * 1024 * 1024;
+
+/// One `dexdata0` container found inside a retained image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DexDataSpot {
+    /// Offset of the 12-byte count/size/name-length header.
+    pub header_offset: u64,
+    /// Vendor payload count.
+    pub count: u32,
+    /// Size field stored beside the `dexdata0` name.
+    pub declared_bytes: u64,
+}
+
+/// Type descriptors stored as DEX `string_data_item`s inside a retained image.
+///
+/// These are plaintext names. They are not `class_defs` and they are not decrypted bytecode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaintextTypeDescriptors {
+    /// Unique `L...;` names, sorted.
+    pub names: Vec<String>,
+    /// True when `limit` stopped the scan before the buffer ended.
+    pub truncated: bool,
+}
+
+/// Collect uleb128-prefixed `L...;` descriptors that end in NUL.
+///
+/// A leading `L` without a matching length byte is ignored, so a descriptor is not
+/// reported twice as `LL...`.
+#[must_use]
+pub fn plaintext_type_descriptors(bytes: &[u8], limit: usize) -> PlaintextTypeDescriptors {
+    let mut names = BTreeSet::new();
+    let mut truncated = false;
+    let mut index = 0_usize;
+    while index + 8 < bytes.len() {
+        if bytes[index] != b'L' {
+            index = index.saturating_add(1);
+            continue;
+        }
+        let Some(relative_end) = bytes[index + 1..]
+            .iter()
+            .position(|byte| *byte == b';' || *byte == 0 || *byte == b' ')
+        else {
+            break;
+        };
+        if bytes[index + 1 + relative_end] != b';' {
+            index = index.saturating_add(1);
+            continue;
+        }
+        let desc_len = relative_end.saturating_add(2);
+        let end = index.saturating_add(desc_len);
+        if desc_len < 8
+            || desc_len > 240
+            || end >= bytes.len()
+            || bytes[end] != 0
+            || !type_descriptor_bytes(&bytes[index..end])
+            || !uleb_matches(bytes, index, desc_len)
+        {
+            index = index.saturating_add(1);
+            continue;
+        }
+        if names.len() >= limit {
+            truncated = true;
+            break;
+        }
+        names.insert(String::from_utf8_lossy(&bytes[index..end]).into_owned());
+        index = end.saturating_add(1);
+    }
+    PlaintextTypeDescriptors {
+        names: names.into_iter().collect(),
+        truncated,
+    }
+}
+
+fn type_descriptor_bytes(bytes: &[u8]) -> bool {
+    bytes.contains(&b'/')
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'$' | b'_' | b';'))
+}
+
+fn uleb_matches(bytes: &[u8], at: usize, value: usize) -> bool {
+    if at >= 1 {
+        let low = bytes[at - 1];
+        if low < 0x80 && usize::from(low) == value {
+            return true;
+        }
+    }
+    if at >= 2 {
+        let first = bytes[at - 2];
+        let second = bytes[at - 1];
+        if first & 0x80 != 0 && second < 0x80 {
+            let decoded = usize::from(first & 0x7f) | (usize::from(second) << 7);
+            if decoded == value {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Locate the first well-formed `dexdata0` header. The body is not copied.
+#[must_use]
+pub fn locate_dexdata0(bytes: &[u8]) -> Option<DexDataSpot> {
+    let needle = b"dexdata0";
+    let mut from = 0_usize;
+    while from.saturating_add(needle.len()) <= bytes.len() {
+        let Some(rel) = bytes[from..].windows(needle.len()).position(|window| window == needle) else {
+            break;
+        };
+        let at = from.saturating_add(rel);
+        if at >= 12 {
+            let header = &bytes[at - 12..at];
+            let count = u32::from_le_bytes(header[0..4].try_into().ok()?);
+            let declared = u32::from_le_bytes(header[4..8].try_into().ok()?) as u64;
+            let name_len = u32::from_le_bytes(header[8..12].try_into().ok()?);
+            if (1..=8).contains(&count)
+                && name_len == 8
+                && (16..DEX_IMAGE_LIMIT as u64).contains(&declared)
+            {
+                return Some(DexDataSpot {
+                    header_offset: u64::try_from(at - 12).unwrap_or(0),
+                    count,
+                    declared_bytes: declared,
+                });
+            }
+        }
+        from = at.saturating_add(1);
+    }
+    None
+}
+
+/// Header-declared DEX length. This stays set when the retained buffer is shorter.
+#[must_use]
+pub fn peek_declared_dex_len(bytes: &[u8]) -> Option<usize> {
     if bytes.len() < 0x70 || !bytes.starts_with(b"dex\n") {
         return None;
     }
@@ -759,10 +1007,15 @@ fn valid_dex_len(bytes: &[u8]) -> Option<usize> {
         return None;
     }
     let declared = u32::from_le_bytes(bytes[32..36].try_into().ok()?) as usize;
-    if declared < 0x70 || declared > bytes.len() || declared > 64 * 1024 * 1024 {
+    if declared < 0x70 || declared > DEX_IMAGE_LIMIT {
         return None;
     }
     Some(declared)
+}
+
+fn valid_dex_len(bytes: &[u8]) -> Option<usize> {
+    let declared = peek_declared_dex_len(bytes)?;
+    (declared <= bytes.len()).then_some(declared)
 }
 
 /// Parse a vendor `DexHelper` `dexdata0` blob (count + size + name + body).
@@ -1031,7 +1284,7 @@ fn publish_apk_dex_splits(apk_dex: &Path, readable: &Path) -> std::io::Result<us
         let Ok(bytes) = std::fs::read(&path) else {
             continue;
         };
-        count = count.saturating_add(write_split_parts(name, &bytes, &split_dir, readable)?);
+        count = count.saturating_add(write_split_parts(name, &bytes, &split_dir, readable, None)?);
     }
     Ok(count)
 }
@@ -1077,11 +1330,12 @@ fn publish_runtime_dex(runtime: &Path, readable: &Path) -> std::io::Result<usize
             let out_name = format!("{prefix}-{name}");
             let slices = split_concatenated_dex(&bytes);
             if slices.len() > 1 {
-                count =
-                    count.saturating_add(write_split_parts(&out_name, &bytes, readable, readable)?);
+                count = count.saturating_add(write_split_parts(
+                    &out_name, &bytes, readable, readable, None,
+                )?);
                 continue;
             }
-            std::fs::write(readable.join(&out_name), bytes)?;
+            crate::output_budget::write(readable.join(&out_name), bytes)?;
             count = count.saturating_add(1);
         }
     }
@@ -1093,9 +1347,23 @@ fn write_split_parts(
     bytes: &[u8],
     split_dir: &Path,
     readable: &Path,
+    evidence: Option<(&Path, &serde_json::Value, &str)>,
 ) -> std::io::Result<usize> {
     std::fs::create_dir_all(split_dir)?;
     std::fs::create_dir_all(readable)?;
+    let retain = |path: std::path::PathBuf,
+                  body: &[u8],
+                  offset: u64,
+                  transform: &str|
+     -> std::io::Result<()> {
+        if let Some((root, source, raw_hash)) = evidence {
+            let mut source = source.clone();
+            source["member_offset"] = serde_json::json!(offset);
+            crate::code_evidence::retain(root, &path, body, &source, raw_hash, transform)
+        } else {
+            crate::output_budget::write(path, body)
+        }
+    };
     let stem = name
         .strip_suffix(".dex")
         .or_else(|| name.strip_suffix(".DEX"))
@@ -1104,27 +1372,47 @@ fn write_split_parts(
     if slices.len() > 1 {
         for (index, slice) in slices.iter().enumerate() {
             let part_name = format!("{stem}_part{index:02}_{}.dex", slice.offset);
-            std::fs::write(split_dir.join(&part_name), &slice.bytes)?;
+            retain(
+                split_dir.join(&part_name),
+                &slice.bytes,
+                slice.offset,
+                "split_concatenated_dex/v1",
+            )?;
             if split_dir != readable {
-                std::fs::write(readable.join(&part_name), &slice.bytes)?;
+                retain(
+                    readable.join(&part_name),
+                    &slice.bytes,
+                    slice.offset,
+                    "split_concatenated_dex/v1",
+                )?;
             }
         }
         return Ok(slices.len());
     }
     if let Some(slice) = slices.first() {
         let out_name = format!("{stem}.dex");
-        std::fs::write(split_dir.join(&out_name), &slice.bytes)?;
+        retain(
+            split_dir.join(&out_name),
+            &slice.bytes,
+            slice.offset,
+            "split_concatenated_dex/v1",
+        )?;
         if split_dir != readable {
-            std::fs::write(readable.join(&out_name), &slice.bytes)?;
+            retain(
+                readable.join(&out_name),
+                &slice.bytes,
+                slice.offset,
+                "split_concatenated_dex/v1",
+            )?;
         }
         return Ok(1);
     }
     if is_dex_magic(bytes) {
         let body = repair_dex(bytes).map_or_else(|| bytes.to_vec(), |repaired| repaired.bytes);
         let out_name = format!("{stem}.dex");
-        std::fs::write(split_dir.join(&out_name), &body)?;
+        retain(split_dir.join(&out_name), &body, 0, "repair_dex/v1")?;
         if split_dir != readable {
-            std::fs::write(readable.join(&out_name), &body)?;
+            retain(readable.join(&out_name), &body, 0, "repair_dex/v1")?;
         }
         return Ok(1);
     }
@@ -1185,6 +1473,21 @@ fn collect_apks(dir: &Path, out: &mut Vec<PathBuf>, depth: u32) -> std::io::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
+
+    #[test]
+    fn plaintext_descriptors_require_a_matching_uleb_length() {
+        let splash = b"Lcom/boc/bocsoft/mobile/bocmobile/buss/system/splash/SplashActivity;";
+        let mut bytes = vec![splash.len() as u8];
+        bytes.extend_from_slice(splash);
+        bytes.push(0);
+        bytes.push(b'L');
+        bytes.extend_from_slice(&splash[1..]);
+        bytes.push(0);
+        let found = plaintext_type_descriptors(&bytes, 8);
+        assert_eq!(found.names, vec![String::from_utf8(splash.to_vec()).unwrap()]);
+        assert!(!found.truncated);
+    }
 
     fn header_with(file_size: u32, map_off: u32, data_size: u32, data_off: u32) -> Vec<u8> {
         let mut bytes = vec![0_u8; 0x70];
@@ -1196,6 +1499,31 @@ mod tests {
         bytes[104..108].copy_from_slice(&data_size.to_le_bytes());
         bytes[108..112].copy_from_slice(&data_off.to_le_bytes());
         bytes
+    }
+
+    #[test]
+    fn locates_dexdata0_header_without_copying_the_body() {
+        let mut bytes = vec![0_u8; 32];
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.extend_from_slice(&92_192_788_u32.to_le_bytes());
+        bytes.extend_from_slice(&8_u32.to_le_bytes());
+        bytes.extend_from_slice(b"dexdata0");
+        bytes.extend_from_slice(&[0xab; 32]);
+        let spot = locate_dexdata0(&bytes).expect("spot");
+        assert_eq!(spot.header_offset, 32);
+        assert_eq!(spot.count, 1);
+        assert_eq!(spot.declared_bytes, 92_192_788);
+    }
+
+    #[test]
+    fn declared_length_is_visible_when_the_retained_prefix_is_shorter() {
+        let mut bytes = header_with(92_319_172, 0x70, 0, 0x70);
+        bytes.truncate(0x70);
+        assert_eq!(peek_declared_dex_len(&bytes), Some(92_319_172));
+        assert!(split_concatenated_dex(&bytes).is_empty());
+        let mut over = header_with(0x70, 0x70, 0, 0x70);
+        over[32..36].copy_from_slice(&((DEX_IMAGE_LIMIT as u32).saturating_add(1)).to_le_bytes());
+        assert_eq!(peek_declared_dex_len(&over), None);
     }
 
     #[test]
@@ -1264,6 +1592,32 @@ mod tests {
         assert_eq!(extracted[0].payload_bytes, 8_192);
         assert!(dir.join("out/repaired/classes.dex").is_file());
         assert!(dir.join("out/classes.dex.payload").is_file());
+        let notes = std::fs::read_dir(dir.join("code-evidence"))
+            .unwrap()
+            .map(|entry| {
+                serde_json::from_slice::<serde_json::Value>(
+                    &std::fs::read(entry.unwrap().path()).unwrap(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let original = notes
+            .iter()
+            .find(|note| note["transformation"] == "identity")
+            .unwrap();
+        assert_eq!(original["sha256"], original["raw_member_sha256"]);
+        for note in &notes {
+            assert_eq!(note["raw_member_sha256"], original["sha256"]);
+            assert_eq!(note["source"]["zip_member"], "classes.dex");
+        }
+        assert!(notes
+            .iter()
+            .any(|note| note["transformation"] == "slice_tail/v1"
+                && note["source"]["member_offset"] == logical));
+        assert!(notes
+            .iter()
+            .any(|note| note["relative_path"] == "readable-dex/classes.dex"));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1326,6 +1680,21 @@ mod tests {
     }
 
     #[test]
+    fn shell_declared_length_does_not_hide_an_inner_dex() {
+        let mut image = header_with(0xE0, 0x70, 0, 0x70);
+        image.resize(0xE0, 0);
+        let mut inner = header_with(0x70, 0x70, 0, 0x70);
+        inner.resize(0x70, 1);
+        image[0x70..].copy_from_slice(&inner);
+        let slices = split_concatenated_dex(&image);
+        assert_eq!(slices.len(), 2);
+        assert_eq!(slices[0].offset, 0);
+        assert_eq!(slices[0].bytes.len(), 0xE0);
+        assert_eq!(slices[1].offset, 0x70);
+        assert_eq!(slices[1].bytes.len(), 0x70);
+    }
+
+    #[test]
     fn parses_secneo_dexdata0_header() {
         let mut blob = Vec::new();
         blob.extend_from_slice(&1_u32.to_le_bytes());
@@ -1372,7 +1741,7 @@ mod tests {
         second.resize(0x80, 1);
         let mut glued = first;
         glued.extend_from_slice(&second);
-        std::fs::write(apk_dex.join("classes.dex"), &glued).expect("write");
+        crate::output_budget::write(apk_dex.join("classes.dex"), &glued).expect("write");
         let count = publish_readable_dex(&dir).expect("publish");
         assert_eq!(count, 2);
         assert!(apk_dex.join("split/classes_part00_0.dex").is_file());

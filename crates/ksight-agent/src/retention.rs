@@ -328,13 +328,13 @@ fn process_is_alive(pid: u32) -> bool {
     }
 }
 
-fn boot_id() -> Option<String> {
+pub(crate) fn boot_id() -> Option<String> {
     fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .ok()
         .map(|value| value.trim().to_owned())
 }
 
-fn process_start_ticks(pid: u32) -> Option<u64> {
+pub(crate) fn process_start_ticks(pid: u32) -> Option<u64> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let after_comm = stat.rsplit_once(')')?.1;
     after_comm.split_whitespace().nth(19)?.parse().ok()

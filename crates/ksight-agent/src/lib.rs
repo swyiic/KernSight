@@ -89,3 +89,11 @@ pub use capabilities::{
     CapabilityProbe, CapabilityStatus, HostCapabilityProbe, ProbeReport, TracepointCapability,
 };
 pub use runtime::{AgentRuntime, RuntimeState};
+
+pub mod capture_lifecycle;
+pub mod capture_relation;
+pub mod capture_stages;
+pub mod evidence_inventory;
+mod memory_windows;
+pub mod qualified_code;
+pub mod runtime_paths;

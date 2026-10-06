@@ -55,6 +55,12 @@ impl AndroidIdentityResolver {
         })
     }
 
+    /// Explicit package enrollment refuses shared UIDs instead of guessing by mutable cmdline.
+    pub fn exclusive_package_uid(&self, package_name: &str) -> Option<u32> {
+        self.packages_by_uid
+            .iter()
+            .find_map(|(uid, names)| (names.len() == 1 && names[0] == package_name).then_some(*uid))
+    }
     fn from_packages_list(packages: &str) -> Self {
         let mut packages_by_uid: BTreeMap<u32, Vec<String>> = BTreeMap::new();
         for line in packages.lines() {
@@ -208,6 +214,18 @@ mod tests {
         assert_eq!(resolver.uid_for_package("com.example.beta"), Some(10123));
     }
 
+    #[test]
+    fn production_qualification_enrollment_rejects_shared_and_missing_uid() {
+        let resolver = AndroidIdentityResolver::from_packages_list(
+            "p.one 10001 0
+p.two 10001 0
+p.solo 10002 0
+",
+        );
+        assert_eq!(resolver.exclusive_package_uid("p.one"), None);
+        assert_eq!(resolver.exclusive_package_uid("missing"), None);
+        assert_eq!(resolver.exclusive_package_uid("p.solo"), Some(10002));
+    }
     #[test]
     fn isolated_uid_uses_bounded_cmdline_inference() {
         let resolver = AndroidIdentityResolver::default();

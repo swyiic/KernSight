@@ -31,6 +31,12 @@ pub struct LiveDump {
     pub plaintext_windows: usize,
     /// Signing/crypto marker windows copied beside plaintext (local artifacts only).
     pub crypto_windows: usize,
+    /// Failed window evidence writes, including metadata writes.
+    pub memory_window_write_failures: usize,
+    /// Window scan reads ending in an IO error (including open failure).
+    pub memory_window_read_failures: usize,
+    /// Window scan EOF short reads; IO failures are counted separately.
+    pub memory_window_short_reads: usize,
     /// Heap/BSS pointers followed from packer mappings (SM4 key candidates).
     pub key_slots: usize,
     /// DEX images harvested from payload-sized anonymous heaps.
@@ -47,37 +53,65 @@ pub struct LiveDump {
 ///
 /// Writes raw images plus a repaired copy under `repaired/` when the bytes are DEX.
 pub fn dump_live_process(pid: u32, dest_dir: &Path, deadline: Instant) -> LiveDump {
+    dump_live_process_scoped(pid, dest_dir, deadline, true, true)
+}
+
+/// Code discovery remains enabled; broad windows and key probes require selection.
+pub fn dump_live_process_scoped(
+    pid: u32,
+    dest_dir: &Path,
+    deadline: Instant,
+    keys: bool,
+    windows: bool,
+) -> LiveDump {
+    dump_live_process_with_pause(pid, dest_dir, deadline, keys, windows, true)
+}
+/// Same discovery scope, optionally racing live pages instead of pausing the App.
+pub fn dump_live_process_with_pause(
+    pid: u32,
+    dest_dir: &Path,
+    deadline: Instant,
+    keys: bool,
+    windows: bool,
+    pause_target: bool,
+) -> LiveDump {
+    let deadline = ksight_core::output_budget::deadline(dest_dir, deadline);
     let _ = std::fs::create_dir_all(dest_dir);
     let _ = std::fs::create_dir_all(dest_dir.join("repaired"));
     let maps_path = format!("/proc/{pid}/maps");
     let maps_text = std::fs::read_to_string(&maps_path).unwrap_or_default();
     if !maps_text.is_empty() {
-        let _ = std::fs::write(
+        let _ = ksight_core::output_budget::write(
             dest_dir.join(format!("maps-{pid}.txt")),
             maps_text.as_bytes(),
         );
     }
     let maps = parse_maps(&maps_text);
     write_mapped_code(pid, dest_dir, &maps);
-    let pause = StoppedProcess::enter(pid);
+    let pause = choose_pause(pause_target, || StoppedProcess::enter(pid));
     let started = Instant::now();
     let mut dump = LiveDump {
         paused: pause.active,
         ..LiveDump::default()
     };
     // Interface catalog first: Inspect shutdown used to spend the 8s budget on DEX heaps.
-    dump.plaintext_windows = dump_plaintext_windows(pid, dest_dir, deadline);
-    if Instant::now() < deadline {
-        dump.crypto_windows = dump_crypto_windows(pid, dest_dir, deadline);
+    if windows {
+        dump.plaintext_windows = dump_plaintext_windows(pid, dest_dir, deadline, &mut dump);
+    }
+    if windows && (Instant::now() < deadline && !ksight_core::output_budget::should_stop(dest_dir))
+    {
+        dump.crypto_windows = dump_crypto_windows(pid, dest_dir, deadline, &mut dump);
     }
     dump.native_libs = dump_loaded_sos(pid, dest_dir, deadline);
     write_open_code(pid, dest_dir);
     let packer = maps_have_packer_so(&maps);
-    if packer && Instant::now() < deadline {
+    if packer && (Instant::now() < deadline && !ksight_core::output_budget::should_stop(dest_dir)) {
         dump.packer_regions = dump_packer_regions(pid, dest_dir, deadline);
-        dump.key_slots = dump_followed_keys(pid, dest_dir, deadline);
+        if keys {
+            dump.key_slots = dump_followed_keys(pid, dest_dir, deadline);
+        }
     }
-    if Instant::now() < deadline {
+    if Instant::now() < deadline && !ksight_core::output_budget::should_stop(dest_dir) {
         let memory = dump_process_dex_from_maps(pid, dest_dir, deadline, &maps);
         dump.memory_images = memory.dex;
         dump.vdex_images = memory.vdex;
@@ -136,7 +170,7 @@ fn dump_process_dex_from_maps(
     let _ = std::fs::create_dir_all(&repaired_dir);
     let mut dumped = MemoryDump::default();
     for (index, row) in maps.iter().enumerate() {
-        if Instant::now() >= deadline {
+        if Instant::now() >= deadline || ksight_core::output_budget::should_stop(dest_dir) {
             break;
         }
         if !row.perms.contains('r') {
@@ -172,7 +206,7 @@ fn dump_process_dex_from_maps(
             }
             ContainerKind::Vdex => available.min(MAX_REGION).min(96 * 1024 * 1024),
         };
-        let Some(bytes) = read_region(&mut mem, magic_at, want) else {
+        let Some(bytes) = read_region_scoped(&mut mem, magic_at, want, dest_dir) else {
             continue;
         };
         if matches!(kind, ContainerKind::Dex | ContainerKind::Cdex) && bytes.len() < 1024 {
@@ -191,7 +225,7 @@ fn dump_process_dex_from_maps(
                 continue;
             }
         }
-        if File::create(&raw)
+        if ksight_core::output_budget::BudgetFile::create(&raw)
             .and_then(|mut file| file.write_all(&bytes))
             .is_err()
         {
@@ -203,7 +237,8 @@ fn dump_process_dex_from_maps(
             }
             ContainerKind::Dex | ContainerKind::Cdex => {
                 if let Some(repaired) = ksight_core::repair_dex(&bytes) {
-                    let _ = std::fs::write(repaired_dir.join(&name), repaired.bytes);
+                    let _ =
+                        ksight_core::output_budget::write(repaired_dir.join(&name), repaired.bytes);
                 }
                 dumped.dex = dumped.dex.saturating_add(1);
             }
@@ -292,19 +327,52 @@ const PLAINTEXT_WINDOW: usize = 8192;
 const PLAINTEXT_CAP: usize = 96;
 const PLAINTEXT_PER_NEEDLE: usize = 16;
 
-fn dump_plaintext_windows(pid: u32, dest_dir: &Path, deadline: Instant) -> usize {
-    let Ok(maps) = std::fs::read_to_string(format!("/proc/{pid}/maps")) else {
-        return 0;
-    };
-    let Ok(mut mem) = File::open(format!("/proc/{pid}/mem")) else {
-        return 0;
-    };
+fn account_window_read(stats: &mut LiveDump, read: &crate::memory_windows::RegionRead) {
+    match read.evidence["read_status"].as_str() {
+        Some("read_failed") => stats.memory_window_read_failures += 1,
+        Some("short_read") => stats.memory_window_short_reads += 1,
+        _ => {}
+    }
+}
+
+fn open_window_memory(pid: u32, out_dir: &Path, stats: &mut LiveDump) -> Option<(String, File)> {
+    let result = std::fs::read_to_string(format!("/proc/{pid}/maps"))
+        .and_then(|maps| File::open(format!("/proc/{pid}/mem")).map(|mem| (maps, mem)));
+    match result {
+        Ok(value) => Some(value),
+        Err(error) => {
+            stats.memory_window_read_failures += 1;
+            let record = serde_json::json!({"schema":"kernsight.memory-read/v1", "pid":pid, "read_status":"read_failed", "read_error":format!("{:?}",error.kind()), "operation":"open_maps_or_mem"});
+            if let Err(write_error) = crate::memory_windows::note(out_dir, "read", &record) {
+                stats.memory_window_write_failures += 1;
+                eprintln!(
+                    "memory window evidence write failed: {:?}",
+                    write_error.kind()
+                );
+            }
+            None
+        }
+    }
+}
+
+fn dump_plaintext_windows(
+    pid: u32,
+    dest_dir: &Path,
+    deadline: Instant,
+    stats: &mut LiveDump,
+) -> usize {
     let out_dir = dest_dir.join("plaintext");
+    let Some((maps, mut mem)) = open_window_memory(pid, &out_dir, stats) else {
+        return 0;
+    };
     let _ = std::fs::create_dir_all(&out_dir);
     let mut dumped = 0_usize;
     let mut seen = BTreeSet::new();
     for line in maps.lines() {
-        if Instant::now() >= deadline || dumped >= PLAINTEXT_CAP {
+        if Instant::now() >= deadline
+            || ksight_core::output_budget::should_stop(dest_dir)
+            || dumped >= PLAINTEXT_CAP
+        {
             break;
         }
         let Some((start, end, perms, path)) = parse_map_line(line) else {
@@ -330,37 +398,59 @@ fn dump_plaintext_windows(pid: u32, dest_dir: &Path, deadline: Instant) -> usize
         if len < 64 * 1024 {
             continue;
         }
-        let Some(bytes) = read_region(&mut mem, start, len) else {
+        let mut read = crate::memory_windows::read(&mut mem, start, len);
+        read.evidence["pid"] = serde_json::json!(pid);
+        account_window_read(stats, &read);
+        if let Err(error) = crate::memory_windows::note(&out_dir, "read", &read.evidence) {
+            stats.memory_window_write_failures += 1;
+            eprintln!("memory window evidence write failed: {:?}", error.kind());
+            return dumped;
+        }
+        let bytes = &read.bytes;
+        if bytes.is_empty() {
             continue;
-        };
+        }
         for needle in PLAINTEXT_NEEDLES {
             let mut from = 0_usize;
             let mut needle_hits = 0_usize;
             while dumped < PLAINTEXT_CAP && needle_hits < PLAINTEXT_PER_NEEDLE {
-                if Instant::now() >= deadline {
+                if Instant::now() >= deadline || ksight_core::output_budget::should_stop(dest_dir) {
                     return dumped;
                 }
                 let Some(rel) = find_bytes(&bytes[from..], needle) else {
                     break;
                 };
                 let at = from.saturating_add(rel);
-                let begin = plaintext_window_begin(&bytes, at, needle);
+                let begin = plaintext_window_begin(bytes, at, needle);
                 let stop = (at.saturating_add(PLAINTEXT_WINDOW)).min(bytes.len());
                 let Some(slice) = keep_plaintext_window(&bytes[begin..stop]) else {
                     from = at.saturating_add(needle.len().max(1));
                     continue;
                 };
-                let fingerprint = plaintext_fingerprint(slice);
-                if !seen.insert(fingerprint) {
-                    from = at.saturating_add(needle.len().max(1));
-                    continue;
-                }
-                let name = format!("mem-{pid}-{start:x}+{at:x}.txt");
-                let dest = out_dir.join(&name);
-                if !dest.exists() {
-                    let _ = std::fs::write(&dest, slice);
-                    dumped = dumped.saturating_add(1);
-                    needle_hits = needle_hits.saturating_add(1);
+                needle_hits = needle_hits.saturating_add(1);
+                match crate::memory_windows::save(
+                    &out_dir,
+                    crate::memory_windows::Window {
+                        pid,
+                        read: &read.evidence,
+                        begin,
+                        requested_bytes: (at.saturating_add(PLAINTEXT_WINDOW))
+                            .min(len as usize)
+                            .saturating_sub(begin),
+                        raw: &bytes[begin..stop],
+                        selected: slice,
+                    },
+                    &mut seen,
+                ) {
+                    Ok(true) => {
+                        dumped = dumped.saturating_add(1);
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        stats.memory_window_write_failures += 1;
+                        eprintln!("memory window evidence write failed: {:?}", error.kind());
+                        return dumped;
+                    }
                 }
                 from = at.saturating_add(needle.len().max(1));
             }
@@ -393,19 +483,24 @@ const CRYPTO_CAP: usize = 48;
 const CRYPTO_PER_NEEDLE: usize = 8;
 
 /// Bounded signing/crypto windows under `runtime/crypto-windows/` (not Burp, not http_calls).
-fn dump_crypto_windows(pid: u32, dest_dir: &Path, deadline: Instant) -> usize {
-    let Ok(maps) = std::fs::read_to_string(format!("/proc/{pid}/maps")) else {
-        return 0;
-    };
-    let Ok(mut mem) = File::open(format!("/proc/{pid}/mem")) else {
-        return 0;
-    };
+fn dump_crypto_windows(
+    pid: u32,
+    dest_dir: &Path,
+    deadline: Instant,
+    stats: &mut LiveDump,
+) -> usize {
     let out_dir = dest_dir.join("crypto-windows");
+    let Some((maps, mut mem)) = open_window_memory(pid, &out_dir, stats) else {
+        return 0;
+    };
     let _ = std::fs::create_dir_all(&out_dir);
     let mut dumped = 0_usize;
     let mut seen = BTreeSet::new();
     for line in maps.lines() {
-        if Instant::now() >= deadline || dumped >= CRYPTO_CAP {
+        if Instant::now() >= deadline
+            || ksight_core::output_budget::should_stop(dest_dir)
+            || dumped >= CRYPTO_CAP
+        {
             break;
         }
         let Some((start, end, perms, path)) = parse_map_line(line) else {
@@ -431,14 +526,23 @@ fn dump_crypto_windows(pid: u32, dest_dir: &Path, deadline: Instant) -> usize {
         if len < 64 * 1024 {
             continue;
         }
-        let Some(bytes) = read_region(&mut mem, start, len) else {
+        let mut read = crate::memory_windows::read(&mut mem, start, len);
+        read.evidence["pid"] = serde_json::json!(pid);
+        account_window_read(stats, &read);
+        if let Err(error) = crate::memory_windows::note(&out_dir, "read", &read.evidence) {
+            stats.memory_window_write_failures += 1;
+            eprintln!("memory window evidence write failed: {:?}", error.kind());
+            return dumped;
+        }
+        let bytes = &read.bytes;
+        if bytes.is_empty() {
             continue;
-        };
+        }
         for needle in CRYPTO_NEEDLES {
             let mut from = 0_usize;
             let mut needle_hits = 0_usize;
             while dumped < CRYPTO_CAP && needle_hits < CRYPTO_PER_NEEDLE {
-                if Instant::now() >= deadline {
+                if Instant::now() >= deadline || ksight_core::output_budget::should_stop(dest_dir) {
                     return dumped;
                 }
                 let Some(rel) = find_bytes(&bytes[from..], needle) else {
@@ -451,17 +555,30 @@ fn dump_crypto_windows(pid: u32, dest_dir: &Path, deadline: Instant) -> usize {
                     from = at.saturating_add(needle.len().max(1));
                     continue;
                 };
-                let fingerprint = plaintext_fingerprint(slice);
-                if !seen.insert(fingerprint) {
-                    from = at.saturating_add(needle.len().max(1));
-                    continue;
-                }
-                let name = format!("mem-{pid}-{start:x}+{at:x}.txt");
-                let dest = out_dir.join(&name);
-                if !dest.exists() {
-                    let _ = std::fs::write(&dest, slice);
-                    dumped = dumped.saturating_add(1);
-                    needle_hits = needle_hits.saturating_add(1);
+                needle_hits = needle_hits.saturating_add(1);
+                match crate::memory_windows::save(
+                    &out_dir,
+                    crate::memory_windows::Window {
+                        pid,
+                        read: &read.evidence,
+                        begin,
+                        requested_bytes: (at.saturating_add(CRYPTO_WINDOW))
+                            .min(len as usize)
+                            .saturating_sub(begin),
+                        raw: &bytes[begin..stop],
+                        selected: slice,
+                    },
+                    &mut seen,
+                ) {
+                    Ok(true) => {
+                        dumped = dumped.saturating_add(1);
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        stats.memory_window_write_failures += 1;
+                        eprintln!("memory window evidence write failed: {:?}", error.kind());
+                        return dumped;
+                    }
                 }
                 from = at.saturating_add(needle.len().max(1));
             }
@@ -543,15 +660,6 @@ fn contains_ignore_ascii(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window.eq_ignore_ascii_case(needle))
 }
 
-fn plaintext_fingerprint(slice: &[u8]) -> (u64, usize) {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in slice.iter().take(96) {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x1000_0000_01b3);
-    }
-    (hash, slice.len())
-}
-
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
@@ -572,7 +680,7 @@ fn dump_packer_regions(pid: u32, dest_dir: &Path, deadline: Instant) -> usize {
     let mut dumped = 0_usize;
     let mut last_packer_end = 0_u64;
     for line in maps.lines() {
-        if Instant::now() >= deadline {
+        if Instant::now() >= deadline || ksight_core::output_budget::should_stop(dest_dir) {
             break;
         }
         let Some((start, end, perms, path)) = parse_map_line(line) else {
@@ -593,7 +701,7 @@ fn dump_packer_regions(pid: u32, dest_dir: &Path, deadline: Instant) -> usize {
         {
             continue;
         }
-        let Some(bytes) = read_region(&mut mem, start, len) else {
+        let Some(bytes) = read_region_scoped(&mut mem, start, len, dest_dir) else {
             continue;
         };
         let label = packer_region_label(path);
@@ -601,7 +709,7 @@ fn dump_packer_regions(pid: u32, dest_dir: &Path, deadline: Instant) -> usize {
         if raw.exists() {
             continue;
         }
-        if File::create(&raw)
+        if ksight_core::output_budget::BudgetFile::create(&raw)
             .and_then(|mut file| file.write_all(&bytes))
             .is_err()
         {
@@ -625,11 +733,11 @@ fn dump_packer_regions(pid: u32, dest_dir: &Path, deadline: Instant) -> usize {
             if dest.exists() {
                 continue;
             }
-            if std::fs::write(&dest, dex).is_err() {
+            if ksight_core::output_budget::write(&dest, dex).is_err() {
                 continue;
             }
             if let Some(repaired) = ksight_core::repair_dex(dex) {
-                let _ = std::fs::write(repaired_dir.join(&name), repaired.bytes);
+                let _ = ksight_core::output_budget::write(repaired_dir.join(&name), repaired.bytes);
             }
         }
     }
@@ -670,7 +778,7 @@ fn dump_followed_keys(pid: u32, dest_dir: &Path, deadline: Instant) -> usize {
     candidates.sort_unstable();
     candidates.dedup();
     for ptr in candidates.into_iter().take(MAX_KEY_SLOTS) {
-        if Instant::now() >= deadline {
+        if Instant::now() >= deadline || ksight_core::output_budget::should_stop(dest_dir) {
             break;
         }
         let Some((map_start, map_end, _, _)) =
@@ -687,7 +795,7 @@ fn dump_followed_keys(pid: u32, dest_dir: &Path, deadline: Instant) -> usize {
             seen_maps.push(*map_start);
             if let Some(bytes) = read_region(&mut mem, *map_start, map_len) {
                 let path = key_dir.join(format!("heap-{pid}-{map_start:x}.bin"));
-                let _ = std::fs::write(path, bytes);
+                let _ = ksight_core::output_budget::write(path, bytes);
             }
         }
         let Some(slot) = read_region(&mut mem, ptr, KEY_SLOT_BYTES) else {
@@ -697,7 +805,7 @@ fn dump_followed_keys(pid: u32, dest_dir: &Path, deadline: Instant) -> usize {
         if path.exists() {
             continue;
         }
-        if std::fs::write(&path, slot).is_ok() {
+        if ksight_core::output_budget::write(&path, slot).is_ok() {
             dumped = dumped.saturating_add(1);
         }
     }
@@ -735,14 +843,14 @@ fn snapshot_dexhelper_keys(pid: u32, dest_dir: &Path, seq: u32) -> KeyPoll {
     got_addrs.truncate(MAX_KEY_SLOTS);
     if seq == 0 && !probes.is_empty() {
         if let Some(first) = probes.first() {
-            let _ = std::fs::write(key_dir.join("cipher-probe.bin"), first);
+            let _ = ksight_core::output_budget::write(key_dir.join("cipher-probe.bin"), first);
         }
     }
     let mut got_live = false;
     for got in &got_addrs {
         let word = got.to_le_bytes();
         let path = key_dir.join(format!("ptr-{pid}-{seq:04}-{got:x}.bin"));
-        if std::fs::write(&path, word).is_ok() {
+        if ksight_core::output_budget::write(&path, word).is_ok() {
             poll.dumped = poll.dumped.saturating_add(1);
         }
         got_live = got_live || looks_like_heap_ptr(*got);
@@ -761,7 +869,7 @@ fn snapshot_dexhelper_keys(pid: u32, dest_dir: &Path, seq: u32) -> KeyPoll {
                     }
                 }
                 let path = key_dir.join(format!("poll-heap-{pid}-{seq:04}-{at:x}.bin"));
-                if !path.exists() && std::fs::write(&path, bytes).is_ok() {
+                if !path.exists() && ksight_core::output_budget::write(&path, bytes).is_ok() {
                     poll.dumped = poll.dumped.saturating_add(1);
                 }
             }
@@ -773,7 +881,7 @@ fn snapshot_dexhelper_keys(pid: u32, dest_dir: &Path, seq: u32) -> KeyPoll {
         poll.dumped = poll.dumped.saturating_add(1);
     }
     if let Some(key) = poll.recovered_key {
-        let _ = std::fs::write(key_dir.join("recovered-sm4.bin"), key);
+        let _ = ksight_core::output_budget::write(key_dir.join("recovered-sm4.bin"), key);
     }
     poll
 }
@@ -824,14 +932,14 @@ fn harvest_one_blob(
         return 0;
     }
     let peek_len = len.min(BLOB_PEEK_MAX);
-    let Some(peek) = read_region(mem, start, peek_len) else {
+    let Some(peek) = read_region_scoped(mem, start, peek_len, dest_dir) else {
         return 0;
     };
     if find_dex_magic_offset(&peek).is_none() {
         return 0;
     }
     let take = len.min(PAYLOAD_BLOB_MAX);
-    let Some(bytes) = read_region(mem, start, take) else {
+    let Some(bytes) = read_region_scoped(mem, start, take, dest_dir) else {
         return 0;
     };
     let slices = ksight_core::split_concatenated_dex(&bytes);
@@ -847,8 +955,8 @@ fn harvest_one_blob(
     let mut files = Vec::new();
     for (index, slice) in slices.iter().enumerate() {
         let name = format!("blob-{pid}-{start:x}_part{index:02}_{}.dex", slice.offset);
-        let _ = std::fs::write(split_dir.join(&name), &slice.bytes);
-        let _ = std::fs::write(readable.join(&name), &slice.bytes);
+        let _ = ksight_core::output_budget::write(split_dir.join(&name), &slice.bytes);
+        let _ = ksight_core::output_budget::write(readable.join(&name), &slice.bytes);
         files.push(name);
         written = written.saturating_add(1);
     }
@@ -867,10 +975,10 @@ fn harvest_one_blob(
         let json_path = dest_dir
             .join("blob-dex")
             .join(format!("{pid}-{start:x}.json"));
-        if let Err(error) = std::fs::write(&json_path, meta.to_string()) {
+        if let Err(error) = ksight_core::output_budget::write(&json_path, meta.to_string()) {
             eprintln!("blob sidecar {}: {error}", json_path.display());
         }
-        let _ = std::fs::write(
+        let _ = ksight_core::output_budget::write(
             marker,
             format!("seq={seq} bytes={} slices={written}\n", bytes.len()),
         );
@@ -1167,11 +1275,11 @@ fn live_scan_key_maps(
         };
         if seq == 0 && len <= 128 * 1024 {
             let out = key_dir.join(format!("poll-bss-{pid}-{seq:04}-{start:x}.bin"));
-            let _ = std::fs::write(out, &bytes);
+            let _ = ksight_core::output_budget::write(out, &bytes);
         }
         if let Some(key) = ksight_core::scan_sm4_one_block(&bytes, &cipher, 16, 20_000) {
             let hit = key_dir.join(format!("poll-hit-{pid}-{seq:04}-{start:x}.bin"));
-            let _ = std::fs::write(hit, &bytes);
+            let _ = ksight_core::output_budget::write(hit, &bytes);
             return Some(key);
         }
     }
@@ -1195,7 +1303,7 @@ fn scan_got_if_live(
     let (at, bytes) = read_heap_around_ptr(mem, maps, &word)?;
     let key = scan_ptr_window(&bytes, at, &word, cipher)?;
     let hit = key_dir.join(format!("poll-hit-{pid}-{seq:04}-{ptr:x}.bin"));
-    let _ = std::fs::write(hit, &bytes);
+    let _ = ksight_core::output_budget::write(hit, &bytes);
     Some(key)
 }
 
@@ -1308,7 +1416,7 @@ fn dump_ptr_chain(
     let at = ptr.saturating_sub(16);
     if let Some(slot) = read_region(mem, at, KEY_SLOT_BYTES) {
         let path = key_dir.join(format!("slot-{pid}-{seq:04}-d{depth}-{ptr:x}.bin"));
-        if std::fs::write(&path, &slot).is_ok() {
+        if ksight_core::output_budget::write(&path, &slot).is_ok() {
             dumped = dumped.saturating_add(1);
         }
         if slot.len() >= 24 {
@@ -1454,7 +1562,7 @@ fn dump_process_fds(pid: u32, dest_dir: &Path, deadline: Instant) -> usize {
     let _ = std::fs::create_dir_all(&fd_dir);
     let mut dumped = 0_usize;
     for entry in entries.flatten() {
-        if Instant::now() >= deadline {
+        if Instant::now() >= deadline || ksight_core::output_budget::should_stop(dest_dir) {
             break;
         }
         let name = entry.file_name();
@@ -1520,7 +1628,7 @@ fn dump_process_fds(pid: u32, dest_dir: &Path, deadline: Instant) -> usize {
         if dex {
             if let Ok(bytes) = std::fs::read(&out) {
                 if let Some(repaired) = ksight_core::repair_dex(&bytes) {
-                    let _ = std::fs::write(
+                    let _ = ksight_core::output_budget::write(
                         repaired_dir.join(out.file_name().unwrap_or_default()),
                         repaired.bytes,
                     );
@@ -1542,7 +1650,7 @@ fn dump_loaded_sos(pid: u32, dest_dir: &Path, deadline: Instant) -> usize {
     let mut dumped = 0_usize;
     let mut extracted_apk = Vec::<String>::new();
     for line in maps.lines() {
-        if Instant::now() >= deadline {
+        if Instant::now() >= deadline || ksight_core::output_budget::should_stop(dest_dir) {
             break;
         }
         let Some((start, end, perms, path)) = parse_map_line(line) else {
@@ -1585,10 +1693,12 @@ fn dump_loaded_sos(pid: u32, dest_dir: &Path, deadline: Instant) -> usize {
         if dest.exists() {
             continue;
         }
-        let copied = std::fs::copy(path, &dest).ok().or_else(|| {
-            let map_file = format!("/proc/{pid}/map_files/{start:x}-{end:x}");
-            std::fs::copy(map_file, &dest).ok()
-        });
+        let copied = ksight_core::output_budget::copy(path, &dest)
+            .ok()
+            .or_else(|| {
+                let map_file = format!("/proc/{pid}/map_files/{start:x}-{end:x}");
+                ksight_core::output_budget::copy(map_file, &dest).ok()
+            });
         if copied.is_some() {
             dumped = dumped.saturating_add(1);
         } else {
@@ -1631,7 +1741,9 @@ fn extract_mapped_apk_native(apk: &str, so_dir: &Path, pid: u32) -> usize {
             let _ = std::fs::remove_file(&src);
             continue;
         }
-        if std::fs::rename(&src, &dest).is_ok() || std::fs::copy(&src, &dest).is_ok() {
+        if std::fs::rename(&src, &dest).is_ok()
+            || ksight_core::output_budget::copy(&src, &dest).is_ok()
+        {
             renamed = renamed.saturating_add(1);
         }
         let _ = std::fs::remove_file(&src);
@@ -1640,7 +1752,7 @@ fn extract_mapped_apk_native(apk: &str, so_dir: &Path, pid: u32) -> usize {
 }
 
 fn copy_capped(input: &mut File, dest: &Path, max_bytes: u64) -> std::io::Result<u64> {
-    let mut output = File::create(dest)?;
+    let mut output = ksight_core::output_budget::BudgetFile::create(dest)?;
     let mut buffer = [0_u8; 8192];
     let mut total = 0_u64;
     loop {
@@ -1784,6 +1896,42 @@ fn peek_declared_size(mem: &mut File, magic_at: u64) -> Option<u64> {
     Some(u64::from(u32::from_le_bytes(size)))
 }
 
+fn read_region_scoped<R: std::io::Read + std::io::Seek>(
+    mem: &mut R,
+    start: u64,
+    want: u64,
+    scope: &Path,
+) -> Option<Vec<u8>> {
+    let len = usize::try_from(want).ok()?;
+    // Same largest existing discovery range. Selection of anonymous DEXs is unchanged.
+    if len < 4 || want > PAYLOAD_BLOB_MAX || ksight_core::output_budget::should_stop(scope) {
+        return None;
+    }
+    mem.seek(SeekFrom::Start(start)).ok()?;
+    let mut bytes = vec![0; len];
+    for chunk in bytes.chunks_mut(65536) {
+        if ksight_core::output_budget::should_stop(scope) {
+            return None;
+        }
+        let mut used = 0;
+        while used < chunk.len() {
+            if ksight_core::output_budget::should_stop(scope) {
+                return None;
+            }
+            match mem.read(&mut chunk[used..]) {
+                Ok(0) => return None,
+                Ok(n) => used += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => return None,
+            }
+        }
+        if ksight_core::output_budget::should_stop(scope) {
+            return None;
+        }
+    }
+    Some(bytes)
+}
+
 pub(crate) fn read_region(mem: &mut File, start: u64, want: u64) -> Option<Vec<u8>> {
     let len = usize::try_from(want).ok()?;
     if len < 4 {
@@ -1918,9 +2066,26 @@ fn harvest_spans(maps: &[MapRow], hints: &[u64]) -> Vec<(u8, u64, u64, u64, Stri
     spans
 }
 
+fn choose_pause(pause_target: bool, stop: impl FnOnce() -> StoppedProcess) -> StoppedProcess {
+    if pause_target {
+        stop()
+    } else {
+        StoppedProcess::inert()
+    }
+}
+
 pub(crate) struct StoppedProcess {
     pid: i32,
     pub(crate) active: bool,
+    resume_on_drop: bool,
+}
+
+impl StoppedProcess {
+    /// True only when this guard sent SIGSTOP and will send SIGCONT on drop.
+    #[must_use]
+    pub(crate) fn stopped_by_tool(&self) -> bool {
+        self.resume_on_drop
+    }
 }
 
 impl StoppedProcess {
@@ -1928,6 +2093,7 @@ impl StoppedProcess {
         Self {
             pid: -1,
             active: false,
+            resume_on_drop: false,
         }
     }
 
@@ -1938,24 +2104,73 @@ impl StoppedProcess {
         }
         #[cfg(any(target_os = "android", target_os = "linux"))]
         {
-            let active = nix::sys::signal::kill(
+            if all_threads_stopped(pid) {
+                return Self {
+                    pid: raw,
+                    active: true,
+                    resume_on_drop: false,
+                };
+            }
+            let sent = nix::sys::signal::kill(
                 nix::unistd::Pid::from_raw(raw),
                 nix::sys::signal::Signal::SIGSTOP,
             )
             .is_ok();
-            Self { pid: raw, active }
+            let mut guard = Self {
+                pid: raw,
+                active: false,
+                resume_on_drop: sent,
+            };
+            if sent {
+                let started = std::time::Instant::now();
+                while started.elapsed() < std::time::Duration::from_millis(500) {
+                    if all_threads_stopped(pid) {
+                        guard.active = true;
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+            guard
         }
         #[cfg(not(any(target_os = "android", target_os = "linux")))]
         Self {
             pid: raw,
             active: false,
+            resume_on_drop: false,
         }
     }
 }
 
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn all_threads_stopped(pid: u32) -> bool {
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return false;
+    };
+    let mut count = 0;
+    for task in tasks {
+        let Ok(task) = task else {
+            return false;
+        };
+        let Ok(status) = std::fs::read_to_string(task.path().join("status")) else {
+            return false;
+        };
+        let stopped = status
+            .lines()
+            .find_map(|line| line.strip_prefix("State:"))
+            .and_then(|line| line.split_whitespace().next())
+            .is_some_and(|state| matches!(state, "T" | "t"));
+        if !stopped {
+            return false;
+        }
+        count += 1;
+    }
+    count > 0
+}
+
 impl Drop for StoppedProcess {
     fn drop(&mut self) {
-        if !self.active {
+        if !self.resume_on_drop {
             return;
         }
         #[cfg(any(target_os = "android", target_os = "linux"))]
@@ -2015,7 +2230,7 @@ fn write_mapped_code(pid: u32, dest_dir: &Path, maps: &[MapRow]) {
         "note": "maps order of apk/dex/jar/so, not ClassLoader load order",
         "entries": rows,
     });
-    let _ = std::fs::write(
+    let _ = ksight_core::output_budget::write(
         dest_dir.join(format!("mapped-code-{pid}.json")),
         payload.to_string(),
     );
@@ -2024,7 +2239,7 @@ fn write_mapped_code(pid: u32, dest_dir: &Path, maps: &[MapRow]) {
         "note": "path-derived ClassLoader role from maps; not a Java ClassLoader instance",
         "entries": loaders,
     });
-    let _ = std::fs::write(
+    let _ = ksight_core::output_budget::write(
         dest_dir.join(format!("code-loader-{pid}.json")),
         loader_payload.to_string(),
     );
@@ -2066,7 +2281,7 @@ fn write_open_code(pid: u32, dest_dir: &Path) {
         "note": "open apk/dex/jar fds; not a Java ClassLoader instance",
         "entries": loaders,
     });
-    let _ = std::fs::write(
+    let _ = ksight_core::output_budget::write(
         dest_dir.join(format!("open-code-{pid}.json")),
         payload.to_string(),
     );
@@ -2151,13 +2366,13 @@ fn write_snapshot_sidecar(pid: u32, dest_dir: &Path, dump: &LiveDump) {
         "stitched_spans": dump.stitched_spans,
         "memory_images": dump.memory_images,
         "blob_dex": dump.blob_dex,
-        "visibility": "L2 forensic SIGSTOP + /proc/pid/mem copy",
+        "visibility": if dump.paused { "L2 forensic SIGSTOP + /proc/pid/mem copy" } else { "live /proc/pid/mem copy without target pause; pages may tear" },
     });
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or(0);
-    let _ = std::fs::write(
+    let _ = ksight_core::output_budget::write(
         dest_dir.join(format!("snapshot-{pid}-{stamp}.json")),
         payload.to_string(),
     );
@@ -2197,6 +2412,22 @@ fn maps_pathname(line: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_window_read_counts_are_mutually_exclusive() {
+        let mut stats = LiveDump::default();
+        let complete = crate::memory_windows::read(&mut std::io::Cursor::new(b"abc"), 0, 3);
+        let short = crate::memory_windows::read(&mut std::io::Cursor::new(b"abc"), 0, 8);
+        let failed = crate::memory_windows::RegionRead {
+            bytes: b"abc".to_vec(),
+            evidence: serde_json::json!({"read_status":"read_failed"}),
+        };
+        account_window_read(&mut stats, &complete);
+        account_window_read(&mut stats, &short);
+        account_window_read(&mut stats, &failed);
+        assert_eq!(stats.memory_window_read_failures, 1);
+        assert_eq!(stats.memory_window_short_reads, 1);
+    }
 
     #[test]
     fn parses_named_and_anonymous_map_lines() {
@@ -2518,5 +2749,62 @@ mod tests {
         let pki =
             b"http://crl.digicert.cn/GeoTrustG2TLSCNRSA4096SHA2562022CA1.crl extra-bytes-here!!";
         assert!(keep_plaintext_window(pki).is_none());
+    }
+}
+
+#[cfg(test)]
+mod cooperative_copy_tests {
+    use super::*;
+    #[test]
+    fn lifecycle_running_copy_never_calls_pause_backend() {
+        let guard = choose_pause(false, || panic!("code discovery must not SIGSTOP a target"));
+        assert!(!guard.active);
+        assert!(!guard.stopped_by_tool());
+        let mut called = false;
+        let _legacy = choose_pause(true, || {
+            called = true;
+            StoppedProcess::inert()
+        });
+        assert!(called, "legacy forensic selection remains available");
+    }
+    #[test]
+    fn lifecycle_scoped_reader_checks_cancel_between_bounded_reads() {
+        use std::io::{Cursor, Read, Seek};
+        struct Inject {
+            data: Cursor<Vec<u8>>,
+            root: std::path::PathBuf,
+            calls: usize,
+            max: usize,
+        }
+        impl Read for Inject {
+            fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+                self.calls += 1;
+                self.max = self.max.max(b.len());
+                let n = self.data.read(b)?;
+                ksight_core::output_budget::interrupt(&self.root, "parent_cancelled");
+                Ok(n)
+            }
+        }
+        impl Seek for Inject {
+            fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+                self.data.seek(pos)
+            }
+        }
+        let root = std::env::temp_dir().join(format!("lifecycle-read-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let guard =
+            ksight_core::output_budget::Guard::install(vec![root.clone()], 1024, 1000).unwrap();
+        let mut input = Inject {
+            data: Cursor::new(vec![1; 131_072]),
+            root: root.clone(),
+            calls: 0,
+            max: 0,
+        };
+        assert!(read_region_scoped(&mut input, 0, 131_072, &root).is_none());
+        assert_eq!(input.calls, 1);
+        assert_eq!(input.max, 65536);
+        assert_eq!(guard.receipt().reason.as_deref(), Some("parent_cancelled"));
+        drop(guard);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

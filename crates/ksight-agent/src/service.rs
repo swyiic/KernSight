@@ -303,6 +303,10 @@ impl ServiceConfig {
                 ServiceConfigError::Invalid("spool capacity overflows u64".to_owned())
             })?;
         Ok(CaptureRequest {
+            code_only: false,
+            startup: None,
+            collect_keys: false,
+            collect_memory_windows: false,
             collector_mode: ksight_model::CollectorMode::DetachedDaemon,
             status: None,
             process_object: self.objects.process.clone(),
@@ -336,6 +340,7 @@ impl ServiceConfig {
                 quiet: true,
             },
             storage: StorageOptions {
+                capture_relation: None,
                 spool_root: Some(self.storage.spool_root.clone()),
                 max_spool_bytes,
                 events_per_batch: self.storage.events_per_batch,
@@ -359,6 +364,7 @@ impl ServiceConfig {
             uid: self.scope.uid,
             package: self.scope.package.clone(),
             inspect: ksight_core::InspectPolicy::default(),
+            inspect_stages: Vec::new(),
             inspect_adapters: vec![crate::inspect_runtime::InspectAdapterKind::LinkerSoLoad],
             uprobe_object: PathBuf::from("/data/local/tmp/ksight/uprobe_regs.bpf.o"),
             mirror_http: None,

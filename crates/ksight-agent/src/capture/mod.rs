@@ -1,5 +1,8 @@
 //! Foreground multi-sensor capture orchestration.
 
+mod auxiliary;
+pub use auxiliary::{AuxiliaryAction, AuxiliaryCapturePlan, AuxiliaryStage};
+
 use std::path::PathBuf;
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
@@ -62,6 +65,8 @@ pub struct OutputOptions {
 /// Optional durable event batching controls.
 #[derive(Debug, Clone)]
 pub struct StorageOptions {
+    /// Optional validated automatic-capture ancestry.
+    pub capture_relation: Option<crate::capture_relation::CaptureRelation>,
     /// Root under which a session-specific spool directory is created.
     pub spool_root: Option<PathBuf>,
     /// Maximum complete batch bytes retained for the session.
@@ -83,6 +88,7 @@ pub struct StorageOptions {
 impl Default for StorageOptions {
     fn default() -> Self {
         Self {
+            capture_relation: None,
             spool_root: None,
             max_spool_bytes: 64 * 1024 * 1024,
             events_per_batch: 64,
@@ -145,7 +151,19 @@ impl Default for SamplingOptions {
 
 /// Complete validated-by-construction capture request from the CLI boundary.
 #[derive(Debug)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "These independently selected flags are part of the existing CLI and evidence schema."
+)]
 pub struct CaptureRequest {
+    /// Explicit code scope; legacy requests retain their old selection.
+    pub code_only: bool,
+    /// Optional attempt-owned launch, performed only after probes attach.
+    pub startup: Option<crate::capture_lifecycle::Startup>,
+    /// Collect keys retained by this evidence operation.
+    pub collect_keys: bool,
+    /// Collect memory windows retained by this evidence operation.
+    pub collect_memory_windows: bool,
     /// Whether the session is foreground-controlled or device-daemon owned.
     pub collector_mode: ksight_model::CollectorMode,
     /// Optional daemon status writer; foreground captures leave this unset.
@@ -184,12 +202,187 @@ pub struct CaptureRequest {
     pub inspect: ksight_core::InspectPolicy,
     /// Inspect adapters selected by the operator. TLS and Binder may be combined.
     pub inspect_adapters: Vec<crate::inspect_runtime::InspectAdapterKind>,
+    /// Explicit sequential phase plan; empty preserves legacy single-mode capture.
+    pub inspect_stages: Vec<crate::capture_stages::InspectStage>,
     /// Compiled uprobe object used by Inspect adapters.
     pub uprobe_object: PathBuf,
     /// Optional Burp HTTP proxy `host:port`. Device feeds reconstructed HTTP/WS there.
     pub mirror_http: Option<String>,
-    /// Transparent per-UID REDIRECT of 80/443 through a CONNECT forwarder to Burp.
+    /// Reserved per-UID MITM path; currently refused before injection/routing
+    /// actions because complete target-state restoration is unproved.
     pub mitm_burp: bool,
+}
+
+impl CaptureRequest {
+    /// Validate the minimal mirror boundary without any I/O, before layout/load.
+    ///
+    /// # Errors
+    /// Rejects unscoped or expanded mirror capture requests.
+    /// Validate live sampling capability before any external or filesystem action.
+    ///
+    /// # Errors
+    /// Strict mirror is unavailable on the current numeric-TGID-only backend.
+    pub fn validate_live_backend(&self) -> Result<()> {
+        if self.code_only {
+            crate::qualified_code::capability()?;
+        }
+        if self.mitm_burp {
+            ksight_core::capture_scope::require_injection_restore_backend()
+                .map_err(anyhow::Error::msg)?;
+        }
+        if self.mirror_http.is_some() {
+            ksight_core::capture_scope::require_strict_mirror_backend()
+                .map_err(anyhow::Error::msg)?;
+        }
+        self.auxiliary_plan()?;
+        Ok(())
+    }
+
+    ///
+    /// # Errors
+    /// Returns the validation or required operation error; no successful result is fabricated.
+    /// Auxiliary plan retained by this evidence operation.
+    pub fn auxiliary_plan(&self) -> Result<AuxiliaryCapturePlan> {
+        if !self.inspect_stages.is_empty() {
+            let text = self
+                .inspect_stages
+                .iter()
+                .map(|s| format!("{}:{}", s.name, s.seconds))
+                .collect::<Vec<_>>()
+                .join(",");
+            crate::capture_stages::parse_stages(&text).map_err(anyhow::Error::msg)?;
+            if !self.inspect.enabled
+                || self.inspect.elf_path.is_some()
+                || self.inspect.offset.is_some()
+                || self.inspect.build_id.is_some()
+                || self.mirror_http.is_some()
+                || self.mitm_burp
+                || self.inspect.whole_device
+                || self.count != 0
+                || (self.pid.is_none() && self.package.is_none())
+                || self.storage.spool_root.is_none()
+                || self.duration_seconds
+                    != self.inspect_stages.iter().map(|s| s.seconds).sum::<u64>()
+            {
+                bail!("staged capture requires package/PID, spool, exact total duration, no count/mirror/MITM/whole-device mode");
+            }
+        }
+
+        if self.mirror_http.is_some() {
+            let package = self
+                .package
+                .as_deref()
+                .filter(|p| !p.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("minimal mirror requires --package"))?;
+            if self.mitm_burp
+                || self.sensors.files
+                || self.sensors.file_descriptors
+                || self.sensors.memory != MemorySelection::Disabled
+                || self.sensors.binder
+                || self.sensors.sched
+                || self.sensors.network != NetworkSelection::Lifecycle
+                || !self.inspect.enabled
+                || self.inspect.whole_device
+                || self
+                    .inspect
+                    .package
+                    .as_deref()
+                    .is_some_and(|p| p != package)
+                || self.inspect.pid.is_some_and(|pid| Some(pid) != self.pid)
+                || self.inspect.uid.is_some_and(|uid| Some(uid) != self.uid)
+                || self.inspect_adapters.is_empty()
+                || self.inspect_adapters.iter().any(|a| {
+                    !matches!(
+                        a,
+                        crate::inspect_runtime::InspectAdapterKind::TlsSslWrite
+                            | crate::inspect_runtime::InspectAdapterKind::TlsSslRead
+                    )
+                })
+            {
+                bail!("minimal mirror permits only package-scoped TLS/QUIC and network lifecycle; auxiliary sensors and MITM are forbidden");
+            }
+        }
+        let plan = AuxiliaryCapturePlan::scoped(
+            self.mirror_http.is_some(),
+            self.code_only,
+            self.collect_keys,
+        );
+        Ok(if self.storage.capture_relation.is_some() {
+            plan.without_automatic_dump()
+        } else {
+            plan
+        })
+    }
+
+    /// Minimal mirror installs only selected default objects; custom paths stay untouched.
+    /// None preserves the legacy non-mirror distribution layout.
+    pub fn capture_layout_assets(&self) -> Option<Vec<&'static str>> {
+        self.mirror_http.as_ref()?;
+        let mut names = Vec::new();
+        for (path, name) in [
+            (&self.process_object, "process_lifecycle.bpf.o"),
+            (&self.network_object, "network_connect.bpf.o"),
+            (&self.uprobe_object, "uprobe_regs.bpf.o"),
+        ] {
+            if *path == crate::runtime_paths::root().join(name) {
+                names.push(name);
+            }
+        }
+        Some(names)
+    }
+}
+
+#[cfg(any(test, target_os = "android", target_os = "linux"))]
+fn inherit_inspect_scope(
+    policy: &mut ksight_core::InspectPolicy,
+    pid: Option<u32>,
+    uid: Option<u32>,
+    package: Option<&str>,
+    qualified: bool,
+) {
+    if policy.enabled || qualified {
+        if policy.pid.is_none() {
+            policy.pid = pid;
+        }
+        if policy.uid.is_none() {
+            policy.uid = uid;
+        }
+        if policy.package.is_none() {
+            policy.package = package.map(str::to_owned);
+        }
+    }
+}
+#[cfg(test)]
+mod disabled_qualified_l0_test {
+    #[test]
+    fn production_disabled_l0_keeps_package_enrollment_without_enabling_inspect() {
+        let mut policy = ksight_core::InspectPolicy {
+            enabled: false,
+            whole_device: false,
+            ..ksight_core::InspectPolicy::default()
+        };
+        super::inherit_inspect_scope(
+            &mut policy,
+            None,
+            Some(10001),
+            Some("fixture.package"),
+            true,
+        );
+        assert!(!policy.enabled);
+        assert_eq!(policy.package.as_deref(), Some("fixture.package"));
+        let runtime = crate::inspect_runtime::InspectRuntime::prepare_qualified_candidate(
+            &policy,
+            &[crate::inspect_runtime::InspectAdapterKind::LinkerSoLoad],
+            std::path::Path::new("not-loaded"),
+            vec![],
+        );
+        assert!(runtime.is_ok());
+        assert!(runtime
+            .unwrap()
+            .initial_observations()
+            .iter()
+            .all(|o| !o.attached));
+    }
 }
 
 /// Run a foreground capture session.
@@ -198,14 +391,50 @@ pub struct CaptureRequest {
 ///
 /// Returns an error for invalid scope, unavailable identity data, BPF load failure, or output I/O.
 #[cfg(any(target_os = "android", target_os = "linux"))]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "The unsupported-platform entry keeps the same owned API as the live backend."
+)]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "Local fixture or owned callback keeps its explicit scope and fallible signature."
+)]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "The platform entry point preserves the owned capture request API."
+)]
 pub fn run(request: CaptureRequest) -> Result<()> {
     use crate::normalize::EventNormalizer;
+
+    request.validate_live_backend()?;
+    request.auxiliary_plan()?;
 
     if std::env::consts::ARCH != "aarch64" {
         bail!(
             "the current raw-syscall adapters support only aarch64; refusing architecture {}",
             std::env::consts::ARCH
         );
+    }
+    // Backend verification precedes target actions. Instance qualification waits until the new App exists.
+    let qualified_backend = if request.code_only || request.storage.capture_relation.is_some() {
+        let backend = crate::qualified_code::Backend::open()?;
+        let package = request
+            .package
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("qualified production capture requires package"))?;
+        let uid = backend.uid(package)?;
+        if crate::dexdump::live_uid_for_package(package).is_some_and(|live| live != uid) {
+            bail!("not-supported: virtual/container UID enrollment");
+        }
+        Some(backend)
+    } else {
+        None
+    };
+    if let Some(startup) = &request.startup {
+        if let Err(error) = startup.force_stop() {
+            let _ = startup.retain_timing();
+            return Err(error);
+        }
     }
     if request.sensors.sched
         && request.pid.is_none()
@@ -280,6 +509,16 @@ pub fn run(request: CaptureRequest) -> Result<()> {
             )
         })
         .transpose()?;
+    if let (Some(relation), Some(root)) = (
+        &request.storage.capture_relation,
+        &request.storage.spool_root,
+    ) {
+        relation.retain(
+            &root.join(normalizer.session_id().to_string()),
+            Some(normalizer.session_id()),
+            request.package.as_deref(),
+        )?;
+    }
     stream_events(
         sensors,
         identity_resolver,
@@ -290,6 +529,7 @@ pub fn run(request: CaptureRequest) -> Result<()> {
         environment,
         baseline_events,
         baseline_sockets,
+        qualified_backend,
     )
 }
 
@@ -299,7 +539,12 @@ pub fn run(request: CaptureRequest) -> Result<()> {
 ///
 /// Always returns an error on unsupported host platforms.
 #[cfg(not(any(target_os = "android", target_os = "linux")))]
-pub fn run(_request: CaptureRequest) -> Result<()> {
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "The platform entry point preserves the owned capture request API."
+)]
+pub fn run(request: CaptureRequest) -> Result<()> {
+    request.validate_live_backend()?;
     bail!("live eBPF capture is available only in Linux or Android builds")
 }
 
@@ -514,6 +759,7 @@ fn stream_events(
     environment: ksight_model::SessionEnvironment,
     baseline_events: Vec<ksight_model::Event>,
     baseline_sockets: Vec<(u32, i32)>,
+    qualified_backend: Option<crate::qualified_code::Backend>,
 ) -> Result<()> {
     use std::{
         io::Write as _,
@@ -530,6 +776,7 @@ fn stream_events(
     let running = Arc::new(AtomicBool::new(true));
     let signal_state = Arc::clone(&running);
     ctrlc::set_handler(move || signal_state.store(false, Ordering::SeqCst))?;
+    let auxiliary = request.auxiliary_plan()?;
     let mut pipeline = EventPipeline::new(
         normalizer,
         identity_resolver,
@@ -543,13 +790,6 @@ fn stream_events(
     );
     let mut last_environment = environment.clone();
     pipeline.emit_session_payload(ksight_model::EventPayload::SessionEnvironment(environment))?;
-    if let Some(root) = request.storage.spool_root.as_ref() {
-        let _ = std::fs::create_dir_all(root);
-        let _ = std::fs::write(
-            root.join("last_session"),
-            pipeline.normalizer.session_id().to_string(),
-        );
-    }
     let mut tls_inject: Option<crate::tls_inject::TlsInject> = None;
     if request.mitm_burp {
         match crate::tls_inject::TlsInject::start(request.package.as_deref()) {
@@ -633,28 +873,58 @@ fn stream_events(
     }
 
     let mut inspect_policy = request.inspect.clone();
-    if inspect_policy.enabled {
-        if inspect_policy.pid.is_none() {
-            inspect_policy.pid = request.pid;
-        }
-        if inspect_policy.uid.is_none() {
-            inspect_policy.uid = request.uid.or(scope.target_uid);
-        }
-        if inspect_policy.package.is_none() {
-            inspect_policy.package.clone_from(&request.package);
-        }
-    }
-    let mut inspect = crate::inspect_runtime::InspectRuntime::prepare_all(
-        &inspect_policy,
-        &request.inspect_adapters,
-        &request.uprobe_object,
+    inherit_inspect_scope(
+        &mut inspect_policy,
+        request.pid,
+        request.uid.or(scope.target_uid),
+        request.package.as_deref(),
+        qualified_backend.is_some(),
     );
+    let mut stage_cursor = (!request.inspect_stages.is_empty())
+        .then(|| crate::capture_stages::StageCursor::new(&request.inspect_stages));
+    let mut stage_open = stage_cursor.is_some();
+    let mut target_instance = None;
+    let mut next_instance_check = Instant::now();
+    let active_adapters = if let Some(cursor) = &stage_cursor {
+        let stage = &request.inspect_stages[cursor.index];
+        inspect_policy.enabled = stage.name != "l0";
+        inspect_policy.max_duration_secs = u32::try_from(stage.seconds).unwrap_or(300);
+        stage.adapters()
+    } else {
+        request.inspect_adapters.clone()
+    };
+    let mut inspect = if let Some(backend) = &qualified_backend {
+        crate::inspect_runtime::InspectRuntime::prepare_qualified_candidate(
+            &inspect_policy,
+            &active_adapters,
+            &backend.uprobe,
+            vec![],
+        )?
+    } else {
+        crate::inspect_runtime::InspectRuntime::prepare_all(
+            &inspect_policy,
+            &active_adapters,
+            &request.uprobe_object,
+        )
+    };
+    let mut qualified_source: Option<crate::qualified_code::SourceIdentity> = None;
+    let mut next_qualification = Instant::now();
     if request.inspect.enabled {
         for observation in inspect.initial_observations() {
             pipeline.emit_inspect(observation)?;
         }
     }
 
+    if let Some(cursor) = &stage_cursor {
+        emit_capture_stage(
+            &mut pipeline,
+            cursor.index,
+            &request.inspect_stages[cursor.index],
+            "started",
+            Some(&inspect),
+            target_instance,
+        )?;
+    }
     publish_service_health(request, &pipeline, &sensors)?;
     let mut next_heartbeat = Instant::now() + Duration::from_secs(1);
     let mut next_crypto = Instant::now() + Duration::from_secs(3);
@@ -674,287 +944,236 @@ fn stream_events(
         pipeline.emit_event(event)?;
     }
 
-    // Passive on-wire capture for the mirror workflow: the pcap plus a keylog
-    // file (when a keylog probe is configured) decrypt offline to the full
-    // traffic picture that symbol probes cannot reach on stripped stacks.
-    let mut pcap_child: Option<std::process::Child> = None;
-    let pcap_dest = request.storage.spool_root.as_ref().map(|root| {
-        let dir = root
-            .join("forensics")
-            .join(pipeline.normalizer.session_id().to_string());
-        let _ = std::fs::create_dir_all(&dir);
-        dir.join("traffic.pcap")
-    });
-    let mut keylog_probe: Option<crate::keylog_probe::KeylogProbe> = None;
-    let mut keylog_attached = false;
-    let mut next_keylog_try = Instant::now();
-    let mut infosec_probe: Option<crate::infosec_probe::InfosecProbe> = None;
-    let mut next_infosec_try = Instant::now();
-    let mut next_stack_inventory = Instant::now();
-    let keylog_file = pcap_dest
-        .as_ref()
-        .map(|pcap| pcap.with_file_name("sslkeylog.txt"));
+    let launch_task = request.startup.as_ref().map(|s| s.start()).transpose()?;
 
-    if request.mirror_http.is_some() {
-        if let Some(dest) = pcap_dest.as_ref() {
-            let filter = "tcp port 443 or udp port 443";
-            for iface in ["any", "wlan0", "rmnet_data0"] {
-                match spawn_pcap_watchdog(iface, dest, filter) {
-                    Ok(child) => {
-                        eprintln!("pcap capture started iface={iface} dest={}", dest.display());
-                        pcap_child = Some(child);
-                        break;
-                    }
-                    Err(error) => {
-                        eprintln!("pcap spawn iface={iface} failed: {error}");
+    let mut next_startup_observation = Instant::now();
+    let mut next_stack_inventory = Instant::now();
+    let mut unprocessed_inspect_outputs = 0usize;
+    // Loop errors must not skip final counters, raw checkpoints or own child cleanup.
+    let capture_loop_result = (|| -> Result<()> {
+        while running.load(Ordering::SeqCst)
+            && (request.count == 0 || pipeline.stats.live_emitted < request.count)
+            && deadline.is_none_or(|duration| started.elapsed() < duration)
+        {
+            if let Some(backend) = &qualified_backend {
+                if Instant::now() >= next_qualification {
+                    let package = request.package.as_deref().unwrap();
+                    if let Some(existing) = qualified_source.clone() {
+                        match backend.qualify(package, existing.pid, false) {
+                            Ok(target) if target.identity == existing => {
+                                inspect.refresh_qualified(vec![target.qualified])?;
+                                next_qualification = Instant::now() + Duration::from_secs(2);
+                            }
+                            _ => {
+                                bail!("qualified capture task exited; no numeric replacement");
+                            }
+                        }
+                    } else if let Some(pid) = backend.main_pid(package)? {
+                        let target = backend.qualify(package, pid, false)?;
+                        qualified_source = Some(target.identity.clone());
+                        inspect.refresh_qualified(vec![target.qualified])?;
+                        next_qualification = Instant::now() + Duration::from_secs(2);
+                    } else {
+                        next_qualification = Instant::now() + Duration::from_millis(100);
                     }
                 }
             }
-        }
-    }
-
-    while running.load(Ordering::SeqCst)
-        && (request.count == 0 || pipeline.stats.live_emitted < request.count)
-        && deadline.is_none_or(|duration| started.elapsed() < duration)
-    {
-        if Instant::now() >= next_environment_check {
-            let current = crate::environment::collect(request.collector_mode);
-            if !same_environment_state(&last_environment, &current) {
-                pipeline.environment.clone_from(&current);
-                pipeline.emit_session_payload(ksight_model::EventPayload::SessionEnvironment(
-                    current.clone(),
-                ))?;
-                last_environment = current;
+            if let Some(task) = &launch_task {
+                task.check()?;
             }
-            next_environment_check = Instant::now() + environment_check_interval;
-        }
-        let mut consumed_any = false;
-        for sensor in &mut sensors {
-            if request.count != 0 && pipeline.stats.live_emitted >= request.count {
+            if Instant::now() >= next_startup_observation {
+                if let Some(startup) = &request.startup {
+                    startup.observe_target();
+                }
+                next_startup_observation = Instant::now() + Duration::from_millis(100);
+            }
+            if request
+                .storage
+                .spool_root
+                .as_ref()
+                .is_some_and(|root| ksight_core::output_budget::should_stop(root))
+            {
+                pipeline.storage_limit_reached = true;
                 break;
             }
-            match sensor.next_record() {
-                Ok(Some(record)) => {
-                    consumed_any = true;
-                    pipeline.emit(record)?;
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    pipeline.stats.invalid_records += 1;
-                    eprintln!(
-                        "discard invalid {} ring-buffer record: {error}",
-                        sensor.name
-                    );
-                }
-            }
-        }
-        if request.inspect.enabled {
-            for observation in inspect.attach_when_safe() {
-                pipeline.emit_inspect(observation)?;
-            }
-            if let (Some(inject), Some(package)) = (tls_inject.as_mut(), request.package.as_deref())
-            {
-                if let Some(pid) = crate::tls_inject::TlsInject::main_pid(package) {
-                    inject.inject(pid);
-                    let items = inject.poll();
-                    if !items.is_empty() {
-                        eprintln!(
-                            "tls-inject plaintext {} chunks first={}B",
-                            items.len(),
-                            items[0].bytes.len()
-                        );
-                    }
-                    if let Some(mirror) = pipeline.burp_mirror.as_mut() {
-                        for item in items {
-                            let adapter = if item.direction == "send" {
-                                "tls_ssl_write"
-                            } else {
-                                "tls_ssl_read"
-                            };
-                            mirror.observe_bytes(pid, 0, adapter, item.direction, &item.bytes);
-                        }
-                    }
-                }
-            }
-            for output in inspect.poll() {
-                if let Some(mirror) = pipeline.burp_mirror.as_mut() {
-                    if let crate::inspect_runtime::InspectOutput::Plaintext {
-                        pid,
-                        tid,
-                        connection_id,
-                        fragment,
-                        raw,
-                    } = &output
-                    {
-                        mirror.observe_bytes_for_connection(
-                            *pid,
-                            *tid,
-                            *connection_id,
-                            &fragment.adapter,
-                            &fragment.direction,
-                            raw,
-                        );
-                    }
-                }
-                pipeline.emit_inspect_output(output)?;
-            }
-            if let Some(observation) = inspect.expire_if_needed() {
-                pipeline.emit_inspect(observation)?;
-            }
-            if request.mirror_http.is_some() && Instant::now() >= next_keylog_try {
-                if !keylog_attached {
-                    eprintln!(
-                        "keylog attempt: mirror={} pids={:?} table={}",
-                        request.mirror_http.is_some(),
-                        request
-                            .package
-                            .as_deref()
-                            .map(crate::dexdump::pids_for_package)
-                            .unwrap_or_default(),
-                        crate::keylog_probe::table_path().display()
-                    );
-                }
-                let pids = request
-                    .package
-                    .as_deref()
-                    .map(crate::dexdump::pids_for_package)
-                    .unwrap_or_default();
-                if !pids.is_empty() {
-                    let (probe, status) = if keylog_attached {
-                        (
-                            None,
-                            keylog_probe.as_mut().map_or_else(Vec::new, |probe| {
-                                probe.retry_attach(&request.uprobe_object, &pids)
-                            }),
-                        )
+            if let Some(cursor) = stage_cursor.as_mut() {
+                let elapsed = started.elapsed().as_secs();
+                if Instant::now() >= next_instance_check || cursor.due(elapsed) {
+                    let current = observe_stage_target(request, target_instance);
+                    if let Some(expected) = target_instance {
+                        crate::capture_stages::confirm_instance(expected, current)
+                            .map_err(anyhow::Error::msg)?;
                     } else {
-                        let (probe, status) = crate::keylog_probe::KeylogProbe::attach_for_pids(
-                            &request.uprobe_object,
-                            &pids,
-                        );
-                        keylog_attached = true;
-                        (Some(probe), status)
-                    };
-                    for line in &status {
-                        eprintln!("{line}");
+                        target_instance = current;
                     }
-                    if let Some(probe) = probe {
-                        keylog_probe = Some(probe);
-                    }
+                    next_instance_check = Instant::now() + Duration::from_secs(1);
                 }
-                next_keylog_try = Instant::now() + Duration::from_secs(5);
-                if !infosec_probe.as_ref().is_some_and(|probe| probe.is_armed())
-                    && Instant::now() >= next_infosec_try
-                {
-                    let pids = request
-                        .package
-                        .as_deref()
-                        .map(crate::dexdump::pids_for_package)
-                        .unwrap_or_default();
-                    if !pids.is_empty() {
-                        let (probe, status) = crate::infosec_probe::InfosecProbe::attach_for_pids(
-                            &request.uprobe_object,
-                            &pids,
-                            request
-                                .inspect_adapters
-                                .iter()
-                                .any(|adapter| adapter.is_jni()),
-                        );
-                        for line in &status {
-                            eprintln!("{line}");
+                if cursor.due(elapsed) {
+                    if target_instance.is_none() {
+                        bail!("staged target instance was never verified; stopping before the next phase");
+                    }
+                    finish_capture_stage(
+                        &mut pipeline,
+                        cursor.index,
+                        &request.inspect_stages[cursor.index],
+                        "window_elapsed",
+                        &mut inspect,
+                        target_instance,
+                    )?;
+                    stage_open = false;
+                    if !cursor.advance(elapsed).map_err(anyhow::Error::msg)? {
+                        running.store(false, Ordering::SeqCst);
+                        break;
+                    }
+                    let stage = &request.inspect_stages[cursor.index];
+                    inspect_policy.enabled = stage.name != "l0";
+                    inspect_policy.max_duration_secs = u32::try_from(stage.seconds).unwrap_or(300);
+                    // Old owned uprobe sessions were dropped before new resources are prepared.
+                    inspect = if let Some(backend) = &qualified_backend {
+                        let source = qualified_source.as_ref().ok_or_else(|| {
+                            anyhow::anyhow!("stage transition has no physical source")
+                        })?;
+                        let current = backend.qualify(&source.package, source.pid, false)?;
+                        if current.identity != *source {
+                            bail!("physical generation changed at stage transition");
                         }
-                        infosec_probe = Some(probe);
-                        next_infosec_try = Instant::now() + Duration::from_secs(15);
+                        crate::inspect_runtime::InspectRuntime::prepare_qualified_candidate(
+                            &inspect_policy,
+                            &stage.adapters(),
+                            &backend.uprobe,
+                            vec![current.qualified],
+                        )?
+                    } else {
+                        crate::inspect_runtime::InspectRuntime::prepare_all(
+                            &inspect_policy,
+                            &stage.adapters(),
+                            &request.uprobe_object,
+                        )
+                    };
+                    stage_open = true;
+                    emit_capture_stage(
+                        &mut pipeline,
+                        cursor.index,
+                        stage,
+                        "started",
+                        Some(&inspect),
+                        target_instance,
+                    )?;
+                    for observation in inspect.initial_observations() {
+                        pipeline.emit_inspect(observation)?;
                     }
                 }
             }
-            if let Some(probe) = keylog_probe.as_mut() {
-                let lines = probe.poll();
-                if !lines.is_empty() {
-                    if let Some(dest) = keylog_file.as_ref() {
-                        if let Ok(mut file) = std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(dest)
-                        {
-                            use std::io::Write as _;
-                            for line in &lines {
-                                let _ = writeln!(file, "{line}");
+            if Instant::now() >= next_environment_check {
+                let current = crate::environment::collect(request.collector_mode);
+                if !same_environment_state(&last_environment, &current) {
+                    pipeline.environment.clone_from(&current);
+                    pipeline.emit_session_payload(
+                        ksight_model::EventPayload::SessionEnvironment(current.clone()),
+                    )?;
+                    last_environment = current;
+                }
+                next_environment_check = Instant::now() + environment_check_interval;
+            }
+            let mut consumed_any = false;
+            for sensor in &mut sensors {
+                if request.count != 0 && pipeline.stats.live_emitted >= request.count {
+                    break;
+                }
+                match sensor.next_record() {
+                    Ok(Some(record)) => {
+                        consumed_any = true;
+                        pipeline.emit(record)?;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        pipeline.stats.invalid_records += 1;
+                        eprintln!(
+                            "discard invalid {} ring-buffer record: {error}",
+                            sensor.name
+                        );
+                    }
+                }
+            }
+            if inspect_policy.enabled {
+                for observation in inspect.attach_when_safe() {
+                    if observation.attached {
+                        if let Some(startup) = &request.startup {
+                            startup.record_attach(&observation.adapter);
+                        }
+                    }
+                    pipeline.emit_inspect(observation)?;
+                }
+                if let (Some(inject), Some(package)) =
+                    (tls_inject.as_mut(), request.package.as_deref())
+                {
+                    if let Some(pid) = crate::tls_inject::TlsInject::main_pid(package) {
+                        inject.inject(pid);
+                        let items = inject.poll();
+                        if !items.is_empty() {
+                            eprintln!(
+                                "tls-inject plaintext {} chunks first={}B",
+                                items.len(),
+                                items[0].bytes.len()
+                            );
+                        }
+                        if let Some(mirror) = pipeline.burp_mirror.as_mut() {
+                            for item in items {
+                                let adapter = if item.direction == "send" {
+                                    "tls_ssl_write"
+                                } else {
+                                    "tls_ssl_read"
+                                };
+                                mirror.observe_bytes(pid, 0, adapter, item.direction, &item.bytes);
                             }
                         }
                     }
-                    eprintln!("keylog lines captured: {}", lines.len());
+                }
+                let outputs = inspect.poll();
+                let output_count = outputs.len();
+                for (output_index, output) in outputs.into_iter().enumerate() {
                     if let Some(mirror) = pipeline.burp_mirror.as_mut() {
-                        mirror.ingest_keylog_lines(&lines);
+                        route_inspect_to_mirror(mirror, &output);
+                    }
+                    if let Err(error) = pipeline.emit_inspect_output(output) {
+                        unprocessed_inspect_outputs = output_count - output_index - 1;
+                        return Err(error);
                     }
                 }
-            }
-            if let Some(probe) = infosec_probe.as_mut() {
-                for capture in probe.poll_captures() {
-                    let output = crate::inspect_runtime::external_plaintext(capture);
-                    if let Some(mirror) = pipeline.burp_mirror.as_mut() {
-                        if let crate::inspect_runtime::InspectOutput::Plaintext {
-                            pid,
-                            tid,
-                            connection_id,
-                            fragment,
-                            raw,
-                        } = &output
-                        {
-                            mirror.observe_bytes_for_connection(
-                                *pid,
-                                *tid,
-                                *connection_id,
-                                &fragment.adapter,
-                                &fragment.direction,
-                                raw,
-                            );
-                        }
-                    }
-                    pipeline.emit_inspect_output(output)?;
-                }
-                for line in probe.poll(
-                    request
-                        .package
-                        .as_deref()
-                        .map(crate::dexdump::pids_for_package)
-                        .unwrap_or_default()
-                        .as_slice(),
-                ) {
-                    eprintln!("{line}");
+                if let Some(observation) = inspect.expire_if_needed() {
+                    pipeline.emit_inspect(observation)?;
                 }
             }
-        }
-        if request.mirror_http.is_some() && Instant::now() >= next_stack_inventory {
-            if let (Some(package), Some(mirror)) =
-                (request.package.as_deref(), pipeline.burp_mirror.as_mut())
-            {
-                mirror.set_stack_coverage(mapped_stack_coverage(package));
+            if request.mirror_http.is_some() && Instant::now() >= next_stack_inventory {
+                if let (Some(package), Some(mirror)) =
+                    (request.package.as_deref(), pipeline.burp_mirror.as_mut())
+                {
+                    mirror.set_stack_coverage(mapped_stack_coverage(package));
+                }
+                next_stack_inventory = Instant::now() + Duration::from_secs(15);
             }
-            next_stack_inventory = Instant::now() + Duration::from_secs(15);
-        }
-        if Instant::now() >= next_inspect_stats {
-            let (raw, decoded, lost) = inspect.drain_totals();
-            let (ssl_re, ssl_rr, ssl_rok, ssl_rf, ssl_rw) = inspect.ssl_read_funnel();
-            let (ssl_gt0, ssl_dgt0, ssl_wo, ssl_wc, ssl_oko, ssl_okc, ssl_gto, ssl_gtc) =
-                inspect.ssl_read_funnel_ex();
-            let (conn_streams, conn_returns, conn_shared) = inspect.connkey_stats();
-            let mirror_diagnostics = pipeline
-                .burp_mirror
-                .as_ref()
-                .map(crate::burp_mirror::BurpMirror::diagnostic_detail);
-            let mirror_metrics = pipeline
-                .burp_mirror
-                .as_ref()
-                .map(crate::burp_mirror::BurpMirror::diagnostic_metrics)
-                .unwrap_or_default();
-            eprintln!(
+            if Instant::now() >= next_inspect_stats {
+                let (raw, decoded, lost) = inspect.drain_totals();
+                let (ssl_re, ssl_rr, ssl_rok, ssl_rf, ssl_rw) = inspect.ssl_read_funnel();
+                let (ssl_gt0, ssl_dgt0, ssl_wo, ssl_wc, ssl_oko, ssl_okc, ssl_gto, ssl_gtc) =
+                    inspect.ssl_read_funnel_ex();
+                let (conn_streams, conn_returns, conn_shared) = inspect.connkey_stats();
+                let mirror_diagnostics = pipeline
+                    .burp_mirror
+                    .as_ref()
+                    .map(crate::burp_mirror::BurpMirror::diagnostic_detail);
+                let mirror_metrics = pipeline
+                    .burp_mirror
+                    .as_ref()
+                    .map(crate::burp_mirror::BurpMirror::diagnostic_metrics)
+                    .unwrap_or_default();
+                eprintln!(
                 "inspect layers: raw_uprobe={raw} decoded={decoded} perf_lost={lost} ssl_read_entry={ssl_re} ssl_read_ret={ssl_rr} ssl_read_ok={ssl_rok} ssl_read_fail={ssl_rf} ssl_read_want={ssl_rw} ssl_read_ret_gt0={ssl_gt0} ssl_read_drop_gt0={ssl_dgt0} ssl_read_want_openssl={ssl_wo} ssl_read_want_conscrypt={ssl_wc} ssl_read_ok_openssl={ssl_oko} ssl_read_ok_conscrypt={ssl_okc} ssl_read_gt0_openssl={ssl_gto} ssl_read_gt0_conscrypt={ssl_gtc} quic_connkey_streams={conn_streams} quic_connkey_returns={conn_returns} quic_connkey_shared={conn_shared} {}",
                 mirror_diagnostics.as_deref().unwrap_or("mirror=disabled")
             );
-            if pipeline.burp_mirror.is_some() {
-                let get = |name: &str| mirror_metrics.get(name).copied().unwrap_or(0);
-                eprintln!(
+                if pipeline.burp_mirror.is_some() {
+                    let get = |name: &str| mirror_metrics.get(name).copied().unwrap_or(0);
+                    eprintln!(
                     "mirror rates: coverage candidates={} export={} pinned={} empirical={} keylog={} uncovered={} | retention raw={} decoded={} perf_lost={} drop_gt0={} | delivery delivered={} reconstructed={} ok_paired={} no_status={} no_host={} unpaired_req={} unpaired_resp={} orphan_overflow={} incomplete={} http3_dirs={} http3_yielded={}",
                     get("stack_candidates"),
                     get("stack_export_candidates"),
@@ -978,21 +1197,23 @@ fn stream_events(
                     get("http3_directions"),
                     get("http3_yielded"),
                 );
+                }
+                if let Some(detail) = mirror_diagnostics {
+                    pipeline.emit_inspect(ksight_model::InspectObservation {
+                        adapter: "burp_mirror_diagnostics".to_owned(),
+                        attached: true,
+                        hit: true,
+                        detail,
+                        metrics: mirror_metrics,
+                        detectability_notice:
+                            "diagnostic counters only; no additional probe was attached".to_owned(),
+                        ..ksight_model::InspectObservation::default()
+                    })?;
+                }
+                next_inspect_stats = Instant::now() + Duration::from_secs(10);
             }
-            if let Some(detail) = mirror_diagnostics {
-                pipeline.emit_inspect(ksight_model::InspectObservation {
-                    adapter: "burp_mirror_diagnostics".to_owned(),
-                    attached: true,
-                    hit: true,
-                    detail,
-                    metrics: mirror_metrics,
-                    detectability_notice:
-                        "diagnostic counters only; no additional probe was attached".to_owned(),
-                    ..ksight_model::InspectObservation::default()
-                })?;
-            }
-            next_inspect_stats = Instant::now() + Duration::from_secs(10);
-        }
+            auxiliary.dispatch(AuxiliaryStage::Poll, true, |action| -> Result<()> {
+                debug_assert_eq!(action, AuxiliaryAction::CryptoWatch);
         if Instant::now() >= next_crypto {
             if let Some(package) = request.package.as_deref() {
                 if let Some(pid) = crate::tls_inject::TlsInject::main_pid(package) {
@@ -1022,37 +1243,122 @@ fn stream_events(
                                     .to_owned(),
                             ..ksight_model::InspectObservation::default()
                         })?;
+                        }
+                    }
+                }
+                next_crypto = Instant::now() + Duration::from_secs(5);
+            }
+                Ok(())
+            })?;
+            if !consumed_any {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if let Some(spool) = pipeline.spool.as_mut() {
+                flush_capture_idle(spool)?;
+            }
+            if Instant::now() >= next_heartbeat {
+                publish_service_health(request, &pipeline, &sensors)?;
+                next_heartbeat = Instant::now() + Duration::from_secs(1);
+                if pipeline.normalizer.boot_id_changed().unwrap_or(false) {
+                    if stage_cursor.is_some() {
+                        bail!("boot changed during staged capture");
+                    }
+                    if !pipeline.rotate(
+                        ksight_model::CaptureStopReason::BootChanged,
+                        &sensors,
+                        request,
+                    )? {
+                        break;
                     }
                 }
             }
-            next_crypto = Instant::now() + Duration::from_secs(5);
-        }
-        if !consumed_any {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        if Instant::now() >= next_heartbeat {
-            publish_service_health(request, &pipeline, &sensors)?;
-            next_heartbeat = Instant::now() + Duration::from_secs(1);
-            if pipeline.normalizer.boot_id_changed().unwrap_or(false) {
-                if !pipeline.rotate(
-                    ksight_model::CaptureStopReason::BootChanged,
-                    &sensors,
-                    request,
-                )? {
+            if pipeline.should_rotate() {
+                if stage_cursor.is_some() {
+                    bail!("staged session reached rotation boundary; refusing to silently start another session");
+                }
+                let reason = ksight_model::CaptureStopReason::SessionRotated;
+                if !pipeline.rotate(reason, &sensors, request)? {
+                    running.store(false, Ordering::SeqCst);
                     break;
                 }
             }
         }
-        if pipeline.should_rotate() {
-            let reason = ksight_model::CaptureStopReason::SessionRotated;
-            if !pipeline.rotate(reason, &sensors, request)? {
-                running.store(false, Ordering::SeqCst);
-                break;
+
+        Ok(())
+    })();
+    let mut stage_evidence_error = None;
+    if let Some(cursor) = &stage_cursor {
+        if !cursor.finished {
+            let last_elapsed = capture_loop_result.is_ok()
+                && running.load(Ordering::SeqCst)
+                && cursor.index + 1 == request.inspect_stages.len()
+                && cursor.due(started.elapsed().as_secs())
+                && target_instance.is_some()
+                && observe_stage_target(request, target_instance) == target_instance;
+            if !last_elapsed {
+                stage_evidence_error = Some(anyhow::anyhow!(
+                    "staged capture did not finish all windows; remaining phases not started"
+                ));
+            }
+            let state = if last_elapsed {
+                "window_elapsed"
+            } else if capture_loop_result.is_err() {
+                "failed"
+            } else {
+                "aborted"
+            };
+            if stage_open {
+                if let Err(error) = finish_capture_stage(
+                    &mut pipeline,
+                    cursor.index,
+                    &request.inspect_stages[cursor.index],
+                    state,
+                    &mut inspect,
+                    target_instance,
+                ) {
+                    eprintln!("staged final evidence failed: {error}");
+                    stage_evidence_error = Some(error);
+                }
+            }
+            for index in cursor.index + 1..request.inspect_stages.len() {
+                if let Err(error) = emit_capture_stage(
+                    &mut pipeline,
+                    index,
+                    &request.inspect_stages[index],
+                    "not_started",
+                    None,
+                    target_instance,
+                ) {
+                    eprintln!("staged pending evidence failed: {error}");
+                    stage_evidence_error = Some(error);
+                    break;
+                }
             }
         }
     }
+    if let (Some(r), Some(source)) = (&request.storage.capture_relation, &qualified_source) {
+        crate::capture_lifecycle::retain_qualification(
+            &crate::capture_lifecycle::control_root(&crate::runtime_paths::captures(), r),
+            r,
+            std::slice::from_ref(source),
+        )?;
+    }
+    let capture_loop_result = if qualified_backend.is_some() && qualified_source.is_none() {
+        capture_loop_result.and(Err(anyhow::anyhow!(
+            "qualified target never appeared; no payload admitted"
+        )))
+    } else {
+        capture_loop_result
+    };
+    let launcher_result = launch_task.map_or(Ok(()), |task| task.finish());
+    let capture_loop_result = capture_loop_result.and(launcher_result);
+    let capture_loop_result =
+        capture_loop_result.and_then(|()| stage_evidence_error.map_or(Ok(()), Err));
+    if capture_loop_result.is_err() {
+        eprintln!("capture loop stopped with error; unprocessed_inspect_outputs={unprocessed_inspect_outputs}; finalizing retained evidence");
+    }
 
-    if request.duration_seconds != 0 {
+    if capture_loop_result.is_ok() && request.duration_seconds != 0 {
         eprintln!(
             "duration {}s elapsed, sealing capture",
             request.duration_seconds
@@ -1096,46 +1402,89 @@ fn stream_events(
                     "incomplete_messages": get("incomplete_messages"),
                     "perf_lost": lost,
                     "ssl_read_drop_gt0": ssl_dgt0,
+                    "untyped_quic_fragments": get("untyped_quic_fragments"),
+                    "untyped_quic_bytes": get("untyped_quic_bytes"),
+                    "quic_fin_observations": get("quic_fin_observations"),
+                    "quic_fin_unknown": get("quic_fin_unknown"),
+                    "quic_zero_byte_events": get("quic_zero_byte_events"),
+                    "untyped_quic_raw_rejected": get("untyped_quic_raw_rejected"),
+                    "raw_memory_evicted_fragments": get("raw_memory_evicted_fragments"),
+                    "raw_memory_evicted_bytes": get("raw_memory_evicted_bytes"),
+                    "raw_idle_reaped_fragments": get("raw_idle_reaped_fragments"),
+                    "raw_idle_reaped_bytes": get("raw_idle_reaped_bytes"),
                 })
             );
         }
     }
-    if let Some(mut child) = pcap_child.take() {
-        stop_pcap_watchdog(&mut child);
-        if let Some(dest) = pcap_dest.as_ref() {
-            if let Ok(meta) = std::fs::metadata(dest) {
-                eprintln!("pcap captured {} bytes at {}", meta.len(), dest.display());
+    auxiliary.dispatch(
+        AuxiliaryStage::Finish,
+        capture_loop_result.is_ok() && !pipeline.storage_limit_reached,
+        |action| -> Result<()> {
+            debug_assert_eq!(action, AuxiliaryAction::MemoryDump);
+            if let Some(root) = request
+                .storage
+                .spool_root
+                .as_ref()
+                .filter(|_| capture_loop_result.is_ok())
+            {
+                let dest = root
+                    .join("forensics")
+                    .join(pipeline.normalizer.session_id().to_string());
+                let pids = request
+                    .package
+                    .as_deref()
+                    .map(crate::dexdump::pids_for_package)
+                    .unwrap_or_default();
+                let dump_deadline = Instant::now() + Duration::from_secs(8);
+                for pid in pids.into_iter().take(8) {
+                    if Instant::now() >= dump_deadline {
+                        eprintln!("in-memory DEX dump budget exceeded, continuing shutdown");
+                        break;
+                    }
+                    let dumped = if let (Some(backend), Some(source)) =
+                        (&qualified_backend, &qualified_source)
+                    {
+                        if pid != source.pid {
+                            continue;
+                        }
+                        backend.copy_code(source, &dest, dump_deadline)?
+                    } else {
+                        crate::dexdump::dump_live_process_with_pause(
+                            pid,
+                            &dest,
+                            dump_deadline,
+                            request.collect_keys,
+                            request.collect_memory_windows,
+                            !(request.code_only || request.storage.capture_relation.is_some()),
+                        )
+                    };
+
+                    let total = dumped
+                        .memory_images
+                        .saturating_add(dumped.vdex_images)
+                        .saturating_add(dumped.fd_images)
+                        .saturating_add(dumped.native_libs);
+                    if total > 0 {
+                        eprintln!(
+                            "dumped pid {pid}: memory_dex={} vdex={} fd={} so={}",
+                            dumped.memory_images,
+                            dumped.vdex_images,
+                            dumped.fd_images,
+                            dumped.native_libs
+                        );
+                    }
+                }
             }
+            Ok(())
+        },
+    )?;
+
+    if let Err(error) = capture_loop_result {
+        if let Some(spool) = pipeline.spool.as_mut() {
+            report_spool_failure(spool); // idempotent: never retries the tail twice
         }
-    }
-    if let Some(root) = request.storage.spool_root.as_ref() {
-        let dest = root
-            .join("forensics")
-            .join(pipeline.normalizer.session_id().to_string());
-        let pids = request
-            .package
-            .as_deref()
-            .map(crate::dexdump::pids_for_package)
-            .unwrap_or_default();
-        let dump_deadline = Instant::now() + Duration::from_secs(8);
-        for pid in pids.into_iter().take(8) {
-            if Instant::now() >= dump_deadline {
-                eprintln!("in-memory DEX dump budget exceeded, continuing shutdown");
-                break;
-            }
-            let dumped = crate::dexdump::dump_live_process(pid, &dest, dump_deadline);
-            let total = dumped
-                .memory_images
-                .saturating_add(dumped.vdex_images)
-                .saturating_add(dumped.fd_images)
-                .saturating_add(dumped.native_libs);
-            if total > 0 {
-                eprintln!(
-                    "dumped pid {pid}: memory_dex={} vdex={} fd={} so={}",
-                    dumped.memory_images, dumped.vdex_images, dumped.fd_images, dumped.native_libs
-                );
-            }
-        }
+        std::io::stdout().flush()?;
+        return Err(error); // no false DurationElapsed / capture_complete receipt
     }
 
     let stop_reason = if pipeline.storage_limit_reached {
@@ -2374,3 +2723,174 @@ fn format_payload(payload: &ksight_model::EventPayload) -> (String, String) {
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+/// Production persistence boundary, portable so host tests exercise it directly.
+/// Write JSON without println!'s broken-pipe panic so the capture error path
+/// can still commit the accepted tail and record an interrupted final state.
+#[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
+pub(crate) fn write_capture_json(
+    output: &mut impl std::io::Write,
+    event: &ksight_model::Event,
+) -> std::io::Result<()> {
+    serde_json::to_writer(&mut *output, event).map_err(std::io::Error::other)?;
+    output.write_all(b"\n")
+}
+
+#[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
+pub(crate) fn persist_capture_event(
+    spool: &mut crate::spool::SessionSpoolWriter,
+    event: &ksight_model::Event,
+) -> Result<(), crate::spool::SpoolError> {
+    if let Err(error) = spool.push(event) {
+        report_spool_failure(spool);
+        return Err(error);
+    }
+    Ok(())
+}
+#[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
+fn flush_capture_idle(
+    spool: &mut crate::spool::SessionSpoolWriter,
+) -> Result<(), crate::spool::SpoolError> {
+    if let Err(error) = spool.flush_if_idle() {
+        report_spool_failure(spool);
+        return Err(error);
+    }
+    Ok(())
+}
+#[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
+fn report_spool_failure(spool: &mut crate::spool::SessionSpoolWriter) {
+    let manifest_recorded = spool.finish_interrupted().is_ok();
+    let diagnostics = spool.diagnostics();
+    eprintln!(
+        "spool_failed diagnostics={}",
+        serde_json::to_string(&diagnostics).unwrap_or_else(|_| "serialization_failed".into())
+    );
+    if !manifest_recorded {
+        eprintln!("spool_failed failure_manifest_unavailable=true");
+    }
+}
+
+/// Preserve the baseline mirror adapter; qualified code capture never enables it.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn route_inspect_to_mirror(
+    mirror: &mut crate::burp_mirror::BurpMirror,
+    output: &crate::inspect_runtime::InspectOutput,
+) {
+    if let crate::inspect_runtime::InspectOutput::Plaintext {
+        pid,
+        tid,
+        connection_id,
+        raw,
+        ..
+    } = output
+    {
+        if let crate::inspect_runtime::InspectOutput::Plaintext { fragment, .. } = output {
+            mirror.observe_bytes_for_connection(
+                *pid,
+                *tid,
+                *connection_id,
+                &fragment.adapter,
+                &fragment.direction,
+                raw,
+            );
+        }
+    }
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn observe_stage_target(
+    request: &CaptureRequest,
+    expected: Option<crate::capture_stages::TargetInstance>,
+) -> Option<crate::capture_stages::TargetInstance> {
+    let pid = if let Some(pid) = request.pid.or(expected.map(|i| i.pid)) {
+        pid
+    } else {
+        let package = request.package.as_deref()?;
+        let main: Vec<u32> = crate::dexdump::pids_for_package(package)
+            .into_iter()
+            .filter(|pid| {
+                std::fs::read(format!("/proc/{pid}/cmdline"))
+                    .ok()
+                    .is_some_and(|bytes| {
+                        bytes.split(|b| *b == 0).next() == Some(package.as_bytes())
+                    })
+            })
+            .collect();
+        if main.len() != 1 {
+            return None;
+        }
+        main[0]
+    };
+    if let Some(package) = request.package.as_deref() {
+        let bytes = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+        let cmd = bytes.split(|b| *b == 0).next()?;
+        if cmd != package.as_bytes() && !cmd.starts_with(format!("{package}:").as_bytes()) {
+            return None;
+        }
+    }
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    crate::capture_stages::instance_from_stat(pid, &stat)
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn emit_capture_stage(
+    pipeline: &mut EventPipeline,
+    index: usize,
+    stage: &crate::capture_stages::InspectStage,
+    status: &str,
+    inspect: Option<&crate::inspect_runtime::InspectRuntime>,
+    instance: Option<crate::capture_stages::TargetInstance>,
+) -> Result<()> {
+    let metrics: std::collections::BTreeMap<String, u64> = inspect
+        .map(|runtime| {
+            let (raw, decoded, lost) = runtime.drain_totals();
+            let (pending, incomplete) = runtime.pending_depth();
+            [
+                ("raw_records".into(), raw),
+                ("decoded".into(), decoded),
+                ("perf_lost".into(), lost),
+                ("pending".into(), pending),
+                ("incomplete_calls".into(), incomplete),
+            ]
+            .into_iter()
+            .collect()
+        })
+        .unwrap_or_default();
+    let mut payload = serde_json::json!({"schema":"kernsight.capture-stage/v1","session":pipeline.normalizer.session_id().to_string(),"index":index,"stage":stage.name,"planned_seconds":stage.seconds,"stage_elapsed_ms":inspect.map(crate::inspect_runtime::InspectRuntime::stage_elapsed_ms),"state":status,"metrics":metrics,"pid":instance.map(|i|i.pid),"process_start_ticks":instance.map(|i|i.start_ticks.to_string()),"coverage":"not_attested","requested_adapters":stage.adapters().iter().map(|a|a.as_str()).collect::<Vec<_>>(),"observation_state":if stage.name == "l0" {"kernel_only"} else if metrics.get("raw_records").copied().unwrap_or(0)==0 {"not_triggered_or_blocked"} else {"observed_not_complete"},"restart":false,"resource_release":"owned_probes_dropped_on_close; unread_perf_tail_not_attested"});
+    payload["recorded_unix_ms"] = serde_json::json!(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0));
+    if let Some(relation) = pipeline.storage.capture_relation.as_ref() {
+        if let Some(link) = relation
+            .stage_links
+            .iter()
+            .find(|r| r["stageKey"].as_str() == Some(stage.name.as_str()))
+        {
+            payload["parent_relation"] = link.clone();
+        }
+    }
+    eprintln!("{payload}");
+    pipeline.emit_inspect(ksight_model::InspectObservation {
+        adapter: "capture_stage".into(),
+        detail: payload.to_string(),
+        metrics,
+        detectability_notice:
+            "sequential uprobe phases; L0 sensors persist; no automatic App restart".into(),
+        ..ksight_model::InspectObservation::default()
+    })
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn finish_capture_stage(
+    pipeline: &mut EventPipeline,
+    index: usize,
+    stage: &crate::capture_stages::InspectStage,
+    status: &str,
+    inspect: &mut crate::inspect_runtime::InspectRuntime,
+    instance: Option<crate::capture_stages::TargetInstance>,
+) -> Result<()> {
+    inspect.revoke_for_stage();
+    let marker = emit_capture_stage(pipeline, index, stage, status, Some(inspect), instance);
+    marker
+}

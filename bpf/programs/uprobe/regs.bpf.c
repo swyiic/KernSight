@@ -1,3 +1,6 @@
+#ifndef KSIGHT_INSTANCE_GATE
+#define KSIGHT_INSTANCE_GATE 0
+#endif
 /* SPDX-License-Identifier: GPL-2.0-only */
 #include "ksight_bpf_helpers.h"
 #include "ksight_hwbp.h"
@@ -15,11 +18,15 @@ struct ksight_user_regs {
     ksight_u64 pstate;
 };
 
+#ifdef KSIGHT_SCOPE_HOST_TEST
+long ksight_bpf_perf_event_output(const void *, const void *, ksight_u64, const void *, ksight_u64);
+#else
 static long (*const ksight_bpf_perf_event_output)(const void *ctx,
                                                    const void *map,
                                                    ksight_u64 flags,
                                                    const void *data,
                                                    ksight_u64 size) = (void *)25;
+#endif
 
 /* per-cpu 临时缓冲。 */
 struct {
@@ -44,7 +51,7 @@ struct {
     __uint(max_entries, 1);
     __type(key, ksight_u32);
     __type(value, ksight_u32);
-} tgid_filter SEC(".maps");
+} tgid_filter_v2 SEC(".maps");
 
 struct {
     __uint(type, KSIGHT_BPF_MAP_TYPE_HASH);
@@ -53,11 +60,19 @@ struct {
     __type(value, ksight_u32);
 } tgid_allow SEC(".maps");
 
+#if KSIGHT_INSTANCE_GATE
+#include "ksight_instance_scope.h"
+#endif
+
 /* Entry-time buffer pointer + length ceiling per tid. Entry and uretprobe MUST
  * share one BPF object so this map is visible on return (SSL_read snapshot). */
 struct entry_info {
     ksight_u64 ptr;
     ksight_u64 num;
+    ksight_u64 call_id;
+#if KSIGHT_INSTANCE_GATE
+    struct ksight_scope_stamp scope;
+#endif
 };
 
 struct {
@@ -74,7 +89,11 @@ static __always_inline int ksight_emit_user_regs(struct ksight_user_regs *ctx,
     struct ksight_hwbp_context *out = ksight_bpf_map_lookup_elem(&hwbp_ctx, &zero);
     ksight_u64 pid_tgid;
     ksight_u32 tgid;
+#if KSIGHT_INSTANCE_GATE
+    struct ksight_scope_stamp scope = {};
+#else
     ksight_u32 *mode;
+#endif
     int i;
 
     if (!out)
@@ -82,11 +101,16 @@ static __always_inline int ksight_emit_user_regs(struct ksight_user_regs *ctx,
 
     pid_tgid = ksight_bpf_get_current_pid_tgid();
     tgid = (ksight_u32)(pid_tgid >> 32);
-    mode = ksight_bpf_map_lookup_elem(&tgid_filter, &zero);
-    if (mode && *mode != 0) {
-        if (!ksight_bpf_map_lookup_elem(&tgid_allow, &tgid))
-            return 0;
-    }
+#if KSIGHT_INSTANCE_GATE
+    if (!ksight_scope_context(out, &scope, &entry_ptr, pid_tgid))
+        return 0;
+#else
+    mode = ksight_bpf_map_lookup_elem(&tgid_filter_v2, &zero);
+    if (!mode || *mode > 1)
+        return 0;
+    if (*mode == 1 && !ksight_bpf_map_lookup_elem(&tgid_allow, &tgid))
+        return 0;
+#endif
     out->pid = tgid;
     out->tid = (ksight_u32)pid_tgid;
 #pragma unroll
@@ -97,6 +121,8 @@ static __always_inline int ksight_emit_user_regs(struct ksight_user_regs *ctx,
     ksight_bpf_probe_read_kernel(&out->pc, sizeof(out->pc), &ctx->pc);
     ksight_bpf_probe_read_kernel(&out->pstate, sizeof(out->pstate), &ctx->pstate);
     out->time_ns = ksight_bpf_ktime_get_ns();
+    out->actual_len = 0;
+    out->call_id = at_return ? 0 : out->time_ns;
     out->aux_bytes = 0;
     /* aux_pad / snapshot_at_return: 1 on EVERY uretprobe event so a paired
      * entry+return session can classify hits without separate LiveProbe rows. */
@@ -108,6 +134,13 @@ static __always_inline int ksight_emit_user_regs(struct ksight_user_regs *ctx,
          * saved num as ceiling when x0==1. */
         ksight_u32 tid = (ksight_u32)pid_tgid;
         struct entry_info *saved = ksight_bpf_map_lookup_elem(&entry_ptr, &tid);
+#if KSIGHT_INSTANCE_GATE
+        if (!saved || !ksight_scope_same(&saved->scope, &scope)) {
+            ksight_bpf_map_delete_elem(&entry_ptr, &tid);
+            return 0;
+        }
+#endif
+        if (saved) out->call_id = saved->call_id;
         /* regs[0] is a signed return (SSL_read byte count or SSL_read_ex 0/1).
          * Treating it as u64 made WANT_READ (-1) look like a huge success and
          * produced 4096-zero false recv fragments on Alipay BABASSL. */
@@ -143,6 +176,10 @@ static __always_inline int ksight_emit_user_regs(struct ksight_user_regs *ctx,
         struct entry_info info = {};
         info.ptr = out->regs[1];
         info.num = out->regs[2];
+        info.call_id = out->call_id;
+#if KSIGHT_INSTANCE_GATE
+        info.scope = scope;
+#endif
         ksight_bpf_map_update_elem(&entry_ptr, &tid, &info, 0);
     }
     {
@@ -155,16 +192,16 @@ static __always_inline int ksight_emit_user_regs(struct ksight_user_regs *ctx,
             ksight_u64 n = len2;
             if (n == 0 || n > 4096)
                 n = 4096;
-            ksight_bpf_probe_read_user(out->aux, sizeof(out->aux),
-                                       (const void *)src1);
-            out->aux_bytes = (ksight_u32)n;
+            if (ksight_bpf_probe_read_user(out->aux, sizeof(out->aux),
+                                       (const void *)src1) == 0)
+                out->aux_bytes = (ksight_u32)n;
         } else if (src2 >= 0x10000ULL && len1 > 0 && len1 <= 4096) {
             ksight_u64 n = len1;
             if (n > 4096)
                 n = 4096;
-            ksight_bpf_probe_read_user(out->aux, sizeof(out->aux),
-                                       (const void *)src2);
-            out->aux_bytes = (ksight_u32)n;
+            if (ksight_bpf_probe_read_user(out->aux, sizeof(out->aux),
+                                       (const void *)src2) == 0)
+                out->aux_bytes = (ksight_u32)n;
         }
     }
 
@@ -186,6 +223,21 @@ int ksight_uretprobe_regs(struct ksight_user_regs *ctx)
     return ksight_emit_user_regs(ctx, 1);
 }
 
+/* Independent registers-only pairing, no payload or TLS entry_ptr access. */
+struct regs_entry_info {
+    ksight_u64 calls[4];
+    ksight_u32 depth, overflow;
+#if KSIGHT_INSTANCE_GATE
+    struct ksight_scope_stamp scope;
+#endif
+};
+struct {
+    __uint(type, KSIGHT_BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 1024);
+    __type(key, ksight_u32);
+    __type(value, struct regs_entry_info);
+} regs_entry_ptr SEC(".maps");
+
 /* Registers only. Used for pointer-returning getters such as
  * xqc_get_conn_user_data_by_stream. Does not read x1/x2 and does not touch
  * entry_ptr, so an SSL_read already stashed on this tid keeps its buffer. */
@@ -196,7 +248,11 @@ static __always_inline int ksight_emit_regs_only(struct ksight_user_regs *ctx,
     struct ksight_hwbp_context *out = ksight_bpf_map_lookup_elem(&hwbp_ctx, &zero);
     ksight_u64 pid_tgid;
     ksight_u32 tgid;
+#if KSIGHT_INSTANCE_GATE
+    struct ksight_scope_stamp scope = {};
+#else
     ksight_u32 *mode;
+#endif
     int i;
 
     if (!out)
@@ -204,11 +260,17 @@ static __always_inline int ksight_emit_regs_only(struct ksight_user_regs *ctx,
 
     pid_tgid = ksight_bpf_get_current_pid_tgid();
     tgid = (ksight_u32)(pid_tgid >> 32);
-    mode = ksight_bpf_map_lookup_elem(&tgid_filter, &zero);
-    if (mode && *mode != 0) {
-        if (!ksight_bpf_map_lookup_elem(&tgid_allow, &tgid))
-            return 0;
-    }
+#if KSIGHT_INSTANCE_GATE
+    if (!ksight_scope_context(out, &scope, &regs_entry_ptr, pid_tgid))
+        return 0;
+#else
+    mode = ksight_bpf_map_lookup_elem(&tgid_filter_v2, &zero);
+    /* 2 is the update transaction gate. Missing/unknown mode also denies. */
+    if (!mode || *mode > 1)
+        return 0;
+    if (*mode == 1 && !ksight_bpf_map_lookup_elem(&tgid_allow, &tgid))
+        return 0;
+#endif
     out->pid = tgid;
     out->tid = (ksight_u32)pid_tgid;
 #pragma unroll
@@ -221,6 +283,47 @@ static __always_inline int ksight_emit_regs_only(struct ksight_user_regs *ctx,
     out->time_ns = ksight_bpf_ktime_get_ns();
     out->aux_bytes = 0;
     out->aux_pad = at_return ? 1 : 0;
+    out->actual_len = 0;
+    out->call_id = 0;
+    ksight_u32 tid = (ksight_u32)pid_tgid;
+    struct regs_entry_info *stack = ksight_bpf_map_lookup_elem(&regs_entry_ptr, &tid);
+#if KSIGHT_INSTANCE_GATE
+    if (stack && !ksight_scope_same(&stack->scope, &scope)) {
+        ksight_bpf_map_delete_elem(&regs_entry_ptr, &tid);
+        stack = 0;
+    }
+    if (at_return && !stack) return 0;
+#endif
+    if (!at_return) {
+        out->call_id = out->time_ns;
+        if (!stack) {
+            struct regs_entry_info empty = {};
+#if KSIGHT_INSTANCE_GATE
+            empty.scope = scope;
+#endif
+            ksight_bpf_map_update_elem(&regs_entry_ptr, &tid, &empty, 0);
+            stack = ksight_bpf_map_lookup_elem(&regs_entry_ptr, &tid);
+        }
+        if (stack) {
+            if (stack->depth < 4 && !stack->overflow) {
+                if (stack->depth == 0) stack->calls[0] = out->call_id;
+                else if (stack->depth == 1) stack->calls[1] = out->call_id;
+                else if (stack->depth == 2) stack->calls[2] = out->call_id;
+                else stack->calls[3] = out->call_id;
+            } else stack->overflow = 1;
+            if (stack->depth < 65535) stack->depth++;
+            else stack->overflow = 1;
+        }
+    } else if (stack && stack->depth > 0) {
+        stack->depth--;
+        if (!(stack->overflow && stack->depth >= 4)) {
+            if (stack->depth == 0) out->call_id = stack->calls[0];
+            else if (stack->depth == 1) out->call_id = stack->calls[1];
+            else if (stack->depth == 2) out->call_id = stack->calls[2];
+            else if (stack->depth == 3) out->call_id = stack->calls[3];
+        }
+        if (stack->depth == 0) ksight_bpf_map_delete_elem(&regs_entry_ptr, &tid);
+    }
     ksight_bpf_perf_event_output(ctx, &hwbp_events,
                                  KSIGHT_BPF_F_CURRENT_CPU, out, sizeof(*out));
     return 0;

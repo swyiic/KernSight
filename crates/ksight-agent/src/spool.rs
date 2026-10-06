@@ -63,6 +63,9 @@ pub struct SessionManifest {
     pub compressed: bool,
     /// Unix milliseconds when the directory was created.
     pub started_unix_ms: u64,
+    /// Bounded writer evidence and failure status (absent on legacy manifests).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer: Option<SpoolWriterDiagnostics>,
 }
 
 /// Durable bounded queue used while the USB client is disconnected.
@@ -111,7 +114,12 @@ pub struct SessionSpoolWriter {
     session_id: Uuid,
     next_batch_sequence: u64,
     max_events_per_batch: usize,
-    events: Vec<Event>,
+    events: Vec<StoredEvent>,
+    event_bytes: u64,
+    pending_since: Option<Instant>,
+    blocked: bool,
+    manifest_dirty: bool,
+    diagnostics: SpoolWriterDiagnostics,
     persisted_batches: u64,
     started: Instant,
 }
@@ -188,6 +196,9 @@ fn summarize_session(
 /// # Errors
 ///
 /// Returns an error when a batch cannot be decoded or belongs to another session.
+///
+/// # Panics
+/// Panics if an internal invariant checked by `expect` or `unwrap` is violated.
 pub fn visit_batches(
     directory: impl AsRef<Path>,
     session_id: Uuid,
@@ -199,7 +210,20 @@ pub fn visit_batches(
         if after_batch_sequence.is_some_and(|after| sequence <= after) {
             continue;
         }
+        if last.is_some_and(|previous| sequence <= previous) {
+            return Err(SpoolError::NonMonotonicSequence {
+                previous: last.unwrap(),
+                observed: sequence,
+            });
+        }
         let batch = decode_batch_file(&path, encoding)?;
+        if batch.batch_sequence != sequence {
+            return Err(SpoolError::FilenameSequenceMismatch {
+                path,
+                filename: sequence,
+                payload: batch.batch_sequence,
+            });
+        }
         if batch.session_id != session_id {
             return Err(SpoolError::DirectorySessionMismatch {
                 directory_session: session_id,
@@ -219,10 +243,10 @@ pub fn visit_batches(
 /// Returns an error for I/O or JSON failure.
 pub fn load_manifest(directory: impl AsRef<Path>) -> Result<Option<SessionManifest>, SpoolError> {
     let path = directory.as_ref().join(MANIFEST_NAME);
-    match fs::read(&path) {
+    match read_bounded(&path, 4096) {
         Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
+        Err(SpoolError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
@@ -239,11 +263,14 @@ pub fn write_manifest(
     fs::create_dir_all(directory)?;
     let destination = directory.join(MANIFEST_NAME);
     let temporary = directory.join(format!(".manifest-{}.tmp", Uuid::new_v4()));
-    write_replace(
-        &temporary,
-        &destination,
-        &serde_json::to_vec_pretty(manifest)?,
-    )?;
+    let bytes = serde_json::to_vec_pretty(manifest)?;
+    if bytes.len() > 4096 {
+        return Err(SpoolError::BatchTooLarge {
+            observed: bytes.len() as u64,
+            maximum: 4096,
+        });
+    }
+    write_replace(&temporary, &destination, &bytes)?;
     Ok(())
 }
 
@@ -269,6 +296,7 @@ pub fn mark_session_state(
         used_bytes: 0,
         compressed: false,
         started_unix_ms: unix_ms(),
+        writer: None,
     });
     if let Some(name) = directory.file_name().and_then(|name| name.to_str()) {
         if let Ok(session_id) = Uuid::parse_str(name) {
@@ -280,142 +308,8 @@ pub fn mark_session_state(
     write_manifest(directory, &manifest)
 }
 
-impl SessionSpoolWriter {
-    /// Create a writer beneath `root/<session-id>`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for a zero event bound or when the session spool cannot be opened.
-    pub fn open(
-        root: impl AsRef<Path>,
-        session_id: Uuid,
-        max_bytes: u64,
-        max_events_per_batch: usize,
-    ) -> Result<Self, SpoolError> {
-        Self::open_with(
-            root,
-            session_id,
-            max_bytes,
-            max_events_per_batch,
-            SpoolOptions {
-                compress: false,
-                completion_reserve_bytes: 0,
-            },
-        )
-    }
-
-    /// Create a writer with compression and completion-reserve options.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for a zero event bound or when the session spool cannot be opened.
-    pub fn open_with(
-        root: impl AsRef<Path>,
-        session_id: Uuid,
-        max_bytes: u64,
-        max_events_per_batch: usize,
-        options: SpoolOptions,
-    ) -> Result<Self, SpoolError> {
-        if max_events_per_batch == 0 || max_events_per_batch > MAX_EVENTS_PER_BATCH {
-            return Err(SpoolError::InvalidBatchSize);
-        }
-        let spool = DirectorySpool::open_with(
-            root.as_ref().join(session_id.to_string()),
-            max_bytes,
-            options,
-        )?;
-        let next_batch_sequence = spool
-            .last_sequence
-            .map_or(1, |sequence| sequence.saturating_add(1));
-        Ok(Self {
-            spool,
-            session_id,
-            next_batch_sequence,
-            max_events_per_batch,
-            events: Vec::with_capacity(max_events_per_batch),
-            persisted_batches: 0,
-            started: Instant::now(),
-        })
-    }
-
-    /// Buffer one event and persist a complete batch when the configured bound is reached.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for a foreign session or persistence failure.
-    pub fn push(&mut self, event: &Event) -> Result<(), SpoolError> {
-        if event.header.session_id != self.session_id {
-            return Err(SpoolError::ForeignEventSession {
-                expected: self.session_id,
-                observed: event.header.session_id,
-            });
-        }
-        self.events.push(event.clone());
-        if self.events.len() >= self.max_events_per_batch {
-            self.flush()?;
-        }
-        Ok(())
-    }
-
-    /// Persist the current partial batch, if any.
-    ///
-    /// # Errors
-    ///
-    /// Returns a persistence or capacity error without discarding buffered events.
-    pub fn flush(&mut self) -> Result<(), SpoolError> {
-        if self.events.is_empty() {
-            return Ok(());
-        }
-        let batch = EventBatch {
-            session_id: self.session_id,
-            batch_sequence: self.next_batch_sequence,
-            events: self.events.clone(),
-        };
-        self.spool.append(&batch)?;
-        self.events.clear();
-        self.next_batch_sequence = self.next_batch_sequence.saturating_add(1);
-        self.persisted_batches = self.persisted_batches.saturating_add(1);
-        self.spool
-            .persist_manifest(self.session_id, DurableSessionState::Running, None)?;
-        Ok(())
-    }
-
-    /// Seal the session with a lifecycle state after the final flush.
-    ///
-    /// # Errors
-    ///
-    /// Returns a persistence error.
-    pub fn seal(
-        &mut self,
-        state: DurableSessionState,
-        stop_reason: Option<CaptureStopReason>,
-    ) -> Result<(), SpoolError> {
-        self.flush()?;
-        self.spool
-            .persist_manifest(self.session_id, state, stop_reason)
-    }
-
-    /// Whether remaining event capacity or age requires a new session directory.
-    pub fn should_rotate(&self, max_age_secs: u64) -> bool {
-        let aged = max_age_secs != 0 && self.started.elapsed().as_secs() >= max_age_secs;
-        aged || self.spool.event_capacity_exhausted()
-    }
-
-    /// Session-specific spool directory.
-    pub fn directory(&self) -> &Path {
-        self.spool.directory()
-    }
-
-    /// Complete batch bytes written or recovered for this session.
-    pub fn used_bytes(&self) -> u64 {
-        self.spool.used_bytes()
-    }
-
-    /// Batches persisted by this writer instance.
-    pub fn persisted_batches(&self) -> u64 {
-        self.persisted_batches
-    }
-}
+include!("spool_writer.rs");
+include!("spool_append.rs");
 
 impl DirectorySpool {
     /// Open or create a single-session spool directory.
@@ -566,61 +460,28 @@ impl Spool for DirectorySpool {
     type Error = SpoolError;
 
     fn append(&mut self, batch: &EventBatch) -> Result<(), Self::Error> {
-        self.reconcile_external_acknowledgements()?;
-        if self
-            .last_sequence
-            .is_some_and(|previous| batch.batch_sequence <= previous)
-        {
-            return Err(SpoolError::NonMonotonicSequence {
-                previous: self.last_sequence.unwrap_or_default(),
-                observed: batch.batch_sequence,
-            });
-        }
-        let json = serde_json::to_vec(batch)?;
-        let json_len = u64::try_from(json.len()).map_err(|_| SpoolError::CapacityOverflow)?;
-        if json_len > u64::from(DEFAULT_MAX_FRAME_BYTES) {
+        let (size, _) = measure_json(batch)?;
+        if size > u64::from(DEFAULT_MAX_FRAME_BYTES) {
             return Err(SpoolError::BatchTooLarge {
-                observed: json_len,
+                observed: size,
                 maximum: DEFAULT_MAX_FRAME_BYTES,
             });
         }
-        let (encoded, suffix) = if self.options.compress {
-            (lz4_flex::compress_prepend_size(&json), BATCH_LZ4_SUFFIX)
-        } else {
-            (json, BATCH_JSON_SUFFIX)
-        };
-        let encoded_len = u64::try_from(encoded.len()).map_err(|_| SpoolError::CapacityOverflow)?;
-        let next_usage = self
-            .used_bytes
-            .checked_add(encoded_len)
-            .ok_or(SpoolError::CapacityOverflow)?;
-        if next_usage > self.max_bytes {
-            return Err(SpoolError::CapacityExceeded {
-                used: self.used_bytes,
-                incoming: encoded_len,
-                maximum: self.max_bytes,
-            });
-        }
-
-        let destination = self
-            .directory
-            .join(batch_filename(batch.batch_sequence, suffix));
-        if destination.exists() {
-            return Err(SpoolError::DestinationExists(destination));
-        }
-        let temporary = self
-            .directory
-            .join(format!(".pending-{}.tmp", Uuid::new_v4()));
-        let result = write_atomic(&temporary, &destination, &encoded);
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
-        result?;
-        self.used_bytes = next_usage;
-        self.last_sequence = Some(batch.batch_sequence);
-        self.event_count = self.event_count.saturating_add(
-            u64::try_from(batch.events.len()).map_err(|_| SpoolError::CapacityOverflow)?,
-        );
+        let mut json =
+            Vec::with_capacity(usize::try_from(size).map_err(|_| SpoolError::CapacityOverflow)?);
+        serde_json::to_writer(&mut json, batch)?;
+        let completion = batch
+            .events
+            .iter()
+            .all(|e| matches!(e.payload, ksight_model::EventPayload::SessionCompletion(_)));
+        self.append_serialized(
+            &json,
+            batch.batch_sequence,
+            batch.events.len() as u64,
+            false,
+            completion,
+            &mut 0,
+        )?;
         Ok(())
     }
 
@@ -630,9 +491,14 @@ impl Spool for DirectorySpool {
     }
 
     fn acknowledge_through(&mut self, batch_sequence: u64) -> Result<(), Self::Error> {
+        let mut remaining_event_count = 0_u64;
         for entry in self.read_pending()? {
             if entry.batch.batch_sequence > batch_sequence {
-                break;
+                remaining_event_count = remaining_event_count.saturating_add(
+                    u64::try_from(entry.batch.events.len())
+                        .map_err(|_| SpoolError::CapacityOverflow)?,
+                );
+                continue;
             }
             let path = batch_path(&self.directory, entry.batch.batch_sequence);
             match fs::remove_file(path) {
@@ -645,9 +511,23 @@ impl Spool for DirectorySpool {
                 .event_count
                 .saturating_sub(u64::try_from(entry.batch.events.len()).unwrap_or(0));
         }
+        self.event_count = remaining_event_count;
         if let Some(name) = self.directory.file_name().and_then(|name| name.to_str()) {
             if let Ok(session_id) = Uuid::parse_str(name) {
-                self.persist_manifest(session_id, DurableSessionState::Running, None)?;
+                let inventory = scan_inventory(&self.directory)?;
+                self.used_bytes = inventory.used_bytes;
+                if let Some(mut manifest) = load_manifest(&self.directory)? {
+                    // ACK changes the pending inventory, not the collector's lifecycle.
+                    manifest.first_batch_sequence = inventory.first_sequence;
+                    manifest.last_batch_sequence = inventory.last_sequence;
+                    manifest.batch_count = inventory.batch_count;
+                    manifest.event_count = self.event_count;
+                    manifest.used_bytes = inventory.used_bytes;
+                    write_manifest(&self.directory, &manifest)?;
+                } else {
+                    // Legacy directories have no persisted lifecycle to preserve.
+                    self.persist_manifest(session_id, DurableSessionState::Running, None)?;
+                }
             }
         }
         Ok(())
@@ -674,27 +554,36 @@ impl DirectorySpool {
         self.used_bytes >= self.max_bytes.saturating_sub(reserve)
     }
 
+    fn manifest(
+        &self,
+        session_id: Uuid,
+        state: DurableSessionState,
+        stop_reason: Option<CaptureStopReason>,
+    ) -> Result<SessionManifest, SpoolError> {
+        let inventory = scan_inventory(&self.directory)?;
+        Ok(SessionManifest {
+            session_id,
+            state,
+            stop_reason,
+            first_batch_sequence: inventory.first_sequence,
+            last_batch_sequence: inventory.last_sequence,
+            batch_count: inventory.batch_count,
+            event_count: self.event_count,
+            used_bytes: inventory.used_bytes,
+            compressed: inventory.compressed || self.options.compress,
+            started_unix_ms: self.started_unix_ms,
+            writer: None,
+        })
+    }
     fn persist_manifest(
         &self,
         session_id: Uuid,
         state: DurableSessionState,
         stop_reason: Option<CaptureStopReason>,
     ) -> Result<(), SpoolError> {
-        let inventory = scan_inventory(&self.directory)?;
         write_manifest(
             &self.directory,
-            &SessionManifest {
-                session_id,
-                state,
-                stop_reason,
-                first_batch_sequence: inventory.first_sequence,
-                last_batch_sequence: inventory.last_sequence,
-                batch_count: inventory.batch_count,
-                event_count: self.event_count,
-                used_bytes: inventory.used_bytes,
-                compressed: inventory.compressed || self.options.compress,
-                started_unix_ms: self.started_unix_ms,
-            },
+            &self.manifest(session_id, state, stop_reason)?,
         )
     }
 }
@@ -771,17 +660,45 @@ fn list_batch_files(directory: &Path) -> Result<Vec<(u64, PathBuf, BatchEncoding
     Ok(paths)
 }
 
-fn decode_batch_file(path: &Path, encoding: BatchEncoding) -> Result<EventBatch, SpoolError> {
-    let bytes = fs::read(path)?;
+fn decode_batch_json(path: &Path, encoding: BatchEncoding) -> Result<Vec<u8>, SpoolError> {
+    let encoded_max =
+        DEFAULT_MAX_FRAME_BYTES as usize + (DEFAULT_MAX_FRAME_BYTES as usize / 255) + 32;
+    let bytes = read_bounded(path, encoded_max)?;
     let json = match encoding {
-        BatchEncoding::Json => bytes,
+        BatchEncoding::Json => {
+            if bytes.len() > DEFAULT_MAX_FRAME_BYTES as usize {
+                return Err(SpoolError::BatchTooLarge {
+                    observed: bytes.len() as u64,
+                    maximum: DEFAULT_MAX_FRAME_BYTES,
+                });
+            }
+            bytes
+        }
         BatchEncoding::Lz4 => {
+            let declared = bytes
+                .get(..4)
+                .and_then(|b| b.try_into().ok())
+                .map(u32::from_le_bytes)
+                .ok_or_else(|| SpoolError::Decompress {
+                    path: path.to_path_buf(),
+                    detail: "missing length prefix".into(),
+                })?;
+            if declared > DEFAULT_MAX_FRAME_BYTES {
+                return Err(SpoolError::BatchTooLarge {
+                    observed: u64::from(declared),
+                    maximum: DEFAULT_MAX_FRAME_BYTES,
+                });
+            }
             lz4_flex::decompress_size_prepended(&bytes).map_err(|error| SpoolError::Decompress {
                 path: path.to_path_buf(),
                 detail: error.to_string(),
             })?
         }
     };
+    Ok(json)
+}
+fn decode_batch_file(path: &Path, encoding: BatchEncoding) -> Result<EventBatch, SpoolError> {
+    let json = decode_batch_json(path, encoding)?;
     let batch: EventBatch =
         serde_json::from_slice(&json).map_err(|source| SpoolError::InvalidBatch {
             path: path.to_path_buf(),
@@ -807,6 +724,22 @@ struct PendingBatch {
 /// Persistent spool failure.
 #[derive(Debug, Error)]
 pub enum SpoolError {
+    /// One event cannot fit the unchanged frame/session byte bound.
+    #[error("event {source_sequence} uses {serialized_bytes} serialized bytes, above {maximum}")]
+    EventTooLarge {
+        /// Sequence of the rejected source event.
+        source_sequence: u64,
+        /// Exact singleton batch bytes after JSON escaping.
+        serialized_bytes: u64,
+        /// Applicable frame/session bound.
+        maximum: u64,
+    },
+    /// An earlier write failed; pending evidence must be retried before new input.
+    #[error("spool writer blocked by retained pending evidence")]
+    WriterBlocked,
+    /// A requested captured byte range could not be proven.
+    #[error("captured evidence recovery failed: {0}")]
+    Evidence(&'static str),
     /// The configured bound cannot hold any data.
     #[error("spool capacity must be greater than zero")]
     InvalidCapacity,
@@ -940,29 +873,61 @@ fn batch_path(directory: &Path, sequence: u64) -> PathBuf {
 }
 
 fn write_atomic(temporary: &Path, destination: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(temporary)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    drop(file);
-    fs::hard_link(temporary, destination)?;
-    let _ = fs::remove_file(temporary);
-    Ok(())
+    let result = (|| {
+        ksight_core::output_budget::charge(temporary, bytes.len() as u64)?;
+        fault("batch_open")?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(temporary)?;
+        file.write_all(&bytes[..bytes.len() / 2])?;
+        fault("batch_short_write")?;
+        file.write_all(&bytes[bytes.len() / 2..])?;
+        fault("batch_file_sync")?;
+        file.sync_all()?;
+        drop(file);
+        fault("batch_publish")?;
+        fs::hard_link(temporary, destination)?;
+        fs::remove_file(temporary)?;
+        fault("batch_directory_sync")?;
+        sync_parent(destination)
+    })();
+    if result.is_err() {
+        ksight_core::output_budget::record_failure(temporary, "spool_output_failed");
+        let _ = fs::remove_file(temporary);
+    }
+    result
 }
 
 fn write_replace(temporary: &Path, destination: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(temporary)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    drop(file);
-    fs::rename(temporary, destination)?;
-    Ok(())
+    let result = (|| {
+        ksight_core::output_budget::charge(temporary, bytes.len() as u64)?;
+        fault("manifest_open")?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(temporary)?;
+        file.write_all(&bytes[..bytes.len() / 2])?;
+        fault("manifest_short_write")?;
+        file.write_all(&bytes[bytes.len() / 2..])?;
+        fault("manifest_file_sync")?;
+        file.sync_all()?;
+        drop(file);
+        fault("manifest_publish")?;
+        fs::rename(temporary, destination)?;
+        fault("manifest_directory_sync")?;
+        sync_parent(destination)
+    })();
+    if result.is_err() {
+        ksight_core::output_budget::record_failure(temporary, "spool_output_failed");
+        let _ = fs::remove_file(temporary);
+    }
+    result
 }
+
+#[cfg(test)]
+#[path = "spool_evidence_tests.rs"]
+mod evidence_tests;
 
 #[cfg(test)]
 mod tests {
@@ -997,6 +962,144 @@ mod tests {
         assert_eq!(reopened.pending().unwrap(), vec![batch(session, 2)]);
         assert!(reopened.used_bytes() < used);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn acknowledgements_preserve_sealed_lifecycle_and_retention_eligibility() {
+        for (state, stop_reason) in [
+            (
+                DurableSessionState::Completed,
+                Some(CaptureStopReason::DurationElapsed),
+            ),
+            (
+                DurableSessionState::Rotated,
+                Some(CaptureStopReason::SessionRotated),
+            ),
+            (DurableSessionState::Interrupted, None),
+            (
+                DurableSessionState::StorageLimited,
+                Some(CaptureStopReason::StorageLimitReached),
+            ),
+        ] {
+            for compress in [false, true] {
+                let root = test_directory();
+                let session = Uuid::new_v4();
+                let mut writer = SessionSpoolWriter::open_with(
+                    &root,
+                    session,
+                    1024 * 1024,
+                    1,
+                    SpoolOptions {
+                        compress,
+                        completion_reserve_bytes: 0,
+                    },
+                )
+                .unwrap();
+                writer.push(&batch(session, 1).events[0]).unwrap();
+                // An ACK handle may be opened before the collector seals the session.
+                let mut spool =
+                    DirectorySpool::open_existing(writer.directory(), 1024 * 1024).unwrap();
+                writer.push(&batch(session, 2).events[0]).unwrap();
+                writer.seal(state, stop_reason).unwrap();
+                let sealed = load_manifest(writer.directory()).unwrap().unwrap();
+                let second_batch_bytes = fs::metadata(batch_path(writer.directory(), 2))
+                    .unwrap()
+                    .len();
+                drop(writer);
+
+                for (through, remaining, next_sequence, used_bytes) in [
+                    (1, 1, Some(2), second_batch_bytes),
+                    (1, 1, Some(2), second_batch_bytes),
+                    (2, 0, None, 0),
+                    (2, 0, None, 0),
+                ] {
+                    spool.acknowledge_through(through).unwrap();
+                    assert_eq!(
+                        load_manifest(spool.directory()).unwrap().unwrap(),
+                        SessionManifest {
+                            first_batch_sequence: next_sequence,
+                            last_batch_sequence: next_sequence,
+                            batch_count: remaining,
+                            event_count: remaining,
+                            used_bytes,
+                            ..sealed.clone()
+                        }
+                    );
+                    assert_eq!(spool.used_bytes(), used_bytes);
+                    assert_eq!(
+                        spool.pending().unwrap().len(),
+                        usize::try_from(remaining).unwrap()
+                    );
+                }
+
+                let retention = crate::retention::SpoolRetention {
+                    root: root.clone(),
+                    max_total_bytes: 0,
+                    keep_completed: 0,
+                };
+                assert_eq!(retention.prune().unwrap(), 0);
+                assert!(!spool.directory().exists());
+                fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn acknowledgements_keep_running_sessions_out_of_retention() {
+        let root = test_directory();
+        let session = Uuid::new_v4();
+        let mut writer = SessionSpoolWriter::open(&root, session, 1024 * 1024, 1).unwrap();
+        writer.push(&batch(session, 1).events[0]).unwrap();
+        let running = load_manifest(writer.directory()).unwrap().unwrap();
+        let mut spool = DirectorySpool::open_existing(writer.directory(), 1024 * 1024).unwrap();
+        spool.acknowledge_through(1).unwrap();
+        assert_eq!(
+            load_manifest(spool.directory()).unwrap().unwrap(),
+            SessionManifest {
+                first_batch_sequence: None,
+                last_batch_sequence: None,
+                batch_count: 0,
+                event_count: 0,
+                used_bytes: 0,
+                ..running
+            }
+        );
+        let retention = crate::retention::SpoolRetention {
+            root: root.clone(),
+            max_total_bytes: 0,
+            keep_completed: 0,
+        };
+        assert_eq!(retention.prune().unwrap(), 0);
+        assert!(spool.directory().is_dir());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn acknowledging_legacy_sessions_synthesizes_remaining_inventory() {
+        let root = test_directory();
+        let session = Uuid::new_v4();
+        let directory = root.join(session.to_string());
+        let mut writer = DirectorySpool::open(&directory, 1024 * 1024).unwrap();
+        writer.append(&batch(session, 1)).unwrap();
+        writer.append(&batch(session, 2)).unwrap();
+        assert!(load_manifest(&directory).unwrap().is_none());
+
+        let mut spool = DirectorySpool::open_existing(&directory, 1024 * 1024).unwrap();
+        for (through, remaining, next_sequence) in
+            [(1, 1, Some(2)), (1, 1, Some(2)), (2, 0, None), (2, 0, None)]
+        {
+            spool.acknowledge_through(through).unwrap();
+            let manifest = load_manifest(&directory).unwrap().unwrap();
+            assert_eq!(manifest.session_id, session);
+            assert_eq!(manifest.state, DurableSessionState::Running);
+            assert_eq!(manifest.stop_reason, None);
+            assert_eq!(manifest.batch_count, remaining);
+            assert_eq!(manifest.event_count, remaining);
+            assert_eq!(manifest.first_batch_sequence, next_sequence);
+            assert_eq!(manifest.last_batch_sequence, next_sequence);
+            assert_eq!(manifest.used_bytes, spool.used_bytes());
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1122,7 +1225,7 @@ mod tests {
         std::env::temp_dir().join(format!("ksight-spool-test-{}", Uuid::new_v4()))
     }
 
-    fn batch(session_id: Uuid, batch_sequence: u64) -> EventBatch {
+    pub(super) fn batch(session_id: Uuid, batch_sequence: u64) -> EventBatch {
         EventBatch {
             session_id,
             batch_sequence,
@@ -1167,5 +1270,23 @@ mod tests {
                 }),
             }],
         }
+    }
+}
+
+#[cfg(test)]
+mod output_budget_tests {
+    use super::*;
+    #[test]
+    fn production_batch_refuses_next_write_and_keeps_sealed_bytes() {
+        let root = std::env::temp_dir().join(format!("spool-budget-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let g = ksight_core::output_budget::Guard::install(vec![root.clone()], 3, 1000).unwrap();
+        write_atomic(&root.join("temp"), &root.join("sealed"), b"abc").unwrap();
+        assert!(write_atomic(&root.join("next-temp"), &root.join("next"), b"x").is_err());
+        assert_eq!(fs::read(root.join("sealed")).unwrap(), b"abc");
+        assert!(g.receipt().partial);
+        assert!(!root.join("next").exists());
+        drop(g);
+        fs::remove_dir_all(root).unwrap();
     }
 }

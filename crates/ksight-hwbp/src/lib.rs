@@ -47,3 +47,21 @@ pub fn close_range(first: i32, last: i32, flags: u32) -> std::io::Result<()> {
         Err(std::io::Error::last_os_error())
     }
 }
+
+pub mod instance_scope;
+#[cfg(any(target_os = "android", target_os = "linux"))]
+mod task_storage;
+
+#[cfg(any(test, target_os = "android", target_os = "linux"))]
+mod metadata_attributes;
+#[cfg(any(test, target_os = "android", target_os = "linux"))]
+mod metadata_io;
+mod metadata_lease;
+mod metadata_object;
+#[cfg(any(target_os = "android", target_os = "linux"))]
+mod metadata_observer;
+pub mod metadata_scope;
+#[cfg(any(target_os = "android", target_os = "linux"))]
+pub use metadata_observer::MetadataObserver;
+
+pub mod perf_drain;

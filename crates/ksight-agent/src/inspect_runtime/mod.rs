@@ -1,5 +1,15 @@
 //! Inspect adapter orchestration. Default-off, auditable, exported-symbol only.
 
+#[cfg(any(test, target_os = "android", target_os = "linux"))]
+mod instance_backend;
+
+#[cfg(any(test, target_os = "android", target_os = "linux"))]
+mod scope_state;
+#[cfg(any(target_os = "android", target_os = "linux"))]
+use scope_state::update_allowlist;
+#[cfg(any(test, target_os = "android", target_os = "linux"))]
+use scope_state::{observe_process_start, ProcStartRead, ProcessEpoch};
+
 use std::{
     collections::{BTreeSet, HashMap},
     fmt::Write as _,
@@ -801,6 +811,10 @@ pub(crate) fn external_plaintext(capture: crate::infosec_probe::BoundaryCapture)
 }
 
 /// Live Inspect session: evaluate, optionally attach, poll, and expire.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "These independently selected flags are part of the existing CLI and evidence schema."
+)]
 pub struct InspectRuntime {
     plans: Vec<InspectPlan>,
     #[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
@@ -863,8 +877,21 @@ pub struct InspectRuntime {
     /// Tid → stream pointers waiting for a getter's return value.
     connkey_pending: HashMap<u32, Vec<u64>>,
     connkey: ksight_core::ConnUserDataBook,
-    #[cfg(any(target_os = "android", target_os = "linux"))]
+    #[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
+    scope_failures: u64,
+    #[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
+    scope_revoked_poll: bool,
+    #[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
+    scope_diagnostics: Vec<String>,
+    #[cfg(any(test, target_os = "android", target_os = "linux"))]
+    process_starts: HashMap<u32, u64>,
+    /// Pids whose starttime changed or whose process exited since the last poll.
+    #[cfg(any(test, target_os = "android", target_os = "linux"))]
+    pending_pid_resets: Vec<u32>,
+    #[cfg(any(test, target_os = "android", target_os = "linux"))]
     scoped_tgids: Vec<u32>,
+    #[cfg(any(test, target_os = "android", target_os = "linux"))]
+    bound_instance_targets: Option<Vec<ksight_hwbp::instance_scope::BoundInstance>>,
     #[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
     delay_notice_emitted: bool,
 }
@@ -1167,6 +1194,121 @@ struct LiveProbe {
 }
 
 impl InspectRuntime {
+    /// Low-level candidate only. No CLI/capture entry selects this until the
+    /// exact metadata issuer, package qualification and target verifier pass.
+    /// The caller owns group-leader pidfds and trusted SAME-task raw identities;
+    /// this constructor is not itself a proof of those prerequisites.
+    #[cfg(any(test, target_os = "android", target_os = "linux"))]
+    ///
+    /// # Errors
+    /// Returns the validation or required operation error; no successful result is fabricated.
+    pub fn prepare_bound_candidate(
+        policy: &InspectPolicy,
+        adapters: &[InspectAdapterKind],
+        object: &Path,
+        targets: Vec<ksight_hwbp::instance_scope::BoundInstance>,
+    ) -> anyhow::Result<Self> {
+        if policy.whole_device || policy.package.as_deref().is_none_or(str::is_empty) {
+            anyhow::bail!("bound candidate requires explicit package policy");
+        }
+        if targets.iter().any(|t| !t.has_metadata_lease()) {
+            anyhow::bail!("candidate targets require sealed physical metadata leases");
+        }
+        if targets.len() > 32
+            || targets
+                .iter()
+                .any(|t| t.identity.tgid == 0 || t.identity.birth_ns == 0)
+        {
+            anyhow::bail!("invalid bound candidate targets");
+        }
+        let mut ids: Vec<_> = targets.iter().map(|t| t.identity.tgid).collect();
+        ids.sort_unstable();
+        if ids.windows(2).any(|w| w[0] == w[1]) {
+            anyhow::bail!("duplicate candidate TGID");
+        }
+        let mut runtime = Self::prepare_all(policy, adapters, object);
+        runtime.bound_instance_targets = Some(targets);
+        Ok(runtime)
+    }
+
+    /// Candidate entry accepting only sealed, unexpired metadata qualifications.
+    /// Does not select or enable strict capture. Enrolled package must match.
+    #[cfg(any(test, target_os = "android", target_os = "linux"))]
+    ///
+    /// # Errors
+    /// Returns the validation or required operation error; no successful result is fabricated.
+    pub fn prepare_qualified_candidate(
+        policy: &InspectPolicy,
+        adapters: &[InspectAdapterKind],
+        object: &Path,
+        targets: Vec<ksight_hwbp::metadata_scope::QualifiedInstance>,
+    ) -> anyhow::Result<Self> {
+        if policy.whole_device || policy.package.as_deref().is_none_or(str::is_empty) {
+            anyhow::bail!("qualified candidate requires explicit package policy");
+        }
+        if targets
+            .iter()
+            .any(|t| Some(t.package()) != policy.package.as_deref())
+        {
+            anyhow::bail!("qualified metadata belongs to a different enrolled package");
+        }
+        let bound = targets
+            .into_iter()
+            .map(ksight_hwbp::metadata_scope::QualifiedInstance::into_bound)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Self::prepare_bound_candidate(policy, adapters, object, bound)
+    }
+
+    /// Fresh physical qualifications for the same enrolled task; no numeric authorization fallback.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn refresh_qualified(
+        &mut self,
+        targets: Vec<ksight_hwbp::metadata_scope::QualifiedInstance>,
+    ) -> anyhow::Result<()> {
+        if self.bound_instance_targets.is_none() {
+            anyhow::bail!("qualified refresh requires the qualified production constructor");
+        }
+        let result = (|| -> anyhow::Result<()> {
+            let package = self
+                .plans
+                .first()
+                .and_then(|p| p.policy.package.as_deref())
+                .ok_or_else(|| anyhow::anyhow!("qualified package policy missing"))?;
+            if targets.iter().any(|t| t.package() != package) {
+                clear_scope_state(self, None);
+                anyhow::bail!("qualified package changed");
+            }
+            let next = targets
+                .into_iter()
+                .map(|t| t.into_bound())
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            for target in &next {
+                target.check_current()?;
+            }
+            if self.bound_instance_targets.as_ref().is_some_and(|old| {
+                !old.is_empty()
+                    && old.iter().map(|t| t.identity).collect::<Vec<_>>()
+                        != next.iter().map(|t| t.identity).collect::<Vec<_>>()
+            }) {
+                clear_scope_state(self, None);
+                anyhow::bail!(
+                    "qualified generation changed; producer must stop, not reuse pending frames"
+                );
+            }
+            for live in &mut self.sessions {
+                live.session.apply_bound_instances(&next)?;
+            }
+            self.tls_pending.drop_all_incomplete();
+            self.scoped_tgids = next.iter().map(|t| t.identity.tgid).collect();
+            self.bound_instance_targets = Some(next);
+            Ok(())
+        })();
+        if let Err(error) = result {
+            clear_scope_state(self, None);
+            return Err(error);
+        }
+        Ok(())
+    }
     /// Evaluate one selected adapter and any registered audited stubs.
     pub fn prepare(
         policy: &InspectPolicy,
@@ -1333,8 +1475,17 @@ impl InspectRuntime {
             binder_dex_cache: crate::binder_dex::ProcessDexAidlCache::default(),
             connkey_pending: HashMap::new(),
             connkey: ksight_core::ConnUserDataBook::default(),
-            #[cfg(any(target_os = "android", target_os = "linux"))]
+            #[cfg(any(test, target_os = "android", target_os = "linux"))]
+            process_starts: HashMap::new(),
+            #[cfg(any(test, target_os = "android", target_os = "linux"))]
+            pending_pid_resets: Vec::new(),
+            #[cfg(any(test, target_os = "android", target_os = "linux"))]
             scoped_tgids: Vec::new(),
+            #[cfg(any(test, target_os = "android", target_os = "linux"))]
+            bound_instance_targets: None,
+            scope_failures: 0,
+            scope_revoked_poll: false,
+            scope_diagnostics: Vec::new(),
             delay_notice_emitted: false,
         }
     }
@@ -1522,14 +1673,61 @@ impl InspectRuntime {
         }
     }
 
+    /// Pids whose process exited or whose starttime changed since the last poll.
+    pub fn take_pid_resets(&mut self) -> Vec<u32> {
+        #[cfg(any(target_os = "android", target_os = "linux"))]
+        {
+            let mut pids = std::mem::take(&mut self.pending_pid_resets);
+            pids.sort_unstable();
+            pids.dedup();
+            pids
+        }
+        #[cfg(not(any(target_os = "android", target_os = "linux")))]
+        {
+            Vec::new()
+        }
+    }
+
     /// Poll authorized hits.
     pub fn poll(&mut self) -> Vec<InspectOutput> {
         if self.expired {
             return Vec::new();
         }
         #[cfg(any(target_os = "android", target_os = "linux"))]
-        refresh_package_tgids(self);
+        {
+            if self
+                .bound_instance_targets
+                .as_ref()
+                .is_some_and(|targets| targets.iter().any(|t| t.check_current().is_err()))
+            {
+                clear_scope_state(self, None);
+                self.scope_revoked_poll = true;
+                self.scope_diagnostics
+                    .push("physical qualification expired/exited; no payload admitted".into());
+                return scope_observations(self);
+            }
+            self.scope_revoked_poll = false;
+            refresh_package_tgids(self);
+        }
         poll_all(self)
+    }
+
+    /// Pending frames and explicitly incomplete calls at a stage boundary.
+    pub fn pending_depth(&self) -> (u64, u64) {
+        (
+            self.tls_pending.frames as u64,
+            self.tls_pending.incomplete as u64,
+        )
+    }
+    /// Elapsed time of this phase, without claiming unread perf tail coverage.
+    pub fn stage_elapsed_ms(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+    /// Close owned probes and revoke every pending payload before a new phase.
+    pub fn revoke_for_stage(&mut self) {
+        self.expired = true;
+        self.tls_pending.drop_all_incomplete();
+        take_attached_sessions(self);
     }
 
     /// Layered counters for loss analysis: (raw drained, decoded, perf lost).
@@ -2547,6 +2745,178 @@ fn note_connkey(runtime: &mut InspectRuntime, retprobe: bool, hit: &ksight_hwbp:
     runtime.connkey.observe(stream, hit.regs[0]);
 }
 
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn cached_process_start(runtime: &mut InspectRuntime, pid: u32) -> u64 {
+    verify_process_read(runtime, pid, read_proc_start(pid))
+}
+
+#[cfg(any(test, target_os = "android", target_os = "linux"))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
+fn verify_process_read(runtime: &mut InspectRuntime, pid: u32, read: ProcStartRead) -> u64 {
+    if runtime.scope_revoked_poll {
+        return 0;
+    }
+    let (next, epoch) = observe_process_start(runtime.process_starts.get(&pid).copied(), read);
+    apply_process_epoch(runtime, pid, next, epoch)
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn refresh_process_epochs(runtime: &mut InspectRuntime) -> Vec<u32> {
+    let pids: Vec<u32> = runtime.process_starts.keys().copied().collect();
+    let mut reset = Vec::new();
+    for pid in pids {
+        let cached = runtime.process_starts.get(&pid).copied();
+        let (next, epoch) = observe_process_start(cached, read_proc_start(pid));
+        if matches!(
+            epoch,
+            ProcessEpoch::Reused { .. } | ProcessEpoch::Exited { .. } | ProcessEpoch::Unverified
+        ) {
+            reset.push(pid);
+        }
+        apply_process_epoch(runtime, pid, next, epoch);
+        if runtime.scope_revoked_poll {
+            break;
+        }
+    }
+    reset
+}
+
+#[cfg(any(test, target_os = "android", target_os = "linux"))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
+fn apply_process_epoch(
+    runtime: &mut InspectRuntime,
+    pid: u32,
+    next: Option<u64>,
+    epoch: ProcessEpoch,
+) -> u64 {
+    match epoch {
+        ProcessEpoch::Reused { .. } | ProcessEpoch::Exited { .. } => {
+            revoke_scope(runtime, Some(pid), "process_instance_changed_or_exited");
+            return 0;
+        }
+        ProcessEpoch::Unverified => {
+            revoke_scope(runtime, Some(pid), "process_instance_unreadable");
+            return 0;
+        }
+        ProcessEpoch::First(_) | ProcessEpoch::Same(_) => {}
+    }
+    if let Some(start) = next {
+        runtime.process_starts.insert(pid, start);
+        start
+    } else {
+        runtime.process_starts.remove(&pid);
+        0
+    }
+}
+
+#[cfg(any(test, target_os = "android", target_os = "linux"))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
+fn revoke_scope(runtime: &mut InspectRuntime, pid: Option<u32>, reason: &str) {
+    clear_scope_state(runtime, pid);
+    runtime.scope_failures = runtime.scope_failures.saturating_add(1);
+    runtime.scope_revoked_poll = true;
+    runtime.scope_diagnostics.push(format!(
+        "scope_fail_closed reason={reason}; owned hooks dropped; pending payload revoked"
+    ));
+    eprintln!("scope_fail_closed reason={reason}; owned hooks dropped; pending payload revoked");
+}
+
+#[cfg(any(test, target_os = "android", target_os = "linux"))]
+fn clear_scope_state(runtime: &mut InspectRuntime, pid: Option<u32>) {
+    // Candidate grants cannot survive any ambiguous scope failure. Keep Some
+    // empty (deny) so a later poll cannot downgrade to numeric authorization.
+    if let Some(targets) = &mut runtime.bound_instance_targets {
+        targets.clear();
+    }
+    // Global sessions share allowlists. Drop owned sessions before forgetting state.
+    take_attached_sessions(runtime);
+    let mut pids: Vec<u32> = runtime.process_starts.keys().copied().collect();
+    if let Some(pid) = pid {
+        if !pids.contains(&pid) {
+            pids.push(pid);
+        }
+    }
+    for pid in pids {
+        forget_pid_state(runtime, pid);
+        runtime.pending_pid_resets.push(pid);
+    }
+    forget_pid_state(runtime, 0);
+    runtime.process_starts.clear();
+    runtime.scoped_tgids.clear();
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    runtime.attach_attempts.clear();
+    runtime.tls_pending.drop_all_incomplete();
+    runtime.connkey_pending.clear();
+    runtime.connkey = ksight_core::ConnUserDataBook::default();
+}
+
+#[cfg(any(test, target_os = "android", target_os = "linux"))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
+fn scope_observations(runtime: &mut InspectRuntime) -> Vec<InspectOutput> {
+    runtime
+        .scope_diagnostics
+        .drain(..)
+        .map(|detail| InspectOutput::Observation {
+            pid: 0,
+            tid: 0,
+            observation: InspectObservation {
+                adapter: "scope_fail_closed".to_owned(),
+                attached: false,
+                hit: false,
+                detail,
+                ..InspectObservation::default()
+            },
+        })
+        .collect()
+}
+
+/// Production final publication guard, also exercised by host failure tests.
+#[cfg(any(test, target_os = "android", target_os = "linux"))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
+fn finish_scope_poll(
+    runtime: &mut InspectRuntime,
+    mut outputs: Vec<InspectOutput>,
+) -> Vec<InspectOutput> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if runtime
+        .bound_instance_targets
+        .as_ref()
+        .is_some_and(|targets| targets.iter().any(|target| target.check_current().is_err()))
+    {
+        revoke_scope(runtime, None, "qualification_invalid_before_publication");
+    }
+    if runtime.scope_revoked_poll {
+        clear_scope_state(runtime, None);
+        outputs.retain(|o| matches!(o, InspectOutput::Observation { .. }));
+    }
+    outputs.extend(scope_observations(runtime));
+    outputs
+}
+
+#[cfg(any(test, target_os = "android", target_os = "linux"))]
+fn forget_pid_state(runtime: &mut InspectRuntime, _pid: u32) {
+    // Conservatively revoke every pending payload; no incomplete call survives
+    // an instance change, even when legacy queues have no instance key.
+    runtime.tls_pending.drop_all_incomplete();
+    runtime.jni_region_pending.clear();
+    runtime.jni_pair = JniPairPending::default();
+    runtime.binder_pending = BinderPending::default();
+    runtime.connkey_pending.clear();
+    runtime.connkey = ksight_core::ConnUserDataBook::default();
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn read_proc_start(pid: u32) -> ProcStartRead {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => match parse_stat_start_ticks(&stat) {
+            Some(ticks) if ticks != 0 => ProcStartRead::Running(ticks),
+            _ => ProcStartRead::Unreadable,
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ProcStartRead::Gone,
+        Err(_) => ProcStartRead::Unreadable,
+    }
+}
+
 fn adapter_probe_programs_for_plan(plan: &InspectPlan) -> &'static [&'static str] {
     // Pointer-returning getters: registers only. The TLS program would copy x1.
     if plan_is_connkey(plan) {
@@ -3005,36 +3375,10 @@ fn tgid_allowlist_transition(
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
 fn sync_live_tgid_allowlist(runtime: &mut InspectRuntime) {
-    let package_scoped = runtime.plans.first().is_some_and(|plan| {
-        !plan.policy.whole_device
-            && plan
-                .policy
-                .package
-                .as_deref()
-                .is_some_and(|name| !name.is_empty())
-    });
-    let scanned = runtime
-        .plans
-        .first()
-        .and_then(|plan| active_tgid_filter(&plan.policy));
-    let Some(next) =
-        tgid_allowlist_transition(&runtime.scoped_tgids, package_scoped, scanned.as_deref())
-    else {
-        return;
-    };
-    if !runtime.sessions.is_empty() {
-        eprintln!(
-            "inspect tgid_filter refresh {} -> {}",
-            join_tgids(&runtime.scoped_tgids),
-            join_tgids(&next)
-        );
-        for live in &mut runtime.sessions {
-            if let Err(error) = live.session.apply_tgid_filter(Some(&next)) {
-                eprintln!("inspect tgid_filter update failed: {error:#}");
-            }
-        }
+    let _ = refresh_process_epochs(runtime);
+    if !runtime.scope_revoked_poll {
+        refresh_tgid_filter(runtime);
     }
-    runtime.scoped_tgids = next;
 }
 
 #[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
@@ -3049,57 +3393,78 @@ fn join_tgids(tgids: &[u32]) -> String {
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
 fn refresh_tgid_filter(runtime: &mut InspectRuntime) {
-    let Some(policy) = runtime.plans.first().map(|plan| &plan.policy) else {
+    if runtime.scope_revoked_poll {
+        return;
+    }
+    let Some(policy) = runtime.plans.first().map(|p| p.policy.clone()) else {
         return;
     };
-    let package_scoped = !policy.whole_device
-        && policy
-            .package
-            .as_deref()
-            .is_some_and(|name| !name.is_empty());
-    let mut next = match active_tgid_filter(policy) {
-        Some(pids) => pids,
-        None if package_scoped => Vec::new(), // deny-all until package PIDs reappear
-        None => return,
-    };
-    // Keep only prior TGIDs that are still alive in /proc. Permanently retaining
-    // dead PIDs after app restart bloated tgid_allow and caused apply_tgid_filter
-    // to detach every uprobe session (decoded=0 until capture restart).
-    for pid in &runtime.scoped_tgids {
-        if next.contains(pid) {
+    if policy.whole_device {
+        return;
+    }
+    let scanned = active_tgid_filter(&policy).unwrap_or_default();
+    let mut next = Vec::new();
+    for pid in scanned {
+        let identity = process_identity(pid, pid, Uuid::nil());
+        if !hit_matches_policy(&policy, &identity) {
             continue;
         }
-        if std::path::Path::new(&format!("/proc/{pid}")).exists() {
-            next.push(*pid);
+        if cached_process_start(runtime, pid) != 0 {
+            next.push(pid);
         }
+        if runtime.scope_revoked_poll {
+            return;
+        }
+    }
+    if let Some(bound) = &runtime.bound_instance_targets {
+        next.retain(|pid| bound.iter().any(|t| t.identity.tgid == *pid));
     }
     next.sort_unstable();
     next.dedup();
-    // Cap allowlist: BPF map overflow + failed apply detaches the whole session.
-    const TGID_ALLOW_CAP: usize = 32;
-    if next.len() > TGID_ALLOW_CAP {
-        // Prefer newest (highest) PIDs — typically the live app processes.
-        next.sort_unstable_by(|a, b| b.cmp(a));
-        next.truncate(TGID_ALLOW_CAP);
-        next.sort_unstable();
+    if next.len() > 32 {
+        revoke_scope(runtime, None, "target_allowlist_capacity");
+        return;
     }
     if next == runtime.scoped_tgids {
         return;
     }
-    let prev = runtime.scoped_tgids.clone();
-    runtime.scoped_tgids.clone_from(&next);
-    eprintln!(
-        "inspect tgid filter refresh prev={} next={}",
-        join_tgids(&prev),
-        join_tgids(&next)
-    );
-    for probe in &mut runtime.sessions {
-        if let Err(error) = probe.session.apply_tgid_filter(Some(&next)) {
-            eprintln!(
-                "inspect tgid filter update failed adapter={}: {error:#}",
-                probe.plan.adapter.as_str()
-            );
-        }
+    if runtime.bound_instance_targets.is_some() && !runtime.sessions.is_empty() {
+        // A membership transition invalidates every consumer/pending generation.
+        // Fresh authorization is required; do not silently reuse handles or
+        // splice records across a per-object transaction.
+        revoke_scope(
+            runtime,
+            None,
+            "bound_membership_changed_requires_fresh_authorization",
+        );
+        return;
+    }
+    let bound_next = match runtime.bound_instance_targets.as_deref() {
+        Some(targets) => match instance_backend::select(targets, Some(&next)) {
+            Ok(targets) => Some(targets),
+            Err(error) => {
+                revoke_scope(runtime, None, &format!("bound_refresh_failed:{error:#}"));
+                return;
+            }
+        },
+        None => None,
+    };
+    let previous = runtime.scoped_tgids.clone();
+    match update_allowlist(
+        &mut runtime.scoped_tgids,
+        &mut runtime.sessions,
+        &next,
+        |probe, keys| match &bound_next {
+            Some(targets) => probe.session.apply_bound_instances(targets),
+            None => probe.session.apply_tgid_filter(Some(keys)),
+        },
+    ) {
+        Ok(()) => eprintln!(
+            "inspect tgid filter committed prev={} next={}",
+            join_tgids(&previous),
+            join_tgids(&next)
+        ),
+        Err(error) => revoke_scope(runtime, None, &format!("allowlist_update_failed:{error:#}")),
     }
 }
 
@@ -3195,6 +3560,9 @@ fn parse_stat_start_ticks(stat: &str) -> Option<u64> {
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
 fn refresh_package_tgids(runtime: &mut InspectRuntime) {
+    if runtime.bound_instance_targets.is_some() {
+        return; // physical qualification owns membership; never discover numeric grants
+    }
     let Some(package) = runtime
         .plans
         .first()
@@ -3250,8 +3618,32 @@ fn start_uprobe_session(
     hit_once: bool,
     pointer_width: u8,
     tgids: Option<&[u32]>,
+    bound: Option<&[ksight_hwbp::instance_scope::BoundInstance]>,
 ) -> anyhow::Result<ksight_hwbp::UprobeSession> {
-    match ksight_hwbp::UprobeSession::start_program(object, program, elf, offset, None, hit_once) {
+    if let Some(targets) = bound {
+        if pointer_width != 8 {
+            anyhow::bail!("bound candidate requires verified ARM64 ABI");
+        }
+        return ksight_hwbp::UprobeSession::start_bound_instances(
+            object,
+            &[program],
+            elf,
+            offset,
+            targets,
+            hit_once,
+            None,
+        );
+    }
+    match ksight_hwbp::UprobeSession::start_configured(
+        object,
+        &[program],
+        elf,
+        offset,
+        None,
+        hit_once,
+        tgids,
+        None,
+    ) {
         Ok(session) => Ok(session),
         Err(error) if pointer_width == 4 && uprobe_attach_unsupported(&error) => {
             let mut last = error;
@@ -3283,13 +3675,25 @@ fn start_uprobe_session(
 #[cfg(any(target_os = "android", target_os = "linux"))]
 fn start_uprobe_entry_return_session(
     object: &Path,
+    programs: &[&str],
     elf: &Path,
     offset: u64,
     hit_once: bool,
     pointer_width: u8,
     tgids: Option<&[u32]>,
+    bound: Option<&[ksight_hwbp::instance_scope::BoundInstance]>,
 ) -> anyhow::Result<ksight_hwbp::UprobeSession> {
-    match ksight_hwbp::UprobeSession::start_entry_return(object, elf, offset, None, hit_once) {
+    if let Some(targets) = bound {
+        if pointer_width != 8 {
+            anyhow::bail!("bound candidate requires verified ARM64 ABI");
+        }
+        return ksight_hwbp::UprobeSession::start_bound_instances(
+            object, programs, elf, offset, targets, hit_once, None,
+        );
+    }
+    match ksight_hwbp::UprobeSession::start_configured(
+        object, programs, elf, offset, None, hit_once, tgids, None,
+    ) {
         Ok(session) => Ok(session),
         Err(error) if pointer_width == 4 && uprobe_attach_unsupported(&error) => {
             let mut last = error;
@@ -3343,6 +3747,17 @@ fn attach_all(runtime: &mut InspectRuntime) -> Vec<InspectObservation> {
     // cmdline match has to be applied here; copying the Vec alone makes
     // refresh_package_tgids treat the allowlist as unchanged.
     sync_live_tgid_allowlist(runtime);
+    if runtime.scope_revoked_poll {
+        out.extend(
+            scope_observations(runtime)
+                .into_iter()
+                .filter_map(|output| match output {
+                    InspectOutput::Observation { observation, .. } => Some(observation),
+                    _ => None,
+                }),
+        );
+        return out;
+    }
     let tgids_attach: Option<Vec<u32>> = if package_scoped {
         Some(runtime.scoped_tgids.clone())
     } else {
@@ -3351,7 +3766,25 @@ fn attach_all(runtime: &mut InspectRuntime) -> Vec<InspectObservation> {
             .first()
             .and_then(|plan| active_tgid_filter(&plan.policy))
     };
+    let bound_attach = match runtime.bound_instance_targets.as_deref() {
+        Some(targets) => match instance_backend::select(targets, tgids_attach.as_deref()) {
+            Ok(targets) => Some(targets),
+            Err(error) => {
+                revoke_scope(runtime, None, &format!("bound_selection_failed:{error:#}"));
+                return out;
+            }
+        },
+        None => None,
+    };
+    if bound_attach.as_ref().is_some_and(Vec::is_empty) {
+        return out; // Explicit empty deny: no hooks or numeric fallback.
+    }
     for plan in plans {
+        if runtime.started.elapsed() >= runtime.max_duration {
+            runtime.expired = true;
+            eprintln!("inspect attach stopped; window elapsed");
+            break;
+        }
         // Kernel uprobe `pid` is a thread id. Attach globally and drop other TGIDs
         // in BPF before perf_output so busy Binder apps are not drowned.
         let Some(elf) = plan.elf_path.as_ref().map(PathBuf::from) else {
@@ -3424,14 +3857,18 @@ fn attach_all(runtime: &mut InspectRuntime) -> Vec<InspectObservation> {
             runtime.attach_attempts.insert(attempt_key, now);
             match start_uprobe_entry_return_session(
                 &plan.uprobe_object,
+                programs,
                 &elf,
                 offset,
                 hit_once,
                 plan.pointer_width,
                 tgids_attach.as_deref(),
+                runtime.bound_instance_targets.as_deref(),
             ) {
                 Ok(mut session) => {
-                    let filter_status = if let Some(tgids) = tgids_attach.as_deref() {
+                    let filter_status = if runtime.bound_instance_targets.is_some() {
+                        String::new()
+                    } else if let Some(tgids) = tgids_attach.as_deref() {
                         match session.apply_tgid_filter(Some(tgids)) {
                             Ok(()) => String::new(),
                             Err(error) => format!(" tgid_filter_error={error:#}"),
@@ -3508,9 +3945,12 @@ fn attach_all(runtime: &mut InspectRuntime) -> Vec<InspectObservation> {
                 hit_once,
                 plan.pointer_width,
                 tgids_attach.as_deref(),
+                runtime.bound_instance_targets.as_deref(),
             ) {
                 Ok(mut session) => {
-                    let filter_status = if let Some(tgids) = tgids_attach.as_deref() {
+                    let filter_status = if runtime.bound_instance_targets.is_some() {
+                        String::new()
+                    } else if let Some(tgids) = tgids_attach.as_deref() {
                         match session.apply_tgid_filter(Some(tgids)) {
                             Ok(()) => String::new(),
                             Err(error) => format!(" tgid_filter_error={error:#}"),
@@ -3555,7 +3995,11 @@ fn attach_all(_runtime: &mut InspectRuntime) -> Vec<InspectObservation> {
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
 fn poll_all(runtime: &mut InspectRuntime) -> Vec<InspectOutput> {
+    let _ = refresh_process_epochs(runtime);
     refresh_tgid_filter(runtime);
+    if runtime.scope_revoked_poll {
+        return finish_scope_poll(runtime, Vec::new());
+    }
     let _ = runtime.tls_pending.drop_stale(PENDING_STALE);
     let mut out = Vec::new();
     let max_payload = usize::try_from(
@@ -3567,15 +4011,32 @@ fn poll_all(runtime: &mut InspectRuntime) -> Vec<InspectOutput> {
     .unwrap_or(256)
     .min(MAX_PAYLOAD_BYTES);
     let mut batch = Vec::new();
+    let mut bound_failure = None;
     for probe in &mut runtime.sessions {
         let before_drained = probe.session.drained_total;
         let before_lost = probe.session.lost_total;
-        let Ok(hits) = probe.session.poll_hits() else {
-            continue;
-        };
+        let polled = probe.session.poll_hits();
         runtime.raw_drained += probe.session.drained_total.saturating_sub(before_drained);
         runtime.perf_lost += probe.session.lost_total.saturating_sub(before_lost);
+        let hits = match polled {
+            Ok(hits) => hits,
+            Err(error) => {
+                if runtime.bound_instance_targets.is_some() {
+                    bound_failure = Some(format!("bound_backend_read_error:{error:#}"));
+                }
+                continue;
+            }
+        };
         for hit in hits {
+            if let Some(targets) = &runtime.bound_instance_targets {
+                if targets.iter().any(|target| target.check_current().is_err())
+                    || !instance_backend::accepts(&hit, targets, probe.session.instance_epoch())
+                {
+                    bound_failure =
+                        Some("bound_consumer_generation_or_identity_mismatch".to_owned());
+                    continue;
+                }
+            }
             let retprobe = if probe.paired_entry_return {
                 hit.snapshot_at_return
             } else {
@@ -3583,6 +4044,10 @@ fn poll_all(runtime: &mut InspectRuntime) -> Vec<InspectOutput> {
             };
             batch.push((probe.plan.clone(), retprobe, hit));
         }
+    }
+    if let Some(error) = bound_failure {
+        revoke_scope(runtime, None, &error);
+        return finish_scope_poll(runtime, Vec::new());
     }
     batch.sort_by_key(|(_, _, hit)| hit.time_ns);
     for (plan, retprobe, hit) in batch {
@@ -3677,7 +4142,7 @@ fn poll_all(runtime: &mut InspectRuntime) -> Vec<InspectOutput> {
             }
         }
     }
-    out
+    finish_scope_poll(runtime, out)
 }
 
 #[cfg(not(any(target_os = "android", target_os = "linux")))]
@@ -5555,6 +6020,10 @@ pub fn record_art_dex_opens(
 
 /// Same as [`record_art_dex_opens`], signalling `ready` after uprobes attach
 /// so dump-package can launch the app without missing the first Open.
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep the admission or lifecycle transaction together for review."
+)]
 pub fn record_art_dex_opens_with_ready(
     package: &str,
     dest_dir: &Path,
@@ -5660,7 +6129,10 @@ pub fn record_art_dex_opens_with_ready(
         "dropped_samples": dropped,
         "entries": hits,
     });
-    let _ = std::fs::write(dest_dir.join("dex-open-order.json"), payload.to_string());
+    let _ = ksight_core::output_budget::write(
+        dest_dir.join("dex-open-order.json"),
+        payload.to_string(),
+    );
     hits.len()
 }
 
@@ -5752,3 +6224,6 @@ fn parse_open_size(path: &str) -> Option<u64> {
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod memory_scope_tests;
