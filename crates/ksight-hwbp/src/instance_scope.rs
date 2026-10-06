@@ -59,6 +59,23 @@ impl BoundInstance {
         }
         Ok(())
     }
+
+    /// Recheck the same pidfd's task mark during and after a read.
+    /// Sampler admission expiry is not an instance change.
+    ///
+    /// # Errors
+    /// Returns when the lease is missing, the task mark changed, or the pidfd is dead.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn recheck_task_mark(&self) -> anyhow::Result<()> {
+        self.metadata_lease
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("physical metadata lease missing"))?
+            .task_mark_matches(self.pidfd.as_fd())?;
+        if !crate::task_storage::alive(self.pidfd.as_fd())? {
+            anyhow::bail!("qualified task exited");
+        }
+        Ok(())
+    }
     ///
     /// # Errors
     /// Returns the validation or required operation error; no successful result is fabricated.
@@ -217,4 +234,3 @@ pub(crate) fn configure(
         bindings,
     })
 }
-

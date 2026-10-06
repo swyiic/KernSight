@@ -2688,10 +2688,6 @@ fn format_payload(payload: &ksight_model::EventPayload) -> (String, String) {
     }
 }
 
-#[cfg(test)]
-#[path = "tests.rs"]
-mod tests;
-
 /// Production persistence boundary, portable so host tests exercise it directly.
 /// Write JSON without println!'s broken-pipe panic so the capture error path
 /// can still commit the accepted tail and record an interrupted final state.

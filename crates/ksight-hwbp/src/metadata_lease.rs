@@ -46,11 +46,20 @@ impl MetadataLease {
     }
     #[cfg(any(target_os = "linux", target_os = "android"))]
     pub(crate) fn check(&self, pidfd: std::os::fd::BorrowedFd<'_>) -> Result<()> {
-        use anyhow::{bail, Context};
-        use std::os::fd::AsRawFd;
+        use anyhow::bail;
         if !self.admission_valid() {
             bail!("metadata lease expired before sampler binding");
         }
+        self.task_mark_matches(pidfd)
+    }
+
+    /// Compare the kernel task mark on this pidfd. The sampler admission
+    /// deadline does not apply: a long read still has to see exec, exit, and
+    /// retarget. Lookup does not mint a replacement grant.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(crate) fn task_mark_matches(&self, pidfd: std::os::fd::BorrowedFd<'_>) -> Result<()> {
+        use anyhow::{bail, Context};
+        use std::os::fd::AsRawFd;
         let key = pidfd.as_raw_fd();
         let mut token = Token { nonce: 0, round: 0 };
         let attr = TaskLookup {

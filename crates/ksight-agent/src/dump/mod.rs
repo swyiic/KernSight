@@ -1050,13 +1050,9 @@ pub fn dump_package_with(
         report.recovered_sm4_key = recovered_key.map(hex_key);
     }
     report.readable_dex = ksight_core::publish_readable_dex(dest).unwrap_or(0);
-    if !(options.collect_memory_windows && !options.code_only) || !(options.collect_keys && !options.code_only)
-    {
-        // Construct the refusal the reader uses. This does not open a process.
-        let _ = live_read_block(LiveReadGate::NotAllowed);
-    }
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
+        let read_cancelled = std::sync::atomic::AtomicBool::new(false);
         let allow_memory = options.collect_memory_windows && !options.code_only && !budget_closed;
         if allow_memory {
             harvest_admitted_anonymous_dex(
@@ -1064,6 +1060,7 @@ pub fn dump_package_with(
                 qualified_backend.as_ref(),
                 options.expected_code_sources.as_deref(),
                 deadline,
+                &read_cancelled,
             );
         }
         let allow_keys = options.collect_keys && !options.code_only && !budget_closed;
@@ -1074,6 +1071,7 @@ pub fn dump_package_with(
                 qualified_backend.as_ref(),
                 options.expected_code_sources.as_deref(),
                 deadline,
+                &read_cancelled,
             );
         }
     }
@@ -2395,8 +2393,9 @@ fn recover_secneo_payload(
     backend: Option<&crate::qualified_code::Backend>,
     sources: Option<&[crate::qualified_code::SourceIdentity]>,
     deadline: Instant,
+    cancelled: &std::sync::atomic::AtomicBool,
 ) {
-    recover_secneo_payload_live(dest, recorded, backend, sources, deadline);
+    recover_secneo_payload_live(dest, recorded, backend, sources, deadline, cancelled);
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -2406,6 +2405,7 @@ fn recover_secneo_payload_live(
     backend: Option<&crate::qualified_code::Backend>,
     sources: Option<&[crate::qualified_code::SourceIdentity]>,
     deadline: Instant,
+    cancelled: &std::sync::atomic::AtomicBool,
 ) {
     let Some((path, spot)) = first_dexdata_file(dest) else {
         return;
@@ -2452,6 +2452,13 @@ fn recover_secneo_payload_live(
         );
         return;
     }
+    let Some(bound) = anchored_bound(&target) else {
+        write_live_note(
+            dest,
+            "dexdata0 payload has no anchored task mark; DexHelper BSS was not read".to_owned(),
+        );
+        return;
+    };
     let Ok(text) = target.maps_text() else {
         return;
     };
@@ -2460,8 +2467,9 @@ fn recover_secneo_payload_live(
     };
     let rows = crate::dexdump::parse_maps(&text);
     let pid = expected.pid;
-    let Some(key) = scan_dexhelper_bss(dest, expected, mem, &rows, &probes, backend, deadline)
-    else {
+    let Some(key) = scan_dexhelper_bss(
+        dest, expected, mem, &rows, &probes, &bound, deadline, cancelled,
+    ) else {
         write_live_note(
             dest,
             format!(
@@ -2571,26 +2579,39 @@ fn decrypt_retained_dexdata(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LiveReadGate {
     Open,
-    NotAllowed,
     Deadline,
     Budget,
     Restarted,
     ExecChanged,
+    Cancelled,
 }
 
 fn live_read_block(gate: LiveReadGate) -> Result<()> {
     match gate {
         LiveReadGate::Open => Ok(()),
-        LiveReadGate::NotAllowed => bail!("collection_not_allowed"),
         LiveReadGate::Deadline => bail!("deadline_reached"),
         LiveReadGate::Budget => bail!("budget_exhausted"),
         LiveReadGate::Restarted => bail!("restarted_instance"),
         LiveReadGate::ExecChanged => bail!("exec_changed"),
+        LiveReadGate::Cancelled => bail!("cancelled"),
     }
 }
 
+/// Bytes already copied are trusted only when the check before the read, between
+/// chunks, and after the read all passed.
+fn trusted_anchored(
+    receipt: &crate::qualified_code::RangeResult,
+    bytes: Vec<u8>,
+) -> Option<Vec<u8>> {
+    if receipt.admission != "qualified_live_copy" {
+        return None;
+    }
+    Some(bytes)
+}
+
 /// One window through `qualified_code::copy_range`. The gate runs before the
-/// first byte and between chunks. A refusal seeks and reads nothing further.
+/// first byte, before every chunk, and once after the last byte. A refusal
+/// does not seek or read any further, and copied bytes stay untrusted.
 fn read_anchored_window<R, W>(
     reader: &mut R,
     writer: &mut W,
@@ -2625,6 +2646,54 @@ fn anchored_source_note(
     })
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn anchored_bound(
+    target: &crate::qualified_code::Target,
+) -> Option<ksight_hwbp::instance_scope::BoundInstance> {
+    target
+        .qualified
+        .try_clone()
+        .ok()
+        .and_then(|instance| instance.into_bound().ok())
+}
+
+/// Parent cancel arrives as an output-budget interrupt (`stop.json`). The
+/// atomic flag is the same refusal for an in-process cancel. Either one,
+/// the parent deadline, budget exhaustion, or a changed task mark runs inside
+/// `copy_range` before the first byte, between chunks, and after the read.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn observe_anchored_read(
+    bound: &ksight_hwbp::instance_scope::BoundInstance,
+    dest: &Path,
+    deadline: Instant,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> LiveReadGate {
+    use std::sync::atomic::Ordering;
+    if cancelled.load(Ordering::SeqCst) {
+        return LiveReadGate::Cancelled;
+    }
+    if let Some(reason) = ksight_core::output_budget::stop_reason(dest) {
+        if reason.contains("cancel") {
+            return LiveReadGate::Cancelled;
+        }
+        if reason.contains("deadline") || reason.contains("time") {
+            return LiveReadGate::Deadline;
+        }
+        return LiveReadGate::Budget;
+    }
+    if Instant::now() >= deadline {
+        return LiveReadGate::Deadline;
+    }
+    if ksight_core::output_budget::should_stop(dest) {
+        return LiveReadGate::Budget;
+    }
+    match bound.recheck_task_mark() {
+        Ok(()) => LiveReadGate::Open,
+        Err(err) if err.to_string().contains("task mark changed") => LiveReadGate::ExecChanged,
+        Err(_) => LiveReadGate::Restarted,
+    }
+}
+
 fn store_anchored_note(dest: &Path, note: &serde_json::Value) -> bool {
     let path = dest.join("runtime").join("anchored-live-reads.json");
     let mut notes = std::fs::read_to_string(&path)
@@ -2644,6 +2713,7 @@ fn harvest_admitted_anonymous_dex(
     backend: Option<&crate::qualified_code::Backend>,
     sources: Option<&[crate::qualified_code::SourceIdentity]>,
     deadline: Instant,
+    cancelled: &std::sync::atomic::AtomicBool,
 ) {
     let (Some(backend), Some(sources)) = (backend, sources) else {
         return;
@@ -2658,13 +2728,16 @@ fn harvest_admitted_anonymous_dex(
         if target.identity() != expected {
             return;
         }
+        let Some(bound) = anchored_bound(&target) else {
+            return;
+        };
         let Ok(text) = target.maps_text() else {
             return;
         };
         let Some(mem) = target.anchored_mem() else {
             return;
         };
-        if !harvest_anonymous_dex(dest, expected, &text, mem, backend, deadline) {
+        if !harvest_anonymous_dex(dest, expected, &text, mem, &bound, deadline, cancelled) {
             return;
         }
     }
@@ -2676,8 +2749,9 @@ fn harvest_anonymous_dex<R>(
     expected: &crate::qualified_code::SourceIdentity,
     maps: &str,
     mem: &mut R,
-    backend: &crate::qualified_code::Backend,
+    bound: &ksight_hwbp::instance_scope::BoundInstance,
     deadline: Instant,
+    cancelled: &std::sync::atomic::AtomicBool,
 ) -> bool
 where
     R: std::io::Read + std::io::Seek,
@@ -2704,43 +2778,17 @@ where
         if want < 0x70 {
             continue;
         }
-        let Ok(current) = backend.qualify(&expected.package, expected.pid, false) else {
-            return false;
-        };
-        if current.identity.exec_id != expected.exec_id {
-            let mut sink = Vec::new();
-            let _ = read_anchored_window(
-                &mut std::io::Cursor::new([]),
-                &mut sink,
-                0,
-                0,
-                || LiveReadGate::ExecChanged,
-            );
-            return false;
-        }
-        if current.identity != *expected {
-            return false;
-        }
-        let Ok(binding) = current.qualified.into_bound() else {
-            return false;
-        };
         let mut bytes = Vec::new();
         let receipt = read_anchored_window(mem, &mut bytes, row.start, want, || {
-            if Instant::now() >= deadline {
-                return LiveReadGate::Deadline;
-            }
-            if ksight_core::output_budget::should_stop(dest) {
-                return LiveReadGate::Budget;
-            }
-            if binding.check_current().is_err() {
-                return LiveReadGate::Restarted;
-            }
-            LiveReadGate::Open
+            observe_anchored_read(bound, dest, deadline, cancelled)
         });
         let note = anchored_source_note(expected, &receipt);
-        if !store_anchored_note(dest, &note) || receipt.admission != "qualified_live_copy" {
+        if !store_anchored_note(dest, &note) {
             return false;
         }
+        let Some(bytes) = trusted_anchored(&receipt, bytes) else {
+            return false;
+        };
         read_total = read_total.saturating_add(receipt.actual_length);
         for (offset, declared) in unpacked_dex_ranges(&bytes, 4_usize.saturating_sub(saved.len())) {
             if saved.len() >= 4 || ksight_core::output_budget::should_stop(dest) {
@@ -2856,8 +2904,9 @@ fn scan_dexhelper_bss<R>(
     mem: &mut R,
     rows: &[crate::dexdump::MapRow],
     probes: &[Vec<u8>],
-    backend: &crate::qualified_code::Backend,
+    bound: &ksight_hwbp::instance_scope::BoundInstance,
     deadline: Instant,
+    cancelled: &std::sync::atomic::AtomicBool,
 ) -> Option<[u8; 16]>
 where
     R: std::io::Read + std::io::Seek,
@@ -2874,33 +2923,16 @@ where
         if len < 16 || read_total.saturating_add(len) > TOTAL_CAP {
             continue;
         }
-        let Ok(current) = backend.qualify(&expected.package, expected.pid, false) else {
-            return None;
-        };
-        if current.identity != *expected {
-            return None;
-        }
-        let Ok(binding) = current.qualified.into_bound() else {
-            return None;
-        };
         let mut bytes = Vec::new();
         let receipt = read_anchored_window(mem, &mut bytes, row.start, len, || {
-            if Instant::now() >= deadline {
-                return LiveReadGate::Deadline;
-            }
-            if ksight_core::output_budget::should_stop(dest) {
-                return LiveReadGate::Budget;
-            }
-            if binding.check_current().is_err() {
-                return LiveReadGate::Restarted;
-            }
-            LiveReadGate::Open
+            observe_anchored_read(bound, dest, deadline, cancelled)
         });
-        if !store_anchored_note(dest, &anchored_source_note(expected, &receipt))
-            || receipt.admission != "qualified_live_copy"
-        {
+        if !store_anchored_note(dest, &anchored_source_note(expected, &receipt)) {
             return None;
         }
+        let Some(bytes) = trusted_anchored(&receipt, bytes) else {
+            return None;
+        };
         read_total = read_total.saturating_add(receipt.actual_length);
         if let Some(key) = ksight_core::scan_sm4_haystack(&bytes, probes, 8, 2_000_000) {
             return Some(key);
@@ -2909,8 +2941,9 @@ where
             &AnchoredProbe {
                 dest,
                 expected,
-                backend,
+                bound,
                 deadline,
+                cancelled,
             },
             mem,
             rows,
@@ -2927,8 +2960,9 @@ where
 struct AnchoredProbe<'a> {
     dest: &'a Path,
     expected: &'a crate::qualified_code::SourceIdentity,
-    backend: &'a crate::qualified_code::Backend,
+    bound: &'a ksight_hwbp::instance_scope::BoundInstance,
     deadline: Instant,
+    cancelled: &'a std::sync::atomic::AtomicBool,
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -2968,36 +3002,16 @@ where
         seen.push(ptr);
         let at = ptr.saturating_sub(128 * 1024).max(row.start);
         let want = row.end.saturating_sub(at).min(256 * 1024);
-        let Ok(current) = probe
-            .backend
-            .qualify(&probe.expected.package, probe.expected.pid, false)
-        else {
-            return None;
-        };
-        if current.identity != *probe.expected {
-            return None;
-        }
-        let Ok(binding) = current.qualified.into_bound() else {
-            return None;
-        };
         let mut window = Vec::new();
         let receipt = read_anchored_window(mem, &mut window, at, want, || {
-            if Instant::now() >= probe.deadline {
-                return LiveReadGate::Deadline;
-            }
-            if ksight_core::output_budget::should_stop(probe.dest) {
-                return LiveReadGate::Budget;
-            }
-            if binding.check_current().is_err() {
-                return LiveReadGate::Restarted;
-            }
-            LiveReadGate::Open
+            observe_anchored_read(probe.bound, probe.dest, probe.deadline, probe.cancelled)
         });
-        if !store_anchored_note(probe.dest, &anchored_source_note(probe.expected, &receipt))
-            || receipt.admission != "qualified_live_copy"
-        {
+        if !store_anchored_note(probe.dest, &anchored_source_note(probe.expected, &receipt)) {
             return None;
         }
+        let Some(window) = trusted_anchored(&receipt, window) else {
+            return None;
+        };
         if let Some(key) = ksight_core::scan_sm4_haystack(&window, probes, 8, 2_000_000) {
             return Some(key);
         }
@@ -4032,4 +4046,126 @@ fn package_cmdline(pid: u32) -> String {
                 .unwrap_or_default()
                 .into_owned()
         })
+}
+
+#[cfg(test)]
+mod anchored_read_stops {
+    use super::{read_anchored_window, trusted_anchored, LiveReadGate};
+    use std::io::{self, Read, Seek, SeekFrom, Write};
+
+    struct CountRead {
+        data: Vec<u8>,
+        pos: usize,
+        reads: usize,
+    }
+
+    impl Read for CountRead {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.reads += 1;
+            let count = buf.len().min(self.data.len().saturating_sub(self.pos));
+            buf[..count].copy_from_slice(&self.data[self.pos..self.pos + count]);
+            self.pos += count;
+            Ok(count)
+        }
+    }
+
+    impl Seek for CountRead {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            let next = match pos {
+                SeekFrom::Start(at) => at,
+                SeekFrom::Current(delta) => {
+                    u64::try_from(i64::try_from(self.pos).unwrap_or(0).saturating_add(delta))
+                        .unwrap_or(0)
+                }
+                SeekFrom::End(delta) => u64::try_from(
+                    i64::try_from(self.data.len())
+                        .unwrap_or(0)
+                        .saturating_add(delta),
+                )
+                .unwrap_or(0),
+            };
+            self.pos = usize::try_from(next).unwrap_or(self.data.len());
+            Ok(next)
+        }
+    }
+
+    struct CountWrite {
+        writes: usize,
+        buf: Vec<u8>,
+    }
+
+    impl Write for CountWrite {
+        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            self.buf.extend_from_slice(data);
+            Ok(data.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn run(len: u64, fail_after: usize, gate: LiveReadGate) -> (usize, usize, bool, u64, String) {
+        let mut seen = 0_usize;
+        let mut reader = CountRead {
+            data: vec![0x11; usize::try_from(len).unwrap_or(0)],
+            pos: 0,
+            reads: 0,
+        };
+        let mut writer = CountWrite {
+            writes: 0,
+            buf: Vec::new(),
+        };
+        let receipt = read_anchored_window(&mut reader, &mut writer, 0, len, || {
+            seen += 1;
+            if seen > fail_after {
+                gate
+            } else {
+                LiveReadGate::Open
+            }
+        });
+        let trusted = trusted_anchored(&receipt, writer.buf).is_some();
+        (
+            reader.reads,
+            writer.writes,
+            trusted,
+            receipt.actual_length,
+            receipt.admission,
+        )
+    }
+
+    #[test]
+    fn during_read_exec_restart_budget_and_cancel_stop_the_reader() {
+        for gate in [
+            LiveReadGate::ExecChanged,
+            LiveReadGate::Restarted,
+            LiveReadGate::Budget,
+            LiveReadGate::Cancelled,
+        ] {
+            let (reads, writes, trusted, actual, admission) = run(200_000, 2, gate);
+            assert_eq!(reads, 1, "{gate:?} kept reading");
+            assert_eq!(writes, 1, "{gate:?} kept writing");
+            assert!(!trusted, "{gate:?} accepted the partial buffer");
+            assert_ne!(admission, "qualified_live_copy");
+            assert!(actual < 200_000, "{gate:?} consumed the whole request");
+        }
+        let (reads, writes, trusted, actual, admission) =
+            run(200_000, usize::MAX, LiveReadGate::Open);
+        assert_eq!(reads, 4);
+        assert_eq!(writes, 4);
+        assert!(trusted);
+        assert_eq!(actual, 200_000);
+        assert_eq!(admission, "qualified_live_copy");
+    }
+
+    #[test]
+    fn after_read_exec_change_drops_the_completed_buffer() {
+        let (reads, writes, trusted, actual, admission) = run(65_536, 2, LiveReadGate::ExecChanged);
+        assert_eq!(reads, 1);
+        assert_eq!(writes, 1);
+        assert_eq!(actual, 65_536);
+        assert!(!trusted);
+        assert_ne!(admission, "qualified_live_copy");
+    }
 }
