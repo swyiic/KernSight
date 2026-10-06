@@ -66,9 +66,12 @@ fn observed_error_status_and_complete_body_remain_observed() {
 #[test]
 fn partial_content_length_retains_declared_size_and_actual_body() {
     let mut assembler = StreamReassembler::default();
-    assert!(assembler
-        .push(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\npart")
-        .is_empty());
+    assert_eq!(
+        assembler
+            .push(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\npart")
+            .len(),
+        0
+    );
     let message = assembler.seal_flush().remove(0);
     assert_eq!(message.status, Some(200));
     assert_eq!(message.body, b"part");
@@ -378,9 +381,12 @@ fn post_headers_and_body_round_trip_to_burp_absolute_form() {
 #[test]
 fn splits_headers_then_body_across_ssl_writes() {
     let mut stream = StreamReassembler::default();
-    assert!(stream
-        .push(b"POST /pay HTTP/1.1\r\nHost: pay.example\r\nContent-Length: 4\r\n\r\n")
-        .is_empty());
+    assert_eq!(
+        stream
+            .push(b"POST /pay HTTP/1.1\r\nHost: pay.example\r\nContent-Length: 4\r\n\r\n")
+            .len(),
+        0
+    );
     let messages = stream.push(b"ABCD");
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].path, "/pay");
@@ -628,8 +634,9 @@ fn via_spanner_token_is_not_used_as_synthetic_host() {
     );
     assert_eq!(messages.len(), 1);
     let synth = messages[0].synthetic_request_for_response();
-    assert!(
-        synth.host.is_empty(),
+    assert_eq!(
+        synth.host.len(),
+        0,
         "Via spanner token must not become host: {}",
         synth.host
     );
@@ -730,8 +737,9 @@ fn http1_locks_after_binary_preamble_within_resync_window() {
 fn chunked_terminal_plus_garbage_resyncs_to_next_response() {
     let mut stream = StreamReassembler::default();
     let first = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n";
-    assert!(
-        stream.push(first).is_empty(),
+    assert_eq!(
+        stream.push(first).len(),
+        0,
         "incomplete chunked should wait"
     );
     let mut second = b"0\r\n\r\n".to_vec();
@@ -758,9 +766,12 @@ fn get_without_host_parses_so_sni_can_fill_later() {
 #[test]
 fn flush_does_not_emit_post_headers_before_body() {
     let mut stream = StreamReassembler::default();
-    assert!(stream
-        .push(b"POST /pay HTTP/1.1\r\nHost: pay.example\r\nContent-Length: 4\r\n\r\n")
-        .is_empty());
+    assert_eq!(
+        stream
+            .push(b"POST /pay HTTP/1.1\r\nHost: pay.example\r\nContent-Length: 4\r\n\r\n")
+            .len(),
+        0
+    );
     assert_eq!(stream.flush().len(), 0);
     let messages = stream.push(b"ABCD");
     assert_eq!(messages.len(), 1);
@@ -847,21 +858,24 @@ fn http2_multi_push_preface_headers_data_reconstructs_request() {
     assert_eq!(stream.push(&preface[..10]).len(), 0);
     assert!(stream.push(&preface[10..]).is_empty() || stream.protocol() == "http2");
     let mid = headers.len() / 2;
-    assert!(
-        stream.push(&headers[..mid]).is_empty(),
+    assert_eq!(
+        stream.push(&headers[..mid]).len(),
+        0,
         "partial HEADERS must wait"
     );
     let after_headers = stream.push(&headers[mid..]);
-    assert!(
-        after_headers.is_empty(),
+    assert_eq!(
+        after_headers.len(),
+        0,
         "HEADERS without END_STREAM stays open: {after_headers:?}"
     );
     let mut messages = stream.push(&data_frame);
     if messages.is_empty() {
         messages = stream.soft_flush();
     }
-    assert!(
-        !messages.is_empty(),
+    assert_ne!(
+        messages.len(),
+        0,
         "multi-push H2 must yield >=1 MirroredMessage"
     );
     assert!(messages[0].is_request);
@@ -898,18 +912,25 @@ fn flush_unknown_late_promotes_http1_response() {
 fn seal_flush_salvages_incomplete_http1_headers() {
     let mut stream = StreamReassembler::default();
     // No terminating CRLFCRLF — bare flush leaves this stranded.
-    assert!(stream
-        .push(b"HTTP/1.1 203 Non-Authoritative\r\nContent-Length: 4\r\n")
-        .is_empty());
-    assert!(
-        stream.flush().is_empty(),
+    assert_eq!(
+        stream
+            .push(b"HTTP/1.1 203 Non-Authoritative\r\nContent-Length: 4\r\n")
+            .len(),
+        0
+    );
+    assert_eq!(
+        stream.flush().len(),
+        0,
         "hard flush must not invent CRLFCRLF"
     );
     // Re-push equivalent leftover via fresh assembler for seal path.
     let mut stream = StreamReassembler::default();
-    assert!(stream
-        .push(b"HTTP/1.1 203 Non-Authoritative\r\nContent-Length: 4\r\n")
-        .is_empty());
+    assert_eq!(
+        stream
+            .push(b"HTTP/1.1 203 Non-Authoritative\r\nContent-Length: 4\r\n")
+            .len(),
+        0
+    );
     let messages = stream.seal_flush();
     assert_eq!(messages.len(), 1, "{messages:?}");
     assert_eq!(messages[0].status, Some(203));
@@ -923,8 +944,9 @@ fn soft_flush_emits_headers_only_incomplete_content_length() {
     // emit so pairing can attach orig=status before grace sweeps the request.
     let messages =
         stream.push(b"HTTP/1.1 202 Accepted\r\nHost: api.example\r\nContent-Length: 12\r\n\r\n");
-    assert!(
-        messages.is_empty(),
+    assert_eq!(
+        messages.len(),
+        0,
         "must wait for body or soft_flush: {messages:?}"
     );
     let messages = stream.soft_flush();
@@ -937,8 +959,9 @@ fn soft_flush_emits_headers_only_incomplete_content_length() {
 fn response_without_content_length_waits_until_soft_flush() {
     let mut stream = StreamReassembler::default();
     let head = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nhello";
-    assert!(
-        stream.push(head).is_empty(),
+    assert_eq!(
+        stream.push(head).len(),
+        0,
         "until-close body must not commit mid-stream"
     );
     let messages = stream.soft_flush();
@@ -954,7 +977,7 @@ fn status_204_and_304_ignore_content_length_body() {
     let messages = stream.push(raw);
     assert_eq!(messages.len(), 1, "{messages:?}");
     assert_eq!(messages[0].status, Some(204));
-    assert!(messages[0].body.is_empty(), "204 must have empty body");
+    assert_eq!(messages[0].body.len(), 0, "204 must have empty body");
 }
 
 #[test]
@@ -1011,10 +1034,7 @@ fn soft_flush_emits_bare_version_headers_only() {
     let mut stream = StreamReassembler::default();
     let messages =
         stream.push(b"1.1 202 Accepted\r\nHost: api.example\r\nContent-Length: 12\r\n\r\n");
-    assert!(
-        messages.is_empty(),
-        "wait for body/soft_flush: {messages:?}"
-    );
+    assert_eq!(messages.len(), 0, "wait for body/soft_flush: {messages:?}");
     let messages = stream.soft_flush();
     assert_eq!(messages.len(), 1, "{messages:?}");
     assert_eq!(messages[0].status, Some(202));
@@ -1170,7 +1190,7 @@ fn chunked_partial_under_8k_waits_for_terminal_or_flush() {
     let mut stream = StreamReassembler::default();
     let mut msg = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n64\r\n".to_vec();
     msg.extend(std::iter::repeat_n(b'x', 100));
-    assert!(stream.push(&msg).is_empty(), "incomplete chunked must wait");
+    assert_eq!(stream.push(&msg).len(), 0, "incomplete chunked must wait");
     assert_eq!(stream.push(b"more").len(), 0);
     let messages = stream.flush();
     assert_eq!(messages.len(), 1);
@@ -1196,8 +1216,9 @@ fn chunked_over_8kib_waits_for_terminal() {
     let mut raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
     raw.extend_from_slice(b"4000\r\n"); // 16384-byte chunk
     raw.extend(std::iter::repeat_n(b'A', 9000));
-    assert!(
-        stream.push(&raw).is_empty(),
+    assert_eq!(
+        stream.push(&raw).len(),
+        0,
         "incomplete chunked must not emit at ~9KiB"
     );
     let mut rest = vec![b'B'; 16384 - 9000];
@@ -1232,7 +1253,7 @@ fn http2_mirrored_message_carries_stream_id() {
     if messages.is_empty() {
         messages = stream.soft_flush();
     }
-    assert!(!messages.is_empty(), "{messages:?}");
+    assert_ne!(messages.len(), 0, "{messages:?}");
     assert_eq!(messages[0].stream_id, Some(7));
     let absolute = messages[0].to_proxy_absolute();
     let wire = String::from_utf8_lossy(&absolute);
@@ -1346,8 +1367,9 @@ fn h2_incomplete_large_data_seal_salvages_remainder() {
         1,
     ]);
     wire.extend(std::iter::repeat_n(b'y', 60 * 1024));
-    assert!(
-        stream.push(&wire).is_empty(),
+    assert_eq!(
+        stream.push(&wire).len(),
+        0,
         "incomplete DATA must stay buffered"
     );
     assert!(

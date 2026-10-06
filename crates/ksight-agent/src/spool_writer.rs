@@ -336,7 +336,7 @@ impl SessionSpoolWriter {
                 // A compressible singleton can fit below the conservative bound.
                 // Only at this boundary, measure its actual encoded bytes before
                 // acceptance and force an immediate flush; no growing trial batches.
-                debug_assert!(self.events.is_empty());
+                debug_assert_eq!(self.events.len(), 0);
                 let mut event_json = Vec::with_capacity(usize::try_from(size).map_err(|_| SpoolError::CapacityOverflow)?);
                 serde_json::to_writer(&mut event_json, event)?;
                 let prefix = batch_prefix(self.session_id, self.next_batch_sequence);

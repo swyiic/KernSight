@@ -192,7 +192,7 @@ mod tests {
         .into_iter();
         let r = drain_reads(|| reads.next().unwrap(), |t| *t);
         assert_eq!(r.raw_samples, 1);
-        assert!(r.records.is_empty());
+        assert_eq!(r.records.len(), 0);
         assert_eq!(r.lost_only_reads, 0);
         assert_eq!(r.notifications[0].notification_monotonic_ns, None);
     }

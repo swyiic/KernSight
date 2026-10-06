@@ -406,7 +406,7 @@ mod tests {
                 &bad.into_iter().map(target).collect::<Vec<_>>()
             )
             .is_err());
-            assert!(maps.calls.is_empty());
+            assert_eq!(maps.calls.len(), 0);
         }
         let mut maps = Maps::default();
         let exhausted = ScopeState {
@@ -414,7 +414,7 @@ mod tests {
             ..ScopeState::default()
         };
         assert!(configure(&mut maps, &exhausted, &[target(identity(123))]).is_err());
-        assert!(maps.calls.is_empty());
+        assert_eq!(maps.calls.len(), 0);
     }
     #[test]
     fn instance_committed_handles_are_owned_after_caller_closes_and_reuses_fds() {
@@ -456,7 +456,7 @@ mod tests {
             configure(&mut maps, &ScopeState::default(), &[target(identity(123))]).unwrap();
         let state = configure(&mut maps, &previous, &[]).unwrap();
         assert_eq!(state.epoch, 2);
-        assert!(maps.rows.is_empty());
+        assert_eq!(maps.rows.len(), 0);
         assert!(!maps.admits(identity(123)));
         assert!(!state.accepts(&InstanceStamp {
             identity: identity(123),

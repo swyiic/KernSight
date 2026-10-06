@@ -160,7 +160,7 @@ mod tests {
     #[test]
     fn exact_capabilities_remain_sequential() {
         let s = parse_stages("l0:15,l1:90,linker:15").unwrap();
-        assert!(s[0].adapters().is_empty());
+        assert_eq!(s[0].adapters().len(), 0);
         assert_eq!(
             s[1].adapters(),
             vec![

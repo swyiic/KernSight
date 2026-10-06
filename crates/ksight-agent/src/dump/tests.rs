@@ -103,8 +103,8 @@ fn recatalog_accepts_legacy_dump_reports() {
     assert_eq!(report.package, "com.example.app");
     assert_eq!(report.packer_regions, 32);
     assert_eq!(report.asset_files, 0);
-    assert!(report.artifacts.is_empty());
-    assert!(report.schema_version.is_empty());
+    assert_eq!(report.artifacts.len(), 0);
+    assert_eq!(report.schema_version.len(), 0);
     assert!(!report.observation_env.hide_debug_requested);
     assert!(!report.observation_env.denylist_applied);
 }
@@ -136,7 +136,7 @@ fn catalog_parses_nul_http_response_without_fake_path() {
     assert_eq!(calls[0].origin, "heap");
     assert_eq!(calls[0].process_id, 4321);
     assert_eq!(calls[0].status, Some(200));
-    assert!(calls[0].path.is_empty());
+    assert_eq!(calls[0].path.len(), 0);
     assert_eq!(calls[0].content_type.as_deref(), Some("image/jpeg"));
     let _ = std::fs::remove_dir_all(dir);
 }

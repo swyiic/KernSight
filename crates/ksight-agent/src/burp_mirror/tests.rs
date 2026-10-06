@@ -106,7 +106,7 @@ fn echoed_ack_without_queue_consumption_is_rejected_and_cleaned() {
     )
     .unwrap_err();
     assert!(error.contains("playback_not_consumed"));
-    assert!(queue.lock().unwrap().entries.is_empty());
+    assert_eq!(queue.lock().unwrap().entries.len(), 0);
     server.join().unwrap();
 }
 
@@ -161,7 +161,7 @@ fn playback_receipt_checks_id_body_framing_and_large_responses() {
         );
         server.join().unwrap();
         assert_eq!(result.is_ok(), mode == "valid_large", "{mode}: {result:?}");
-        assert!(queue.lock().unwrap().entries.is_empty());
+        assert_eq!(queue.lock().unwrap().entries.len(), 0);
     }
 }
 
@@ -316,8 +316,9 @@ fn absolute_timeout_keeps_absolute_wire_no_ksight_rewrite() {
     drop(mirror);
     let _ = server.join();
     let captured = wires.lock().unwrap().clone();
-    assert!(
-        !captured.is_empty(),
+    assert_ne!(
+        captured.len(),
+        0,
         "expected absolute wire attempt, got {}",
         captured.len()
     );
@@ -1317,7 +1318,7 @@ fn delayed_ssl_read_pairs_within_pairing_grace() {
     // Playback listener should have served the paired 201, not unpaired 204.
     // Absolute form may win; either way request must not have been flushed alone
     // before the delayed response arrived.
-    assert!(!text.is_empty());
+    assert_ne!(text.len(), 0);
 }
 
 #[test]
@@ -1804,8 +1805,9 @@ fn peek_without_read_promotes_after_idle() {
         peek.seen_at = Instant::now() - Duration::from_secs(5);
     }
     mirror.promote_stale_peeks();
-    assert!(
-        mirror.pending_peeks.is_empty(),
+    assert_eq!(
+        mirror.pending_peeks.len(),
+        0,
         "stale peek should promote/clear"
     );
     assert!(mirror.recv_fragments >= 1, "promoted peek feeds recv");
@@ -1832,7 +1834,7 @@ fn peek_aged_past_match_window_still_suppressed_by_read() {
         "read must suppress peek even after PEEK_MATCH_WINDOW"
     );
     assert!(mirror.recv_fragments >= 1);
-    assert!(mirror.promoted_peeks.is_empty());
+    assert_eq!(mirror.promoted_peeks.len(), 0);
 }
 
 #[test]
@@ -1849,7 +1851,7 @@ fn peek_promoted_then_matching_read_does_not_double() {
         peek.seen_at = Instant::now() - Duration::from_secs(5);
     }
     mirror.promote_stale_peeks();
-    assert!(mirror.pending_peeks.is_empty());
+    assert_eq!(mirror.pending_peeks.len(), 0);
     let after_promote = mirror.recv_fragments;
     assert!(after_promote >= 1, "promoted peek feeds recv");
     assert_eq!(mirror.promoted_peeks.len(), 1);
@@ -1858,7 +1860,7 @@ fn peek_promoted_then_matching_read_does_not_double() {
         mirror.recv_fragments, after_promote,
         "matching read after promote must not re-inject"
     );
-    assert!(mirror.promoted_peeks.is_empty());
+    assert_eq!(mirror.promoted_peeks.len(), 0);
 }
 
 fn gate_request(body: &[u8]) -> ksight_core::MirroredMessage {
@@ -2003,8 +2005,9 @@ fn connection_host_comes_only_from_the_bound_stream() {
     request.host.clear();
     request.path = "/mgw.htm".into();
     book.fill(&mut request, 7, 11);
-    assert!(
-        request.host.is_empty(),
+    assert_eq!(
+        request.host.len(),
+        0,
         "unobserved /mgw.htm must stay hostless, got {}",
         request.host
     );
@@ -2015,17 +2018,14 @@ fn connection_host_comes_only_from_the_bound_stream() {
     let mut other = gate_request(b"{}");
     other.host.clear();
     book.fill(&mut other, 7, 99);
-    assert!(
-        other.host.is_empty(),
+    assert_eq!(
+        other.host.len(),
+        0,
         "another stream inherited {}",
         other.host
     );
     book.fill_seal(&mut other, 7, 99);
-    assert!(
-        other.host.is_empty(),
-        "seal invented a host: {}",
-        other.host
-    );
+    assert_eq!(other.host.len(), 0, "seal invented a host: {}", other.host);
 
     let mut kept = gate_request(b"{}");
     kept.host = "api.example.test".into();

@@ -2453,7 +2453,7 @@ mod tests {
         let unnamed = "6e5de00000-6e60c00000 ---p 00000000 00:00 0 ";
         let (_, _, perms, path) = parse_map_line(unnamed).expect("unnamed");
         assert_eq!(perms, "---p");
-        assert!(path.is_empty());
+        assert_eq!(path.len(), 0);
     }
 
     #[test]

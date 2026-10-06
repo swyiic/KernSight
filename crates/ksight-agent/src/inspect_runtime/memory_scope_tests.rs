@@ -41,7 +41,7 @@ fn reuse_exit_and_unreadable_identity_drop_pending_payload_and_preserve_deny() {
         );
         assert_eq!(verify_process_read(&mut runtime, 7, observation), 0);
         assert_eq!(runtime.pending_depth(), (0, 1));
-        assert!(runtime.bound_instance_targets.as_ref().unwrap().is_empty());
+        assert_eq!(runtime.bound_instance_targets.as_ref().unwrap().len(), 0);
         let outputs = finish_scope_poll(
             &mut runtime,
             vec![InspectOutput::Plaintext {

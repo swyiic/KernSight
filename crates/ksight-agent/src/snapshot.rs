@@ -657,7 +657,7 @@ mod tests {
             ),
         ];
         let planned = plan_ranges(&maps, None, 32 * 1024 * 1024);
-        assert!(!planned.is_empty());
+        assert_ne!(planned.len(), 0);
         assert_eq!(planned[0].start, 0x2000);
         assert!(planned[0].stitched);
         assert_eq!(
@@ -733,7 +733,7 @@ mod tests {
             row(0x2000, 0x3000, "rw-p", ""),
         ];
         let planned = plan_ranges(&maps, None, 32 * 1024 * 1024);
-        assert!(planned.is_empty());
+        assert_eq!(planned.len(), 0);
         let (skipped, omitted) = unselected_ranges(&maps, None, &planned);
         assert_eq!(omitted, 0);
         assert!(skipped.iter().any(|row| row.reason == "not_harvestable"));

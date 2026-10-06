@@ -1736,7 +1736,7 @@ mod tests {
             "/custom/uprobe.o",
         ])
         .unwrap();
-        assert!(request.capture_layout_assets().unwrap().is_empty());
+        assert_eq!(request.capture_layout_assets().unwrap().len(), 0);
         let mut request = minimal_request(&[]).unwrap();
         request.inspect.package = Some("com.other.app".to_owned());
         assert!(request.auxiliary_plan().is_err());
@@ -1950,7 +1950,7 @@ mod tests {
             panic!()
         };
         let req = plan_capture(*args).unwrap();
-        assert!(req.inspect_stages.is_empty());
+        assert_eq!(req.inspect_stages.len(), 0);
         assert_eq!(req.inspect_adapters.len(), 3);
         let Command::Capture(args) = Args::try_parse_from([
             "ksightd",
@@ -1974,7 +1974,7 @@ mod tests {
         };
         let req = plan_capture(*args).unwrap();
         assert!(!req.inspect.enabled);
-        assert!(req.inspect_stages.is_empty());
+        assert_eq!(req.inspect_stages.len(), 0);
     }
 }
 

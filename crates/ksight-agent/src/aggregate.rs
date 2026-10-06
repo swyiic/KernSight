@@ -149,7 +149,7 @@ mod tests {
 
         let mut exit = event(42, 42, 100, ProcessLifecycleKind::Exit, SensorKind::Process);
         tracker.correlate(&mut exit);
-        assert!(tracker.is_empty());
+        assert_eq!(tracker.len(), 0);
 
         let mut after_exit = event(42, 42, 0, ProcessLifecycleKind::Exec, SensorKind::File);
         tracker.correlate(&mut after_exit);

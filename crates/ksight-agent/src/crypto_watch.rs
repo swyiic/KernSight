@@ -1260,7 +1260,7 @@ mod tests {
     fn needle_bytes_are_nonempty_and_unique() {
         let mut seen = BTreeSet::new();
         for needle in NEEDLES {
-            assert!(!needle.bytes.is_empty());
+            assert_ne!(needle.bytes.len(), 0);
             assert!(
                 seen.insert(needle.bytes),
                 "duplicate needle {}",

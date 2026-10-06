@@ -68,7 +68,7 @@ mod tests {
     #[test]
     fn empty_scope_denies_all_and_clears_old_keys() {
         let mut maps = Fake::default();
-        assert!(configure(&mut maps, &[7], Some(&[])).unwrap().is_empty());
+        assert_eq!(configure(&mut maps, &[7], Some(&[])).unwrap().len(), 0);
         assert_eq!(maps.calls, ["gate:2", "remove:7", "gate:1"]);
     }
     #[test]
@@ -94,7 +94,7 @@ mod tests {
         for keys in [vec![0], (1..=129).collect()] {
             let mut maps = Fake::default();
             assert!(configure(&mut maps, &[], Some(&keys)).is_err());
-            assert!(maps.calls.is_empty());
+            assert_eq!(maps.calls.len(), 0);
         }
     }
     #[test]

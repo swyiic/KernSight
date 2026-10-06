@@ -58,8 +58,8 @@ mod tests {
     fn bound_selection_never_grants_discovered_numeric_pid_or_unscoped_mode() {
         let targets = [target()];
         assert!(select(&targets, None).is_err());
-        assert!(select(&targets, Some(&[])).unwrap().is_empty());
-        assert!(select(&targets, Some(&[8])).unwrap().is_empty());
+        assert_eq!(select(&targets, Some(&[])).unwrap().len(), 0);
+        assert_eq!(select(&targets, Some(&[8])).unwrap().len(), 0);
         let next = select(&targets, Some(&[7, 8])).unwrap();
         assert_eq!(next.len(), 1);
         assert_eq!(next[0].identity, targets[0].identity);
@@ -83,9 +83,9 @@ mod tests {
         runtime.scoped_tgids = vec![7];
         runtime.process_starts.insert(7, 123);
         clear_scope_state(&mut runtime, Some(7));
-        assert!(runtime.bound_instance_targets.as_ref().unwrap().is_empty());
-        assert!(runtime.scoped_tgids.is_empty());
-        assert!(runtime.process_starts.is_empty());
+        assert_eq!(runtime.bound_instance_targets.as_ref().unwrap().len(), 0);
+        assert_eq!(runtime.scoped_tgids.len(), 0);
+        assert_eq!(runtime.process_starts.len(), 0);
     }
     #[test]
     fn qualified_candidate_requires_package_and_empty_scope_stays_denied() {
@@ -115,7 +115,7 @@ mod tests {
         )
         .is_err());
         let runtime = prepare(&policy).unwrap();
-        assert!(runtime.bound_instance_targets.as_ref().unwrap().is_empty());
+        assert_eq!(runtime.bound_instance_targets.as_ref().unwrap().len(), 0);
         assert!(ksight_core::capture_scope::require_strict_mirror_backend().is_err());
     }
     #[test]

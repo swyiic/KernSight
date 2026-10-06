@@ -443,7 +443,7 @@ fn disk_gate_uses_actual_encoded_bytes_and_keeps_completion_reserve() {
         Err(SpoolError::CapacityExceeded { .. })
     ));
     assert_eq!(spool.used_bytes(), 0);
-    assert!(spool.pending().unwrap().is_empty());
+    assert_eq!(spool.pending().unwrap().len(), 0);
 }
 
 fn opaque_bytes(n: usize) -> Vec<u8> {

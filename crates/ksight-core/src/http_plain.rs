@@ -1102,8 +1102,9 @@ mod tests {
         let parsed = parse_http_plain_bytes(&bytes, "text").expect("http");
         assert_eq!(parsed.kind, "http1_response");
         assert_eq!(parsed.status, Some(200));
-        assert!(
-            parsed.path.is_empty(),
+        assert_eq!(
+            parsed.path.len(),
+            0,
             "responses have no URL path: {:?}",
             parsed.path
         );

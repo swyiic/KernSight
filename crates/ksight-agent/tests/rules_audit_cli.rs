@@ -19,7 +19,7 @@ fn explicit_table_reports_configuration_not_runtime_support() {
     assert_eq!(json["source"], table.display().to_string());
     assert_eq!(json["report"]["valid"], true);
     let rows = json["report"]["rules"].as_array().unwrap();
-    assert!(!rows.is_empty());
+    assert_ne!(rows.len(), 0);
     assert!(rows
         .iter()
         .all(|row| row["runtimeVerification"] == "not_assessed"));
@@ -38,5 +38,5 @@ fn explicitly_missing_table_does_not_fall_back_to_embedded() {
         .unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("cannot read rules"));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout.len(), 0);
 }

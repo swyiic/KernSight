@@ -27,7 +27,7 @@ fn binder_follow_on_stages_keep_the_originating_process_scope() {
         &binder(BinderTransactionStage::Received, 42),
         &mut tracked,
     ));
-    assert!(tracked.is_empty());
+    assert_eq!(tracked.len(), 0);
     assert!(!binder_event_matches_scope(
         false,
         &binder(BinderTransactionStage::Received, 43),

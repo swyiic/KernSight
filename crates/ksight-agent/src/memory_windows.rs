@@ -338,8 +338,8 @@ mod tests {
             )))
             .is_err()
         );
-        assert!(seen.is_empty());
-        assert!(records(&dir).is_empty());
+        assert_eq!(seen.len(), 0);
+        assert_eq!(records(&dir).len(), 0);
         assert!(super::save(&dir, window(), &mut seen).unwrap());
         assert!(!super::save(&dir, window(), &mut BTreeSet::new()).unwrap());
         fs::remove_dir_all(dir).unwrap();
@@ -426,7 +426,7 @@ mod tests {
         )))
         .unwrap();
         assert!(save!(&dir, 1, &r.evidence, 0, raw.len(), raw, selected, &mut seen).is_err());
-        assert!(seen.is_empty());
+        assert_eq!(seen.len(), 0);
         let records: Vec<Value> = fs::read_dir(&dir)
             .unwrap()
             .filter_map(|e| {

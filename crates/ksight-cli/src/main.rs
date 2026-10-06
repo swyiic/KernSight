@@ -725,7 +725,7 @@ mod tests {
         let flag = format_mirror_http_flag(Some("127.0.0.1:8080"));
         assert_eq!(flag, " --mirror-http 127.0.0.1:8080");
         assert!(!flag.contains("mirror-burp"));
-        assert!(format_mirror_http_flag(None).is_empty());
+        assert_eq!(format_mirror_http_flag(None).len(), 0);
     }
 
     #[test]

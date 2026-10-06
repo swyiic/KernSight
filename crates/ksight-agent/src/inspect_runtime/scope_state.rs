@@ -134,6 +134,6 @@ mod tests {
         })
         .unwrap();
         assert_eq!(writes, [Vec::<u32>::new()]);
-        assert!(cache.is_empty());
+        assert_eq!(cache.len(), 0);
     }
 }

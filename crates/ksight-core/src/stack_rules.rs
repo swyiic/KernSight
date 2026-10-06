@@ -1031,7 +1031,7 @@ mod tests {
     #[test]
     fn embedded_table_parses_and_classifies() {
         let rules = load();
-        assert!(!rules.stacks.is_empty(), "embedded table must ship stacks");
+        assert_ne!(rules.stacks.len(), 0, "embedded table must ship stacks");
         let conscrypt = stack_for_path("/apex/com.android.conscrypt/lib64/libssl.so", None, None)
             .expect("conscrypt classified");
         assert_eq!(conscrypt.id, "conscrypt_system");
@@ -1441,8 +1441,9 @@ mod tests {
         assert_eq!(rules.schema_version, SCHEMA_VERSION);
         assert_ne!(rules.stacks.len(), 0);
         for stack in &rules.stacks {
-            assert!(
-                !stack.version.kind.trim().is_empty(),
+            assert_ne!(
+                stack.version.kind.trim().len(),
+                0,
                 "stack {} missing version.kind",
                 stack.id
             );
@@ -1455,14 +1456,16 @@ mod tests {
             );
             // Placeholder rows may keep an empty product; everything else must label.
             if stack.id != "quic_generic" {
-                assert!(
-                    !stack.version.product.trim().is_empty(),
+                assert_ne!(
+                    stack.version.product.trim().len(),
+                    0,
                     "stack {} missing version.product",
                     stack.id
                 );
             }
-            assert!(
-                !stack.version.upgrade_note.trim().is_empty(),
+            assert_ne!(
+                stack.version.upgrade_note.trim().len(),
+                0,
                 "stack {} missing version.upgrade_note",
                 stack.id
             );
@@ -1591,17 +1594,21 @@ mod tests {
                 "{banned} must not enter tls_symbol_names"
             );
         }
-        assert!(
-            enabled_plaintext_probes().is_empty(),
+        assert_eq!(
+            enabled_plaintext_probes().len(),
+            0,
             "no enabled plaintext_probes until an ELF-pinned row exists"
         );
         // No JSON pins today — probe_specs_for_path stays empty without inventing rows.
-        assert!(probe_specs_for_path(
-            "/apex/com.android.tethering/lib64/stable_cronet_libssl.so",
-            Some(456_088),
-            Some("0dceef1315310b5520aa046f7119d879"),
-        )
-        .is_empty());
+        assert_eq!(
+            probe_specs_for_path(
+                "/apex/com.android.tethering/lib64/stable_cronet_libssl.so",
+                Some(456_088),
+                Some("0dceef1315310b5520aa046f7119d879"),
+            )
+            .len(),
+            0
+        );
 
         let cronet = stack_for_path(
             "/apex/com.android.tethering/lib64/stable_cronet_libssl.so",

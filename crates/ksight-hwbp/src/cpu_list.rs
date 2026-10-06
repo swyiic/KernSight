@@ -63,6 +63,6 @@ mod tests {
         assert_eq!(parse_cpu_list("0-7\n"), (0..=7).collect::<Vec<_>>());
         assert_eq!(parse_cpu_list("0-3,6-7"), vec![0, 1, 2, 3, 6, 7]);
         assert_eq!(parse_cpu_list("0,2,4"), vec![0, 2, 4]);
-        assert!(parse_cpu_list("").is_empty());
+        assert_eq!(parse_cpu_list("").len(), 0);
     }
 }

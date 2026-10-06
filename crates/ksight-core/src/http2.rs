@@ -1369,8 +1369,9 @@ mod tests {
         let mut assembler = Http2Assembler::default();
         let mid = 9_usize;
         let first_rows = assembler.push(&frame1[..mid]);
-        assert!(
-            first_rows.is_empty(),
+        assert_eq!(
+            first_rows.len(),
+            0,
             "incomplete HEADERS must wait: {first_rows:?}"
         );
         let first_rows = assembler.push(&frame1[mid..]);
