@@ -1313,4 +1313,3 @@ fn read_i64(bytes: &[u8], offset: usize) -> i64 {
             .expect("fixed event record"),
     )
 }
-

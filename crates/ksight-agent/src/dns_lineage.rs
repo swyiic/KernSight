@@ -66,4 +66,3 @@ fn stamp_connect(
         connect.resolved_name = Some(name.clone());
     }
 }
-

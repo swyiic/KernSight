@@ -37,4 +37,3 @@ pub(super) fn accepts(
         _ => false,
     }
 }
-

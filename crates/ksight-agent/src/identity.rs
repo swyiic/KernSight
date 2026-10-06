@@ -189,4 +189,3 @@ fn command_line_package(command: &str) -> Option<String> {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_'));
     valid.then(|| package.to_owned())
 }
-

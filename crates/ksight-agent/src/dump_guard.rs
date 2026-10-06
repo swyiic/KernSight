@@ -175,4 +175,3 @@ pub fn cmdline_dump_rank(package: &str, cmdline: &str) -> u8 {
         2
     }
 }
-

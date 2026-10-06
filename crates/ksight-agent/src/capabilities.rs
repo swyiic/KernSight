@@ -191,4 +191,3 @@ fn effective_uid() -> Option<u32> {
     let line = status.lines().find(|line| line.starts_with("Uid:"))?;
     line.split_whitespace().nth(2)?.parse().ok()
 }
-

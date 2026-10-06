@@ -1123,4 +1123,3 @@ fn label_for_pid(processes: &[ProcessActivity], pid: u32) -> String {
         .find(|process| process.process_ids.contains(&pid))
         .map_or_else(|| format!("pid:{pid}"), |process| process.label.clone())
 }
-

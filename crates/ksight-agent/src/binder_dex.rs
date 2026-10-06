@@ -980,4 +980,3 @@ fn merge_tables(into: &mut ProcessAidlTables, extra: ProcessAidlTables) {
         into.entry(iface).or_default().extend(methods);
     }
 }
-

@@ -231,4 +231,3 @@ pub fn classify_native_frameworks(artifacts: &[DumpArtifact]) -> Vec<NativeFrame
 fn parse_rules() -> Option<NativeRuleDocument> {
     serde_json::from_str(RULES_JSON).ok()
 }
-

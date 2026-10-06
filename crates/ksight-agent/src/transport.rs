@@ -117,4 +117,3 @@ impl<Reader: Read, Writer: Write> Transport for SplitFramedTransport<Reader, Wri
         Ok(())
     }
 }
-

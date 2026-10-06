@@ -33,4 +33,3 @@ pub fn require_code_collection_backend() -> Result<(), &'static str> {
     }
     Ok(()) // Platform prerequisite only. Agent separately loads/verifies the physical backend.
 }
-

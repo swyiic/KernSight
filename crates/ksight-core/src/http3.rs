@@ -571,4 +571,3 @@ pub fn explain_http3_stream(bytes: &[u8], outbound: bool) -> Http3Explanation {
 pub fn parse_http3_stream(bytes: &[u8], outbound: bool) -> Vec<MirroredMessage> {
     explain_http3_stream(bytes, outbound).messages
 }
-

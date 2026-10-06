@@ -1246,4 +1246,3 @@ fn find_tshark() -> Option<std::path::PathBuf> {
     }
     None
 }
-

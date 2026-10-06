@@ -1427,4 +1427,3 @@ fn read_regs(_pid: i32) -> Result<Regs, String> {
 fn write_regs(_pid: i32, _regs: &Regs) -> Result<(), String> {
     Err("aarch64 only".into())
 }
-

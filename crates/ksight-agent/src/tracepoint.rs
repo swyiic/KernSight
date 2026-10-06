@@ -110,4 +110,3 @@ fn parse_fields(format: &str) -> BTreeMap<String, (u32, u32)> {
     }
     fields
 }
-

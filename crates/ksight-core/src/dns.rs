@@ -117,4 +117,3 @@ fn read_name(payload: &[u8], offset: &mut usize) -> Option<String> {
     let name = labels.join(".");
     (!name.is_empty()).then_some(name)
 }
-

@@ -342,4 +342,3 @@ fn message_name(message: &Message) -> &'static str {
         Message::AgentStatus(_) => "agent_status",
     }
 }
-

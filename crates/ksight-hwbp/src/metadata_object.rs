@@ -142,4 +142,3 @@ pub(crate) fn parse(bytes: &[u8], target_bytes: &[u8]) -> Result<MetadataObject>
         changed_instructions,
     })
 }
-

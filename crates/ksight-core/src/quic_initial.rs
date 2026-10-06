@@ -1056,4 +1056,3 @@ fn parse_client_hello_from_stream(stream: &[u8]) -> Option<crate::handshake::Han
     }
     parse_client_hello_body(&stream[..4 + length])
 }
-

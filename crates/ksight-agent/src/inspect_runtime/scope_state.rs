@@ -56,4 +56,3 @@ pub(super) fn update_allowlist<T, E>(
     *current = next.to_vec();
     Ok(())
 }
-

@@ -412,4 +412,3 @@ fn decode_add_imm64(insn: u32) -> Option<(usize, usize, u64)> {
     };
     Some((rd, rn, imm))
 }
-

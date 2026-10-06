@@ -53,4 +53,3 @@ pub(crate) fn online_cpu_ids() -> Vec<u32> {
         .clamp(1, 128);
     (0..n).collect()
 }
-

@@ -67,4 +67,3 @@ pub(super) fn take_pending_for_response(
     }
     Some(request)
 }
-

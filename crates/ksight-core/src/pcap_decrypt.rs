@@ -793,4 +793,3 @@ fn walk_tls_records(stream: &[u8], dir: &mut DirectionDecryptor, candidates: &[V
         offset = end;
     }
 }
-

@@ -623,4 +623,3 @@ fn cap_unselected(mut skipped: Vec<SnapshotSkipped>) -> (Vec<SnapshotSkipped>, u
     skipped.truncate(MAX_UNSELECTED);
     (skipped, omitted)
 }
-

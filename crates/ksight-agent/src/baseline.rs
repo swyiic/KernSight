@@ -332,4 +332,3 @@ fn now_ns() -> u64 {
         })
         .unwrap_or(0)
 }
-

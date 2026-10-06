@@ -51,4 +51,3 @@ pub fn classify_critical_form(
     }
     None
 }
-

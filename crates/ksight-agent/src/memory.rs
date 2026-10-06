@@ -48,4 +48,3 @@ fn mapped_path(maps: &str, address: u64) -> Option<String> {
         Some(path.to_owned())
     })
 }
-

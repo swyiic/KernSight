@@ -238,4 +238,3 @@ fn socket_peer_accept(accept: &SocketAccept) -> String {
         },
     )
 }
-

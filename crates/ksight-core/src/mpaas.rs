@@ -210,4 +210,3 @@ pub fn parse_mpaas_response(bytes: &[u8]) -> Option<MirroredMessage> {
         stream_id: None,
     })
 }
-

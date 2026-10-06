@@ -36,4 +36,3 @@ pub(crate) fn configure(
     maps.gate(1)?;
     Ok(keys)
 }
-

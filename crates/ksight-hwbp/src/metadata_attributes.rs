@@ -30,4 +30,3 @@ pub(crate) fn map_diagnostic(arg: &bpf_attr__bindgen_ty_1) -> String {
         .collect();
     format!("command=0 attr_size={} type={} key_size={} value_size={} max_entries={} flags={} btf_fd={} btf_key_type_id={} btf_value_type_id={} map_name={} name_nul_terminated={}", std::mem::size_of::<aya_obj::generated::bpf_attr>(), arg.map_type, arg.key_size, arg.value_size, arg.max_entries, arg.map_flags, arg.btf_fd, arg.btf_key_type_id, arg.btf_value_type_id, name, arg.map_name.contains(&0))
 }
-

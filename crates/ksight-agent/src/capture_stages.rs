@@ -157,4 +157,3 @@ pub fn confirm_instance(
         )
     }
 }
-

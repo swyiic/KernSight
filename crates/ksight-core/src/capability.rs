@@ -155,4 +155,3 @@ const fn keypoint(
         enabled_by_default: false,
     }
 }
-

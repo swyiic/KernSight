@@ -1219,4 +1219,3 @@ fn now_unix_ms() -> u64 {
 fn json_str(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_owned())
 }
-

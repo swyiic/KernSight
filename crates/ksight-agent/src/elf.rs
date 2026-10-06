@@ -587,4 +587,3 @@ pub fn plausible_elf_file(path: &str) -> bool {
             && magic == [0x7f, b'E', b'L', b'F']
     })
 }
-

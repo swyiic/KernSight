@@ -1471,4 +1471,3 @@ fn collect_apks(dir: &Path, out: &mut Vec<PathBuf>, depth: u32) -> std::io::Resu
     }
     Ok(())
 }
-

@@ -47,4 +47,3 @@ pub(crate) fn reject_unsafe_entries(entries: &mut Vec<KeylogEntry>) -> usize {
     });
     before - entries.len()
 }
-

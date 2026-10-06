@@ -688,4 +688,3 @@ fn boundary_sample_score(bytes: &[u8]) -> u32 {
         0
     }
 }
-

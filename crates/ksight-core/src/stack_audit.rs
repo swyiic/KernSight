@@ -125,4 +125,3 @@ pub fn audit_stack_rules_json(input: &str) -> Result<StackRulesAudit, String> {
         ],
     })
 }
-

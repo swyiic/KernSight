@@ -339,4 +339,3 @@ pub(crate) fn process_start_ticks(pid: u32) -> Option<u64> {
     let after_comm = stat.rsplit_once(')')?.1;
     after_comm.split_whitespace().nth(19)?.parse().ok()
 }
-

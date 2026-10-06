@@ -1206,4 +1206,3 @@ pub(crate) fn decode_huffman(src: &[u8]) -> Option<Vec<u8>> {
     }
     Some(out)
 }
-

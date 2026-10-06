@@ -129,4 +129,3 @@ impl SensorCounters {
         self.counts.get(&sensor).copied().unwrap_or_default()
     }
 }
-

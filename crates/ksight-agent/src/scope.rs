@@ -43,4 +43,3 @@ fn process_name_matches(command: &str, package: &str) -> bool {
             .strip_prefix(package)
             .is_some_and(|suffix| suffix.starts_with(':'))
 }
-

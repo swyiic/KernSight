@@ -782,4 +782,3 @@ pub enum ServiceConfigError {
     #[error("failed to signal collector: {0}")]
     Signal(String),
 }
-

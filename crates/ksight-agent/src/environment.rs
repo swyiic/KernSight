@@ -110,4 +110,3 @@ fn effective_uid() -> Option<u32> {
         .parse()
         .ok()
 }
-

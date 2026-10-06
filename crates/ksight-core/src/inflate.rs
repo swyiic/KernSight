@@ -124,4 +124,3 @@ fn hex_nibble(byte: u8) -> Option<u8> {
         _ => None,
     }
 }
-

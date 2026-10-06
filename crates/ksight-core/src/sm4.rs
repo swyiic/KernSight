@@ -155,4 +155,3 @@ pub fn encrypt_ecb(key: &[u8; 16], data: &[u8]) -> Vec<u8> {
     }
     out
 }
-

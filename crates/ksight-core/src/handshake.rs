@@ -271,4 +271,3 @@ fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
     let slice = bytes.get(offset..offset + 2)?;
     Some(u16::from_be_bytes([slice[0], slice[1]]))
 }
-

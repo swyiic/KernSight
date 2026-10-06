@@ -969,4 +969,3 @@ fn script_command(
     command.arg(script);
     command
 }
-

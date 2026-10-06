@@ -897,4 +897,3 @@ pub fn is_third_party_host(host: &str) -> bool {
     let lower = host.to_ascii_lowercase();
     THIRD_PARTY_HOST.iter().any(|needle| lower.contains(needle))
 }
-

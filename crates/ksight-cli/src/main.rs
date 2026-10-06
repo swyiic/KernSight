@@ -676,4 +676,3 @@ fn run_capture(serial: Option<&str>, mut options: CaptureOptions) -> Result<()> 
     }
     Ok(())
 }
-

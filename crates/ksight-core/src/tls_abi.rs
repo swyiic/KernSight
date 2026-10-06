@@ -482,4 +482,3 @@ impl TlsDirection {
         }
     }
 }
-

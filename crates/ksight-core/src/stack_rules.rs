@@ -980,4 +980,3 @@ pub fn boundary_rule_for_symbol(
     }
     None
 }
-

@@ -693,4 +693,3 @@ pub fn hashed_file(path: &str, sha256: String, size: u64, kind: ArtifactKind) ->
         provenance: ArtifactProvenance::Original,
     }
 }
-

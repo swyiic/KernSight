@@ -2262,4 +2262,3 @@ pub fn fragment_bytes(preview: &str, preview_encoding: &str, content_class: &str
     }
     preview.replace('\0', "\n").into_bytes()
 }
-

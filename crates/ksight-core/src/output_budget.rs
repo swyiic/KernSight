@@ -366,4 +366,3 @@ pub fn should_stop(path: &Path) -> bool {
     }
     false
 }
-

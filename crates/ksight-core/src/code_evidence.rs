@@ -124,4 +124,3 @@ pub(crate) fn retain(
     )?;
     result.map(|_| ())
 }
-

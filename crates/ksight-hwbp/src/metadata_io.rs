@@ -94,4 +94,3 @@ pub(crate) fn issue(
         (Err(e), Ok(())) | (Ok(_), Err(e)) => Err(e),
     }
 }
-

@@ -122,4 +122,3 @@ impl EvidenceStore {
         Ok(final_path)
     }
 }
-
