@@ -905,26 +905,16 @@ fn print_dump_report(
     Ok(())
 }
 
-fn validate_mirror_profile(
-    all: bool,
-    network_io: bool,
-    memory_all: bool,
-    binder: bool,
-    sched: bool,
-    inspect_jni: bool,
-    inspect_linker: bool,
-    inspect_all_apps: bool,
-    inspect_adapter: bool,
-) -> Result<()> {
-    if all
-        || network_io
-        || memory_all
-        || binder
-        || sched
-        || inspect_jni
-        || inspect_linker
-        || inspect_all_apps
-        || inspect_adapter
+fn validate_mirror_profile(args: &CaptureArgs) -> Result<()> {
+    if args.all
+        || args.network_io
+        || args.memory_all
+        || args.binder
+        || args.sched
+        || args.inspect_jni
+        || args.inspect_linker
+        || args.inspect_all_apps
+        || args.inspect_adapter.is_some()
     {
         bail!("--mirror-http uses the minimal profile (--package + --network + --inspect-tls); retry without --all/--network-io/--memory-all/--binder/--sched/--inspect-jni/--inspect-linker/--inspect-all-apps/--inspect-adapter");
     }
@@ -1067,17 +1057,7 @@ fn plan_capture(mut args: CaptureArgs) -> Result<CaptureRequest> {
         if let Err(error) = ksight_core::parse_mirror_endpoint(endpoint) {
             bail!("{error}");
         }
-        validate_mirror_profile(
-            args.all,
-            args.network_io,
-            args.memory_all,
-            args.binder,
-            args.sched,
-            args.inspect_jni,
-            args.inspect_linker,
-            args.inspect_all_apps,
-            args.inspect_adapter.is_some(),
-        )?;
+        validate_mirror_profile(&args)?;
         args.inspect_tls = true;
         args.network = true;
         if args.inspect_max_hits == 0 {

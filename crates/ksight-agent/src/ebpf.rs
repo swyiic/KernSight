@@ -48,7 +48,7 @@ pub struct EbpfSensor {
     /// Known socket descriptors keyed by `(tgid << 32) | fd` (network sensor only).
     socket_fds: Option<HashMap<MapData, u64, u8>>,
     /// Per-CPU kprobe perf events; must outlive the program.
-    _probe_session: Option<ksight_hwbp::KprobeSession>,
+    probe_session: Option<ksight_hwbp::KprobeSession>,
 }
 
 impl std::fmt::Debug for EbpfSensor {
@@ -324,7 +324,7 @@ fn attach_binder_parcel_kprobe(sensor: &mut EbpfSensor) -> Result<()> {
         "binder parcel kprobe attached on {} CPUs (32-bit and 64-bit clients)",
         session.cpu_count()
     );
-    sensor._probe_session = Some(session);
+    sensor.probe_session = Some(session);
     Ok(())
 }
 
@@ -410,7 +410,7 @@ fn load_sensor(
         events,
         dropped,
         socket_fds,
-        _probe_session: None,
+        probe_session: None,
     })
 }
 
@@ -421,7 +421,10 @@ impl EbpfSensor {
             return;
         };
         for (tgid, fd) in entries {
-            let key = (u64::from(*tgid) << 32) | u64::from(*fd as u32);
+            let Ok(fd) = u32::try_from(*fd) else {
+                continue;
+            };
+            let key = (u64::from(*tgid) << 32) | u64::from(fd);
             let _ = map.insert(key, 1, 0);
         }
     }

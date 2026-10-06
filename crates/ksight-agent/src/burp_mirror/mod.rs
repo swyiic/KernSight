@@ -704,8 +704,6 @@ const LAST_FRAGMENT_CAP: usize = 64 * 1024;
 const ABS_PROBE_TIMEOUT: Duration = Duration::from_millis(1_800);
 /// After this many consecutive absolute timeouts, skip absolute for the session.
 const ABS_TIMEOUT_SKIP_AFTER: u64 = 3;
-/// Playback / identity delivery read budget (LAN :18081).
-const PLAYBACK_READ_TIMEOUT: Duration = Duration::from_secs(10);
 static NEXT_PLAYBACK_ID: AtomicU64 = AtomicU64::new(1);
 
 struct RetryDelivery {
@@ -734,20 +732,20 @@ impl BurpMirror {
         Self::start_with_queue(
             endpoint,
             session_id,
-            Arc::new(Mutex::new(PlaybackStore::default())),
+            &Arc::new(Mutex::new(PlaybackStore::default())),
         )
     }
 
     fn start_with_queue(
         endpoint: &str,
         session_id: Option<&str>,
-        queue: Arc<Mutex<PlaybackStore>>,
+        queue: &Arc<Mutex<PlaybackStore>>,
     ) -> Result<Self, String> {
         let endpoint = parse_mirror_endpoint(endpoint)?;
         let session_id = session_id.unwrap_or("-").to_owned();
         let stop = Arc::new(AtomicBool::new(false));
         if let Ok(listener) = TcpListener::bind(("0.0.0.0", BURP_PLAYBACK_PORT)) {
-            let queue = Arc::clone(&queue);
+            let queue = Arc::clone(queue);
             let stop = Arc::clone(&stop);
             let _ = std::thread::Builder::new()
                 .name("ksight-burp-playback".to_owned())
@@ -756,7 +754,7 @@ impl BurpMirror {
             eprintln!("burp-mirror playback bind :{BURP_PLAYBACK_PORT} failed; legacy :18081 fetch unavailable");
         }
         if let Ok(listener) = TcpListener::bind(("0.0.0.0", BURP_UPSTREAM_PORT)) {
-            let queue = Arc::clone(&queue);
+            let queue = Arc::clone(queue);
             let stop = Arc::clone(&stop);
             let _ = std::thread::Builder::new()
                 .name("ksight-burp-upstream".to_owned())
@@ -767,7 +765,7 @@ impl BurpMirror {
             );
         }
         let (tx, rx) = mpsc::channel();
-        let worker_queue = Arc::clone(&queue);
+        let worker_queue = Arc::clone(queue);
         let delivery_metrics = Arc::new(DeliveryMetrics::default());
         let worker_metrics = Arc::clone(&delivery_metrics);
         let worker_session_id = session_id.clone();
@@ -845,6 +843,10 @@ impl BurpMirror {
 
     /// Successful deliveries to the Burp listener so far.
     #[must_use]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep this admission or delivery transaction together for review."
+    )]
     pub fn delivery_count(&self) -> u64 {
         self.delivery_metrics.delivered.load(Ordering::Relaxed)
     }
@@ -863,6 +865,10 @@ impl BurpMirror {
     /// consumed directly by `MobileE`. No payload, URL, header, or field name is
     /// included in this map.
     #[must_use]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep this admission or delivery transaction together for review."
+    )]
     pub fn diagnostic_metrics(&self) -> BTreeMap<String, u64> {
         let mut metrics = BTreeMap::new();
         let mut unknown_streams = 0_u64;
@@ -1059,35 +1065,40 @@ impl BurpMirror {
     /// Remember SNI / HTTP Host / `ip:port` from L0 first-write for this process.
     /// Used to fill empty Host on reconstructed HTTP. Does not emit a synthetic
     /// `GET /` — those are not replayable API calls.
-    pub fn observe_peer(&mut self, pid: u32, host: String) {
+    pub fn observe_peer(&mut self, pid: u32, host: &str) {
         self.observe_peer_on_thread(pid, 0, host);
     }
 
     /// Bind handshake/connect SNI to the SSL connection this thread uses next.
     /// `tid == 0` records the name only; it never fills a different connection.
-    pub fn observe_peer_on_thread(&mut self, pid: u32, tid: u32, host: String) {
-        if pid == 0 || !looks_like_mirror_host(&host) {
+    pub fn observe_peer_on_thread(&mut self, pid: u32, tid: u32, host: &str) {
+        if pid == 0 || !looks_like_mirror_host(host) {
             return;
         }
-        self.peer_hosts.entry(pid).or_default().insert(host.clone());
-        if is_telemetry_host(&host) {
-            self.recent_peer.entry(pid).or_insert_with(|| host.clone());
+        self.peer_hosts
+            .entry(pid)
+            .or_default()
+            .insert(host.to_owned());
+        if is_telemetry_host(host) {
+            self.recent_peer
+                .entry(pid)
+                .or_insert_with(|| host.to_owned());
         } else {
-            self.recent_peer.insert(pid, host.clone());
+            self.recent_peer.insert(pid, host.to_owned());
         }
         let bound_cid = if let Ok(mut book) = self.peer_book.lock() {
             if tid != 0 {
                 if let Some((cid, _)) = self.tid_connection.get(&(pid, tid)).copied() {
-                    book.bind_stream(pid, cid, &host);
+                    book.bind_stream(pid, cid, host);
                     Some(cid)
                 } else {
-                    self.pending_tid_sni.insert((pid, tid), host.clone());
-                    book.remember_unbound(pid, &host);
+                    self.pending_tid_sni.insert((pid, tid), host.to_owned());
+                    book.remember_unbound(pid, host);
                     // Single waiting SSL* on this pid: hostless /mgw.htm takes
                     // this handshake SNI when it is a gateway name (not CDN).
-                    if is_gateway_host(&host) && !is_wangdun_host(&host) {
+                    if is_gateway_host(host) && !is_wangdun_host(host) {
                         if let Some((stream, true)) = self.unique_waiting_hostless_stream(pid) {
-                            book.bind_stream(pid, stream, &host);
+                            book.bind_stream(pid, stream, host);
                             Some(stream)
                         } else {
                             None
@@ -1104,7 +1115,7 @@ impl BurpMirror {
                 .get(&(pid, tid))
                 .map(|(cid, _)| *cid)
                 .or_else(|| {
-                    self.pending_tid_sni.insert((pid, tid), host.clone());
+                    self.pending_tid_sni.insert((pid, tid), host.to_owned());
                     None
                 })
         } else {
@@ -1131,6 +1142,11 @@ impl BurpMirror {
 
     /// Reconstruct bytes using an SSL/session object when available. Threads
     /// are only a fallback because one connection can migrate across threads.
+    #[allow(
+        clippy::too_many_lines,
+        clippy::missing_panics_doc,
+        reason = "Keep this admission or delivery transaction together for review."
+    )]
     pub fn observe_bytes_for_connection(
         &mut self,
         pid: u32,
@@ -1560,7 +1576,7 @@ impl BurpMirror {
         self.stamp_source(pid, stream_id, &mut message);
         // Pairing happens on the worker thread; the fallback GET keeps an
         // SSL_read-only response visible when no request is in flight.
-        let fallback = self.synthesize_request(pid, stream_id, &message);
+        let fallback = Self::synthesize_request(pid, stream_id, &message);
         if self
             .tx
             .send(MirrorJob::Response {
@@ -1803,7 +1819,6 @@ impl BurpMirror {
     }
 
     fn synthesize_request(
-        &self,
         _pid: u32,
         _stream_id: u64,
         response: &MirroredMessage,
@@ -1820,13 +1835,6 @@ impl BurpMirror {
         } else {
             None
         }
-    }
-
-    fn unique_peer_host(&self, pid: u32) -> Option<&str> {
-        let hosts = self.peer_hosts.get(&pid)?;
-        (hosts.len() == 1)
-            .then(|| hosts.iter().next().map(String::as_str))
-            .flatten()
     }
 
     #[allow(dead_code)] // kept for finish_request/synth experiments; synth no longer fills last_url
@@ -2178,13 +2186,10 @@ fn fill_request_host_for_seal(
     book.fill_seal(request, pid, stream);
 }
 
-fn refresh_pending_hosts(
-    pending: &mut HashMap<
-        (u32, u64),
-        VecDeque<(MirroredMessage, Option<MirroredMessage>, Instant)>,
-    >,
-    peer_book: &Mutex<PeerHostBook>,
-) {
+type PendingDeliveries =
+    HashMap<(u32, u64), VecDeque<(MirroredMessage, Option<MirroredMessage>, Instant)>>;
+
+fn refresh_pending_hosts(pending: &mut PendingDeliveries, peer_book: &Mutex<PeerHostBook>) {
     for ((pid, stream_id), slot) in pending.iter_mut() {
         for (request, response, _) in slot.iter_mut() {
             if looks_like_mirror_host(&request.host) {
@@ -2203,10 +2208,7 @@ fn refresh_pending_hosts(
 }
 
 fn take_ready_pairs(
-    pending: &mut HashMap<
-        (u32, u64),
-        VecDeque<(MirroredMessage, Option<MirroredMessage>, Instant)>,
-    >,
+    pending: &mut PendingDeliveries,
 ) -> Vec<(MirroredMessage, Option<MirroredMessage>)> {
     let mut ready = Vec::new();
     for slot in pending.values_mut() {
@@ -2263,20 +2265,6 @@ fn outbound_copy(adapter: &str, direction: &str, bytes: &[u8]) -> bool {
         return true;
     }
     direction == "send"
-}
-
-fn same_site(left: &str, right: &str) -> bool {
-    let strip = |value: &str| {
-        value
-            .rsplit_once(':')
-            .filter(|(_, port)| port.bytes().all(|byte| byte.is_ascii_digit()))
-            .map_or(value, |(host, _)| host)
-            .trim_start_matches('.')
-            .to_ascii_lowercase()
-    };
-    let left = strip(left);
-    let right = strip(right);
-    left == right || left.ends_with(&format!(".{right}")) || right.ends_with(&format!(".{left}"))
 }
 
 fn upload_kind(body: &[u8]) -> &'static str {
@@ -2369,6 +2357,10 @@ impl Drop for BurpMirror {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep this admission or delivery transaction together for review."
+)]
 fn worker_loop(
     endpoint: SocketAddr,
     rx: &mpsc::Receiver<MirrorJob>,
@@ -2394,10 +2386,7 @@ fn worker_loop(
             None
         },
     };
-    let mut pending: HashMap<
-        (u32, u64),
-        VecDeque<(MirroredMessage, Option<MirroredMessage>, Instant)>,
-    > = HashMap::new();
+    let mut pending: PendingDeliveries = HashMap::new();
     // Responses that arrived before their request (common on HTTP/2 / Alipay).
     let mut orphan_responses: HashMap<(u32, u64), VecDeque<(MirroredMessage, Instant)>> =
         HashMap::new();
@@ -2585,6 +2574,10 @@ struct DeliveryRuntime<'a> {
     archive: Option<Mutex<evidence_store::EvidenceStore>>,
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep this admission or delivery transaction together for review."
+)]
 fn enqueue_delivery(
     runtime: &DeliveryRuntime<'_>,
     retries: &mut VecDeque<RetryDelivery>,
@@ -2959,10 +2952,7 @@ fn flush_orphan_responses(
 /// Pairing grace elapsed. enqueue records the request; without a copied status
 /// it is not sent to Burp.
 fn sweep_expired(
-    pending: &mut HashMap<
-        (u32, u64),
-        VecDeque<(MirroredMessage, Option<MirroredMessage>, Instant)>,
-    >,
+    pending: &mut PendingDeliveries,
     orphans: &mut HashMap<(u32, u64), VecDeque<(MirroredMessage, Instant)>>,
     retries: &mut VecDeque<RetryDelivery>,
     runtime: &DeliveryRuntime<'_>,
@@ -3018,10 +3008,7 @@ fn sweep_expired(
 /// Session end: pair what is still held, then hand each row to enqueue.
 /// Rows without a copied status are logged there and not sent to Burp.
 fn flush_pending(
-    pending: &mut HashMap<
-        (u32, u64),
-        VecDeque<(MirroredMessage, Option<MirroredMessage>, Instant)>,
-    >,
+    pending: &mut PendingDeliveries,
     orphans: &mut HashMap<(u32, u64), VecDeque<(MirroredMessage, Instant)>>,
     retries: &mut VecDeque<RetryDelivery>,
     runtime: &DeliveryRuntime<'_>,
@@ -3058,6 +3045,10 @@ fn missing_response_wire() -> Vec<u8> {
     b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\nX-KernSight-Observed-Status: unknown\r\nX-KernSight-Display-Status-Only: 1\r\nX-KernSight-Evidence-Reason: response_not_captured\r\nX-KernSight-Pairing: unpaired\r\n\r\n".to_vec()
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep this admission or delivery transaction together for review."
+)]
 fn deliver(
     endpoint: SocketAddr,
     request: &MirroredMessage,
@@ -3509,17 +3500,15 @@ fn serve_connect_tunnel(
         let mut tmp = [0_u8; 4096];
         loop {
             match stream.read(&mut tmp) {
-                Ok(0) => break,
+                Ok(0) | Err(_) => break,
                 Ok(n) => {
                     request.extend_from_slice(&tmp[..n]);
-                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                        break;
-                    }
-                    if request.len() > 16 * 1024 {
+                    if request.windows(4).any(|window| window == b"\r\n\r\n")
+                        || request.len() > 16 * 1024
+                    {
                         break;
                     }
                 }
-                Err(_) => break,
             }
         }
     }

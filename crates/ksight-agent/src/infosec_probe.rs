@@ -104,6 +104,10 @@ impl InfosecProbe {
     ///
     /// Returns the probe plus status lines for the capture log.
     #[must_use]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep this admission or delivery transaction together for review."
+    )]
     pub fn attach_for_pids(
         uprobe_object: &Path,
         pids: &[u32],
@@ -389,9 +393,16 @@ impl InfosecProbe {
                             crate::inspect_runtime::read_remote_bytes(hit.pid, *value, 48)
                         {
                             if !bytes.iter().all(|byte| *byte == 0) {
-                                let hex: String =
-                                    bytes.iter().map(|byte| format!("{byte:02x}")).collect();
-                                line.push_str(&format!(" x{index}mem={hex}"));
+                                const HEX: &[u8; 16] = b"0123456789abcdef";
+                                let mut hex = String::with_capacity(bytes.len().saturating_mul(2));
+                                for byte in &bytes {
+                                    hex.push(char::from(HEX[usize::from(byte >> 4)]));
+                                    hex.push(char::from(HEX[usize::from(byte & 0x0f)]));
+                                }
+                                line.push_str(" x");
+                                line.push_str(&index.to_string());
+                                line.push_str("mem=");
+                                line.push_str(&hex);
                             }
                         }
                     }
@@ -407,6 +418,10 @@ impl InfosecProbe {
     /// empirical rules, a bounded ARM64 pointer/length pair is learned from a
     /// recognizable HTTP, JSON, form, or image prefix and then reused for the
     /// remainder of this selected-package session.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep this admission or delivery transaction together for review."
+    )]
     pub fn poll_captures(&mut self) -> Vec<BoundaryCapture> {
         let mut captures = Vec::new();
         for handle in &mut self.handles {

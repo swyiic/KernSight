@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     io::{Read, Seek, SeekFrom, Write},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 #[allow(
@@ -20,9 +20,9 @@ fn prioritize_install_rows(rows: &mut [crate::dexdump::MapRow], apks: &[std::pat
             .filter_map(|p| p.parent())
             .any(|dir| Path::new(&r.path).starts_with(dir))
         {
-            if r.path.ends_with(".dex") || r.path.ends_with(".vdex") {
+            if android_suffix(&r.path, ".dex") || android_suffix(&r.path, ".vdex") {
                 0
-            } else if r.path.ends_with(".so") {
+            } else if android_suffix(&r.path, ".so") {
                 1
             } else {
                 2
@@ -74,6 +74,16 @@ fn android_suffix(path: &str, suffix: &str) -> bool {
     path.len() >= suffix.len() && path.as_bytes().ends_with(suffix.as_bytes())
 }
 
+fn hex_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    out
+}
+
 fn eligible_mapping(r: &crate::dexdump::MapRow) -> bool {
     r.perms.contains('r')
         && (r.perms.contains('x')
@@ -97,22 +107,75 @@ fn code_range_cap(path: &str) -> u64 {
     }
 }
 
-fn bound_copy_gap_state(
+enum BoundRangeStep {
+    Stop {
+        saw_budget_reserve: bool,
+    },
+    Copied {
+        record: serde_json::Value,
+        partial: bool,
+        saw_budget_reserve: bool,
+        saw_range_cap: bool,
+        vdex: bool,
+        dex: bool,
+        native: bool,
+    },
+}
+
+fn publish_bound_pending(
+    pending: &Path,
+    out: &Path,
+    expected: &SourceIdentity,
+    row: &crate::dexdump::MapRow,
+    admitted: bool,
+) -> (PathBuf, Option<String>) {
+    if !admitted {
+        return (pending.to_path_buf(), None);
+    }
+    let published = out.join(format!(
+        "bound-{}-{:x}-{}.code",
+        expected.pid,
+        row.start,
+        uuid::Uuid::new_v4()
+    ));
+    // Reserve a fresh destination before replacing only our own empty placeholder.
+    let publish = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&published)
+        .and_then(|owned| {
+            drop(owned);
+            std::fs::rename(pending, &published)
+        });
+    match publish {
+        Ok(()) => (published, None),
+        Err(error) => (pending.to_path_buf(), Some(error.to_string())),
+    }
+}
+
+#[derive(Clone, Copy)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "These stop flags are independent and are not a state machine."
+)]
+struct BoundCopyStops {
     stopped_early: bool,
     budget_stop: bool,
     saw_range_cap: bool,
     saw_budget_reserve: bool,
-) -> (&'static str, &'static str) {
-    let unattempted = if stopped_early && budget_stop {
+}
+
+fn bound_copy_gap_state(stops: BoundCopyStops) -> (&'static str, &'static str) {
+    let unattempted = if stops.stopped_early && stops.budget_stop {
         "not_attempted_parent_deadline_or_output_exhausted"
-    } else if stopped_early {
+    } else if stops.stopped_early {
         "not_attempted_parent_deadline"
     } else {
         "none"
     };
-    let truncation = if saw_range_cap {
+    let truncation = if stops.saw_range_cap {
         "per_range_cap"
-    } else if saw_budget_reserve {
+    } else if stops.saw_budget_reserve {
         "runtime_payload_budget_metadata_reserve"
     } else {
         "none"
@@ -396,9 +459,10 @@ pub(crate) fn copy_range(
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod physical {
     use super::{
-        app_code_mapped_bytes, bail, bound_copy_gap_state, budget_io, candidate_ledger,
-        code_range_cap, copy_range, eligible_mapping, prioritize_install_rows, stat_start_ticks,
-        write_candidate_ledger, Digest, Path, Read, Result, Sha256, SourceIdentity,
+        android_suffix, app_code_mapped_bytes, bail, bound_copy_gap_state, budget_io,
+        candidate_ledger, code_range_cap, copy_range, eligible_mapping, hex_bytes,
+        prioritize_install_rows, publish_bound_pending, stat_start_ticks, write_candidate_ledger,
+        BoundCopyStops, BoundRangeStep, Digest, Path, Read, Result, Sha256, SourceIdentity,
     };
     use anyhow::Context as _;
     use ksight_hwbp::{
@@ -539,6 +603,10 @@ mod physical {
             })
         }
         ///
+        /// # Errors
+        ///
+        /// Returns when the package process list cannot be read.
+        ///
         /// # Panics
         ///
         /// Panics if a debug assertion in this function fails.
@@ -617,6 +685,111 @@ mod physical {
         /// # Errors
         ///
         /// Returns the existing failure for this operation. No success value is invented.
+        fn copy_one_bound_range(
+            &self,
+            target: &mut Target,
+            expected: &SourceIdentity,
+            out: &Path,
+            deadline: Instant,
+            row: &crate::dexdump::MapRow,
+        ) -> Result<BoundRangeStep> {
+            let current = self.qualify(&expected.package, expected.pid, false)?;
+            if current.identity != *expected {
+                bail!("source generation changed before next range");
+            }
+            let binding = current.qualified.into_bound()?;
+            let requested = row.end.saturating_sub(row.start);
+            let range_cap = code_range_cap(&row.path);
+            let want = requested.min(range_cap).min(
+                ksight_core::output_budget::remaining(out)
+                    .map_or(u64::MAX, |n| n.saturating_sub(256 * 1024)),
+            );
+            let saw_budget_reserve = want < requested.min(range_cap);
+            let saw_range_cap = !saw_budget_reserve && want < requested;
+            if want == 0 {
+                return Ok(BoundRangeStep::Stop { saw_budget_reserve });
+            }
+            let pending = out.join(format!(
+                "bound-{}-{:x}-{}.pending",
+                expected.pid,
+                row.start,
+                uuid::Uuid::new_v4()
+            ));
+            let mut output = match ksight_core::output_budget::BudgetFile::create(&pending) {
+                Ok(file) => file,
+                Err(error) if budget_io(&error) => {
+                    return Ok(BoundRangeStep::Stop { saw_budget_reserve });
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let mut receipt = copy_range(
+                target.mem.as_mut().context("bound mem handle missing")?,
+                &mut output,
+                row.start,
+                want,
+                || {
+                    if Instant::now() >= deadline || ksight_core::output_budget::should_stop(out) {
+                        bail!("parent_deadline_or_output_exhausted");
+                    }
+                    binding.check_current()
+                },
+            );
+            if receipt.admission == "qualified_live_copy" {
+                match self.qualify(&expected.package, expected.pid, false) {
+                    Ok(current) if current.identity == *expected => {}
+                    _ => {
+                        receipt.admission = "rejected_generation_after_read".into();
+                    }
+                }
+            }
+            let stable_mapping = read_at(&target.dir, "maps", 2 * 1024 * 1024)
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .is_some_and(|text| {
+                    crate::dexdump::parse_maps(&text).iter().any(|now| {
+                        now.start == row.start
+                            && now.end == row.end
+                            && now.path == row.path
+                            && now.inode == row.inode
+                            && now.perms == row.perms
+                    })
+                });
+            if !stable_mapping {
+                receipt.admission = "rejected_mapping_changed_or_unknown".into();
+            }
+            if output.sync_all().is_err() {
+                receipt.write_status = "write_failed".into();
+                receipt.write_error = Some("sync failed".into());
+            }
+            let admitted = receipt.admission == "qualified_live_copy"
+                && receipt.read_status == "complete"
+                && receipt.write_status == "complete";
+            let (final_path, publish_error) =
+                publish_bound_pending(&pending, out, expected, row, admitted);
+            if let Some(error) = publish_error {
+                receipt.write_status = "write_failed".into();
+                receipt.write_error = Some(error);
+                receipt.admission = "rejected_publish_failure".into();
+            }
+            let admitted_now = admitted && receipt.write_status == "complete";
+            let record = serde_json::json!({"source":expected,"mapping":{"start":row.start,"end":row.end,"path":row.path,"inode":row.inode,"perms":row.perms},"requested_mapping_bytes":requested,"selection_limit_bytes":want,"selection_limit_reason":if saw_budget_reserve {"runtime_payload_budget_metadata_reserve"} else if saw_range_cap {"per_range_cap"} else {"full_mapping_selected"},"read":receipt,"raw_evidence":final_path.file_name().and_then(|n|n.to_str()),"derived":[],"selection_policy":"app_install_dex_then_elf_then_other_original_maps_order","scope":"anchored original task/mm; named code or executable mappings","admitted":admitted_now});
+            Ok(BoundRangeStep::Copied {
+                record,
+                partial: !admitted_now || want < requested,
+                saw_budget_reserve,
+                saw_range_cap,
+                vdex: admitted_now && android_suffix(&row.path, ".vdex"),
+                dex: admitted_now
+                    && (android_suffix(&row.path, ".dex") || android_suffix(&row.path, ".cdex")),
+                native: admitted_now && android_suffix(&row.path, ".so"),
+            })
+        }
+
+        /// Copy qualified code ranges from the anchored task.
+        ///
+        /// # Errors
+        ///
+        /// Returns when qualification, the maps handle, or the copy note cannot be written.
         pub fn copy_code(
             &self,
             expected: &SourceIdentity,
@@ -660,141 +833,44 @@ mod physical {
                     stopped_early = true;
                     break;
                 }
-                let current = self.qualify(&expected.package, expected.pid, false)?;
-                if current.identity != *expected {
-                    bail!("source generation changed before next range");
-                }
-                let binding = current.qualified.into_bound()?;
-                let requested = row.end.saturating_sub(row.start);
-                let range_cap = code_range_cap(&row.path);
-                let want = requested.min(range_cap).min(
-                    ksight_core::output_budget::remaining(out)
-                        .map_or(u64::MAX, |n| n.saturating_sub(256 * 1024)),
-                );
-                if want < requested.min(range_cap) {
-                    saw_budget_reserve = true;
-                } else if want < requested {
-                    saw_range_cap = true;
-                }
-                if want == 0 {
-                    partial = true;
-                    break;
-                }
-
-                let pending = out.join(format!(
-                    "bound-{}-{:x}-{}.pending",
-                    expected.pid,
-                    row.start,
-                    uuid::Uuid::new_v4()
-                ));
-                let mut output = match ksight_core::output_budget::BudgetFile::create(&pending) {
-                    Ok(file) => file,
-                    Err(error) if budget_io(&error) => {
+                match self.copy_one_bound_range(&mut target, expected, out, deadline, &row)? {
+                    BoundRangeStep::Stop {
+                        saw_budget_reserve: reserve,
+                    } => {
                         partial = true;
+                        saw_budget_reserve |= reserve;
                         break;
                     }
-                    Err(error) => return Err(error.into()),
-                };
-                let mut receipt = copy_range(
-                    target.mem.as_mut().context("bound mem handle missing")?,
-                    &mut output,
-                    row.start,
-                    want,
-                    || {
-                        if Instant::now() >= deadline
-                            || ksight_core::output_budget::should_stop(out)
-                        {
-                            bail!("parent_deadline_or_output_exhausted");
+                    BoundRangeStep::Copied {
+                        record,
+                        partial: row_partial,
+                        saw_budget_reserve: reserve,
+                        saw_range_cap: capped,
+                        vdex,
+                        dex,
+                        native,
+                    } => {
+                        partial |= row_partial;
+                        saw_budget_reserve |= reserve;
+                        saw_range_cap |= capped;
+                        if vdex {
+                            stats.vdex_images = stats.vdex_images.saturating_add(1);
+                        } else if dex {
+                            stats.memory_images = stats.memory_images.saturating_add(1);
+                        } else if native {
+                            stats.native_libs = stats.native_libs.saturating_add(1);
                         }
-                        binding.check_current()
-                    },
-                );
-                // Fresh raw metadata comparison after copying. Unknown/different exec never becomes qualified data.
-                if receipt.admission == "qualified_live_copy" {
-                    match self.qualify(&expected.package, expected.pid, false) {
-                        Ok(current) if current.identity == *expected => {}
-                        _ => {
-                            receipt.admission = "rejected_generation_after_read".into();
-                            partial = true;
-                        }
+                        records.push(record);
                     }
                 }
-                let stable_mapping = read_at(&target.dir, "maps", 2 * 1024 * 1024)
-                    .ok()
-                    .and_then(|b| String::from_utf8(b).ok())
-                    .is_some_and(|text| {
-                        crate::dexdump::parse_maps(&text).iter().any(|now| {
-                            now.start == row.start
-                                && now.end == row.end
-                                && now.path == row.path
-                                && now.inode == row.inode
-                                && now.perms == row.perms
-                        })
-                    });
-                if !stable_mapping {
-                    receipt.admission = "rejected_mapping_changed_or_unknown".into();
-                    partial = true;
-                }
-                if output.sync_all().is_err() {
-                    receipt.write_status = "write_failed".into();
-                    receipt.write_error = Some("sync failed".into());
-                }
-                let admitted = receipt.admission == "qualified_live_copy"
-                    && receipt.read_status == "complete"
-                    && receipt.write_status == "complete";
-                let final_path = if admitted {
-                    let p = out.join(format!(
-                        "bound-{}-{:x}-{}.code",
-                        expected.pid,
-                        row.start,
-                        uuid::Uuid::new_v4()
-                    ));
-                    // Reserve a fresh destination before replacing only our own empty placeholder.
-                    // Rename retains the raw bytes without doubling inventory/budget via a hard-link alias.
-                    let publish = std::fs::OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(&p)
-                        .and_then(|owned| {
-                            drop(owned);
-                            std::fs::rename(&pending, &p)
-                        });
-                    match publish {
-                        Ok(()) => p,
-                        Err(error) => {
-                            receipt.write_status = "write_failed".into();
-                            receipt.write_error = Some(error.to_string());
-                            receipt.admission = "rejected_publish_failure".into();
-                            partial = true;
-                            pending.clone()
-                        }
-                    }
-                } else {
-                    partial = true;
-                    pending.clone()
-                };
-                if want < requested {
-                    partial = true;
-                }
-                if admitted && receipt.write_status == "complete" {
-                    if row.path.ends_with(".vdex") {
-                        stats.vdex_images = stats.vdex_images.saturating_add(1);
-                    } else if row.path.ends_with(".dex") || row.path.ends_with(".cdex") {
-                        stats.memory_images = stats.memory_images.saturating_add(1);
-                    } else if row.path.ends_with(".so") {
-                        stats.native_libs = stats.native_libs.saturating_add(1);
-                    }
-                }
-                records.push(serde_json::json!({"source":expected,"mapping":{"start":row.start,"end":row.end,"path":row.path,"inode":row.inode,"perms":row.perms},"requested_mapping_bytes":requested,"selection_limit_bytes":want,"selection_limit_reason":if want<requested.min(range_cap){"runtime_payload_budget_metadata_reserve"}else if want<requested{"per_range_cap"}else{"full_mapping_selected"},"read":receipt,"raw_evidence":final_path.file_name().and_then(|n|n.to_str()),"derived":[],"selection_policy":"app_install_dex_then_elf_then_other_original_maps_order","scope":"anchored original task/mm; named code or executable mappings","admitted":admitted && receipt.write_status=="complete"}));
-                // These are qualified raw code ranges, not reconstructed complete DEX/SO images.
             }
-            let (unattempted_state, truncation) = bound_copy_gap_state(
+            let (unattempted_state, truncation) = bound_copy_gap_state(BoundCopyStops {
                 stopped_early,
-                ksight_core::output_budget::should_stop(out),
+                budget_stop: ksight_core::output_budget::should_stop(out),
                 saw_range_cap,
                 saw_budget_reserve,
-            );
-            let note = serde_json::json!({"schema":"kernsight.bound-code-copy/v1","source":expected,"candidate_manifest":candidate_name,"candidate_result":{"attempted":records.len(),"unattempted_state":unattempted_state,"truncation":truncation,"actual_ranges":"records.read","budget_stop":ksight_core::output_budget::should_stop(out)},"records":records,"partial":partial,"paused":false,"torn":true,"torn_reason":"process_not_paused","unsupported":"unregistered anonymous heap/FD/private scans; main-process enrollment only","object_sha256":format!("{:x}",Sha256::digest(std::fs::read(&self.metadata)?)),"btf_sha256":self.btf_hash.iter().map(|b|format!("{b:02x}")).collect::<String>()});
+            });
+            let note = serde_json::json!({"schema":"kernsight.bound-code-copy/v1","source":expected,"candidate_manifest":candidate_name,"candidate_result":{"attempted":records.len(),"unattempted_state":unattempted_state,"truncation":truncation,"actual_ranges":"records.read","budget_stop":ksight_core::output_budget::should_stop(out)},"records":records,"partial":partial,"paused":false,"torn":true,"torn_reason":"process_not_paused","unsupported":"unregistered anonymous heap/FD/private scans; main-process enrollment only","object_sha256":format!("{:x}",Sha256::digest(std::fs::read(&self.metadata)?)),"btf_sha256":hex_bytes(&self.btf_hash)});
             let note_body = serde_json::to_vec_pretty(&note)?;
             let note_path = out.join(format!(
                 "bound-source-{}-{}.json",

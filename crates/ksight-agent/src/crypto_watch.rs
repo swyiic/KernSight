@@ -317,12 +317,12 @@ pub struct CryptoWatchScanResult {
 /// Scan one process and append new findings (log + durable JSONL + rules).
 #[must_use]
 pub fn scan_pid(pid: u32, package: &str) -> usize {
-    scan_pid_ex(pid, package, Paths::device()).added
+    scan_pid_ex(pid, package, &Paths::device()).added
 }
 
 /// Scan with explicit paths (unit tests / offline fixtures).
 #[must_use]
-pub fn scan_pid_ex(pid: u32, package: &str, paths: Paths) -> CryptoWatchScanResult {
+pub fn scan_pid_ex(pid: u32, package: &str, paths: &Paths) -> CryptoWatchScanResult {
     let Ok(maps) = std::fs::read_to_string(format!("/proc/{pid}/maps")) else {
         return CryptoWatchScanResult::default();
     };
@@ -338,7 +338,7 @@ pub fn scan_maps(
     package: &str,
     maps: &str,
     mem: &mut dyn MemSource,
-    paths: Paths,
+    paths: &Paths,
 ) -> CryptoWatchScanResult {
     let mut seen = load_seen(&paths.log);
     let mut result = CryptoWatchScanResult::default();
@@ -961,9 +961,8 @@ fn merge_versioned_rules_ex(
             if !arr.contains(&fp) {
                 arr.push(fp);
             }
-            const FP_CAP: usize = 32;
-            if arr.len() > FP_CAP {
-                let drain = arr.len() - FP_CAP;
+            if arr.len() > 32 {
+                let drain = arr.len() - 32;
                 arr.drain(0..drain);
             }
         }
@@ -1177,11 +1176,7 @@ fn redact_header_value(input: &str, header: &str) -> String {
         out.push_str("[REDACTED]");
         let end = trimmed.find(['\n', '\r', ' ']).unwrap_or(trimmed.len());
         // if space-delimited mid-line, keep remainder after first token
-        if end < trimmed.len() && trimmed.as_bytes().get(end) == Some(&b' ') {
-            rest = &trimmed[end..];
-        } else {
-            rest = &trimmed[end..];
-        }
+        rest = &trimmed[end..];
     }
     out.push_str(rest);
     out
@@ -1203,17 +1198,22 @@ fn redact_form_value(input: &str, key: &str) -> String {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     let dig = hasher.finalize();
-    dig.iter().map(|b| format!("{b:02x}")).collect()
+    let mut hex = String::with_capacity(dig.len().saturating_mul(2));
+    for byte in dig {
+        hex.push(char::from(HEX[usize::from(byte >> 4)]));
+        hex.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    hex
 }
 
 fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 fn json_str(s: &str) -> String {

@@ -224,7 +224,7 @@ fn dump_process_dex_from_maps(
         let name = format!("mem-{pid}-{magic_at:x}.{ext}");
         let raw = dest_dir.join(&name);
         if raw.exists() {
-            let existing = raw.metadata().map(|meta| meta.len()).unwrap_or(0);
+            let existing = raw.metadata().map_or(0, |meta| meta.len());
             if existing >= u64::try_from(bytes.len()).unwrap_or(0) {
                 continue;
             }
@@ -2374,8 +2374,7 @@ fn write_snapshot_sidecar(pid: u32, dest_dir: &Path, dump: &LiveDump) {
     });
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or(0);
+        .map_or(0, |duration| duration.as_millis());
     let _ = ksight_core::output_budget::write(
         dest_dir.join(format!("snapshot-{pid}-{stamp}.json")),
         payload.to_string(),

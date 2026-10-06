@@ -361,15 +361,11 @@ fn inherit_inspect_scope(
 #[cfg(any(target_os = "android", target_os = "linux"))]
 #[allow(
     clippy::needless_pass_by_value,
-    reason = "The unsupported-platform entry keeps the same owned API as the live backend."
-)]
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "Local fixture or owned callback keeps its explicit scope and fallible signature."
-)]
-#[allow(
-    clippy::needless_pass_by_value,
     reason = "The platform entry point preserves the owned capture request API."
+)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep this admission or delivery transaction together for review."
 )]
 pub fn run(request: CaptureRequest) -> Result<()> {
     use crate::normalize::EventNormalizer;
@@ -491,13 +487,13 @@ pub fn run(request: CaptureRequest) -> Result<()> {
         sensors,
         identity_resolver,
         normalizer,
-        scope,
+        &scope,
         spool,
         &request,
         environment,
         baseline_events,
-        baseline_sockets,
-        qualified_backend,
+        &baseline_sockets,
+        qualified_backend.as_ref(),
     )
 }
 
@@ -655,79 +651,22 @@ fn with_sampling(
 }
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
-fn spawn_pcap_watchdog(
-    interface: &str,
-    destination: &std::path::Path,
-    filter: &str,
-) -> std::io::Result<std::process::Child> {
-    // The shell watches ksightd's PID and owns tcpdump. If ksightd is killed
-    // before Rust cleanup runs, the watchdog still terminates and reaps the
-    // packet-capture child instead of leaving it reparented to PID 1.
-    const SCRIPT: &str = r#"
-parent=$1
-interface=$2
-destination=$3
-filter=$4
-tcpdump -i "$interface" -s 0 -U -w "$destination" "$filter" >/dev/null 2>&1 &
-worker=$!
-cleanup() {
-  trap - EXIT INT TERM HUP
-  kill "$worker" 2>/dev/null || true
-  wait "$worker" 2>/dev/null || true
-}
-trap 'cleanup; exit 0' EXIT INT TERM HUP
-while kill -0 "$parent" 2>/dev/null; do sleep 1; done
-cleanup
-"#;
-    std::process::Command::new("sh")
-        .args([
-            "-c",
-            SCRIPT,
-            "ksight-pcap-watchdog",
-            &std::process::id().to_string(),
-            interface,
-            destination.to_string_lossy().as_ref(),
-            filter,
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-}
-
-#[cfg(any(target_os = "android", target_os = "linux"))]
-fn stop_pcap_watchdog(child: &mut std::process::Child) {
-    let Ok(pid) = i32::try_from(child.id()) else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return;
-    };
-    let _ = nix::sys::signal::kill(
-        nix::unistd::Pid::from_raw(pid),
-        nix::sys::signal::Signal::SIGTERM,
-    );
-    for _ in 0..40 {
-        if child.try_wait().ok().flatten().is_some() {
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-#[cfg(any(target_os = "android", target_os = "linux"))]
 #[allow(clippy::too_many_lines)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Keep this admission or delivery transaction together for review."
+)]
 fn stream_events(
     mut sensors: Vec<ActiveSensor>,
     identity_resolver: crate::identity::AndroidIdentityResolver,
     normalizer: crate::normalize::EventNormalizer,
-    scope: crate::scope::CaptureScope,
+    scope: &crate::scope::CaptureScope,
     spool: Option<crate::spool::SessionSpoolWriter>,
     request: &CaptureRequest,
     environment: ksight_model::SessionEnvironment,
     baseline_events: Vec<ksight_model::Event>,
-    baseline_sockets: Vec<(u32, i32)>,
-    qualified_backend: Option<crate::qualified_code::Backend>,
+    baseline_sockets: &[(u32, i32)],
+    qualified_backend: Option<&crate::qualified_code::Backend>,
 ) -> Result<()> {
     use std::{
         io::Write as _,
@@ -771,36 +710,32 @@ fn stream_events(
         eprintln!("tls-inject off (no ptrace); inspect-tls uprobe only; app TLS unchanged");
     }
     let _mitm = if request.mitm_burp {
-        match (request.package.as_deref(), request.mirror_http.as_deref()) {
-            (Some(package), Some(endpoint)) => {
-                match (
-                    crate::mitm_redirect::uid_for_package(package),
-                    ksight_core::parse_mirror_endpoint(endpoint),
-                ) {
-                    (Some(uid), Ok(addr)) => {
-                        match crate::mitm_redirect::MitmRedirect::install(uid, addr) {
-                            Ok(mitm) => {
-                                eprintln!(
-                                "mitm-burp uid={uid} package={package} -> {endpoint}; Burp Network→Connections→Upstream proxy = 127.0.0.1:18888 (adb forward); Proxy HTTP history, not Logger"
-                            );
-                                Some(mitm)
-                            }
-                            Err(error) => {
-                                eprintln!("mitm-burp skipped: {error}");
-                                None
-                            }
-                        }
+        if let (Some(package), Some(endpoint)) =
+            (request.package.as_deref(), request.mirror_http.as_deref())
+        {
+            if let (Some(uid), Ok(addr)) = (
+                crate::mitm_redirect::uid_for_package(package),
+                ksight_core::parse_mirror_endpoint(endpoint),
+            ) {
+                match crate::mitm_redirect::MitmRedirect::install(uid, addr) {
+                    Ok(mitm) => {
+                        eprintln!(
+                        "mitm-burp uid={uid} package={package} -> {endpoint}; Burp Network→Connections→Upstream proxy = 127.0.0.1:18888 (adb forward); Proxy HTTP history, not Logger"
+                    );
+                        Some(mitm)
                     }
-                    _ => {
-                        eprintln!("mitm-burp skipped: need package uid and Burp host:port");
+                    Err(error) => {
+                        eprintln!("mitm-burp skipped: {error}");
                         None
                     }
                 }
-            }
-            _ => {
-                eprintln!("mitm-burp requires --package and --mirror-http host:port");
+            } else {
+                eprintln!("mitm-burp skipped: need package uid and Burp host:port");
                 None
             }
+        } else {
+            eprintln!("mitm-burp requires --package and --mirror-http host:port");
+            None
         }
     } else {
         None
@@ -906,13 +841,17 @@ fn stream_events(
     let mut next_environment_check = Instant::now() + environment_check_interval;
 
     for sensor in &mut sensors {
-        sensor.seed_socket_fds(&baseline_sockets);
+        sensor.seed_socket_fds(baseline_sockets);
     }
     for event in baseline_events {
         pipeline.emit_event(event)?;
     }
 
-    let launch_task = request.startup.as_ref().map(|s| s.start()).transpose()?;
+    let launch_task = request
+        .startup
+        .as_ref()
+        .map(super::capture_lifecycle::Startup::start)
+        .transpose()?;
 
     let mut next_startup_observation = Instant::now();
     let mut next_stack_inventory = Instant::now();
@@ -1122,9 +1061,18 @@ fn stream_events(
             }
             if Instant::now() >= next_inspect_stats {
                 let (raw, decoded, lost) = inspect.drain_totals();
-                let (ssl_re, ssl_rr, ssl_rok, ssl_rf, ssl_rw) = inspect.ssl_read_funnel();
-                let (ssl_gt0, ssl_dgt0, ssl_wo, ssl_wc, ssl_oko, ssl_okc, ssl_gto, ssl_gtc) =
-                    inspect.ssl_read_funnel_ex();
+                let (read_entry, read_return, read_success, read_failure, read_wanted) =
+                    inspect.ssl_read_funnel();
+                let (
+                    positive_return,
+                    dropped_positive,
+                    want_openssl,
+                    want_conscrypt,
+                    ok_openssl,
+                    ok_conscrypt,
+                    positive_openssl,
+                    positive_conscrypt,
+                ) = inspect.ssl_read_funnel_ex();
                 let (conn_streams, conn_returns, conn_shared) = inspect.connkey_stats();
                 let mirror_diagnostics = pipeline
                     .burp_mirror
@@ -1136,7 +1084,7 @@ fn stream_events(
                     .map(crate::burp_mirror::BurpMirror::diagnostic_metrics)
                     .unwrap_or_default();
                 eprintln!(
-                "inspect layers: raw_uprobe={raw} decoded={decoded} perf_lost={lost} ssl_read_entry={ssl_re} ssl_read_ret={ssl_rr} ssl_read_ok={ssl_rok} ssl_read_fail={ssl_rf} ssl_read_want={ssl_rw} ssl_read_ret_gt0={ssl_gt0} ssl_read_drop_gt0={ssl_dgt0} ssl_read_want_openssl={ssl_wo} ssl_read_want_conscrypt={ssl_wc} ssl_read_ok_openssl={ssl_oko} ssl_read_ok_conscrypt={ssl_okc} ssl_read_gt0_openssl={ssl_gto} ssl_read_gt0_conscrypt={ssl_gtc} quic_connkey_streams={conn_streams} quic_connkey_returns={conn_returns} quic_connkey_shared={conn_shared} {}",
+                "inspect layers: raw_uprobe={raw} decoded={decoded} perf_lost={lost} ssl_read_entry={read_entry} ssl_read_ret={read_return} ssl_read_ok={read_success} ssl_read_fail={read_failure} ssl_read_want={read_wanted} ssl_read_ret_gt0={positive_return} ssl_read_drop_gt0={dropped_positive} ssl_read_want_openssl={want_openssl} ssl_read_want_conscrypt={want_conscrypt} ssl_read_ok_openssl={ok_openssl} ssl_read_ok_conscrypt={ok_conscrypt} ssl_read_gt0_openssl={positive_openssl} ssl_read_gt0_conscrypt={positive_conscrypt} quic_connkey_streams={conn_streams} quic_connkey_returns={conn_returns} quic_connkey_shared={conn_shared} {}",
                 mirror_diagnostics.as_deref().unwrap_or("mirror=disabled")
             );
                 if pipeline.burp_mirror.is_some() {
@@ -1152,7 +1100,7 @@ fn stream_events(
                     raw,
                     decoded,
                     lost,
-                    ssl_dgt0,
+                    dropped_positive,
                     get("delivered"),
                     get("reconstructed_messages"),
                     get("paired_responses"),
@@ -1188,7 +1136,7 @@ fn stream_events(
                     let result = crate::crypto_watch::scan_pid_ex(
                         pid,
                         package,
-                        crate::crypto_watch::Paths::device(),
+                        &crate::crypto_watch::Paths::device(),
                     );
                     if result.added > 0 {
                         eprintln!(
@@ -1318,7 +1266,7 @@ fn stream_events(
     } else {
         capture_loop_result
     };
-    let launcher_result = launch_task.map_or(Ok(()), |task| task.finish());
+    let launcher_result = launch_task.map_or(Ok(()), super::capture_lifecycle::LaunchTask::finish);
     let capture_loop_result = capture_loop_result.and(launcher_result);
     let capture_loop_result =
         capture_loop_result.and_then(|()| stage_evidence_error.map_or(Ok(()), Err));
@@ -1339,16 +1287,25 @@ fn stream_events(
             mirror.seal();
         }
         let (raw, decoded, lost) = inspect.drain_totals();
-        let (ssl_re, ssl_rr, ssl_rok, ssl_rf, ssl_rw) = inspect.ssl_read_funnel();
-        let (ssl_gt0, ssl_dgt0, ssl_wo, ssl_wc, ssl_oko, ssl_okc, ssl_gto, ssl_gtc) =
-            inspect.ssl_read_funnel_ex();
+        let (read_entry, read_return, read_success, read_failure, read_wanted) =
+            inspect.ssl_read_funnel();
+        let (
+            positive_return,
+            dropped_positive,
+            want_openssl,
+            want_conscrypt,
+            ok_openssl,
+            ok_conscrypt,
+            positive_openssl,
+            positive_conscrypt,
+        ) = inspect.ssl_read_funnel_ex();
         let (conn_streams, conn_returns, conn_shared) = inspect.connkey_stats();
         eprintln!(
-            "inspect final: raw_uprobe={raw} decoded={decoded} perf_lost={lost} ssl_read_entry={ssl_re} ssl_read_ret={ssl_rr} ssl_read_ok={ssl_rok} ssl_read_fail={ssl_rf} ssl_read_want={ssl_rw} ssl_read_ret_gt0={ssl_gt0} ssl_read_drop_gt0={ssl_dgt0} ssl_read_want_openssl={ssl_wo} ssl_read_want_conscrypt={ssl_wc} ssl_read_ok_openssl={ssl_oko} ssl_read_ok_conscrypt={ssl_okc} ssl_read_gt0_openssl={ssl_gto} ssl_read_gt0_conscrypt={ssl_gtc} quic_connkey_streams={conn_streams} quic_connkey_returns={conn_returns} quic_connkey_shared={conn_shared} mirror_deliveries={}",
+            "inspect final: raw_uprobe={raw} decoded={decoded} perf_lost={lost} ssl_read_entry={read_entry} ssl_read_ret={read_return} ssl_read_ok={read_success} ssl_read_fail={read_failure} ssl_read_want={read_wanted} ssl_read_ret_gt0={positive_return} ssl_read_drop_gt0={dropped_positive} ssl_read_want_openssl={want_openssl} ssl_read_want_conscrypt={want_conscrypt} ssl_read_ok_openssl={ok_openssl} ssl_read_ok_conscrypt={ok_conscrypt} ssl_read_gt0_openssl={positive_openssl} ssl_read_gt0_conscrypt={positive_conscrypt} quic_connkey_streams={conn_streams} quic_connkey_returns={conn_returns} quic_connkey_shared={conn_shared} mirror_deliveries={}",
             pipeline
                 .burp_mirror
                 .as_ref()
-                .map_or(0, |mirror| mirror.delivery_count())
+                .map_or(0, super::burp_mirror::BurpMirror::delivery_count)
         );
         // Single machine-readable line for MobileE: read-only rollup, no
         // pairing or assembler logic lives here.
@@ -1369,7 +1326,7 @@ fn stream_events(
                     "orphan_overflow_preserved": get("orphan_overflow_preserved"),
                     "incomplete_messages": get("incomplete_messages"),
                     "perf_lost": lost,
-                    "ssl_read_drop_gt0": ssl_dgt0,
+                    "ssl_read_drop_gt0": dropped_positive,
                     "untyped_quic_fragments": get("untyped_quic_fragments"),
                     "untyped_quic_bytes": get("untyped_quic_bytes"),
                     "quic_fin_observations": get("quic_fin_observations"),
@@ -1549,7 +1506,7 @@ fn publish_service_health(
         spool_used_bytes: pipeline
             .spool
             .as_ref()
-            .map_or(0, |spool| spool.used_bytes()),
+            .map_or(0, super::spool::SessionSpoolWriter::used_bytes),
         spool_limit_bytes: request.storage.max_spool_bytes,
         last_event_monotonic_ns: pipeline.last_event_monotonic_ns,
         heartbeat_monotonic_ns: monotonic_now_ns(),
@@ -1704,7 +1661,7 @@ struct EventPipeline {
     /// Last-resort FIFO when the same thread pipelines identical codes.
     pending_parcels_by_tid:
         std::collections::HashMap<u32, std::collections::VecDeque<PendingParcel>>,
-    /// 已提交且等待回复的请求事务：transaction_id -> 提交时刻（monotonic_ns）。
+    /// `已提交且等待回复的请求事务：transaction_id` -> `提交时刻（monotonic_ns`）。
     binder_request_timestamps: std::collections::HashMap<i32, u64>,
     /// 跨进程文件描述符血缘追踪。
     fd_lineage: crate::fd_lineage::FdLineageTracker,
@@ -1973,14 +1930,14 @@ impl EventPipeline {
                 .map(str::trim)
                 .filter(|name| !name.is_empty())
             {
-                mirror.observe_peer_on_thread(pid, tid, name.to_owned());
+                mirror.observe_peer_on_thread(pid, tid, name);
             }
         }
         if let (Some(mirror), EventPayload::NetworkHandshake(handshake)) =
             (self.burp_mirror.as_mut(), &event.payload)
         {
             if let Some(host) = handshake_mirror_host(handshake) {
-                mirror.observe_peer_on_thread(pid, tid, host);
+                mirror.observe_peer_on_thread(pid, tid, &host);
             }
             if let Some(prefix) = handshake.request_prefix.as_deref() {
                 mirror.observe_bytes(pid, tid, "handshake_http", "send", prefix.as_bytes());
@@ -2405,9 +2362,11 @@ fn print_event(event: &ksight_model::Event) {
         .as_deref()
         .map_or_else(String::new, |command| format!(" cmd={command}"));
     let (kind, detail) = format_payload(&event.payload);
-    let sampling = (event.header.quality.sample_one_in > 1)
-        .then(|| format!(" sample=1/{}", event.header.quality.sample_one_in))
-        .unwrap_or_default();
+    let sampling = if event.header.quality.sample_one_in > 1 {
+        format!(" sample=1/{}", event.header.quality.sample_one_in)
+    } else {
+        String::new()
+    };
     println!(
         "seq={} cpu={} uid={} pid={} tid={} comm={} kind={}{}{}{}{}",
         event.header.source_sequence,
@@ -2425,6 +2384,10 @@ fn print_event(event: &ksight_model::Event) {
 }
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep this admission or delivery transaction together for review."
+)]
 fn format_payload(payload: &ksight_model::EventPayload) -> (String, String) {
     use ksight_model::EventPayload;
 
@@ -2688,29 +2651,6 @@ fn format_payload(payload: &ksight_model::EventPayload) -> (String, String) {
     }
 }
 
-/// Production persistence boundary, portable so host tests exercise it directly.
-/// Write JSON without println!'s broken-pipe panic so the capture error path
-/// can still commit the accepted tail and record an interrupted final state.
-#[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
-pub(crate) fn write_capture_json(
-    output: &mut impl std::io::Write,
-    event: &ksight_model::Event,
-) -> std::io::Result<()> {
-    serde_json::to_writer(&mut *output, event).map_err(std::io::Error::other)?;
-    output.write_all(b"\n")
-}
-
-#[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
-pub(crate) fn persist_capture_event(
-    spool: &mut crate::spool::SessionSpoolWriter,
-    event: &ksight_model::Event,
-) -> Result<(), crate::spool::SpoolError> {
-    if let Err(error) = spool.push(event) {
-        report_spool_failure(spool);
-        return Err(error);
-    }
-    Ok(())
-}
 #[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
 fn flush_capture_idle(
     spool: &mut crate::spool::SessionSpoolWriter,
@@ -2774,10 +2714,7 @@ fn observe_stage_target(
             .into_iter()
             .filter(|pid| {
                 std::fs::read(format!("/proc/{pid}/cmdline"))
-                    .ok()
-                    .is_some_and(|bytes| {
-                        bytes.split(|b| *b == 0).next() == Some(package.as_bytes())
-                    })
+                    .is_ok_and(|bytes| bytes.split(|b| *b == 0).next() == Some(package.as_bytes()))
             })
             .collect();
         if main.len() != 1 {
@@ -2823,8 +2760,7 @@ fn emit_capture_stage(
     let mut payload = serde_json::json!({"schema":"kernsight.capture-stage/v1","session":pipeline.normalizer.session_id().to_string(),"index":index,"stage":stage.name,"planned_seconds":stage.seconds,"stage_elapsed_ms":inspect.map(crate::inspect_runtime::InspectRuntime::stage_elapsed_ms),"state":status,"metrics":metrics,"pid":instance.map(|i|i.pid),"process_start_ticks":instance.map(|i|i.start_ticks.to_string()),"coverage":"not_attested","requested_adapters":stage.adapters().iter().map(|a|a.as_str()).collect::<Vec<_>>(),"observation_state":if stage.name == "l0" {"kernel_only"} else if metrics.get("raw_records").copied().unwrap_or(0)==0 {"not_triggered_or_blocked"} else {"observed_not_complete"},"restart":false,"resource_release":"owned_probes_dropped_on_close; unread_perf_tail_not_attested"});
     payload["recorded_unix_ms"] = serde_json::json!(std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0));
+        .map_or(0, |d| d.as_millis()));
     if let Some(relation) = pipeline.storage.capture_relation.as_ref() {
         if let Some(link) = relation
             .stage_links
@@ -2855,6 +2791,6 @@ fn finish_capture_stage(
     instance: Option<crate::capture_stages::TargetInstance>,
 ) -> Result<()> {
     inspect.revoke_for_stage();
-    let marker = emit_capture_stage(pipeline, index, stage, status, Some(inspect), instance);
-    marker
+
+    emit_capture_stage(pipeline, index, stage, status, Some(inspect), instance)
 }

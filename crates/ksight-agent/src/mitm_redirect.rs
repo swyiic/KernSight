@@ -70,7 +70,7 @@ impl MitmRedirect {
         redirect.apply_tcp("-I")?;
         let _ = redirect.apply_udp("-I");
         let _ = redirect.apply_ipv6("-I");
-        let _ = redirect.apply_input("-I");
+        let _ = Self::apply_input("-I");
         let lan = lan_ipv4().unwrap_or_else(|| "PHONE_IP".to_owned());
         eprintln!(
             "mitm-redirect uid={uid} all TCP :{FORWARD_PORT} -> {burp}; UDP except DNS rejected; IPv6 rejected; Burp upstream 127.0.0.1:{UPSTREAM_PORT} or {lan}:{UPSTREAM_PORT}"
@@ -113,11 +113,10 @@ impl MitmRedirect {
                 .status();
             match status {
                 Ok(status) if status.success() || insert_or_delete == "-D" => {}
-                Ok(_) if binary == "ip6tables" => {}
+                Ok(_) | Err(_) if binary == "ip6tables" => {}
                 Ok(_) => {
                     return Err(format!("{binary} {insert_or_delete} all-tcp failed"));
                 }
-                Err(_) if binary == "ip6tables" => {}
                 Err(error) => return Err(error.to_string()),
             }
         }
@@ -162,7 +161,7 @@ impl MitmRedirect {
                 .status();
             match status {
                 Ok(status) if status.success() || insert_or_delete == "-D" => {}
-                Ok(_) if binary == "ip6tables" => {}
+                Ok(_) | Err(_) if binary == "ip6tables" => {}
                 Ok(_) => {
                     let drop = Command::new(binary)
                         .args([
@@ -188,15 +187,13 @@ impl MitmRedirect {
                         .status();
                     match drop {
                         Ok(status) if status.success() || insert_or_delete == "-D" => {}
-                        Ok(_) if binary == "ip6tables" => {}
+                        Ok(_) | Err(_) if binary == "ip6tables" => {}
                         Ok(_) => {
                             return Err(format!("{binary} {insert_or_delete} udp-block failed"));
                         }
-                        Err(_) if binary == "ip6tables" => {}
                         Err(error) => return Err(error.to_string()),
                     }
                 }
-                Err(_) if binary == "ip6tables" => {}
                 Err(error) => return Err(error.to_string()),
             }
         }
@@ -284,10 +281,10 @@ impl MitmRedirect {
                 }
             }
         }
-        let _ = self.apply_input("-D");
+        let _ = Self::apply_input("-D");
     }
 
-    fn apply_input(&self, insert_or_delete: &str) -> Result<(), String> {
+    fn apply_input(insert_or_delete: &str) -> Result<(), String> {
         for binary in ["iptables", "ip6tables"] {
             let status = Command::new(binary)
                 .args([
@@ -303,13 +300,12 @@ impl MitmRedirect {
                 .status();
             match status {
                 Ok(status) if status.success() || insert_or_delete == "-D" => {}
-                Ok(_) if binary == "ip6tables" => {}
+                Ok(_) | Err(_) if binary == "ip6tables" => {}
                 Ok(_) => {
                     return Err(format!(
                         "{binary} {insert_or_delete} INPUT {UPSTREAM_PORT} failed"
                     ));
                 }
-                Err(_) if binary == "ip6tables" => {}
                 Err(error) => return Err(error.to_string()),
             }
         }

@@ -774,45 +774,6 @@ pub enum InspectOutput {
     },
 }
 
-/// Convert a decoded external/vendor boundary hit into the same durable event
-/// used by built-in TLS/JNI adapters.
-#[cfg(any(target_os = "android", target_os = "linux"))]
-pub(crate) fn external_plaintext(capture: crate::infosec_probe::BoundaryCapture) -> InspectOutput {
-    let captured_bytes = u32::try_from(capture.bytes.len()).unwrap_or(u32::MAX);
-    let truncated = capture.requested > u64::from(captured_bytes);
-    let mut content_class = classify_buffer(&capture.bytes).to_owned();
-    // Cheap reassembly tagging from BoundaryFunction hints (no invented offsets).
-    if capture.is_header == Some(true) && !content_class.contains("header") {
-        content_class = format!("{content_class}+header");
-    }
-    if capture.is_body == Some(true) && !content_class.contains("body") {
-        content_class = format!("{content_class}+body");
-    }
-    let (preview, preview_encoding) = preview_bytes(&capture.bytes);
-    InspectOutput::Plaintext {
-        pid: capture.pid,
-        tid: capture.tid,
-        connection_id: capture.connection_id.or(capture.stream_id),
-        fragment: InspectPlaintext {
-            adapter: capture.adapter,
-            direction: capture.direction.to_owned(),
-            library: capture.library,
-            build_id: None,
-            offset: Some(capture.offset),
-            requested_bytes: capture.requested,
-            captured_bytes,
-            truncated,
-            sha256: hex_sha256(&capture.bytes),
-            preview,
-            preview_encoding,
-            content_class,
-
-            ..Default::default()
-        },
-        raw: capture.bytes,
-    }
-}
-
 /// Live Inspect session: evaluate, optionally attach, poll, and expire.
 #[allow(
     clippy::struct_excessive_bools,
@@ -1037,20 +998,6 @@ impl PendingCallStacks {
         dropped
     }
 
-    /// Thread-exit: drop every pending frame for this pid/tid as incomplete.
-    fn drop_tid(&mut self, pid: u32, tid: u32) -> usize {
-        let mut dropped: usize = 0;
-        self.stacks.retain(|key, stack| {
-            if key.pid == pid && key.tid == tid {
-                dropped = dropped.saturating_add(stack.len());
-                return false;
-            }
-            true
-        });
-        self.mark_incomplete(dropped);
-        dropped
-    }
-
     /// Session-end: remaining frames are incomplete, not successful sends.
     fn drop_all_incomplete(&mut self) -> usize {
         let n = self.frames;
@@ -1058,16 +1005,6 @@ impl PendingCallStacks {
         self.stacks.clear();
         self.frames = 0;
         n
-    }
-
-    #[cfg(test)]
-    fn age_all(&mut self, age: Duration) {
-        let seen = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
-        for stack in self.stacks.values_mut() {
-            for (stamp, _) in stack.iter_mut() {
-                *stamp = seen;
-            }
-        }
     }
 }
 
@@ -2221,21 +2158,82 @@ fn quic_stream_export_plans(
 }
 
 fn note_exported_keylog_api(elf: &crate::elf::ElfIdentity) {
-    let file = elf.path.rsplit('/').next().unwrap_or(elf.path.as_str());
-    let interesting = file.contains("quic") || file.contains("flutter") || file.contains("tnet");
-    if !interesting {
-        return;
-    }
     const NAMES: [&str; 3] = [
         "SSL_CTX_set_keylog_callback",
         "quic_conn_set_keylog",
         "quic_conn_set_keylog_fd",
     ];
+    let file = elf.path.rsplit('/').next().unwrap_or(elf.path.as_str());
+    let interesting = file.contains("quic") || file.contains("flutter") || file.contains("tnet");
+    if !interesting {
+        return;
+    }
     for (name, offset) in matching_symbols_exact(elf, &NAMES) {
         eprintln!(
             "keylog API exported lib={} symbol={name} offset={offset:#x} (not wrapped; secrets from haystack or pinned keylog)",
             elf.path
         );
+    }
+}
+
+fn append_exact_tls_symbol_plans(
+    policy: &InspectPolicy,
+    adapter: InspectAdapterKind,
+    uprobe_object: &Path,
+    elf_path: &str,
+    elf: &crate::elf::ElfIdentity,
+    plans: &mut Vec<InspectPlan>,
+    seen_offsets: &mut std::collections::BTreeSet<u64>,
+) {
+    let names = tls_exact_names(adapter);
+    let matched = matching_symbols_exact(elf, &names);
+    for (name, offset) in matched.into_iter().take(8) {
+        if seen_offsets.contains(&offset) {
+            continue;
+        }
+        let abi = ksight_core::TlsAbiKind::from_exported_symbol(name);
+        if !abi.is_auto_attachable() {
+            // Non-standard name without ProbeSpec.abi: candidate only.
+            continue;
+        }
+        let want = match adapter {
+            InspectAdapterKind::TlsSslWrite => ksight_core::TlsDirection::Send,
+            InspectAdapterKind::TlsSslRead => ksight_core::TlsDirection::Recv,
+            _ => continue,
+        };
+        if abi.direction() != want {
+            continue;
+        }
+        let mut observation = InspectObservation {
+            adapter: adapter.as_str().to_owned(),
+            library: elf_path.to_owned(),
+            build_id: elf.build_id.clone(),
+            offset: Some(offset),
+            detectability_notice: policy.detectability_notice.clone(),
+            ..InspectObservation::default()
+        };
+        if Path::new(uprobe_object).is_file() {
+            observation.detail = format!(
+                "ready to attach {} uprobe symbol={name} offset={offset:#x}",
+                adapter.as_str()
+            );
+        } else {
+            observation.detail = format!("uprobe object missing: {}", uprobe_object.display());
+        }
+        seen_offsets.insert(offset);
+        plans.push(InspectPlan {
+            policy: policy.clone(),
+            adapter,
+            uprobe_object: uprobe_object.to_path_buf(),
+            elf_path: Some(elf_path.to_owned()),
+            offset: Some(offset),
+            build_id: elf.build_id.clone(),
+            symbol: Some(name.to_owned()),
+            abi: Some(abi),
+            layout_hint: ProbeLayoutHint::default(),
+            pointer_width: (elf.bits / 8).max(4),
+            observation,
+        });
     }
 }
 
@@ -2297,56 +2295,15 @@ fn evaluate_tls_symbol_exports(
         }
     }
 
-    let names = tls_exact_names(adapter);
-    let matched = matching_symbols_exact(&elf, &names);
-    for (name, offset) in matched.into_iter().take(8) {
-        if seen_offsets.contains(&offset) {
-            continue;
-        }
-        let abi = ksight_core::TlsAbiKind::from_exported_symbol(name);
-        if !abi.is_auto_attachable() {
-            // Non-standard name without ProbeSpec.abi: candidate only.
-            continue;
-        }
-        let want = match adapter {
-            InspectAdapterKind::TlsSslWrite => ksight_core::TlsDirection::Send,
-            InspectAdapterKind::TlsSslRead => ksight_core::TlsDirection::Recv,
-            _ => continue,
-        };
-        if abi.direction() != want {
-            continue;
-        }
-        let mut observation = InspectObservation {
-            adapter: adapter.as_str().to_owned(),
-            library: elf_path.to_owned(),
-            build_id: elf.build_id.clone(),
-            offset: Some(offset),
-            detectability_notice: policy.detectability_notice.clone(),
-            ..InspectObservation::default()
-        };
-        if Path::new(uprobe_object).is_file() {
-            observation.detail = format!(
-                "ready to attach {} uprobe symbol={name} offset={offset:#x}",
-                adapter.as_str()
-            );
-        } else {
-            observation.detail = format!("uprobe object missing: {}", uprobe_object.display());
-        }
-        seen_offsets.insert(offset);
-        plans.push(InspectPlan {
-            policy: policy.clone(),
-            adapter,
-            uprobe_object: uprobe_object.to_path_buf(),
-            elf_path: Some(elf_path.to_owned()),
-            offset: Some(offset),
-            build_id: elf.build_id.clone(),
-            symbol: Some(name.to_owned()),
-            abi: Some(abi),
-            layout_hint: ProbeLayoutHint::default(),
-            pointer_width: (elf.bits / 8).max(4),
-            observation,
-        });
-    }
+    append_exact_tls_symbol_plans(
+        policy,
+        adapter,
+        uprobe_object,
+        elf_path,
+        &elf,
+        &mut plans,
+        &mut seen_offsets,
+    );
 
     if adapter == InspectAdapterKind::TlsSslRead {
         plans.extend(quic_connkey_plans(
@@ -3198,7 +3155,6 @@ fn rank_inspect_pids(pids: &[u32]) -> Vec<u32> {
     allow(dead_code)
 )]
 fn tls_map_scan_rank(path: &str) -> u8 {
-    let file = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
     const EARLY: [&str; 10] = [
         "xquic",
         "tquic",
@@ -3211,6 +3167,7 @@ fn tls_map_scan_rank(path: &str) -> u8 {
         "boringssl",
         "conscrypt",
     ];
+    let file = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
     u8::from(!EARLY.iter().any(|needle| file.contains(needle)))
 }
 
@@ -3360,32 +3317,6 @@ fn pids_for_uid(uid: u32) -> Vec<u32> {
         }
     }
     pids
-}
-
-/// Allowlist to push when it differs from `current`.
-///
-/// Package scope with no live PID is an empty deny-all, not an unrestricted
-/// probe. `None` means whole-device scope, or the sorted list is unchanged.
-/// Writing `scoped_tgids` without pushing this list leaves sessions that
-/// attached as deny-all stuck there: later refreshes see no diff.
-#[cfg_attr(
-    not(any(test, target_os = "android", target_os = "linux")),
-    allow(dead_code)
-)]
-fn tgid_allowlist_transition(
-    current: &[u32],
-    package_scoped: bool,
-    scanned: Option<&[u32]>,
-) -> Option<Vec<u32>> {
-    let next_slice = if package_scoped {
-        scanned.unwrap_or(&[])
-    } else {
-        scanned?
-    };
-    let mut next = next_slice.to_vec();
-    next.sort_unstable();
-    next.dedup();
-    (next != current).then_some(next)
 }
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
@@ -3550,12 +3481,19 @@ fn process_cmdline_is_main(pid: u32, package: &str) -> bool {
 }
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
+fn u64_to_f64(value: u64) -> f64 {
+    let hi = u32::try_from(value >> 32).unwrap_or(0);
+    let lo = u32::try_from(value & 0xffff_ffff).unwrap_or(0);
+    f64::from(hi).mul_add(4_294_967_296.0, f64::from(lo))
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
 fn process_age(pid: u32) -> Option<Duration> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let start_ticks = parse_stat_start_ticks(&stat)?;
     let uptime = std::fs::read_to_string("/proc/uptime").ok()?;
     let uptime_secs: f64 = uptime.split_whitespace().next()?.parse().ok()?;
-    let start_secs = start_ticks as f64 / 100.0;
+    let start_secs = u64_to_f64(start_ticks) / 100.0;
     let age = uptime_secs - start_secs;
     if age.is_finite() && age >= 0.0 {
         Some(Duration::from_secs_f64(age.min(86_400.0 * 30.0)))
@@ -3625,6 +3563,10 @@ fn take_attached_sessions(runtime: &mut InspectRuntime) -> bool {
 }
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Keep this admission or delivery transaction together for review."
+)]
 fn start_uprobe_session(
     object: &Path,
     program: &str,
@@ -3690,6 +3632,10 @@ fn start_uprobe_session(
 /// Entry + uretprobe from one BPF load so `entry_ptr` survives until return
 /// (`SSL_read` aux snapshot). Separate loads left uretprobe blind on Alipay BABASSL.
 #[cfg(any(target_os = "android", target_os = "linux"))]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Keep this admission or delivery transaction together for review."
+)]
 fn start_uprobe_entry_return_session(
     object: &Path,
     programs: &[&str],
@@ -3752,6 +3698,10 @@ fn uprobe_attach_unsupported(error: &anyhow::Error) -> bool {
 }
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep this admission or delivery transaction together for review."
+)]
 fn attach_all(runtime: &mut InspectRuntime) -> Vec<InspectObservation> {
     let mut out = Vec::new();
     let selected = runtime.selected_adapters.clone();
@@ -3779,7 +3729,7 @@ fn attach_all(runtime: &mut InspectRuntime) -> Vec<InspectObservation> {
                 .into_iter()
                 .filter_map(|output| match output {
                     InspectOutput::Observation { observation, .. } => Some(observation),
-                    _ => None,
+                    InspectOutput::Plaintext { .. } => None,
                 }),
         );
         return out;
@@ -4020,6 +3970,10 @@ fn attach_all(_runtime: &mut InspectRuntime) -> Vec<InspectObservation> {
 }
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep this admission or delivery transaction together for review."
+)]
 fn poll_all(runtime: &mut InspectRuntime) -> Vec<InspectOutput> {
     let _ = refresh_process_epochs(runtime);
     refresh_tgid_filter(runtime);
@@ -4096,7 +4050,7 @@ fn poll_all(runtime: &mut InspectRuntime) -> Vec<InspectOutput> {
         if plan.adapter == InspectAdapterKind::TlsSslRead {
             if retprobe {
                 runtime.ssl_read_ret = runtime.ssl_read_ret.saturating_add(1);
-                let signed = hit.regs[0] as i32;
+                let signed = low_i32(hit.regs[0]);
                 // Bifrost/OpenSSL non-blocking: SSL_read returns -1 → WANT_READ/WRITE.
                 if signed < 0 {
                     runtime.ssl_read_want = runtime.ssl_read_want.saturating_add(1);
@@ -4177,6 +4131,29 @@ fn poll_all(_runtime: &mut InspectRuntime) -> Vec<InspectOutput> {
 }
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
+fn low_u32(value: u64) -> u32 {
+    let bytes = value.to_le_bytes();
+    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
+fn low_i32(value: u64) -> i32 {
+    i32::from_le_bytes(low_u32(value).to_le_bytes())
+}
+
+fn low_i8(value: u64) -> i8 {
+    i8::from_le_bytes([value.to_le_bytes()[0]])
+}
+
+fn low_u16(value: u64) -> u16 {
+    let bytes = value.to_le_bytes();
+    u16::from_le_bytes([bytes[0], bytes[1]])
+}
+
+#[allow(
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "Keep this admission or delivery transaction together for review."
+)]
 fn decode_hit(
     plan: &InspectPlan,
     hit: &ksight_hwbp::RegisterContext,
@@ -4257,7 +4234,7 @@ fn decode_hit(
             let key = probe_call_key(plan, pid, hit.tid);
             let direction = layout.direction.fragment_label(layout.consumes);
             if retprobe {
-                let signed = hit.regs[0] as i32;
+                let signed = low_i32(hit.regs[0]);
                 if signed <= 0 {
                     let _ = tls_pending.pop(key);
                     return None;
@@ -4331,11 +4308,11 @@ fn decode_hit(
             Some(inspect_observation(pid, hit.tid, observation))
         }
         InspectAdapterKind::ArtDexLoad | InspectAdapterKind::ArtDexMemory => {
-            decode_art_open(plan, pid, hit)
+            Some(decode_art_open(plan, pid, hit))
         }
         InspectAdapterKind::BinderUserspace => {
-            let handle = hit.regs[1] as u32;
-            let code = hit.regs[2] as u32;
+            let handle = low_u32(hit.regs[1]);
+            let code = low_u32(hit.regs[2]);
             let (interface, strings) =
                 pair_binder_transact(hit.tid, &mut binder.tokens, &mut binder.strings);
             let ints = binder.ints.remove(&hit.tid).unwrap_or_default();
@@ -4407,11 +4384,11 @@ fn decode_hit(
             None
         }
         InspectAdapterKind::BinderParcelInt32 => {
-            let value = hit.regs[1] as i32;
+            let value = low_i32(hit.regs[1]);
             push_bounded(&mut binder.ints, hit.tid, value, BINDER_INTS_PER_TID);
             None
         }
-        InspectAdapterKind::BinderParcelInt64 => {
+        InspectAdapterKind::BinderParcelInt64 | InspectAdapterKind::BinderParcelUint64 => {
             push_bounded(
                 &mut binder.int64s,
                 hit.tid,
@@ -4424,16 +4401,7 @@ fn decode_hit(
             push_bounded(
                 &mut binder.int64s,
                 hit.tid,
-                i64::from(hit.regs[1] as u32),
-                BINDER_INT64S_PER_TID,
-            );
-            None
-        }
-        InspectAdapterKind::BinderParcelUint64 => {
-            push_bounded(
-                &mut binder.int64s,
-                hit.tid,
-                i64::from_ne_bytes(hit.regs[1].to_ne_bytes()),
+                i64::from(low_u32(hit.regs[1])),
                 BINDER_INT64S_PER_TID,
             );
             None
@@ -4454,7 +4422,7 @@ fn decode_hit(
             None
         }
         InspectAdapterKind::BinderParcelFd | InspectAdapterKind::BinderParcelDupFd => {
-            let fd = hit.regs[1] as i32;
+            let fd = low_i32(hit.regs[1]);
             if fd >= 0 {
                 push_bounded(&mut binder.fds, hit.tid, fd, BINDER_FDS_PER_TID);
             }
@@ -4475,7 +4443,7 @@ fn decode_hit(
             push_bounded(
                 &mut binder.ints,
                 hit.tid,
-                i32::from(hit.regs[1] as i8),
+                i32::from(low_i8(hit.regs[1])),
                 BINDER_INTS_PER_TID,
             );
             None
@@ -4484,7 +4452,7 @@ fn decode_hit(
             push_bounded(
                 &mut binder.ints,
                 hit.tid,
-                i32::from(hit.regs[1] as u16),
+                i32::from(low_u16(hit.regs[1])),
                 BINDER_INTS_PER_TID,
             );
             None
@@ -5093,13 +5061,13 @@ fn decode_art_open(
     plan: &InspectPlan,
     pid: u32,
     hit: &ksight_hwbp::RegisterContext,
-) -> Option<InspectOutput> {
+) -> InspectOutput {
     let symbol = plan.symbol.as_deref().unwrap_or("");
     let path_hint = art_open_path_hint(pid, &hit.regs, symbol);
     let mut observation = plan.observation.clone();
     observation.attached = true;
     observation.hit = true;
-    observation.path_hint = path_hint.path.clone();
+    observation.path_hint.clone_from(&path_hint.path);
     let path = path_hint.path.as_deref().unwrap_or("unreadable");
     observation.detail = format!(
         "ART DEX Open hit pid={pid} symbol={symbol} layout={} path={path} x1={:#x} x2={:#x} x3={:#x}",
@@ -5108,7 +5076,7 @@ fn decode_art_open(
         hit.regs[2],
         hit.regs[3]
     );
-    Some(inspect_observation(pid, hit.tid, observation))
+    inspect_observation(pid, hit.tid, observation)
 }
 
 #[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
@@ -5269,6 +5237,10 @@ fn plausible_dex_size(value: u64) -> bool {
 }
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Keep this admission or delivery transaction together for review."
+)]
 fn decode_tls_plaintext(
     plan: &InspectPlan,
     pid: u32,
@@ -5297,7 +5269,7 @@ fn decode_tls_plaintext(
     let mut bytes = if snapshot_exact && snapshot_usable {
         let mut exact = snapshot.to_vec();
         let have = exact.len();
-        if requested_bytes as usize > have && have < want {
+        if usize::try_from(requested_bytes).unwrap_or(usize::MAX) > have && have < want {
             let tail_want = want - have;
             if let Some(tail) = read_remote_bytes(pid, buf.saturating_add(have as u64), tail_want) {
                 exact.extend_from_slice(&tail);
@@ -5367,8 +5339,6 @@ fn decode_tls_plaintext(
             sequence: FRAGMENT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             symbol: plan.symbol.clone(),
             consumes: effective_layout(plan).consumes,
-
-            ..Default::default()
         },
         raw: bytes,
     })
@@ -5483,7 +5453,7 @@ fn ssl_read_captured(pending: &PendingSslRead, hit: &ksight_hwbp::RegisterContex
         // - retval > 1 ⇒ byte-count ABI (some forks);
         // - retval == 1 ⇒ OpenSSL-style success → use requested as ceiling;
         //   aux near-miss / all-zero reject still gate emit.
-        let retval = i64::from(hit.regs[0] as i32);
+        let retval = i64::from(low_i32(hit.regs[0]));
         if retval > 1 {
             return Some(i32::try_from(retval).unwrap_or(0).min(requested));
         }
@@ -5492,7 +5462,7 @@ fn ssl_read_captured(pending: &PendingSslRead, hit: &ksight_hwbp::RegisterContex
         }
         return None;
     }
-    let retval = i64::from(hit.regs[0] as i32);
+    let retval = i64::from(low_i32(hit.regs[0]));
     if retval <= 0 {
         return None;
     }

@@ -867,13 +867,10 @@ pub fn dump_package_with(
         }
     }
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    if qualified_backend.is_some() && options.expected_code_sources.is_none() {
-        pids = qualified_backend
-            .as_ref()
-            .unwrap()
-            .main_pid(package)?
-            .into_iter()
-            .collect();
+    if options.expected_code_sources.is_none() {
+        if let Some(backend) = qualified_backend.as_ref() {
+            pids = backend.main_pid(package)?.into_iter().collect();
+        }
     }
     report.pids.clone_from(&pids);
     report.key_slots = report.key_slots.saturating_add(live_key.slots);
@@ -1345,6 +1342,14 @@ fn default_dump_warnings() -> Vec<String> {
     ]
 }
 
+fn exact_suffix(name: &str, suffix: &str) -> bool {
+    name.len() >= suffix.len() && name.as_bytes().ends_with(suffix.as_bytes())
+}
+
+fn image_limit_u64() -> u64 {
+    u64::try_from(ksight_core::DEX_IMAGE_LIMIT).unwrap_or(u64::MAX)
+}
+
 fn unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1464,6 +1469,25 @@ fn build_dex_sets(
         method_names.extend(semantic.method_names.iter().cloned());
         method_prototypes.extend(semantic.method_prototypes.iter().cloned());
     }
+    let index = package_dex_index(
+        &sets,
+        &class_owners,
+        method_names.len(),
+        method_prototypes.len(),
+        semantic_parse_failures,
+        semantic_index_truncated,
+    );
+    (sets, index)
+}
+
+fn package_dex_index(
+    sets: &[ksight_core::DexArtifactSet],
+    class_owners: &BTreeMap<String, BTreeSet<String>>,
+    method_names: usize,
+    method_prototypes: usize,
+    semantic_parse_failures: usize,
+    semantic_index_truncated: bool,
+) -> ksight_core::PackageDexIndex {
     let class_conflicts = class_owners
         .iter()
         .filter(|(_, owners)| owners.len() > 1)
@@ -1473,17 +1497,16 @@ fn build_dex_sets(
             dex_sha256: owners.iter().cloned().collect(),
         })
         .collect();
-    let index = ksight_core::PackageDexIndex {
+    ksight_core::PackageDexIndex {
         unique_dex: sets.len(),
         observations: sets.iter().map(|set| set.observations.len()).sum(),
         indexed_class_samples: class_owners.len(),
-        indexed_method_name_samples: method_names.len(),
-        indexed_method_prototype_samples: method_prototypes.len(),
+        indexed_method_name_samples: method_names,
+        indexed_method_prototype_samples: method_prototypes,
         class_conflicts,
         semantic_parse_failures,
         semantic_index_truncated,
-    };
-    (sets, index)
+    }
 }
 
 fn dex_source_priority(artifact: &ksight_core::DumpArtifact) -> u8 {
@@ -1611,7 +1634,7 @@ fn catalog_dynamic_symbols(
                 .file_name()
                 .and_then(|value| value.to_str())
                 .unwrap_or("");
-            if !name.ends_with(".code") || paths.contains(&path) {
+            if !exact_suffix(name, ".code") || paths.contains(&path) {
                 continue;
             }
             let too_big = path.metadata().map_or(true, |meta| {
@@ -2467,9 +2490,14 @@ fn recover_secneo_payload_live(
     };
     let rows = crate::dexdump::parse_maps(&text);
     let pid = expected.pid;
-    let Some(key) = scan_dexhelper_bss(
-        dest, expected, mem, &rows, &probes, &bound, deadline, cancelled,
-    ) else {
+    let probe = AnchoredProbe {
+        dest,
+        expected,
+        bound: &bound,
+        deadline,
+        cancelled,
+    };
+    let Some(key) = scan_dexhelper_bss(&probe, mem, &rows, &probes) else {
         write_live_note(
             dest,
             format!(
@@ -2490,13 +2518,18 @@ fn recover_secneo_payload_live(
         );
         return;
     };
+    publish_decrypted_secneo(dest, pid, &plain);
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn publish_decrypted_secneo(dest: &Path, pid: u32, plain: &[u8]) {
     let class_defs = plain
         .get(96..100)
-        .and_then(|b| b.try_into().ok())
+        .and_then(|bytes| bytes.try_into().ok())
         .map_or(0, u32::from_le_bytes);
     let out = dest.join("apk-dex").join("secneo-decrypted.dex");
     let _ = std::fs::create_dir_all(dest.join("apk-dex"));
-    if write_catalog_bytes(&out, &plain).is_err() {
+    if write_catalog_bytes(&out, plain).is_err() {
         write_live_note(dest, "decrypted SecNeo DEX could not be written".to_owned());
         return;
     }
@@ -2522,13 +2555,13 @@ fn first_dexdata_file(dest: &Path) -> Option<(PathBuf, ksight_core::DexDataSpot)
         let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
             continue;
         };
-        if !name.ends_with(".code") || !path.is_file() {
+        if !exact_suffix(name, ".code") || !path.is_file() {
             continue;
         }
         let Ok(meta) = path.metadata() else {
             continue;
         };
-        if meta.len() as usize > ksight_core::DEX_IMAGE_LIMIT {
+        if meta.len() > image_limit_u64() {
             continue;
         }
         let Ok(bytes) = std::fs::read(&path) else {
@@ -2899,14 +2932,10 @@ fn unpacked_dex_ranges(bytes: &[u8], limit: usize) -> Vec<(usize, usize)> {
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn scan_dexhelper_bss<R>(
-    dest: &Path,
-    expected: &crate::qualified_code::SourceIdentity,
+    probe: &AnchoredProbe<'_>,
     mem: &mut R,
     rows: &[crate::dexdump::MapRow],
     probes: &[Vec<u8>],
-    bound: &ksight_hwbp::instance_scope::BoundInstance,
-    deadline: Instant,
-    cancelled: &std::sync::atomic::AtomicBool,
 ) -> Option<[u8; 16]>
 where
     R: std::io::Read + std::io::Seek,
@@ -2925,31 +2954,17 @@ where
         }
         let mut bytes = Vec::new();
         let receipt = read_anchored_window(mem, &mut bytes, row.start, len, || {
-            observe_anchored_read(bound, dest, deadline, cancelled)
+            observe_anchored_read(probe.bound, probe.dest, probe.deadline, probe.cancelled)
         });
-        if !store_anchored_note(dest, &anchored_source_note(expected, &receipt)) {
+        if !store_anchored_note(probe.dest, &anchored_source_note(probe.expected, &receipt)) {
             return None;
         }
-        let Some(bytes) = trusted_anchored(&receipt, bytes) else {
-            return None;
-        };
+        let bytes = trusted_anchored(&receipt, bytes)?;
         read_total = read_total.saturating_add(receipt.actual_length);
         if let Some(key) = ksight_core::scan_sm4_haystack(&bytes, probes, 8, 2_000_000) {
             return Some(key);
         }
-        if let Some(key) = scan_pointer_windows(
-            &AnchoredProbe {
-                dest,
-                expected,
-                bound,
-                deadline,
-                cancelled,
-            },
-            mem,
-            rows,
-            &bytes,
-            probes,
-        ) {
+        if let Some(key) = scan_pointer_windows(probe, mem, rows, &bytes, probes) {
             return Some(key);
         }
     }
@@ -2981,10 +2996,7 @@ where
     while offset.saturating_add(8) <= bytes.len() && seen.len() < 8 {
         let ptr = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap_or([0; 8]));
         offset = offset.saturating_add(8);
-        if !(0x1_0000..=0x00ff_ffff_ffff).contains(&ptr)
-            || !ptr.is_multiple_of(8)
-            || seen.contains(&ptr)
-        {
+        if !(0x1_0000..=0x00ff_ffff_ffff).contains(&ptr) || ptr % 8 != 0 || seen.contains(&ptr) {
             continue;
         }
         let Some(row) = rows.iter().find(|row| ptr >= row.start && ptr < row.end) else {
@@ -3009,9 +3021,7 @@ where
         if !store_anchored_note(probe.dest, &anchored_source_note(probe.expected, &receipt)) {
             return None;
         }
-        let Some(window) = trusted_anchored(&receipt, window) else {
-            return None;
-        };
+        let window = trusted_anchored(&receipt, window)?;
         if let Some(key) = ksight_core::scan_sm4_haystack(&window, probes, 8, 2_000_000) {
             return Some(key);
         }
@@ -3065,11 +3075,11 @@ fn catalog_bound_code_dex(dest: &Path, out: &mut Vec<ksight_core::DumpArtifact>)
         let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
             continue;
         };
-        if !name.ends_with(".code") || !path.is_file() {
+        if !exact_suffix(name, ".code") || !path.is_file() {
             continue;
         }
-        let file_len = path.metadata().map_or(0, |meta| meta.len()) as usize;
-        if file_len > ksight_core::DEX_IMAGE_LIMIT {
+        let file_len = path.metadata().map_or(0, |meta| meta.len());
+        if file_len > image_limit_u64() {
             notes.push(format!(
                 "runtime/{name} is {file_len} bytes, over the {0} byte image bound; not read again",
                 ksight_core::DEX_IMAGE_LIMIT

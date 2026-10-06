@@ -171,8 +171,7 @@ where
         if path.extension().and_then(|ext| ext.to_str()) != Some("json")
             || entry
                 .metadata()
-                .map(|m| m.len() > 256 * 1024)
-                .unwrap_or(true)
+                .map_or(true, |meta| meta.len() > 256 * 1024)
         {
             return false;
         }
@@ -191,10 +190,7 @@ where
             && value["requested_bytes"] == requested_bytes
     });
     let duplicate = seen.contains(&key)
-        || (committed
-            && fs::read(dir.join(&analysis_name))
-                .map(|bytes| bytes == selected)
-                .unwrap_or(false));
+        || (committed && fs::read(dir.join(&analysis_name)).is_ok_and(|bytes| bytes == selected));
     let mut record = json!({"schema":"kernsight.memory-window/v1", "pid":pid, "read":read, "window_status":window_status, "source_start":start, "source_bytes":raw.len(), "requested_start":start, "requested_bytes":requested_bytes, "actual_bytes":raw.len(), "source_relative_path":raw_name, "source_sha256":source_hash, "relative_path":analysis_name, "sha256":hash, "derived_offset":offset, "derived_bytes":selected.len(), "transformation":"trim_nul_padding/v1", "parse_status":"unparsed", "duplicate":duplicate, "write_status":"retained"});
     let result = retain(&dir.join(&raw_name), raw)
         .and_then(|()| retain(&dir.join(&analysis_name), selected));

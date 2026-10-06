@@ -40,16 +40,6 @@ pub struct AuxiliaryCapturePlan {
 }
 
 impl AuxiliaryCapturePlan {
-    #[cfg(test)]
-    pub(super) const fn new(mirror: bool) -> Self {
-        Self {
-            mirror,
-            _code_only: false,
-            collect_keys: false,
-            automatic_dump: true,
-        }
-    }
-
     pub(super) const fn scoped(mirror: bool, code_only: bool, collect_keys: bool) -> Self {
         Self {
             mirror,

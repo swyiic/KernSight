@@ -35,27 +35,6 @@ pub(super) fn copy_app_private(package: &str, dest: &Path) -> Result<usize> {
     Ok(copied)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-pub(super) fn copy_app_private_from(roots: &[PathBuf], dest: &Path) -> Result<usize> {
-    let mut copied = 0_usize;
-    let mut seen = BTreeSet::new();
-    for root in roots {
-        for dir in APP_PRIVATE_DIRS {
-            copied = copied.saturating_add(copy_private_tree(
-                &root.join(dir),
-                &dest.join(dir),
-                dest,
-                &mut seen,
-                0,
-            )?);
-            if copied >= MAX_PRIVATE_FILES {
-                return Ok(copied);
-            }
-        }
-    }
-    Ok(copied)
-}
-
 pub(super) fn copy_private_tree(
     src: &Path,
     dest: &Path,

@@ -28,7 +28,6 @@ const SECRET_MAX_BYTES: usize = 128;
 struct KeylogHandle {
     session: UprobeSession,
     client_random_offset: Option<u64>,
-    library: String,
 }
 
 /// Live keylog probes for one capture session.
@@ -73,7 +72,6 @@ impl KeylogProbe {
                         self.handles.push(KeylogHandle {
                             session,
                             client_random_offset: entry.client_random_offset,
-                            library,
                         });
                         placed = true;
                         break;
@@ -110,6 +108,10 @@ impl KeylogProbe {
     ///
     /// Returns the probe plus status lines for the capture log.
     #[must_use]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep this admission or delivery transaction together for review."
+    )]
     pub fn attach_for_pids(uprobe_object: &Path, pids: &[u32]) -> (Self, Vec<String>) {
         let mut status = Vec::new();
         status.extend(ensure_device_stack_tables());
@@ -194,7 +196,6 @@ impl KeylogProbe {
                 handles.push(KeylogHandle {
                     session,
                     client_random_offset: entry.client_random_offset,
-                    library,
                 });
                 placed = true;
                 break;
@@ -266,14 +267,22 @@ fn render_line(hit: &ksight_hwbp::RegisterContext, handle: &KeylogHandle) -> Opt
         return None;
     }
     let secret = crate::inspect_runtime::read_remote_bytes(hit.pid, secret_ptr, secret_len)?;
-    let secret_hex: String = secret.iter().map(|byte| format!("{byte:02x}")).collect();
+    let mut secret_hex = String::with_capacity(secret.len().saturating_mul(2));
+    for byte in secret {
+        secret_hex.push(char::from(b"0123456789abcdef"[usize::from(byte >> 4)]));
+        secret_hex.push(char::from(b"0123456789abcdef"[usize::from(byte & 0x0f)]));
+    }
     let ssl_ptr = hit.regs.first().copied().unwrap_or(0);
     if let Some(offset) = handle.client_random_offset {
         if let Some(random) =
             crate::inspect_runtime::read_remote_bytes(hit.pid, ssl_ptr.saturating_add(offset), 32)
         {
             if random.len() == 32 {
-                let random_hex: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+                let mut random_hex = String::with_capacity(random.len().saturating_mul(2));
+                for byte in random {
+                    random_hex.push(char::from(b"0123456789abcdef"[usize::from(byte >> 4)]));
+                    random_hex.push(char::from(b"0123456789abcdef"[usize::from(byte & 0x0f)]));
+                }
                 return Some(format!("{label} {random_hex} {secret_hex}"));
             }
         }
@@ -313,7 +322,10 @@ pub fn ensure_device_stack_tables() -> Vec<String> {
     let mut status = Vec::new();
     let dir = Path::new("/data/local/tmp/ksight");
     if let Err(error) = std::fs::create_dir_all(dir) {
-        status.push(format!("keylog probe: mkdir {dir:?} failed: {error}"));
+        status.push(format!(
+            "keylog probe: mkdir {} failed: {error}",
+            dir.display()
+        ));
         return status;
     }
     let stacks = dir.join("tls_stacks.json");

@@ -45,7 +45,7 @@ impl TlsInject {
         let cache = package.map(cache_path);
         thread::Builder::new()
             .name("ksight-tls-inject".into())
-            .spawn(move || listen_loop(sock, cache, tx))
+            .spawn(move || listen_loop(&sock, cache.as_deref(), &tx))
             .map_err(|error| error.to_string())?;
         Ok(Self {
             rx,
@@ -182,7 +182,8 @@ fn process_age(pid: u32) -> Option<Duration> {
     let start_ticks = parse_stat_start_ticks(&stat)?;
     let uptime = std::fs::read_to_string("/proc/uptime").ok()?;
     let uptime_secs: f64 = uptime.split_whitespace().next()?.parse().ok()?;
-    let start_secs = start_ticks as f64 / 100.0;
+    let start_secs = f64::from(u32::try_from(start_ticks / 100).unwrap_or(u32::MAX))
+        + f64::from(u32::try_from(start_ticks % 100).unwrap_or(0)) / 100.0;
     let age = uptime_secs - start_secs;
     if age.is_finite() && age >= 0.0 {
         Some(Duration::from_secs_f64(age.min(86_400.0 * 30.0)))
@@ -199,13 +200,13 @@ fn parse_stat_start_ticks(stat: &str) -> Option<u64> {
         .and_then(|field| field.parse().ok())
 }
 
-fn listen_loop(sock: UdpSocket, cache: Option<String>, tx: Sender<InjectedPlaintext>) {
+fn listen_loop(sock: &UdpSocket, cache: Option<&str>, tx: &Sender<InjectedPlaintext>) {
     let mut buf = [0_u8; 12 + 2048];
     let mut file_off = 0_u64;
     loop {
         match sock.recv(&mut buf) {
             Ok(n) if n >= 12 => {
-                push_packet(&buf[..n], &tx);
+                push_packet(&buf[..n], tx);
             }
             Ok(_) => {}
             Err(error)
@@ -213,8 +214,8 @@ fn listen_loop(sock: UdpSocket, cache: Option<String>, tx: Sender<InjectedPlaint
             }
             Err(_) => thread::sleep(Duration::from_millis(50)),
         }
-        if let Some(path) = cache.as_deref() {
-            file_off = drain_file(path, file_off, &tx);
+        if let Some(path) = cache {
+            file_off = drain_file(path, file_off, tx);
         }
     }
 }
