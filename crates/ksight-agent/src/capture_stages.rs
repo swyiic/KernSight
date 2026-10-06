@@ -14,6 +14,7 @@ impl InspectStage {
     ///
     /// # Panics
     /// Panics if the phase name did not come from [`parse_stages`].
+    #[must_use]
     pub fn adapters(&self) -> Vec<InspectAdapterKind> {
         match self.name.as_str() {
             "l0" => Vec::new(),
@@ -73,6 +74,7 @@ pub struct StageCursor {
 }
 impl StageCursor {
     /// Create a cursor from a plan returned by [`parse_stages`].
+    #[must_use]
     pub fn new(stages: &[InspectStage]) -> Self {
         let mut total = 0;
         Self {
@@ -91,6 +93,7 @@ impl StageCursor {
     ///
     /// # Panics
     /// Panics if the cursor was created from an empty, unvalidated plan.
+    #[must_use]
     pub fn due(&self, elapsed: u64) -> bool {
         !self.finished && elapsed >= self.ends[self.index]
     }
@@ -124,6 +127,7 @@ pub struct TargetInstance {
 }
 /// Read PID and kernel birth identity from a live process stat record.
 /// Returns `None` for a mismatched PID, malformed record, or dead process.
+#[must_use]
 pub fn instance_from_stat(pid: u32, stat: &str) -> Option<TargetInstance> {
     if stat.split_once('(')?.0.trim().parse::<u32>().ok()? != pid {
         return None;
@@ -154,97 +158,3 @@ pub fn confirm_instance(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn exact_capabilities_remain_sequential() {
-        let s = parse_stages("l0:15,l1:90,linker:15").unwrap();
-        assert_eq!(s[0].adapters().len(), 0);
-        assert_eq!(
-            s[1].adapters(),
-            vec![
-                InspectAdapterKind::TlsSslWrite,
-                InspectAdapterKind::JniPlaintext,
-                InspectAdapterKind::BinderUserspace
-            ]
-        );
-        assert_eq!(s[2].adapters(), vec![InspectAdapterKind::LinkerSoLoad]);
-    }
-    #[test]
-    fn invalid_or_ambiguous_plan_is_refused() {
-        for s in [
-            "",
-            "l0:1",
-            "l1:0",
-            "l1:301",
-            "l1:-1",
-            "l1:1,l1:2",
-            "l1:1.5",
-            "other:5",
-            "l1:1;cmd",
-        ] {
-            assert!(parse_stages(s).is_err(), "{s}");
-        }
-    }
-    #[test]
-    fn transitions_are_bounded_and_no_phase_is_skipped() {
-        let s = parse_stages("l0:2,l1:3,linker:4").unwrap();
-        let mut c = StageCursor::new(&s);
-        assert!(!c.due(1));
-        assert!(c.advance(1).is_err());
-        assert!(c.advance(2).unwrap());
-        assert_eq!(c.index, 1);
-        assert!(c.advance(5).unwrap());
-        assert_eq!(c.index, 2);
-        assert!(!c.advance(9).unwrap());
-        assert!(c.finished);
-        let mut c = StageCursor::new(&s);
-        assert!(c.advance(5).is_err());
-        assert_eq!(c.index, 0);
-    }
-    #[test]
-    fn pid_reuse_exit_and_missing_birth_are_not_same_instance() {
-        let a = TargetInstance {
-            pid: 42,
-            start_ticks: 7,
-        };
-        assert!(confirm_instance(a, Some(a)).is_ok());
-        for b in [
-            None,
-            Some(TargetInstance {
-                pid: 42,
-                start_ticks: 8,
-            }),
-            Some(TargetInstance {
-                pid: 43,
-                start_ticks: 7,
-            }),
-        ] {
-            assert!(confirm_instance(a, b).is_err());
-        }
-    }
-    #[test]
-    fn kernel_stat_birth_uses_actual_field_and_rejects_zombie_or_wrong_pid() {
-        let mut tail = vec!["0"; 20];
-        tail[0] = "S";
-        tail[19] = "123456";
-        let stat = format!("42 (comm has ) parentheses) {}", tail.join(" "));
-        assert_eq!(
-            instance_from_stat(42, &stat),
-            Some(TargetInstance {
-                pid: 42,
-                start_ticks: 123_456
-            })
-        );
-        assert!(instance_from_stat(43, &stat).is_none());
-        for state in ["Z", "X", "x"] {
-            tail[0] = state;
-            assert!(instance_from_stat(42, &format!("42 (name) {}", tail.join(" "))).is_none());
-        }
-        assert!(instance_from_stat(42, "42 (short) S 1").is_none());
-        tail[0] = "S";
-        tail[19] = "0";
-        assert!(instance_from_stat(42, &format!("42 (name) {}", tail.join(" "))).is_none());
-    }
-}

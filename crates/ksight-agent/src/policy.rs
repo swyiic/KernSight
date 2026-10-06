@@ -27,6 +27,7 @@ impl PolicyStore {
     }
 
     /// Current validated policy.
+    #[must_use]
     pub fn current(&self) -> Option<&UpdatePolicy> {
         self.current.as_ref()
     }

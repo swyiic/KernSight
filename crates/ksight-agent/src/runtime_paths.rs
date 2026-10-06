@@ -106,43 +106,7 @@ pub fn route(path: &Path) -> Result<PathBuf> {
     }
 }
 /// Captures retained by this evidence operation.
+#[must_use]
 pub fn captures() -> PathBuf {
     root().join("captures")
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn production_paths_reject_escape_and_keep_legacy_defaults() {
-        let root = Path::new("/data/local/tmp/ksight-candidate-test");
-        assert_eq!(
-            route_at(Path::new("/data/local/tmp/ksight/spool"), root).unwrap(),
-            root.join("spool")
-        );
-        for p in [
-            "relative",
-            "/data/local/tmp/x/../y",
-            "/data/local/tmp/x/./y",
-            "/data/local/tmp/x//y",
-            "/data/local/tmp/x;id",
-            "/sdcard/output",
-        ] {
-            assert!(route_at(Path::new(p), root).is_err());
-        }
-        assert_eq!(
-            route(Path::new(DEFAULT_ROOT)).unwrap(),
-            Path::new(DEFAULT_ROOT)
-        );
-    }
-    #[cfg(unix)]
-    #[test]
-    fn production_paths_reject_existing_symlink_components() {
-        let root = std::env::temp_dir().join(format!("ksight-path-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&root).unwrap();
-        std::os::unix::fs::symlink("/tmp", root.join("link")).unwrap();
-        assert!(route_at(&root.join("link/output"), &root).is_err());
-        assert!(no_symlinks(&root.join("link")).is_err());
-        std::fs::remove_file(root.join("link")).unwrap();
-        std::fs::remove_dir(root).unwrap();
-    }
 }

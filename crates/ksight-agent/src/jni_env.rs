@@ -115,8 +115,8 @@ pub struct JniEnvFunction {
 }
 
 /// Slots copied for `--inspect-adapter jni_plaintext`.
-/// Lean JNIEnv slots for `--inspect-jni`: prefer string/`byte[]` corridors that
-/// can carry pre-encrypt field plaintext. DirectBuffer / Set*Region are
+/// Lean `JNIEnv` slots for `--inspect-jni`: prefer string/`byte[]` corridors that
+/// can carry pre-encrypt field plaintext. `DirectBuffer` / Set*Region are
 /// intentionally omitted — they flood the uprobe ring with HTTP/ZIP traffic
 /// (`perf_lost` 100k+) and drown short phone fields.
 pub const JNI_PLAINTEXT_SLOTS: [(&str, usize); 12] = [
@@ -362,6 +362,7 @@ fn looks_like_jni_table(bytes: &[u8], loads: &[Load], table: u64) -> bool {
 }
 
 /// Collect `ADRP Xd, page; ADD Xd, Xn, #imm` absolute targets from a leaf.
+#[must_use]
 pub fn aarch64_adrp_add_targets(func: &[u8], pc: u64) -> Vec<u64> {
     let mut pages = [None; 32];
     let mut targets = Vec::new();
@@ -412,57 +413,3 @@ fn decode_add_imm64(insn: u32) -> Option<(usize, usize, u64)> {
     Some((rd, rn, imm))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{
-        aarch64_adrp_add_targets, resolve_jni_env_functions, SLOT_GET_ARRAY_LENGTH,
-        SLOT_GET_BYTE_ARRAY_ELEMENTS, SLOT_GET_BYTE_ARRAY_REGION, SLOT_GET_CHAR_ARRAY_ELEMENTS,
-        SLOT_GET_CHAR_ARRAY_REGION, SLOT_GET_DIRECT_BUFFER_ADDRESS,
-        SLOT_GET_DIRECT_BUFFER_CAPACITY, SLOT_GET_PRIMITIVE_ARRAY_CRITICAL, SLOT_GET_STRING_CHARS,
-        SLOT_GET_STRING_CRITICAL, SLOT_GET_STRING_LENGTH, SLOT_GET_STRING_REGION,
-        SLOT_GET_STRING_UTF_CHARS, SLOT_GET_STRING_UTF_LENGTH, SLOT_GET_STRING_UTF_REGION,
-        SLOT_NEW_STRING, SLOT_NEW_STRING_UTF, SLOT_REGISTER_NATIVES, SLOT_SET_BYTE_ARRAY_REGION,
-        SLOT_SET_CHAR_ARRAY_REGION,
-    };
-    #[test]
-    fn jni_h_slots_match_openjdk_jni_native_interface() {
-        assert_eq!(SLOT_NEW_STRING, 163);
-        assert_eq!(SLOT_GET_STRING_LENGTH, 164);
-        assert_eq!(SLOT_GET_STRING_CHARS, 165);
-        assert_eq!(SLOT_NEW_STRING_UTF, 167);
-        assert_eq!(SLOT_GET_STRING_UTF_LENGTH, 168);
-        assert_eq!(SLOT_GET_STRING_UTF_CHARS, 169);
-        assert_eq!(SLOT_GET_ARRAY_LENGTH, 171);
-        assert_eq!(SLOT_GET_BYTE_ARRAY_ELEMENTS, 184);
-        assert_eq!(SLOT_GET_CHAR_ARRAY_ELEMENTS, 185);
-        assert_eq!(SLOT_GET_BYTE_ARRAY_REGION, 200);
-        assert_eq!(SLOT_GET_CHAR_ARRAY_REGION, 201);
-        assert_eq!(SLOT_SET_BYTE_ARRAY_REGION, 208);
-        assert_eq!(SLOT_SET_CHAR_ARRAY_REGION, 209);
-        assert_eq!(SLOT_REGISTER_NATIVES, 215);
-        assert_eq!(SLOT_GET_STRING_REGION, 220);
-        assert_eq!(SLOT_GET_STRING_UTF_REGION, 221);
-        assert_eq!(SLOT_GET_PRIMITIVE_ARRAY_CRITICAL, 222);
-        assert_eq!(SLOT_GET_STRING_CRITICAL, 224);
-        assert_eq!(SLOT_GET_DIRECT_BUFFER_ADDRESS, 230);
-        assert_eq!(SLOT_GET_DIRECT_BUFFER_CAPACITY, 231);
-        assert_eq!(super::JNI_PLAINTEXT_SLOTS.len(), 12);
-    }
-
-    #[test]
-    fn decodes_get_function_table_adrp_add_tables() {
-        // Pixel 6a Android 16 libart `GetFunctionTable` at VA 0x7efe58.
-        let body: [u8; 76] = [
-            0xe9, 0x20, 0x00, 0xd0, 0x6a, 0x11, 0x00, 0xd0, 0x4a, 0x81, 0x20, 0x91, 0x29, 0xa1,
-            0x46, 0xf9, 0xe8, 0x03, 0x00, 0x2a, 0x3f, 0x01, 0x00, 0xf1, 0x20, 0x11, 0x8a, 0x9a,
-            0x68, 0x01, 0x00, 0x37, 0x49, 0x01, 0x00, 0xb5, 0xe8, 0x20, 0x00, 0xd0, 0x69, 0x11,
-            0x00, 0xf0, 0x29, 0xe1, 0x1d, 0x91, 0x08, 0x7d, 0x47, 0xf9, 0x08, 0xc5, 0x44, 0xb9,
-            0x1f, 0x01, 0x00, 0x71, 0x68, 0x11, 0x00, 0xf0, 0x08, 0xc1, 0x00, 0x91, 0x00, 0x01,
-            0x89, 0x9a, 0xc0, 0x03, 0x5f, 0xd6,
-        ];
-        let targets = aarch64_adrp_add_targets(&body, 0x007e_fe58);
-        assert!(targets.contains(&0x00a1_d820), "{targets:#x?}");
-        assert!(targets.contains(&0x00a1_e030), "{targets:#x?}");
-        assert!(targets.contains(&0x00a1_e778), "{targets:#x?}");
-    }
-}

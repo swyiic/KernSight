@@ -15,7 +15,7 @@ const MAGIC: u32 = 0x3154_4c4b;
 const UDP_PORT: u16 = 18444;
 const PACKER_GRACE: Duration = Duration::from_secs(6);
 
-/// One plaintext SSL_write/SSL_read copy from the injected library.
+/// One plaintext `SSL_write/SSL_read` copy from the injected library.
 #[derive(Debug, Clone)]
 pub struct InjectedPlaintext {
     /// `send` or `recv`.
@@ -42,7 +42,7 @@ impl TlsInject {
         let sock = UdpSocket::bind(("127.0.0.1", UDP_PORT)).map_err(|error| error.to_string())?;
         let _ = sock.set_read_timeout(Some(Duration::from_millis(50)));
         let (tx, rx) = mpsc::channel();
-        let cache = package.map(|name| cache_path(name));
+        let cache = package.map(cache_path);
         thread::Builder::new()
             .name("ksight-tls-inject".into())
             .spawn(move || listen_loop(sock, cache, tx))

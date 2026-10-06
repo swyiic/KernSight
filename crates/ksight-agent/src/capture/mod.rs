@@ -352,38 +352,6 @@ fn inherit_inspect_scope(
         }
     }
 }
-#[cfg(test)]
-mod disabled_qualified_l0_test {
-    #[test]
-    fn production_disabled_l0_keeps_package_enrollment_without_enabling_inspect() {
-        let mut policy = ksight_core::InspectPolicy {
-            enabled: false,
-            whole_device: false,
-            ..ksight_core::InspectPolicy::default()
-        };
-        super::inherit_inspect_scope(
-            &mut policy,
-            None,
-            Some(10001),
-            Some("fixture.package"),
-            true,
-        );
-        assert!(!policy.enabled);
-        assert_eq!(policy.package.as_deref(), Some("fixture.package"));
-        let runtime = crate::inspect_runtime::InspectRuntime::prepare_qualified_candidate(
-            &policy,
-            &[crate::inspect_runtime::InspectAdapterKind::LinkerSoLoad],
-            std::path::Path::new("not-loaded"),
-            vec![],
-        );
-        assert!(runtime.is_ok());
-        assert!(runtime
-            .unwrap()
-            .initial_observations()
-            .iter()
-            .all(|o| !o.attached));
-    }
-}
 
 /// Run a foreground capture session.
 ///

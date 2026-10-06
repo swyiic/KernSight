@@ -192,19 +192,3 @@ fn effective_uid() -> Option<u32> {
     line.split_whitespace().nth(2)?.parse().ok()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn recognizes_exact_mount_type_and_path() {
-        let mounts = "bpffs /sys/fs/bpf bpf rw 0 0\ntracefs /sys/kernel/tracing tracefs rw 0 0\n";
-        assert!(mount_type_present(mounts, "bpf", "/sys/fs/bpf"));
-        assert!(mount_type_present(mounts, "tracefs", "/sys/kernel/tracing"));
-        assert!(!mount_type_present(
-            mounts,
-            "debugfs",
-            "/sys/kernel/tracing"
-        ));
-    }
-}

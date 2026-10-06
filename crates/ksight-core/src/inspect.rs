@@ -53,6 +53,7 @@ impl Default for InspectPolicy {
 
 impl InspectPolicy {
     /// Whether this policy may attach an adapter.
+    #[must_use]
     pub fn may_attach(&self) -> bool {
         self.enabled
             && (self.whole_device

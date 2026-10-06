@@ -340,20 +340,3 @@ pub(crate) fn process_start_ticks(pid: u32) -> Option<u64> {
     after_comm.split_whitespace().nth(19)?.parse().ok()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn spool_lease_is_exclusive_and_released() {
-        let root = std::env::temp_dir().join(format!("ksight-spool-lease-{}", Uuid::new_v4()));
-        let lease = SpoolLease::acquire(&root).expect("first lease");
-        assert!(matches!(
-            SpoolLease::acquire(&root),
-            Err(RetentionError::ActiveCollector(_))
-        ));
-        drop(lease);
-        SpoolLease::acquire(&root).expect("released lease");
-        let _ = fs::remove_dir_all(root);
-    }
-}

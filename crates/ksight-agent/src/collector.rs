@@ -28,6 +28,7 @@ impl RawRecord {
     }
 
     /// Whether this record declares the ABI implemented by this agent build.
+    #[must_use]
     pub fn has_supported_abi(&self) -> bool {
         self.abi_version == ksight_abi::RAW_ABI_VERSION
     }

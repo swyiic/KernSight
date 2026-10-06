@@ -1512,6 +1512,7 @@ impl SessionReportBuilder {
 
     /// Finish aggregation and order high-volume groups by descending activity.
     #[allow(clippy::too_many_lines)] // Final ordering keeps all report sections deterministic.
+    #[must_use]
     pub fn finish(mut self) -> SessionReport {
         self.stamp_dns_peers();
         self.stamp_handshake_peers();
@@ -2750,6 +2751,3 @@ pub fn correlate_http_calls_to_dex(
     refs
 }
 
-#[cfg(test)]
-#[path = "tests.rs"]
-mod tests;

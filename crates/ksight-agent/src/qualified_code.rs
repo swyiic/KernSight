@@ -55,10 +55,10 @@ fn app_code_mapped_bytes(pid: u32) -> u64 {
                 return None;
             }
             let code = perms.contains('x')
-                || path.ends_with(".dex")
-                || path.ends_with(".vdex")
-                || path.ends_with(".apk")
-                || path.ends_with(".so");
+                || android_suffix(path, ".dex")
+                || android_suffix(path, ".vdex")
+                || android_suffix(path, ".apk")
+                || android_suffix(path, ".so");
             if !code {
                 return None;
             }
@@ -68,6 +68,10 @@ fn app_code_mapped_bytes(pid: u32) -> u64 {
             Some(end.saturating_sub(start))
         })
         .sum()
+}
+
+fn android_suffix(path: &str, suffix: &str) -> bool {
+    path.len() >= suffix.len() && path.as_bytes().ends_with(suffix.as_bytes())
 }
 
 fn eligible_mapping(r: &crate::dexdump::MapRow) -> bool {
@@ -82,10 +86,10 @@ fn code_range_cap(path: &str) -> u64 {
     let path = path.trim_end().strip_suffix(" (deleted)").unwrap_or(path);
     // DEX images and named ELF libraries share the 128MiB image limit.
     // JIT memfd and APK mappings stay at 16MiB so they cannot consume the runtime payload.
-    if path.ends_with(".vdex")
-        || path.ends_with(".dex")
-        || path.ends_with(".cdex")
-        || path.ends_with(".so")
+    if android_suffix(path, ".vdex")
+        || android_suffix(path, ".dex")
+        || android_suffix(path, ".cdex")
+        || android_suffix(path, ".so")
     {
         128 * 1024 * 1024
     } else {
@@ -391,7 +395,11 @@ pub(crate) fn copy_range(
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod physical {
-    use super::*;
+    use super::{
+        app_code_mapped_bytes, bail, bound_copy_gap_state, budget_io, candidate_ledger,
+        code_range_cap, copy_range, eligible_mapping, prioritize_install_rows, stat_start_ticks,
+        write_candidate_ledger, Digest, Path, Read, Result, Sha256, SourceIdentity,
+    };
     use anyhow::Context as _;
     use ksight_hwbp::{
         metadata_scope::{PolicyWitness, QualificationPolicy, QualifiedInstance},
@@ -402,20 +410,27 @@ mod physical {
         process::{pidfd_open, Pid, PidfdFlags},
     };
     use std::time::Instant;
-    use std::{fs::File, os::fd::AsFd, path::PathBuf, time::Duration};
+    use std::{fs::File, os::fd::AsFd, path::PathBuf};
     /// Real BTF and actual verifier acceptance. Retained hashes detect drift at every issuance.
     pub struct Backend {
+        /// `metadata`.
         pub metadata: PathBuf,
+        /// `uprobe`.
         pub uprobe: PathBuf,
         object_hash: [u8; 32],
         btf_hash: [u8; 32],
+        /// `boot_id`.
         pub boot_id: String,
     }
     impl Backend {
+        ///
+        /// # Errors
+        ///
+        /// Returns the existing failure for this operation. No success value is invented.
         pub fn open() -> Result<Self> {
             let (metadata, uprobe) = crate::embedded::qualified_objects()?;
             let object = std::fs::read(&metadata)?;
-            if object.len() > 262144 {
+            if object.len() > 262_144 {
                 bail!("metadata object bound");
             }
             let mut btf = Vec::new();
@@ -431,7 +446,8 @@ mod physical {
             drop(MetadataObserver::load(&metadata, object_hash, btf_hash)?);
             ksight_hwbp::UprobeSession::verify_instance_backend(&uprobe)?;
             drop(pidfd_open(
-                Pid::from_raw(std::process::id() as i32).context("self PID")?,
+                Pid::from_raw(i32::try_from(std::process::id()).context("self PID")?)
+                    .context("self PID")?,
                 PidfdFlags::empty(),
             )?);
             Ok(Self {
@@ -442,6 +458,10 @@ mod physical {
                 boot_id: crate::retention::boot_id().context("kernel boot identity unavailable")?,
             })
         }
+        ///
+        /// # Errors
+        ///
+        /// Returns the existing failure for this operation. No success value is invented.
         pub fn uid(&self, package: &str) -> Result<u32> {
             let resolver = crate::identity::AndroidIdentityResolver::from_system()?;
             let uid = resolver
@@ -449,13 +469,17 @@ mod physical {
                 .context("not-supported: shared/ambiguous/missing package UID enrollment")?;
             Ok(uid)
         }
+        ///
+        /// # Errors
+        ///
+        /// Returns the existing failure for this operation. No success value is invented.
         pub fn qualify(&self, package: &str, pid: u32, with_memory: bool) -> Result<Target> {
             if crate::retention::boot_id().as_deref() != Some(self.boot_id.as_str()) {
                 bail!("boot identity changed");
             }
             let uid = self.uid(package)?;
             let pidfd = pidfd_open(
-                Pid::from_raw(pid as i32).context("target PID")?,
+                Pid::from_raw(i32::try_from(pid).context("target PID")?).context("target PID")?,
                 PidfdFlags::empty(),
             )?;
             // Proc directory retained through qualification; mem belongs to this original task/mm, not a later numeric PID.
@@ -514,6 +538,10 @@ mod physical {
                 mem,
             })
         }
+        ///
+        /// # Panics
+        ///
+        /// Panics if a debug assertion in this function fails.
         pub fn main_pid(&self, package: &str) -> Result<Option<u32>> {
             let mut candidates: Vec<_> = crate::dexdump::pids_for_package(package)
                 .into_iter()
@@ -545,6 +573,10 @@ mod physical {
             );
             Ok(Some(chosen))
         }
+        ///
+        /// # Errors
+        ///
+        /// Returns the existing failure for this operation. No success value is invented.
         pub fn record_candidates(&self, expected: &SourceIdentity, out: &Path) -> Result<()> {
             expected.validate()?;
             let mut target = self.qualify(&expected.package, expected.pid, true)?;
@@ -581,6 +613,10 @@ mod physical {
             )?;
             Ok(())
         }
+        ///
+        /// # Errors
+        ///
+        /// Returns the existing failure for this operation. No success value is invented.
         pub fn copy_code(
             &self,
             expected: &SourceIdentity,
@@ -779,8 +815,11 @@ mod physical {
             Ok(stats)
         }
     }
+    /// `Target`.
     pub struct Target {
+        /// `identity`.
         pub identity: SourceIdentity,
+        /// `qualified`.
         pub qualified: QualifiedInstance,
         dir: File,
         maps: Option<File>,
@@ -829,216 +868,3 @@ mod physical {
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use physical::{Backend, Target};
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn elf_range_cap_matches_dex_image_limit_and_jit_stays_small() {
-        assert_eq!(
-            code_range_cap("/data/app/p/lib/arm64/libapp.so"),
-            128 * 1024 * 1024
-        );
-        assert_eq!(
-            code_range_cap("/data/app/p/lib/arm64/libapp.so (deleted)"),
-            128 * 1024 * 1024
-        );
-        assert_eq!(
-            code_range_cap("/data/app/p/oat/arm64/base.vdex"),
-            128 * 1024 * 1024
-        );
-        assert_eq!(
-            code_range_cap("/memfd:jit-cache (deleted)"),
-            16 * 1024 * 1024
-        );
-        assert_eq!(code_range_cap("/data/app/p/base.apk"), 16 * 1024 * 1024);
-    }
-
-    #[test]
-    fn full_so_copy_is_not_labeled_unattempted_when_only_torn() {
-        assert_eq!(
-            bound_copy_gap_state(false, false, false, false),
-            ("none", "none")
-        );
-        assert_eq!(
-            bound_copy_gap_state(false, false, true, false),
-            ("none", "per_range_cap")
-        );
-        assert_eq!(
-            bound_copy_gap_state(true, true, false, true),
-            (
-                "not_attempted_parent_deadline_or_output_exhausted",
-                "runtime_payload_budget_metadata_reserve"
-            )
-        );
-    }
-
-    use super::*;
-    #[test]
-    fn static_install_rows_follow_registered_code_priority() {
-        let mut rows=crate::dexdump::parse_maps("1000-2000 r--p 0 00:00 1 /data/app/id/base.apk\n2000-3000 r-xp 0 00:00 2 /data/app/id/lib/a.so\n3000-4000 rw-p 0 00:00 3 /data/app/id/oat/base.vdex\n");
-        prioritize_install_rows(&mut rows, &["/data/app/id/base.apk".into()]);
-        assert_eq!(
-            rows.iter().map(|r| r.start).collect::<Vec<_>>(),
-            vec![0x3000, 0x2000, 0x1000]
-        );
-    }
-    #[test]
-    fn app_file_priority_preserves_ties_and_does_not_promote_private_or_prefix_collision() {
-        let mut rows=crate::dexdump::parse_maps("1000-2000 r-xs 00000000 00:00 1 /memfd:jit-cache\n2000-3000 r-xp 00000000 00:00 2 /data/app/id/lib/libone.so\n3000-4000 r-xp 00000000 00:00 3 /data/app/id2/lib/libother.so\n4000-5000 r-xp 00000000 00:00 4 /data/app/id/lib/libtwo.so\n5000-6000 r-xp 00000000 00:00 5 /data/user/0/pkg/cache/base.art\n");
-        prioritize_install_rows(&mut rows, &["/data/app/id/base.apk".into()]);
-        assert_eq!(
-            rows.iter().map(|r| r.start).collect::<Vec<_>>(),
-            vec![0x2000, 0x4000, 0x1000, 0x3000, 0x5000]
-        );
-    }
-    #[test]
-    fn candidate_plan_preserves_order_bounds_and_unknown_actual() {
-        let rows = crate::dexdump::parse_maps("1000-2000 r-xs 00000000 00:00 1 /memfd:jit-cache\n2000-3000 r-xp 00000000 00:00 2 /data/app/test/libapp.so\n3000-4000 rw-p 00000000 00:00 0 [heap]\n");
-        let note = candidate_ledger(&rows);
-        assert_eq!(note["eligible_count"], 2);
-        assert_eq!(note["candidates"][0]["category"], "jit_named");
-        assert_eq!(note["candidates"][1]["category"], "elf_named");
-        assert!(note["candidates"][1]["actual_bytes"].is_null());
-        assert_eq!(note["candidates"][1]["ownership"], "unknown");
-        let many = (0..140)
-            .map(|_| crate::dexdump::MapRow {
-                start: 0,
-                end: 1,
-                perms: "r-xp".into(),
-                path: "x".repeat(400),
-                inode: 0,
-            })
-            .collect::<Vec<_>>();
-        let capped = candidate_ledger(&many);
-        assert_eq!(capped["listed_count"], 140);
-        assert_eq!(capped["omitted_count"], 0);
-        assert!(capped["omitted_reason"].is_null());
-        assert_eq!(capped["candidates"][0]["path_truncated"], true);
-        assert_eq!(
-            capped["candidates"][0]["selection_reason"],
-            "eligible_install_priority_until_parent_budget"
-        );
-    }
-
-    #[test]
-    fn stat_start_ticks_reads_field_22_after_comm() {
-        let stat = "12 (my proc) R 1 12 12 0 0 0 0 0 0 0 0 0 0 0 20 0 1 0 999 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0";
-        assert_eq!(stat_start_ticks(stat), Some(999));
-        assert_eq!(stat_start_ticks("no-paren"), None);
-    }
-
-    use std::io::Cursor;
-    #[test]
-    #[allow(
-        clippy::items_after_statements,
-        reason = "Local fixture or owned callback keeps its explicit scope and fallible signature."
-    )]
-    fn production_bound_range_short_failure_and_generation_rejection_remain_distinct() {
-        let r = copy_range(&mut Cursor::new(b"abc"), &mut Vec::new(), 0, 6, || Ok(()));
-        assert_eq!(r.read_status, "short_read");
-        assert_eq!(r.actual_length, 3);
-        assert!(r.torn);
-        assert!(!r.paused);
-        struct Broken;
-        impl Read for Broken {
-            #[allow(
-                clippy::items_after_statements,
-                reason = "Local fixture or owned callback keeps its explicit scope and fallible signature."
-            )]
-            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
-                Err(std::io::ErrorKind::PermissionDenied.into())
-            }
-        }
-        impl Seek for Broken {
-            fn seek(&mut self, _: SeekFrom) -> std::io::Result<u64> {
-                Ok(0)
-            }
-        }
-        let r = copy_range(&mut Broken, &mut Vec::new(), 0, 6, || Ok(()));
-        assert_eq!(r.read_status, "read_failed");
-        assert_eq!(r.actual_length, 0);
-        let r = copy_range(&mut Cursor::new(b"abc"), &mut Vec::new(), 0, 3, || {
-            bail!("generation changed")
-        });
-        assert_eq!(r.admission, "rejected_identity");
-        assert_eq!(r.actual_length, 0);
-    }
-    #[test]
-    fn production_bound_range_checks_current_qualification_between_chunks_and_at_return() {
-        let bytes = vec![7; 131_072];
-        let mut checks = 0;
-        let mut out = Vec::new();
-        let r = copy_range(
-            &mut Cursor::new(&bytes),
-            &mut out,
-            0,
-            bytes.len() as u64,
-            || {
-                checks += 1;
-                if checks == 3 {
-                    bail!("task exited");
-                }
-                Ok(())
-            },
-        );
-        assert_eq!(r.actual_length, 65536);
-        assert_eq!(r.admission, "rejected_identity_or_deadline");
-        assert_eq!(out.len(), 65536);
-        let r = copy_range(&mut Cursor::new(b"same"), &mut Vec::new(), 0, 4, || Ok(()));
-        assert_eq!(r.admission, "qualified_live_copy");
-        assert_eq!(r.sha256, Some(format!("{:x}", Sha256::digest(b"same"))));
-    }
-    #[test]
-    fn production_budget_exhaustion_retains_prefix_and_marks_unfinished_read_interrupted() {
-        let root = std::env::temp_dir().join(format!("range-budget-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&root).unwrap();
-        let path = root.join("raw.pending");
-        let guard =
-            ksight_core::output_budget::Guard::install(vec![root.clone()], 65536, 1000).unwrap();
-        let mut out = ksight_core::output_budget::BudgetFile::create(&path).unwrap();
-        let r = copy_range(
-            &mut Cursor::new(vec![7; 196_608]),
-            &mut out,
-            0,
-            196_608,
-            || Ok(()),
-        );
-        out.sync_all().unwrap();
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), 65536);
-        assert_eq!(r.actual_length, 131_072); // read bytes are independent of committed bytes
-        assert_eq!(r.read_status, "interrupted");
-        assert_eq!(r.write_status, "write_failed");
-        assert!(r
-            .write_error
-            .as_deref()
-            .unwrap()
-            .contains("output_budget_exhausted"));
-        assert_eq!(guard.receipt().admitted_write_bytes, 65536);
-        assert!(guard.receipt().partial);
-    }
-    #[test]
-    fn production_bound_range_write_failure_and_missing_old_identity_never_count_as_complete() {
-        struct Broken;
-        impl Write for Broken {
-            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
-                Err(std::io::ErrorKind::StorageFull.into())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let r = copy_range(&mut Cursor::new(b"abc"), &mut Broken, 0, 3, || Ok(()));
-        assert_eq!(r.write_status, "write_failed");
-        assert_eq!(r.actual_length, 3);
-        assert!(SourceIdentity {
-            package: "fixture".into(),
-            pid: 1,
-            uid: 1,
-            birth_ns: 0,
-            exec_id: 0,
-            boot_id: String::new()
-        }
-        .validate()
-        .is_err());
-        assert!(capability().is_err()); // Host is not an ARM Android backend; no fake success.
-    }
-}

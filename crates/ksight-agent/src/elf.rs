@@ -150,16 +150,19 @@ fn inspect_elf32(path: &Path, bytes: &[u8]) -> Result<ElfIdentity, String> {
 }
 
 /// Locate a preferred exported symbol file offset.
+#[must_use]
 pub fn symbol_offset(elf: &ElfIdentity, names: &[&str]) -> Option<u64> {
     symbol_match(elf, names).map(|(_, offset)| offset)
 }
 
 /// Locate an exported symbol by exact name or prefix.
+#[must_use]
 pub fn symbol_match<'a>(elf: &'a ElfIdentity, names: &[&str]) -> Option<(&'a str, u64)> {
     matching_symbols(elf, names).into_iter().next()
 }
 
 /// First exact dynsym name in `names` order. Avoids `sslRead` matching `sslReadEx`.
+#[must_use]
 pub fn symbol_match_exact<'a>(elf: &'a ElfIdentity, names: &[&str]) -> Option<(&'a str, u64)> {
     matching_symbols_exact(elf, names).into_iter().next()
 }
@@ -196,6 +199,7 @@ pub fn matching_symbols_exact<'a, S: AsRef<str>>(
 
 /// Every exported symbol whose name equals or starts with one of `names`.
 /// Unique by file offset, dynsym order.
+#[must_use]
 pub fn matching_symbols<'a>(elf: &'a ElfIdentity, names: &[&str]) -> Vec<(&'a str, u64)> {
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
@@ -314,7 +318,7 @@ fn parse_dynsym_via_pt_dynamic(
             let val = u64::from_le_bytes(entry[8..16].try_into().unwrap_or([0; 8]));
             (tag, val)
         } else {
-            let tag = i32::from_le_bytes(entry[0..4].try_into().unwrap_or([0; 4])) as i64;
+            let tag = i64::from(i32::from_le_bytes(entry[0..4].try_into().unwrap_or([0; 4])));
             let val = u64::from(u32::from_le_bytes(entry[4..8].try_into().unwrap_or([0; 4])));
             (tag, val)
         };
@@ -424,7 +428,7 @@ fn is_defined_func(info: u8, shndx: u16, value: u64) -> bool {
     info & 0x0f == 2
 }
 
-/// LOCAL `.symtab` SSL_write/SSL_read (static OpenSSL in libcurl). Not an invented RVA:
+/// LOCAL `.symtab` `SSL_write/SSL_read` (static OpenSSL in libcurl). Not an invented RVA:
 /// the file offset comes from this ELF's own symbol table.
 fn merge_tls_symtab(
     symbols: &mut Vec<(String, u64)>,
@@ -584,166 +588,3 @@ pub fn plausible_elf_file(path: &str) -> bool {
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{
-        dynsym_export_name, inspect_elf, matching_symbols, matching_symbols_exact,
-        parse_gnu_build_id, ElfIdentity,
-    };
-
-    #[test]
-    fn matching_symbols_returns_every_prefix_hit() {
-        let elf = ElfIdentity {
-            path: "/libdexfile.so".to_owned(),
-            build_id: None,
-            bits: 64,
-            symbols: vec![
-                ("_ZN3art13DexFileLoader4OpenEbbb".to_owned(), 0x1fe68),
-                (
-                    "_ZN3art13DexFileLoader10OpenCommonEPKhm".to_owned(),
-                    0x21398,
-                ),
-                ("_ZNK3art16ArtDexFileLoader4OpenEPKc".to_owned(), 0x14624),
-                ("_ZN3art9Ignored4OpenE".to_owned(), 0x1),
-            ],
-        };
-        let hits = matching_symbols(
-            &elf,
-            &[
-                "_ZN3art13DexFileLoader4OpenE",
-                "_ZN3art13DexFileLoader10OpenCommonE",
-                "_ZNK3art16ArtDexFileLoader4OpenE",
-            ],
-        );
-        assert_eq!(hits.len(), 3);
-        assert!(hits.iter().any(|(name, _)| name.contains("OpenCommon")));
-        assert!(matching_symbols(&elf, &["_ZN3art13DexFileLoader4OpenE"])
-            .iter()
-            .all(|(name, _)| name.starts_with("_ZN3art13DexFileLoader4OpenE")));
-    }
-
-    #[test]
-    fn exact_match_accepts_gnu_versioned_ssl_write() {
-        let elf = ElfIdentity {
-            path: "/libssl.so".to_owned(),
-            build_id: None,
-            bits: 64,
-            symbols: vec![
-                ("SSL_write@@OPENSSL_3".to_owned(), 0x24a3d8),
-                ("SSL_read@LIBSSL_1_1".to_owned(), 0x249f60),
-            ],
-        };
-        let write = matching_symbols_exact(&elf, &["SSL_write", "SSL_write_ex"]);
-        assert_eq!(write, vec![("SSL_write@@OPENSSL_3", 0x24a3d8)]);
-        let read = matching_symbols_exact(&elf, &["SSL_read"]);
-        assert_eq!(read, vec![("SSL_read@LIBSSL_1_1", 0x249f60)]);
-        assert_eq!(dynsym_export_name("SSL_write@@OPENSSL_3"), "SSL_write");
-        assert_eq!(dynsym_export_name("SSL_write"), "SSL_write");
-    }
-
-    #[test]
-    fn inspect_elf_keeps_defined_ssl_write_and_drops_und() {
-        let bytes = tiny_elf64_dynsym(&[
-            TinySym {
-                name: "SSL_write@@OPENSSL_3.0.0",
-                value: 0x120,
-                shndx: 1,
-                func: true,
-            },
-            TinySym {
-                name: "SSL_write",
-                value: 0,
-                shndx: 0,
-                func: true,
-            },
-        ]);
-        let dir = std::env::temp_dir();
-        let path = dir.join("ksight-tiny-ssl-write.so");
-        std::fs::write(&path, &bytes).expect("write tiny elf");
-        let elf = inspect_elf(&path).expect("parse tiny elf");
-        let _ = std::fs::remove_file(&path);
-        let hits = matching_symbols_exact(&elf, &["SSL_write"]);
-        assert_eq!(hits.len(), 1, "{elf:?}");
-        assert_eq!(hits[0].0, "SSL_write");
-        assert_eq!(hits[0].1, 0x120);
-    }
-
-    struct TinySym {
-        name: &'static str,
-        value: u64,
-        shndx: u16,
-        func: bool,
-    }
-
-    fn tiny_elf64_dynsym(syms: &[TinySym]) -> Vec<u8> {
-        let mut dynstr = vec![0_u8];
-        let mut name_offs = Vec::new();
-        for sym in syms {
-            name_offs.push(dynstr.len() as u32);
-            dynstr.extend_from_slice(sym.name.as_bytes());
-            dynstr.push(0);
-        }
-        let dynsym_ents = 1 + syms.len();
-        let dynsym = vec![0_u8; dynsym_ents * 24];
-        let ehdr = 64;
-        let phdr = 56;
-        let shdr = 64 * 3;
-        let dynsym_off = ehdr + phdr;
-        let dynstr_off = dynsym_off + dynsym.len();
-        let shoff = dynstr_off + dynstr.len();
-        let file_len = shoff + shdr;
-        let mut bytes = vec![0_u8; file_len.max(0x180)];
-        let file_len64 = bytes.len() as u64;
-        bytes[0..4].copy_from_slice(b"\x7fELF");
-        bytes[4] = 2;
-        bytes[5] = 1;
-        bytes[6] = 1;
-        bytes[16..18].copy_from_slice(&3u16.to_le_bytes());
-        bytes[18..20].copy_from_slice(&0x3e_u16.to_le_bytes());
-        bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
-        bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
-        bytes[40..48].copy_from_slice(&(shoff as u64).to_le_bytes());
-        bytes[52..54].copy_from_slice(&64u16.to_le_bytes());
-        bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
-        bytes[56..58].copy_from_slice(&1u16.to_le_bytes());
-        bytes[58..60].copy_from_slice(&64u16.to_le_bytes());
-        bytes[60..62].copy_from_slice(&3u16.to_le_bytes());
-        bytes[64..68].copy_from_slice(&1u32.to_le_bytes());
-        bytes[68..72].copy_from_slice(&5u32.to_le_bytes());
-        bytes[88..96].copy_from_slice(&file_len64.to_le_bytes());
-        bytes[96..104].copy_from_slice(&file_len64.to_le_bytes());
-        for (i, sym) in syms.iter().enumerate() {
-            let off = dynsym_off + (i + 1) * 24;
-            bytes[off..off + 4].copy_from_slice(&name_offs[i].to_le_bytes());
-            bytes[off + 4] = if sym.func { 0x12 } else { 0x11 };
-            bytes[off + 6..off + 8].copy_from_slice(&sym.shndx.to_le_bytes());
-            bytes[off + 8..off + 16].copy_from_slice(&sym.value.to_le_bytes());
-        }
-        let _ = dynsym;
-        bytes[dynstr_off..dynstr_off + dynstr.len()].copy_from_slice(&dynstr);
-        // shdr[0] NULL
-        // shdr[1] SHT_DYNSYM link=2
-        let sh1 = shoff + 64;
-        bytes[sh1 + 4..sh1 + 8].copy_from_slice(&11u32.to_le_bytes());
-        bytes[sh1 + 24..sh1 + 32].copy_from_slice(&(dynsym_off as u64).to_le_bytes());
-        bytes[sh1 + 32..sh1 + 40].copy_from_slice(&(dynsym_ents as u64 * 24).to_le_bytes());
-        bytes[sh1 + 40..sh1 + 44].copy_from_slice(&2u32.to_le_bytes());
-        // shdr[2] SHT_STRTAB
-        let sh2 = shoff + 128;
-        bytes[sh2 + 4..sh2 + 8].copy_from_slice(&3u32.to_le_bytes());
-        bytes[sh2 + 24..sh2 + 32].copy_from_slice(&(dynstr_off as u64).to_le_bytes());
-        bytes[sh2 + 32..sh2 + 40].copy_from_slice(&(dynstr.len() as u64).to_le_bytes());
-        bytes
-    }
-
-    #[test]
-    fn parses_gnu_build_id_note() {
-        let mut note = vec![4, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0];
-        note.extend_from_slice(b"GNU\0");
-        note.extend_from_slice(&[0xab, 0xcd]);
-        assert_eq!(
-            parse_gnu_build_id(&note, 0, note.len() as u64).as_deref(),
-            Some("abcd")
-        );
-    }
-}

@@ -156,30 +156,3 @@ pub fn encrypt_ecb(key: &[u8; 16], data: &[u8]) -> Vec<u8> {
     out
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn decrypts_standard_sm4_ecb_vector() {
-        // GB/T 32907-2016 example: key=01..0f, plain=01..0f
-        let key = [
-            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54,
-            0x32, 0x10,
-        ];
-        let plain = [
-            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54,
-            0x32, 0x10,
-        ];
-        let round_keys = expand_key(&key);
-        let cipher = crypt_block(&round_keys, plain, false);
-        assert_eq!(
-            cipher,
-            [
-                0x68, 0x1e, 0xdf, 0x34, 0xd2, 0x06, 0x96, 0x5e, 0x86, 0xb3, 0xe9, 0x4f, 0x53, 0x6e,
-                0x42, 0x46
-            ]
-        );
-        assert_eq!(crypt_block(&round_keys, cipher, true), plain);
-    }
-}

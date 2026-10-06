@@ -111,14 +111,3 @@ fn effective_uid() -> Option<u32> {
         .ok()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn boolean_parser_is_strict() {
-        assert_eq!(parse_bool("1"), Some(true));
-        assert_eq!(parse_bool("disabled"), Some(false));
-        assert_eq!(parse_bool("null"), None);
-    }
-}

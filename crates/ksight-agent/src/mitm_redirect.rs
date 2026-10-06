@@ -67,9 +67,7 @@ impl MitmRedirect {
             child: Some(child),
         };
         redirect.purge_uid_rules();
-        if let Err(error) = redirect.apply_tcp("-I") {
-            return Err(error);
-        }
+        redirect.apply_tcp("-I")?;
         let _ = redirect.apply_udp("-I");
         let _ = redirect.apply_ipv6("-I");
         let _ = redirect.apply_input("-I");

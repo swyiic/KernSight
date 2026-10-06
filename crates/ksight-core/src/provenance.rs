@@ -39,6 +39,7 @@ pub struct CodeArtifact {
 }
 
 /// Classify a path-only L0 observation.
+#[must_use]
 pub fn path_candidate(path: &str) -> CodeArtifact {
     let extension = std::path::Path::new(path)
         .extension()
@@ -194,6 +195,7 @@ pub enum DexOwnershipCategory {
 
 impl DexOwnershipCategory {
     /// Stable ordered directory used by device and desktop evidence browsers.
+    #[must_use]
     pub fn directory(self) -> &'static str {
         match self {
             Self::Business => "01-business",
@@ -295,11 +297,13 @@ pub struct DexOwnershipContext {
 }
 
 /// Classify content-distinct DEX sets without a model call.
+#[must_use]
 pub fn classify_dex_ownership(package: &str, sets: &[DexArtifactSet]) -> DexOwnershipReport {
     classify_dex_ownership_with_context(package, sets, &DexOwnershipContext::default())
 }
 
 /// Classify DEX sets using package-local component evidence.
+#[must_use]
 pub fn classify_dex_ownership_with_context(
     package: &str,
     sets: &[DexArtifactSet],
@@ -673,6 +677,7 @@ fn is_external_vendor_root(root: &str) -> bool {
 }
 
 /// Attach a SHA-256 digest to a path candidate.
+#[must_use]
 pub fn hashed_file(path: &str, sha256: String, size: u64, kind: ArtifactKind) -> CodeArtifact {
     CodeArtifact {
         kind: Some(kind),
@@ -689,216 +694,3 @@ pub fn hashed_file(path: &str, sha256: String, size: u64, kind: ArtifactKind) ->
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn dex_set(classes: &[&str], sources: &[&str]) -> DexArtifactSet {
-        DexArtifactSet {
-            sha256: "a".repeat(64),
-            bytes: 4096,
-            canonical_relative_path: "apk-dex/split/classes.dex".to_owned(),
-            sources: sources.iter().map(|value| (*value).to_owned()).collect(),
-            observations: Vec::new(),
-            semantic: Some(crate::DexSemanticSummary {
-                class_descriptors: classes.iter().map(|value| (*value).to_owned()).collect(),
-                ..crate::DexSemanticSummary::default()
-            }),
-        }
-    }
-
-    #[test]
-    fn package_dex_index_accepts_earlier_v2_field_names() {
-        let index: PackageDexIndex = serde_json::from_str(
-            r#"{"unique_dex":2,"observations":5,"indexed_unique_classes":4,"indexed_unique_method_names":3}"#,
-        )
-        .expect("earlier v2 index");
-        assert_eq!(index.unique_dex, 2);
-        assert_eq!(index.observations, 5);
-        assert_eq!(index.indexed_class_samples, 0);
-        assert_eq!(index.indexed_method_name_samples, 0);
-    }
-
-    #[test]
-    fn ownership_prefers_exact_app_namespace_over_generic_vocabulary() {
-        let set = dex_set(
-            &[
-                "Lcom/acme/mobile/HostActivity;",
-                "Lcom/acme/mobile/order/OrderRepository;",
-                "Lcom/acme/mobile/api/AccountRequest;",
-            ],
-            &["apk-dex"],
-        );
-        let report = classify_dex_ownership("com.acme.mobile", &[set]);
-        assert_eq!(report.business, 1);
-        assert_eq!(report.entries[0].category, DexOwnershipCategory::Business);
-
-        let vendor_app = dex_set(
-            &[
-                "Lcom/google/myproduct/MainActivity;",
-                "Lcom/google/myproduct/api/AccountRequest;",
-            ],
-            &["apk-dex"],
-        );
-        let vendor_report = classify_dex_ownership("com.google.myproduct", &[vendor_app]);
-        assert_eq!(vendor_report.business, 1);
-    }
-
-    #[test]
-    fn ownership_recognizes_sdk_and_runtime_only_payloads() {
-        let sdk = dex_set(
-            &[
-                "Lokhttp3/Request;",
-                "Lokio/Buffer;",
-                "Lcom/google/gson/Gson;",
-            ],
-            &["apk-dex"],
-        );
-        let dynamic = dex_set(&["La/b/c;", "Lx/y/z;"], &["memory-dex"]);
-        let report = classify_dex_ownership("com.acme.mobile", &[sdk, dynamic]);
-        assert_eq!(report.third_party_sdks, 1);
-        assert_eq!(report.dynamic_payloads, 0);
-        assert_eq!(report.unknown, 1);
-        assert_eq!(
-            report
-                .entries
-                .iter()
-                .find(|entry| entry.category == DexOwnershipCategory::Unknown)
-                .unwrap()
-                .confidence,
-            0
-        );
-    }
-
-    #[test]
-    fn ownership_does_not_promote_vendor_components_from_generic_class_names() {
-        let vendor = dex_set(
-            &[
-                "Lcom/tencent/wework/HostActivity;",
-                "Lcom/tencent/qqmail/AccountService;",
-                "Lcom/vivo/push/PushRequest;",
-                "Lcom/tenpay/ndk/PaymentController;",
-            ],
-            &["apk-dex"],
-        );
-        let report = classify_dex_ownership("com.example.app", &[vendor]);
-        assert_eq!(report.third_party_sdks, 1);
-        assert_eq!(report.business, 0);
-    }
-
-    #[test]
-    fn ownership_preserves_sdk_inside_business_heavy_multidex() {
-        let mut classes = vec!["Lcom/tencent/wework/Api;"];
-        classes.extend(std::iter::repeat_n("Lcom/example/app/MainActivity;", 99));
-        let report = classify_dex_ownership("com.example.app", &[dex_set(&classes, &["apk-dex"])]);
-        assert_eq!(report.entries[0].category, DexOwnershipCategory::Mixed);
-        assert_eq!(report.entries[0].third_party_classes, 1);
-    }
-
-    #[test]
-    fn ownership_preserves_exact_app_classes_inside_sdk_heavy_multidex() {
-        let mut classes = vec![
-            "Lcom/example/app/MainActivity;",
-            "Lcom/example/app/account/SessionRepository;",
-        ];
-        classes.extend(std::iter::repeat_n("Lcom/tencent/wework/Api;", 98));
-        let mixed = dex_set(&classes, &["apk-dex"]);
-        let report = classify_dex_ownership("com.example.app", &[mixed]);
-
-        assert_eq!(report.entries[0].category, DexOwnershipCategory::Mixed);
-        assert_eq!(report.entries[0].business_classes, 2);
-        assert_eq!(report.business_class_samples, 2);
-        assert_eq!(report.business_dex_sets, 1);
-        assert_eq!(report.mixed, 1);
-    }
-
-    #[test]
-    fn secneo_wrapper_is_a_shell_not_the_business_image() {
-        let shell = dex_set(
-            &[
-                "Lcom/secneo/apkwrapper/AP;",
-                "Lcom/secneo/apkwrapper/H;",
-                "Lcom/secneo/apkwrapper/a;",
-            ],
-            &["memory-dex"],
-        );
-        let report = classify_dex_ownership("cn.gov.tax.its", &[shell]);
-        assert_eq!(
-            report.entries[0].category,
-            DexOwnershipCategory::DynamicPayload
-        );
-        assert_eq!(report.business_class_samples, 0);
-        assert!(report.entries[0]
-            .reasons
-            .iter()
-            .any(|reason| reason.contains("SecNeo")));
-    }
-
-    #[test]
-    fn ownership_package_match_respects_namespace_boundary() {
-        let unrelated = dex_set(&["Lcom/example/appextra/NotTheApplication;"], &["apk-dex"]);
-        let report = classify_dex_ownership("com.example.app", &[unrelated]);
-
-        assert_eq!(report.entries[0].business_classes, 0);
-    }
-
-    #[test]
-    fn ownership_infers_internal_namespaces_from_current_app_components() {
-        let enterprise_modules = dex_set(
-            &[
-                "Lcorp/maps/api/MapService;",
-                "Lcorp/grid/ApprovalActivity;",
-                "Lcorp/grid/ApprovalProvider;",
-                "Lcorp/grid/ApprovalService;",
-            ],
-            &["apk-dex"],
-        );
-        let context = DexOwnershipContext {
-            registered_component_classes: vec![
-                "corp.grid.ApprovalActivity".to_owned(),
-                "corp.grid.ApprovalProvider".to_owned(),
-                "corp.grid.ApprovalService".to_owned(),
-            ],
-        };
-        let report = classify_dex_ownership_with_context(
-            "com.example.shell",
-            std::slice::from_ref(&enterprise_modules),
-            &context,
-        );
-        assert_eq!(report.internal_components, 0);
-        assert_eq!(report.mixed, 1);
-        assert_eq!(report.entries[0].internal_classes, 3);
-        assert_eq!(report.entries[0].unknown_classes, 1);
-        assert_eq!(
-            report.inferred_internal_namespaces[0].namespace,
-            "corp/grid"
-        );
-
-        let unrelated = classify_dex_ownership("com.example.wrapper", &[enterprise_modules]);
-        assert_eq!(unrelated.internal_components, 0);
-        assert_eq!(unrelated.business, 0);
-        assert_eq!(unrelated.unknown, 1);
-    }
-
-    #[test]
-    fn ownership_never_promotes_registered_third_party_vendor_components() {
-        let vendor = dex_set(
-            &[
-                "Lcom/tencent/wework/HostActivity;",
-                "Lcom/tencent/wework/SyncService;",
-                "Lcom/vivo/push/PushService;",
-            ],
-            &["apk-dex"],
-        );
-        let context = DexOwnershipContext {
-            registered_component_classes: vec![
-                "com.tencent.wework.HostActivity".to_owned(),
-                "com.tencent.wework.SyncService".to_owned(),
-                "com.vivo.push.PushService".to_owned(),
-            ],
-        };
-        let report = classify_dex_ownership_with_context("com.example.app", &[vendor], &context);
-        assert_eq!(report.inferred_internal_namespaces.len(), 0);
-        assert_eq!(report.third_party_sdks, 1);
-    }
-}

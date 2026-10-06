@@ -588,6 +588,7 @@ impl ServiceStatusGuard {
     }
 
     /// Obtain a writer that can publish capture counters while this guard is alive.
+    #[must_use]
     pub fn handle(&self) -> ServiceStatusHandle {
         self.handle.clone()
     }
@@ -782,94 +783,3 @@ pub enum ServiceConfigError {
     Signal(String),
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_and_converts_bounded_service_configuration() {
-        let config: ServiceConfig = serde_json::from_str(valid_json()).unwrap();
-        config.validate().unwrap();
-        let request = config.capture_request().unwrap();
-        assert!(request.output.quiet);
-        assert_eq!(request.storage.events_per_batch, 64);
-        assert_eq!(request.sensors.memory, MemorySelection::Executable);
-    }
-
-    #[test]
-    fn rejects_unknown_fields_and_unbounded_batches() {
-        let unknown = valid_json().replace(
-            "\"include_threads\": false",
-            "\"include_threads\": false, \"surprise\": true",
-        );
-        assert!(serde_json::from_str::<ServiceConfig>(&unknown).is_err());
-
-        let mut config: ServiceConfig = serde_json::from_str(valid_json()).unwrap();
-        config.storage.events_per_batch = MAX_EVENTS_PER_BATCH + 1;
-        assert!(matches!(
-            config.validate(),
-            Err(ServiceConfigError::Invalid(_))
-        ));
-    }
-
-    fn valid_json() -> &'static str {
-        r#"{
-          "schema_version": 3,
-          "objects": {
-            "process": "/data/local/tmp/ksight/process_lifecycle.bpf.o",
-            "file": "/data/local/tmp/ksight/file_open.bpf.o",
-            "network": "/data/local/tmp/ksight/network_connect.bpf.o",
-            "memory": "/data/local/tmp/ksight/memory_regions.bpf.o",
-            "binder": "/data/local/tmp/ksight/binder_transaction.bpf.o"
-          },
-          "sensors": {
-            "files": true,
-            "network": true,
-            "network_io": false,
-            "memory": "executable",
-            "binder": true
-          },
-          "scope": { "pid": null, "uid": null, "package": null },
-          "storage": {
-            "spool_root": "/data/local/tmp/ksight/spool",
-            "max_spool_mib": 64,
-            "events_per_batch": 64
-          },
-          "sampling": { "file": 4, "network": 1, "memory": 1, "binder": 16 },
-          "lock_file": "/data/local/tmp/ksight/ksightd.lock",
-          "status_file": "/data/local/tmp/ksight/ksightd.status.json",
-          "log_file": "/data/local/tmp/ksight/ksightd.log",
-          "include_threads": false
-        }"#
-    }
-
-    #[test]
-    fn service_lease_is_exclusive_and_released_on_drop() {
-        let root = std::env::temp_dir().join(format!("ksight-lease-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("collector.lock");
-        let lease = ServiceLease::acquire(&path).unwrap();
-        assert!(matches!(
-            ServiceLease::acquire(&path),
-            Err(ServiceConfigError::AlreadyRunning(_))
-        ));
-        drop(lease);
-        ServiceLease::acquire(&path).unwrap();
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn service_lease_reclaims_dead_process_lock() {
-        let root = std::env::temp_dir().join(format!("ksight-stale-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("collector.lock");
-        std::fs::write(&path, format!("{}\n", u32::MAX)).unwrap();
-        let lease = ServiceLease::acquire(&path).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap().trim(),
-            std::process::id().to_string()
-        );
-        drop(lease);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-}

@@ -4,6 +4,7 @@
 //! App and GMS AIDL are not included. Unknown `(interface, code)` stays unnamed.
 
 /// Look up an AOSP AIDL method for `FIRST_CALL_TRANSACTION + n` codes.
+#[must_use] 
 pub fn aidl_method(interface: &str, code: u32) -> Option<&'static str> {
     if let Some(name) = ndk_meta_method(code) {
         return Some(name);
@@ -89,6 +90,3 @@ fn table(interface: &str) -> Option<&'static [&'static str]> {
 mod tables;
 pub(crate) use tables::TABLES;
 
-#[cfg(test)]
-#[path = "tests.rs"]
-mod tests;

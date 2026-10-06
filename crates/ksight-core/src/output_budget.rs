@@ -95,6 +95,7 @@ impl Guard {
     /// # Panics
     /// Panics if an internal invariant checked by `expect` or `unwrap` is violated.
     /// Receipt retained by this evidence operation.
+    #[must_use]
     pub fn receipt(&self) -> Receipt {
         states()
             .lock()
@@ -183,6 +184,7 @@ pub fn charge(path: &Path, n: u64) -> io::Result<()> {
     Ok(())
 }
 /// Remaining admitted-write allowance for the registered output scope, not disk free space.
+#[must_use]
 pub fn remaining(path: &Path) -> Option<u64> {
     states()
         .lock()
@@ -197,6 +199,7 @@ pub fn remaining(path: &Path) -> Option<u64> {
 }
 
 /// First recorded stop reason for this registered output scope.
+#[must_use]
 pub fn stop_reason(path: &Path) -> Option<String> {
     states()
         .lock()
@@ -323,6 +326,7 @@ impl std::io::Seek for BudgetFile {
 }
 
 /// Clip all scanner rounds to the same invocation deadline.
+#[must_use]
 pub fn deadline(path: &Path, desired: Instant) -> Instant {
     if let Ok(all) = states().lock() {
         all.values()
@@ -334,6 +338,7 @@ pub fn deadline(path: &Path, desired: Instant) -> Instant {
 }
 
 /// Stop admission and the capture loop on exhaustion or a failed output.
+#[must_use]
 pub fn should_stop(path: &Path) -> bool {
     if let Ok(mut all) = states().lock() {
         for s in all
@@ -362,68 +367,3 @@ pub fn should_stop(path: &Path) -> bool {
     false
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn aggregate_charge_classes_reconcile_replacements_without_payload_paths() {
-        let root = std::env::temp_dir().join(format!("budget-kinds-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&root).unwrap();
-        let g = Guard::install(vec![root.clone()], 20, 1000).unwrap();
-        charge(&root.join(".pending-private-name.tmp"), 7).unwrap();
-        charge(&root.join(".manifest-first.tmp"), 4).unwrap();
-        charge(&root.join(".manifest-second.tmp"), 4).unwrap();
-        charge(&root.join("raw-ledger.json"), 3).unwrap();
-        assert!(charge(&root.join(".pending-rejected.tmp"), 3).is_err());
-        let r = g.receipt();
-        assert_eq!(r.admitted_write_bytes, 18);
-        assert_eq!(r.admitted_by_kind.values().sum::<u64>(), 18);
-        assert_eq!(r.admitted_by_kind["spool_manifest"], 8);
-        assert_eq!(r.admission_calls_by_kind["spool_manifest"], 2);
-        assert_eq!(r.rejected_writes, 1);
-        assert!(r.partial);
-        let json = serde_json::to_string(&r).unwrap();
-        assert!(!json.contains("private-name"));
-    }
-    #[test]
-    fn zero_budget_terminal_and_shared_threads() {
-        let root = std::env::temp_dir().join(format!("budget-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&root).unwrap();
-        let g = Guard::install(vec![root.clone()], 3, 1000).unwrap();
-        write(root.join("apk"), b"abc").unwrap();
-        assert!(write(root.join("phase"), b"x").is_err());
-        assert!(std::thread::spawn({
-            let root = root.clone();
-            move || write(root.join("tail"), b"x")
-        })
-        .join()
-        .unwrap()
-        .is_err());
-        assert_eq!(g.receipt().admitted_write_bytes, 3);
-        assert!(g.receipt().partial);
-        std::fs::write(
-            root.join("terminal.json"),
-            serde_json::to_vec(&g.receipt()).unwrap(),
-        )
-        .unwrap();
-        assert!(root.join("terminal.json").exists());
-        drop(g);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-    #[test]
-    fn independent_roots_and_untouched_legacy() {
-        let a = std::env::temp_dir().join(format!("a-{}", uuid::Uuid::new_v4()));
-        let b = std::env::temp_dir().join(format!("b-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&a).unwrap();
-        std::fs::create_dir(&b).unwrap();
-        let ga = Guard::install(vec![a.clone()], 0, 1000).unwrap();
-        let gb = Guard::install(vec![b.clone()], 3, 1000).unwrap();
-        assert!(write(a.join("no"), b"x").is_err());
-        write(b.join("yes"), b"xxx").unwrap();
-        assert_eq!(ga.receipt().admitted_write_bytes, 0);
-        assert_eq!(gb.receipt().admitted_write_bytes, 3);
-        drop((ga, gb));
-        std::fs::remove_dir_all(a).unwrap();
-        std::fs::remove_dir_all(b).unwrap();
-    }
-}

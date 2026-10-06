@@ -23,6 +23,7 @@ pub struct AgentRuntime {
 
 impl AgentRuntime {
     /// Create a runtime that makes no capture claim.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             state: Some(RuntimeState::Created),
@@ -31,6 +32,7 @@ impl AgentRuntime {
     }
 
     /// Current lifecycle state.
+    #[must_use]
     pub fn state(&self) -> RuntimeState {
         self.state.unwrap_or(RuntimeState::Created)
     }

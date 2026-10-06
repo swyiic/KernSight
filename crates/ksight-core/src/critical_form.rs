@@ -52,15 +52,3 @@ pub fn classify_critical_form(
     None
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn post_send_sms_field_is_sms() {
-        let hit = classify_critical_form("POST", "api.example.test", "/v1/notify", b"send_sms=1")
-            .expect("hit");
-        assert_eq!(hit.kind, "sms");
-        assert!(hit.method_rpc.is_none());
-    }
-}

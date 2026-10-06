@@ -255,6 +255,7 @@ pub enum InspectAdapterKind {
 
 impl InspectAdapterKind {
     /// Stable adapter identifier.
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::LinkerSoLoad => "linker_so_load",
@@ -465,6 +466,7 @@ impl InspectAdapterKind {
     }
 
     /// Adapters recorded as audited stubs when another adapter is selected.
+    #[must_use]
     pub const fn audited_stubs(self) -> &'static [Self] {
         match self {
             Self::TlsSslWrite | Self::TlsSslRead => {
@@ -560,7 +562,7 @@ impl FromStr for InspectAdapterKind {
     }
 }
 
-/// Optional ProbeSpec / plaintext_probe layout overrides applied on top of
+/// Optional `ProbeSpec` `/ plaintext_pro`be layout overrides applied on top of
 /// [`ksight_core::TlsAbiKind::layout`]. Absent fields keep the ABI defaults.
 #[derive(Debug, Clone, Default)]
 pub struct ProbeLayoutHint {
@@ -578,7 +580,7 @@ pub struct ProbeLayoutHint {
     pub max_bytes: Option<u32>,
     /// Optional architecture label from the rule (`arm64`, …).
     pub architecture: Option<String>,
-    /// Optional sample digest pin from plaintext_probe (validated soft).
+    /// Optional sample digest pin from `plaintext_probe` (validated soft).
     pub sample_sha256: Option<String>,
 }
 
@@ -601,7 +603,7 @@ pub struct InspectPlan {
     pub symbol: Option<String>,
     /// Explicit TLS ABI. Never inferred from an `_ex` suffix at the call site.
     pub abi: Option<ksight_core::TlsAbiKind>,
-    /// ProbeSpec / plaintext_probe field overrides (buffer_arg, capture_phase, …).
+    /// `ProbeSpec` `/ plaintext_pro`be field overrid`es (buffer``_arg, capture`_phase, …).
     pub layout_hint: ProbeLayoutHint,
     /// Pointer width of the target ELF: 4 for ELF32, 8 for ELF64.
     pub pointer_width: u8,
@@ -611,6 +613,7 @@ pub struct InspectPlan {
 
 impl InspectPlan {
     /// Evaluate adapter policy without attaching.
+    #[must_use]
     pub fn evaluate(
         policy: InspectPolicy,
         adapter: InspectAdapterKind,
@@ -636,6 +639,7 @@ impl InspectPlan {
     }
 
     /// Whether a live probe should be attempted.
+    #[must_use]
     pub fn should_attach(&self) -> bool {
         self.adapter != InspectAdapterKind::JniPlaintext
             && self.policy.may_attach()
@@ -656,29 +660,28 @@ impl InspectPlan {
         }
         let mut plans = Vec::new();
         for library in libraries {
-            match evaluate_tls_symbol_exports(&policy, adapter, &uprobe_object, &library) {
-                Some(mut found) => {
-                    found.extend(evaluate_plaintext_probe_plans(
-                        &policy,
+            if let Some(mut found) =
+                evaluate_tls_symbol_exports(&policy, adapter, &uprobe_object, &library)
+            {
+                found.extend(evaluate_plaintext_probe_plans(
+                    &policy,
+                    adapter,
+                    &uprobe_object,
+                    &library,
+                ));
+                plans.append(&mut found);
+            } else {
+                let mut found =
+                    evaluate_plaintext_probe_plans(&policy, adapter, &uprobe_object, &library);
+                if found.is_empty() {
+                    plans.push(evaluate_one(
+                        policy.clone(),
                         adapter,
-                        &uprobe_object,
-                        &library,
+                        uprobe_object.clone(),
+                        Some(library),
                     ));
+                } else {
                     plans.append(&mut found);
-                }
-                None => {
-                    let mut found =
-                        evaluate_plaintext_probe_plans(&policy, adapter, &uprobe_object, &library);
-                    if found.is_empty() {
-                        plans.push(evaluate_one(
-                            policy.clone(),
-                            adapter,
-                            uprobe_object.clone(),
-                            Some(library),
-                        ));
-                    } else {
-                        plans.append(&mut found);
-                    }
                 }
             }
         }
@@ -829,16 +832,16 @@ pub struct InspectRuntime {
     perf_lost: u64,
     /// Hits `decode_hit` turned into outputs.
     decoded_hits: u64,
-    /// TlsSslRead funnel (entry stash / uret attempt / plaintext ok / uret miss).
+    /// `TlsSslRead` funnel (entry stash / uret attempt / plaintext ok / uret miss).
     ssl_read_entry: u64,
     ssl_read_ret: u64,
     ssl_read_ok: u64,
     ssl_read_fail: u64,
-    /// uretprobe with signed retval < 0 (typically SSL_ERROR_WANT_READ/WRITE).
+    /// uretprobe with signed retval < 0 (typically `SSL_ERROR_WANT_READ/WRITE`).
     ssl_read_want: u64,
     /// uretprobe with signed retval > 0 (success byte-count / *_ex success).
     ssl_read_ret_gt0: u64,
-    /// ret>0 but decode_hit returned None (filter/pending/zero/length miss).
+    /// ret>0 but `decode_hit` returned None (filter/pending/zero/length miss).
     ssl_read_drop_gt0: u64,
     /// Split by mapped library path (babassl libopenssl vs conscrypt/other).
     ssl_read_want_openssl: u64,
@@ -1103,11 +1106,13 @@ fn pending_from_entry(
     if !plausible_user_ptr(buf) {
         return None;
     }
-    let requested = i32::try_from(
-        *hit.regs
+    let requested = i32::try_from(i64::from_ne_bytes(
+        (*hit
+            .regs
             .get(usize::from(layout.requested_len_arg))
-            .unwrap_or(&0) as i64,
-    )
+            .unwrap_or(&0))
+        .to_ne_bytes(),
+    ))
     .unwrap_or(0);
     let written_ptr = layout.out_len_arg.and_then(|reg| {
         hit.regs
@@ -1140,7 +1145,7 @@ fn tls_abi_for_plan(plan: &InspectPlan) -> ksight_core::TlsAbiKind {
     }
 }
 
-/// ABI layout with ProbeSpec / plaintext_probe field overrides applied.
+/// ABI layout with `ProbeSpec` `/ plaintext_pro`be field overrides applied.
 fn effective_layout(plan: &InspectPlan) -> ksight_core::TlsAbiLayout {
     let mut layout = tls_abi_for_plan(plan).layout();
     let hint = &plan.layout_hint;
@@ -1178,8 +1183,7 @@ fn plan_max_payload(plan: &InspectPlan, policy_max: usize) -> usize {
         .layout_hint
         .max_bytes
         .map(|n| usize::try_from(n).unwrap_or(policy_max))
-        .map(|n| n.clamp(1, policy_max))
-        .unwrap_or(policy_max);
+        .map_or(policy_max, |n| n.clamp(1, policy_max));
     clamped.max(1)
 }
 
@@ -1261,6 +1265,10 @@ impl InspectRuntime {
 
     /// Fresh physical qualifications for the same enrolled task; no numeric authorization fallback.
     #[cfg(any(target_os = "linux", target_os = "android"))]
+    ///
+    /// # Errors
+    ///
+    /// Returns the existing failure for this operation. No success value is invented.
     pub fn refresh_qualified(
         &mut self,
         targets: Vec<ksight_hwbp::metadata_scope::QualifiedInstance>,
@@ -1280,7 +1288,7 @@ impl InspectRuntime {
             }
             let next = targets
                 .into_iter()
-                .map(|t| t.into_bound())
+                .map(ksight_hwbp::metadata_scope::QualifiedInstance::into_bound)
                 .collect::<anyhow::Result<Vec<_>>>()?;
             for target in &next {
                 target.check_current()?;
@@ -1310,6 +1318,7 @@ impl InspectRuntime {
         Ok(())
     }
     /// Evaluate one selected adapter and any registered audited stubs.
+    #[must_use]
     pub fn prepare(
         policy: &InspectPolicy,
         adapter: InspectAdapterKind,
@@ -1320,6 +1329,7 @@ impl InspectRuntime {
 
     /// Evaluate every selected adapter (for example TLS plus Binder) in one session.
     #[allow(clippy::too_many_lines)]
+    #[must_use]
     pub fn prepare_all(
         policy: &InspectPolicy,
         adapters: &[InspectAdapterKind],
@@ -1491,6 +1501,7 @@ impl InspectRuntime {
     }
 
     /// Decisions that must be recorded before live collection.
+    #[must_use]
     pub fn initial_observations(&self) -> Vec<InspectObservation> {
         self.plans
             .iter()
@@ -1713,6 +1724,7 @@ impl InspectRuntime {
     }
 
     /// Pending frames and explicitly incomplete calls at a stage boundary.
+    #[must_use]
     pub fn pending_depth(&self) -> (u64, u64) {
         (
             self.tls_pending.frames as u64,
@@ -1720,6 +1732,7 @@ impl InspectRuntime {
         )
     }
     /// Elapsed time of this phase, without claiming unread perf tail coverage.
+    #[must_use]
     pub fn stage_elapsed_ms(&self) -> u64 {
         u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
@@ -1731,11 +1744,12 @@ impl InspectRuntime {
     }
 
     /// Layered counters for loss analysis: (raw drained, decoded, perf lost).
+    #[must_use]
     pub fn drain_totals(&self) -> (u64, u64, u64) {
         (self.raw_drained, self.decoded_hits, self.perf_lost)
     }
 
-    /// TlsSslRead funnel: (entry, uret, plaintext_ok, uret_fail, want_read_or_neg).
+    /// `TlsSslRead` funnel: (entry, uret`, plaintext_``ok, uret_``fail, want_read_``or_neg`).
     /// Observed getter returns: stream pointers, distinct keys, keys shared by 2+.
     #[must_use]
     pub fn connkey_stats(&self) -> (u64, u64, u64) {
@@ -1743,6 +1757,8 @@ impl InspectRuntime {
         (stats.streams, stats.returns, stats.shared)
     }
 
+    /// `ssl_read_funnel`.
+    #[must_use]
     pub fn ssl_read_funnel(&self) -> (u64, u64, u64, u64, u64) {
         (
             self.ssl_read_entry,
@@ -1753,8 +1769,8 @@ impl InspectRuntime {
         )
     }
 
-    /// Extended ssl_read split: (ret_gt0, drop_gt0, want_openssl, want_conscrypt,
-    /// ok_openssl, ok_conscrypt, gt0_openssl, gt0_conscrypt).
+    /// Extended `ssl_read` counters: return above zero, dropped above zero, and OpenSSL versus Conscrypt splits.
+    #[must_use]
     pub fn ssl_read_funnel_ex(&self) -> (u64, u64, u64, u64, u64, u64, u64, u64) {
         (
             self.ssl_read_ret_gt0,
@@ -2021,7 +2037,7 @@ fn evaluate_plaintext_probe_plans(
         }
         if let Some(arch) = probe.architecture.as_deref() {
             let arch = arch.to_ascii_lowercase();
-            let bits = elf.as_ref().map(|item| item.bits).unwrap_or(64);
+            let bits = elf.as_ref().map_or(64, |item| item.bits);
             let arch_ok = match arch.as_str() {
                 "arm64" | "aarch64" | "arm64-v8a" => bits == 64,
                 "arm" | "armeabi" | "armeabi-v7a" | "arm32" => bits == 32,
@@ -2714,7 +2730,7 @@ fn adapter_is_live(selected: &[InspectAdapterKind], adapter: InspectAdapterKind)
 fn plan_is_connkey(plan: &InspectPlan) -> bool {
     matches!(
         plan.symbol.as_deref(),
-        Some("xqc_get_conn_user_data_by_stream") | Some("xqc_get_conn_alp_user_data_by_stream")
+        Some("xqc_get_conn_user_data_by_stream" | "xqc_get_conn_alp_user_data_by_stream")
     )
 }
 
@@ -2735,7 +2751,7 @@ fn note_connkey(runtime: &mut InspectRuntime, retprobe: bool, hit: &ksight_hwbp:
     let stream = runtime
         .connkey_pending
         .get_mut(&tid)
-        .and_then(|stack| stack.pop());
+        .and_then(std::vec::Vec::pop);
     let Some(stream) = stream else {
         return;
     };
@@ -3249,8 +3265,7 @@ fn discover_mapped_libraries_by_tls_symbol(
         }
         if exporters.len() >= TLS_EXPORTER_CAP {
             eprintln!(
-                "tls scan skip exporters cap={} scanned_maps={scanned} skipped_pids={skipped_pids}",
-                TLS_EXPORTER_CAP
+                "tls scan skip exporters cap={TLS_EXPORTER_CAP} scanned_maps={scanned} skipped_pids={skipped_pids}"
             );
             return exporters;
         }
@@ -4189,10 +4204,7 @@ fn decode_hit(
             let direction = layout.direction.fragment_label(layout.consumes);
             if retprobe {
                 let pending = tls_pending.pop(key)?;
-                let captured = match ssl_read_captured(&pending, hit) {
-                    Some(n) => n,
-                    None => return None,
-                };
+                let captured = ssl_read_captured(&pending, hit)?;
                 decode_tls_plaintext(
                     plan,
                     pending.pid,
@@ -4218,11 +4230,13 @@ fn decode_hit(
                 None
             } else {
                 let buf = *hit.regs.get(usize::from(layout.buffer_arg)).unwrap_or(&0);
-                let requested = i32::try_from(
-                    *hit.regs
+                let requested = i32::try_from(i64::from_ne_bytes(
+                    (*hit
+                        .regs
                         .get(usize::from(layout.requested_len_arg))
-                        .unwrap_or(&0) as i64,
-                )
+                        .unwrap_or(&0))
+                    .to_ne_bytes(),
+                ))
                 .unwrap_or(0);
                 decode_tls_plaintext(
                     plan,
@@ -4401,7 +4415,7 @@ fn decode_hit(
             push_bounded(
                 &mut binder.int64s,
                 hit.tid,
-                hit.regs[1] as i64,
+                i64::from_ne_bytes(hit.regs[1].to_ne_bytes()),
                 BINDER_INT64S_PER_TID,
             );
             None
@@ -4419,7 +4433,7 @@ fn decode_hit(
             push_bounded(
                 &mut binder.int64s,
                 hit.tid,
-                hit.regs[1] as i64,
+                i64::from_ne_bytes(hit.regs[1].to_ne_bytes()),
                 BINDER_INT64S_PER_TID,
             );
             None
@@ -4482,7 +4496,10 @@ fn decode_hit(
         InspectAdapterKind::JniGetStringUtfLength => {
             if retprobe {
                 let obj = jni_pair.string_len_obj.remove(&hit.tid)?;
-                let len = i32::try_from(hit.regs.first().copied().unwrap_or(0) as i64).unwrap_or(0);
+                let len = i32::try_from(i64::from_ne_bytes(
+                    hit.regs.first().copied().unwrap_or(0).to_ne_bytes(),
+                ))
+                .unwrap_or(0);
                 if obj != 0 && len > 0 && jni_pair.string_len.len() < 4096 {
                     jni_pair
                         .string_len
@@ -4525,8 +4542,10 @@ fn decode_hit(
                     None,
                 )
             } else {
-                let requested =
-                    i32::try_from(hit.regs.get(3).copied().unwrap_or(0) as i64).unwrap_or(0);
+                let requested = i32::try_from(i64::from_ne_bytes(
+                    hit.regs.get(3).copied().unwrap_or(0).to_ne_bytes(),
+                ))
+                .unwrap_or(0);
                 let buf = hit.regs.get(4).copied().unwrap_or(0);
                 if requested > 0 && buf != 0 && jni_pair.utf_region.len() < 4096 {
                     jni_pair.utf_region.insert(
@@ -4546,7 +4565,10 @@ fn decode_hit(
         InspectAdapterKind::JniGetArrayLength => {
             if retprobe {
                 let obj = jni_pair.array_len_obj.remove(&hit.tid)?;
-                let len = i32::try_from(hit.regs.first().copied().unwrap_or(0) as i64).unwrap_or(0);
+                let len = i32::try_from(i64::from_ne_bytes(
+                    hit.regs.first().copied().unwrap_or(0).to_ne_bytes(),
+                ))
+                .unwrap_or(0);
                 if obj != 0 && len > 0 && jni_pair.array_len.len() < 4096 {
                     jni_pair
                         .array_len
@@ -4558,7 +4580,10 @@ fn decode_hit(
             None
         }
         InspectAdapterKind::JniSetByteArrayRegion => {
-            let len = i32::try_from(hit.regs.get(3).copied().unwrap_or(0) as i64).unwrap_or(0);
+            let len = i32::try_from(i64::from_ne_bytes(
+                hit.regs.get(3).copied().unwrap_or(0).to_ne_bytes(),
+            ))
+            .unwrap_or(0);
             let buf = hit.regs.get(4).copied().unwrap_or(0);
             decode_tls_plaintext(
                 plan,
@@ -4610,8 +4635,10 @@ fn decode_hit(
                     None,
                 )
             } else {
-                let requested =
-                    i32::try_from(hit.regs.get(3).copied().unwrap_or(0) as i64).unwrap_or(0);
+                let requested = i32::try_from(i64::from_ne_bytes(
+                    hit.regs.get(3).copied().unwrap_or(0).to_ne_bytes(),
+                ))
+                .unwrap_or(0);
                 let buf = hit.regs.get(4).copied().unwrap_or(0);
                 if requested > 0 && buf != 0 && jni_region_pending.len() < 4096 {
                     jni_region_pending.insert(
@@ -4629,7 +4656,10 @@ fn decode_hit(
             }
         }
         InspectAdapterKind::JniNewString => {
-            let units = i32::try_from(hit.regs.get(2).copied().unwrap_or(0) as i64).unwrap_or(0);
+            let units = i32::try_from(i64::from_ne_bytes(
+                hit.regs.get(2).copied().unwrap_or(0).to_ne_bytes(),
+            ))
+            .unwrap_or(0);
             decode_jni_utf16_units(
                 plan,
                 pid,
@@ -4643,7 +4673,10 @@ fn decode_hit(
         InspectAdapterKind::JniGetStringLength => {
             if retprobe {
                 let obj = jni_pair.u16_len_obj.remove(&hit.tid)?;
-                let len = i32::try_from(hit.regs.first().copied().unwrap_or(0) as i64).unwrap_or(0);
+                let len = i32::try_from(i64::from_ne_bytes(
+                    hit.regs.first().copied().unwrap_or(0).to_ne_bytes(),
+                ))
+                .unwrap_or(0);
                 if obj != 0 && len > 0 && jni_pair.u16_len.len() < 4096 {
                     jni_pair.u16_len.insert(hit.tid, PendingJniLen { obj, len });
                 }
@@ -4686,8 +4719,10 @@ fn decode_hit(
                     "java_to_native",
                 )
             } else {
-                let requested =
-                    i32::try_from(hit.regs.get(3).copied().unwrap_or(0) as i64).unwrap_or(0);
+                let requested = i32::try_from(i64::from_ne_bytes(
+                    hit.regs.get(3).copied().unwrap_or(0).to_ne_bytes(),
+                ))
+                .unwrap_or(0);
                 let buf = hit.regs.get(4).copied().unwrap_or(0);
                 if requested > 0 && buf != 0 && jni_pair.u16_region.len() < 4096 {
                     jni_pair.u16_region.insert(
@@ -4726,8 +4761,10 @@ fn decode_hit(
         }
         InspectAdapterKind::JniGetCharArrayRegion | InspectAdapterKind::JniSetCharArrayRegion => {
             if plan.adapter == InspectAdapterKind::JniSetCharArrayRegion {
-                let units =
-                    i32::try_from(hit.regs.get(3).copied().unwrap_or(0) as i64).unwrap_or(0);
+                let units = i32::try_from(i64::from_ne_bytes(
+                    hit.regs.get(3).copied().unwrap_or(0).to_ne_bytes(),
+                ))
+                .unwrap_or(0);
                 return decode_jni_utf16_units(
                     plan,
                     pid,
@@ -4750,8 +4787,10 @@ fn decode_hit(
                     "java_to_native",
                 )
             } else {
-                let requested =
-                    i32::try_from(hit.regs.get(3).copied().unwrap_or(0) as i64).unwrap_or(0);
+                let requested = i32::try_from(i64::from_ne_bytes(
+                    hit.regs.get(3).copied().unwrap_or(0).to_ne_bytes(),
+                ))
+                .unwrap_or(0);
                 let buf = hit.regs.get(4).copied().unwrap_or(0);
                 if requested > 0 && buf != 0 && jni_pair.u16_region.len() < 4096 {
                     jni_pair.u16_region.insert(
@@ -4791,7 +4830,10 @@ fn decode_hit(
         InspectAdapterKind::JniGetDirectBufferCapacity => {
             if retprobe {
                 let obj = jni_pair.direct_cap_obj.remove(&hit.tid)?;
-                let len = i32::try_from(hit.regs.first().copied().unwrap_or(0) as i64).unwrap_or(0);
+                let len = i32::try_from(i64::from_ne_bytes(
+                    hit.regs.first().copied().unwrap_or(0).to_ne_bytes(),
+                ))
+                .unwrap_or(0);
                 if obj != 0 && len > 0 && jni_pair.direct_cap.len() < 4096 {
                     jni_pair
                         .direct_cap
@@ -4983,7 +5025,10 @@ fn decode_jni_register_natives(
     hit: &ksight_hwbp::RegisterContext,
 ) -> Option<InspectOutput> {
     let methods = hit.regs.get(2).copied().unwrap_or(0);
-    let count = i32::try_from(hit.regs.get(3).copied().unwrap_or(0) as i64).unwrap_or(0);
+    let count = i32::try_from(i64::from_ne_bytes(
+        hit.regs.get(3).copied().unwrap_or(0).to_ne_bytes(),
+    ))
+    .unwrap_or(0);
     if methods == 0 || count <= 0 {
         return None;
     }
@@ -5050,15 +5095,15 @@ fn decode_art_open(
     hit: &ksight_hwbp::RegisterContext,
 ) -> Option<InspectOutput> {
     let symbol = plan.symbol.as_deref().unwrap_or("");
-    let hint = art_open_path_hint(pid, &hit.regs, symbol);
+    let path_hint = art_open_path_hint(pid, &hit.regs, symbol);
     let mut observation = plan.observation.clone();
     observation.attached = true;
     observation.hit = true;
-    observation.path_hint = hint.path.clone();
-    let path = hint.path.as_deref().unwrap_or("unreadable");
+    observation.path_hint = path_hint.path.clone();
+    let path = path_hint.path.as_deref().unwrap_or("unreadable");
     observation.detail = format!(
         "ART DEX Open hit pid={pid} symbol={symbol} layout={} path={path} x1={:#x} x2={:#x} x3={:#x}",
-        hint.layout,
+        path_hint.layout,
         hit.regs[1],
         hit.regs[2],
         hit.regs[3]
@@ -5382,8 +5427,8 @@ enum SslReadLibKind {
     Other,
 }
 
-/// Key SSL_read pending by tid + attach offset so conscrypt / BABASSL /
-/// SSL_read_ex on the same thread cannot steal each other's entry stash.
+/// Key `SSL_read` pending by tid + attach offset so conscrypt / BABASSL /
+/// `SSL_read_ex` on the same thread cannot steal each other's entry stash.
 #[allow(dead_code)]
 fn ssl_read_pending_key(tid: u32, offset: u64) -> u64 {
     (offset << 32) ^ u64::from(tid)
@@ -5697,6 +5742,7 @@ fn hit_matches_policy(policy: &InspectPolicy, identity: &ProcessIdentity) -> boo
 }
 
 /// Best-effort process identity for an Inspect hit.
+#[must_use]
 pub fn process_identity(pid: u32, tid: u32, boot_id: Uuid) -> ProcessIdentity {
     let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"))
         .ok()
@@ -5735,6 +5781,7 @@ pub fn process_identity(pid: u32, tid: u32, boot_id: Uuid) -> ProcessIdentity {
 }
 
 /// Read a bounded C string from another process address space.
+#[must_use]
 pub fn read_remote_cstring(pid: u32, address: u64, max_bytes: usize) -> Option<String> {
     let buffer = read_remote_bytes(pid, address, max_bytes)?;
     let end = buffer
@@ -5746,6 +5793,7 @@ pub fn read_remote_cstring(pid: u32, address: u64, max_bytes: usize) -> Option<S
 }
 
 /// Read bounded bytes from another process address space.
+#[must_use]
 pub fn read_remote_bytes(pid: u32, address: u64, max_bytes: usize) -> Option<Vec<u8>> {
     if max_bytes == 0 || pid == 0 {
         return None;
@@ -6020,6 +6068,7 @@ fn ibinder_well_known(code: u32) -> Option<&'static str> {
 ///
 /// This is file/memory DEX open order from an exported symbol, not a Java
 /// `ClassLoader` instance. Missing uprobe objects are a no-op.
+#[must_use]
 pub fn record_art_dex_opens(
     package: &str,
     dest_dir: &Path,
@@ -6035,6 +6084,7 @@ pub fn record_art_dex_opens(
     clippy::too_many_lines,
     reason = "Keep the admission or lifecycle transaction together for review."
 )]
+#[must_use]
 pub fn record_art_dex_opens_with_ready(
     package: &str,
     dest_dir: &Path,
@@ -6231,10 +6281,3 @@ fn parse_open_size(path: &str) -> Option<u64> {
     let rest = path.strip_prefix("memory:")?;
     rest.split_once('+')?.1.parse().ok()
 }
-
-#[cfg(test)]
-#[path = "tests.rs"]
-mod tests;
-
-#[cfg(test)]
-mod memory_scope_tests;

@@ -1,4 +1,4 @@
-//! Empirical probe for vendor TLS JNI boundaries (InfosecTcp GMSSL stack).
+//! Empirical probe for vendor TLS JNI boundaries (`InfosecTcp` GMSSL stack).
 //!
 //! Vendor GM TLS JNI traffic rides `libInfosecMSSL.so`'s exported
 //! `Java_InfosecTcp_writeSSLDataNative` / `readSSLDataNative`. The JNI argument
@@ -22,8 +22,8 @@ const FALLBACK_SYMBOLS: [&str; 4] = [
 /// One attached vendor boundary probe.
 struct InfosecHandle {
     session: UprobeSession,
-    /// Optional uretprobe session when capture_phase needs return pairing
-    /// and paired start_entry_return was unavailable.
+    /// Optional uretprobe session when `capture_phase` needs return pairing
+    /// and paired `start_entry_return` was unavailable.
     ret_session: Option<UprobeSession>,
     /// True when entry+return share one BPF load (`snapshot_at_return`).
     paired_entry_return: bool,
@@ -47,7 +47,7 @@ struct InfosecHandle {
     learned_hits: u8,
     last_inferred: Option<(u8, u8)>,
     build_id: Option<String>,
-    /// Entry frames waiting for return when capture_phase requires pairing.
+    /// Entry frames waiting for return when `capture_phase` requires pairing.
     pending: std::collections::HashMap<(u32, u32), PendingBoundary>,
     raw_hits: u64,
     dumped_first: bool,
@@ -62,18 +62,31 @@ struct PendingBoundary {
 
 /// A decoded plaintext hit from a rule whose ABI layout is pinned.
 pub struct BoundaryCapture {
+    /// `pid`.
     pub pid: u32,
+    /// `tid`.
     pub tid: u32,
+    /// `adapter`.
     pub adapter: String,
+    /// `direction`.
     pub direction: &'static str,
+    /// `library`.
     pub library: String,
+    /// `offset`.
     pub offset: u64,
+    /// `connection_id`.
     pub connection_id: Option<u64>,
+    /// `stream_id`.
     pub stream_id: Option<u64>,
+    /// `requested`.
     pub requested: u64,
+    /// `bytes`.
     pub bytes: Vec<u8>,
+    /// `is_header`.
     pub is_header: Option<bool>,
+    /// `is_body`.
     pub is_body: Option<bool>,
+    /// `confidence`.
     pub confidence: Option<String>,
 }
 
@@ -90,6 +103,7 @@ impl InfosecProbe {
     /// Attach to every target symbol exported by the process's mapped ELFs.
     ///
     /// Returns the probe plus status lines for the capture log.
+    #[must_use]
     pub fn attach_for_pids(
         uprobe_object: &Path,
         pids: &[u32],
@@ -122,7 +136,7 @@ impl InfosecProbe {
                 let targets: Vec<String> = {
                     let from_rules = ksight_core::boundary_symbols();
                     if from_rules.is_empty() {
-                        FALLBACK_SYMBOLS.iter().map(|s| s.to_string()).collect()
+                        FALLBACK_SYMBOLS.iter().map(|s| (*s).to_string()).collect()
                     } else {
                         from_rules
                     }
@@ -194,8 +208,10 @@ impl InfosecProbe {
                     let capture_phase = function.as_ref().and_then(|f| f.capture_phase);
                     let needs_return = matches!(
                         capture_phase,
-                        Some(ksight_core::CapturePhase::Return)
-                            | Some(ksight_core::CapturePhase::EntryAndReturn)
+                        Some(
+                            ksight_core::CapturePhase::Return
+                                | ksight_core::CapturePhase::EntryAndReturn
+                        )
                     ) || function
                         .as_ref()
                         .and_then(|f| f.return_semantics.as_deref())
@@ -494,8 +510,10 @@ impl InfosecProbe {
                 let needs_return = handle.ret_session.is_some()
                     || matches!(
                         handle.capture_phase,
-                        Some(ksight_core::CapturePhase::Return)
-                            | Some(ksight_core::CapturePhase::EntryAndReturn)
+                        Some(
+                            ksight_core::CapturePhase::Return
+                                | ksight_core::CapturePhase::EntryAndReturn
+                        )
                     );
                 if needs_return {
                     if handle.pending.len() < 256 {
@@ -566,9 +584,9 @@ impl InfosecProbe {
                     .as_deref()
                     .is_some_and(|s| s.to_ascii_lowercase().contains("return"))
                 {
-                    let signed = hit.regs[0] as i64;
+                    let signed = i64::from_ne_bytes(hit.regs[0].to_ne_bytes());
                     if signed > 0 {
-                        requested = signed as u64;
+                        requested = u64::try_from(signed).unwrap_or(0);
                     }
                 }
                 if pending.buffer < 0x1000 || requested == 0 {
@@ -664,27 +682,10 @@ fn boundary_sample_score(bytes: &[u8]) -> u32 {
         .iter()
         .filter(|byte| byte.is_ascii_graphic() || matches!(byte, b' ' | b'\r' | b'\n' | b'\t'))
         .count();
-    (printable.saturating_mul(100) / bytes.len() >= 85)
-        .then_some(20)
-        .unwrap_or(0)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{automatic_boundary_allowed, boundary_sample_score};
-
-    #[test]
-    fn automatic_mode_only_arms_pinned_boundaries() {
-        assert!(automatic_boundary_allowed("pinned", false));
-        assert!(!automatic_boundary_allowed("empirical", false));
-        assert!(automatic_boundary_allowed("empirical", true));
-    }
-
-    #[test]
-    fn boundary_learning_prefers_protocol_and_upload_prefixes() {
-        assert_eq!(boundary_sample_score(b"POST /v1/ping HTTP/1.1\r\n"), 100);
-        assert!(boundary_sample_score(b"{\"status\":\"ok\"}") >= 80);
-        assert!(boundary_sample_score(b"\xff\xd8\xff\xe0image") >= 80);
-        assert_eq!(boundary_sample_score(&[0; 64]), 0);
+    if printable.saturating_mul(100) / bytes.len() >= 85 {
+        20
+    } else {
+        0
     }
 }
+

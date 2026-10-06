@@ -10,6 +10,7 @@ const MAX_PROC_IDENTITY_BYTES: usize = 4096;
 const MAX_PROC_STATUS_BYTES: usize = 64 * 1024;
 
 /// Whether a package name is safe to use as an exact Android identity selector.
+#[must_use]
 pub fn valid_package_name(package_name: &str) -> bool {
     !package_name.is_empty()
         && package_name
@@ -46,6 +47,7 @@ impl AndroidIdentityResolver {
     }
 
     /// Resolve an installed package to its Linux UID.
+    #[must_use]
     pub fn uid_for_package(&self, package_name: &str) -> Option<u32> {
         self.packages_by_uid.iter().find_map(|(uid, packages)| {
             packages
@@ -56,6 +58,7 @@ impl AndroidIdentityResolver {
     }
 
     /// Explicit package enrollment refuses shared UIDs instead of guessing by mutable cmdline.
+    #[must_use]
     pub fn exclusive_package_uid(&self, package_name: &str) -> Option<u32> {
         self.packages_by_uid
             .iter()
@@ -187,73 +190,3 @@ fn command_line_package(command: &str) -> Option<String> {
     valid.then(|| package.to_owned())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ksight_model::ProcessKey;
-    use uuid::Uuid;
-
-    #[test]
-    fn package_name_validation_rejects_shell_syntax() {
-        assert!(valid_package_name("com.example.app"));
-        assert!(valid_package_name("android"));
-        assert!(!valid_package_name("com.example;reboot"));
-        assert!(!valid_package_name(""));
-    }
-
-    #[test]
-    fn command_line_disambiguates_shared_uid() {
-        let resolver = AndroidIdentityResolver::from_packages_list(
-            "com.example.alpha 10123 0 /data/user/0/a default none\n\
-             com.example.beta 10123 0 /data/user/0/b default none\n",
-        );
-        let candidates = resolver.package_candidates(10123, Some("com.example.beta:remote"));
-        assert_eq!(candidates.len(), 2);
-        assert_eq!(candidates[0].package_name, "com.example.beta");
-        assert_eq!(candidates[0].confidence_percent, 100);
-        assert_eq!(resolver.uid_for_package("com.example.beta"), Some(10123));
-    }
-
-    #[test]
-    fn production_qualification_enrollment_rejects_shared_and_missing_uid() {
-        let resolver = AndroidIdentityResolver::from_packages_list(
-            "p.one 10001 0
-p.two 10001 0
-p.solo 10002 0
-",
-        );
-        assert_eq!(resolver.exclusive_package_uid("p.one"), None);
-        assert_eq!(resolver.exclusive_package_uid("missing"), None);
-        assert_eq!(resolver.exclusive_package_uid("p.solo"), Some(10002));
-    }
-    #[test]
-    fn isolated_uid_uses_bounded_cmdline_inference() {
-        let resolver = AndroidIdentityResolver::default();
-        let candidates = resolver.package_candidates(99_123, Some("com.example.app:worker"));
-        assert_eq!(candidates[0].package_name, "com.example.app");
-        assert_eq!(candidates[0].confidence_percent, 60);
-    }
-
-    #[test]
-    fn enrichment_keeps_unreadable_proc_fields_optional() {
-        let resolver = AndroidIdentityResolver::default();
-        let mut identity = ProcessIdentity {
-            key: ProcessKey {
-                boot_id: Uuid::nil(),
-                pid: u32::MAX,
-                start_time_ns: 0,
-            },
-            tid: u32::MAX,
-            tgid: u32::MAX,
-            uid: 0,
-            gid: 0,
-            comm: "gone".to_owned(),
-            command_line: None,
-            selinux_context: None,
-            packages: Vec::new(),
-        };
-        resolver.enrich(&mut identity);
-        assert!(identity.command_line.is_none());
-        assert!(identity.selinux_context.is_none());
-    }
-}

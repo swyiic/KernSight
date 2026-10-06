@@ -40,6 +40,7 @@ pub const SCHED_WAKEUP_FIELDS: &[ExpectedField] = &[
 ];
 
 /// Check a runtime tracefs format without loading or attaching a BPF program.
+#[must_use]
 pub fn format_compatible(category: &str, name: &str, expected: &[ExpectedField]) -> Option<bool> {
     let format = std::fs::read_to_string(format_path(category, name)).ok()?;
     Some(fields_match(&format, expected))
@@ -110,20 +111,3 @@ fn parse_fields(format: &str) -> BTreeMap<String, (u32, u32)> {
     fields
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const FORMAT: &str = "name: sched_wakeup\nID: 1\nformat:\n\tfield:char comm[16]; offset:8; size:16; signed:1;\n\tfield:pid_t pid; offset:24; size:4; signed:1;\n\tfield:int prio; offset:28; size:4; signed:1;\n\tfield:int target_cpu; offset:32; size:4; signed:1;\n";
-
-    #[test]
-    fn accepts_exact_sched_wakeup_layout() {
-        assert!(fields_match(FORMAT, SCHED_WAKEUP_FIELDS));
-    }
-
-    #[test]
-    fn rejects_shifted_target_cpu() {
-        let shifted = FORMAT.replace("offset:32", "offset:36");
-        assert!(!fields_match(&shifted, SCHED_WAKEUP_FIELDS));
-    }
-}

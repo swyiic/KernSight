@@ -26,7 +26,7 @@ pub struct CaptureFilter {
     pub memory_all: bool,
     /// Include high-frequency socket send/receive byte-count metadata.
     pub network_io: bool,
-    /// Include dup/close/fcntl descriptor events (WebView storms this).
+    /// Include dup/close/fcntl descriptor events (`WebView` storms this).
     pub file_descriptors: bool,
     /// Emit one out of this many eligible sensor records.
     pub sample_one_in: u32,
@@ -421,7 +421,7 @@ impl EbpfSensor {
             return;
         };
         for (tgid, fd) in entries {
-            let key = ((*tgid as u64) << 32) | (*fd as u32 as u64);
+            let key = (u64::from(*tgid) << 32) | u64::from(*fd as u32);
             let _ = map.insert(key, 1, 0);
         }
     }

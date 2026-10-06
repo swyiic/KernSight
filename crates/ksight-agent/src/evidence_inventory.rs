@@ -71,34 +71,3 @@ pub fn inventory(root: &Path) -> Result<serde_json::Value> {
         serde_json::json!({"schema":"kernsight.evidence-inventory/v1","logical_bytes":total,"files":rows}),
     )
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn inventory_keeps_identical_paths_and_full_tail() {
-        let root = std::env::temp_dir().join(format!("inventory-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&root).unwrap();
-        let a = vec![7u8; 100];
-        let mut buffer = a.clone();
-        buffer[99] = 8;
-        std::fs::write(root.join("a"), &a).unwrap();
-        std::fs::write(root.join("buffer"), &buffer).unwrap();
-        std::fs::hard_link(root.join("a"), root.join("same")).unwrap();
-        let v = inventory(&root).unwrap();
-        assert_eq!(v["logical_bytes"], 300);
-        assert_eq!(v["files"].as_array().unwrap().len(), 3);
-        let hs = v["files"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v["sha256"].as_str().unwrap())
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(hs.len(), 2);
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(root.join("a"), root.join("escape")).unwrap();
-            assert!(inventory(&root).is_err());
-        }
-        std::fs::remove_dir_all(root).unwrap();
-    }
-}

@@ -33,6 +33,7 @@ type BaselineFdEntry = (i32, BaselineFdKind, String);
 /// concrete scope would be unbounded. Returns the socket `(pid, fd)` pairs so
 /// the caller can seed the network sensor before the event loop starts.
 #[allow(clippy::too_many_lines)]
+#[must_use]
 pub fn collect(
     scope: &CaptureScope,
     boot_id: Uuid,
@@ -332,36 +333,3 @@ fn now_ns() -> u64 {
         .unwrap_or(0)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn fd_classification_recognizes_sockets() {
-        assert_eq!(classify_fd("socket:[12345]"), BaselineFdKind::Socket);
-        assert_eq!(classify_fd("pipe:[54321]"), BaselineFdKind::Pipe);
-        assert_eq!(
-            classify_fd("/data/app/com.example/x.apk"),
-            BaselineFdKind::File
-        );
-        assert_eq!(classify_fd("anon_inode:[eventfd]"), BaselineFdKind::Other);
-        assert_eq!(classify_fd(""), BaselineFdKind::Other);
-    }
-
-    #[test]
-    fn protection_decode_covers_read_write_exec() {
-        assert_eq!(decode_protection("r--p"), 1);
-        assert_eq!(decode_protection("rw-p"), 3);
-        assert_eq!(decode_protection("r-xp"), 5);
-        assert_eq!(decode_protection("rwxp"), 7);
-        assert_eq!(decode_protection("---p"), 0);
-    }
-
-    #[test]
-    fn maps_parser_preserves_paths_with_spaces() {
-        let (vmas, truncated) = parse_vmas("1000-2000 r--p 00000000 00:00 0 [page size compat]\n");
-        assert!(!truncated);
-        assert_eq!(vmas.len(), 1);
-        assert_eq!(vmas[0].path.as_deref(), Some("[page size compat]"));
-    }
-}

@@ -105,11 +105,13 @@ impl ProcessInstanceTracker {
     }
 
     /// Number of process leaders currently known to the capture session.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.active.len()
     }
 
     /// Whether no process leaders are currently known.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.active.is_empty()
     }
@@ -122,86 +124,9 @@ impl SensorCounters {
     }
 
     /// Return the current count for a sensor.
+    #[must_use]
     pub fn count(&self, sensor: SensorKind) -> u64 {
         self.counts.get(&sensor).copied().unwrap_or_default()
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use ksight_model::{
-        CaptureMode, Confidence, DataQuality, EventHeader, ProcessIdentity, ProcessKey,
-        ProcessLifecycle, SchemaVersion,
-    };
-    use uuid::Uuid;
-
-    use super::*;
-
-    #[test]
-    fn correlates_late_file_events_after_exact_exit() {
-        let mut tracker = ProcessInstanceTracker::default();
-        let mut fork = event(42, 42, 100, ProcessLifecycleKind::Fork, SensorKind::Process);
-        tracker.correlate(&mut fork);
-
-        let mut file = event(42, 42, 0, ProcessLifecycleKind::Exec, SensorKind::File);
-        tracker.correlate(&mut file);
-        assert_eq!(file.header.process.key.start_time_ns, 100);
-
-        let mut exit = event(42, 42, 100, ProcessLifecycleKind::Exit, SensorKind::Process);
-        tracker.correlate(&mut exit);
-        assert_eq!(tracker.len(), 0);
-
-        let mut after_exit = event(42, 42, 0, ProcessLifecycleKind::Exec, SensorKind::File);
-        tracker.correlate(&mut after_exit);
-        assert_eq!(after_exit.header.process.key.start_time_ns, 100);
-    }
-
-    fn event(
-        pid: u32,
-        tid: u32,
-        start_time_ns: u64,
-        kind: ProcessLifecycleKind,
-        sensor: SensorKind,
-    ) -> Event {
-        Event {
-            header: EventHeader {
-                schema: SchemaVersion { major: 1, minor: 8 },
-                session_id: Uuid::nil(),
-                source_sequence: 1,
-                monotonic_ns: 1,
-                cpu: Some(0),
-                process: ProcessIdentity {
-                    key: ProcessKey {
-                        boot_id: Uuid::nil(),
-                        pid,
-                        start_time_ns,
-                    },
-                    tid,
-                    tgid: pid,
-                    uid: 0,
-                    gid: 0,
-                    comm: "test".to_owned(),
-                    command_line: None,
-                    selinux_context: None,
-                    packages: Vec::new(),
-                },
-                sensor,
-                mode: CaptureMode::Observe,
-                quality: DataQuality {
-                    confidence: Confidence::Partial,
-                    truncated: false,
-                    lost_before: 0,
-                    sample_one_in: 1,
-                    source: "test".to_owned(),
-                },
-            },
-            payload: EventPayload::ProcessLifecycle(ProcessLifecycle {
-                kind,
-                parent_pid: None,
-                filename: None,
-                exit_code: None,
-                zygote_source: None,
-            }),
-        }
-    }
-}

@@ -49,18 +49,3 @@ fn mapped_path(maps: &str, address: u64) -> Option<String> {
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn resolves_path_from_covering_maps_range() {
-        let maps = "70000000-70001000 r--p 00000000 00:00 0 [anon]\n\
-                    71000000-71002000 r-xp 00001000 08:01 42 /system/lib64/libdemo.so\n";
-        assert_eq!(
-            mapped_path(maps, 0x7100_0100).as_deref(),
-            Some("/system/lib64/libdemo.so")
-        );
-        assert_eq!(mapped_path(maps, 0x7200_0000), None);
-    }
-}

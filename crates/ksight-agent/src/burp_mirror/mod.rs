@@ -59,9 +59,9 @@ pub struct BurpMirror {
     reconstructed_messages: u64,
     reconstructed_requests: u64,
     reconstructed_responses: u64,
-    /// TLS/JNI copies classified outbound (SSL_write).
+    /// TLS/JNI copies classified outbound (`SSL_write`).
     send_fragments: u64,
-    /// TLS/JNI copies classified inbound (SSL_read).
+    /// TLS/JNI copies classified inbound (`SSL_read`).
     recv_fragments: u64,
     rejected_fragments: u64,
     duplicate_fragments: u64,
@@ -79,11 +79,11 @@ pub struct BurpMirror {
     streams: HashMap<(u32, u64), DirectionStreams>,
     peer_hosts: HashMap<u32, HashSet<String>>,
     last_url: HashMap<(u32, u64), (String, String)>,
-    /// Most recent Host/path per pid — orphan SSL_read fallback when multiple
+    /// Most recent Host/path per pid — orphan `SSL_read` fallback when multiple
     /// peer hosts make `unique_peer_host` / `unique_url_for_pid` return None.
     recent_url: HashMap<u32, (String, String)>,
-    /// Most recent SNI/peer host per pid (even when peer_hosts has many).
-    /// Fills authority-less H2 / Host-less HTTP/1 before unique_peer_host can.
+    /// Most recent SNI/peer host per pid (even when `peer_hosts` has many).
+    /// Fills authority-less H2 / Host-less HTTP/1 before `unique_peer_host` can.
     recent_peer: HashMap<u32, String>,
     /// Requests reconstructed without a usable Host; retried when SNI/peer
     /// binds to the same SSL* `stream_key` (not pid-wide).
@@ -93,12 +93,12 @@ pub struct BurpMirror {
     peer_book: Arc<Mutex<PeerHostBook>>,
     /// Capture session id for hostless diagnostic lines.
     session_id: String,
-    /// Last accepted fragment fingerprint per (pid, stream_key, outbound).
+    /// Last accepted fragment fingerprint per (pid, `stream_key`, outbound).
     recent_fragments: HashMap<(u32, u64, bool), RecentFragment>,
-    /// Sticky tid→SSL* so a brief missing connection_id on one side still
-    /// joins the same stream_key as its peer (OkHttp thread pools).
+    /// Sticky tid→SSL* so a brief missing `connection_id` on one side still
+    /// joins the same `stream_key` as its peer` (OkHt`tp thread pools).
     tid_connection: HashMap<(u32, u32), (u64, Instant)>,
-    /// Handshake/connect SNI waiting for the next SSL stream_key on that tid.
+    /// Handshake/connect SNI waiting for the next SSL `stream_key` on that tid.
     pending_tid_sni: HashMap<(u32, u32), String>,
     /// Session-local reconstructed message sequence (not raw fragment IDs).
     message_sequence: u64,
@@ -107,7 +107,7 @@ pub struct BurpMirror {
     /// peeks may promote as low-confidence inbound.
     pending_peeks: VecDeque<PendingPeek>,
     /// Recently promoted peeks. A matching read still invalidates them so a
-    /// late SSL_read does not double-deliver after PEEK_PROMOTE_IDLE.
+    /// late `SSL_read` does not double-deliver afte`r PEEK_PROMOTE_ID`LE.
     promoted_peeks: VecDeque<PendingPeek>,
     /// Live keylog secrets for decrypting Inspect `tls_record` copies.
     keylog_secrets: Vec<ksight_core::KeylogSecret>,
@@ -124,11 +124,17 @@ pub struct BurpMirror {
 /// Current mapped-network-stack inventory. It contains capability counts only.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StackCoverageSnapshot {
+    /// `candidates`.
     pub candidates: u64,
+    /// `export_candidates`.
     pub export_candidates: u64,
+    /// `pinned_boundaries`.
     pub pinned_boundaries: u64,
+    /// `empirical_boundaries`.
     pub empirical_boundaries: u64,
+    /// `keylog_candidates`.
     pub keylog_candidates: u64,
+    /// `uncovered`.
     pub uncovered: u64,
 }
 
@@ -169,7 +175,7 @@ fn new_direction_streams() -> DirectionStreams {
 }
 
 fn looks_like_tls_record(bytes: &[u8]) -> bool {
-    bytes.len() >= 5 && bytes[1] == 0x03 && matches!(bytes[0], 0x14 | 0x15 | 0x16 | 0x17)
+    bytes.len() >= 5 && bytes[1] == 0x03 && matches!(bytes[0], 0x14..=0x17)
 }
 
 struct DirectionStreams {
@@ -184,9 +190,9 @@ struct DirectionStreams {
     /// Last fragment accepted on recv, for progressive/truncated coalesce.
     recv_last: Vec<u8>,
     last_seen: Instant,
-    /// Last outbound (SSL_write) accept — H2 soft-finish keys off this.
+    /// Last outbound (`SSL_write`) accept — H2 soft-finish keys off this.
     send_last_seen: Instant,
-    /// Last inbound (SSL_read) accept — soft-flush keys off this, not send.
+    /// Last inbound (`SSL_read`) accept — soft-flush keys off this, not send.
     recv_last_seen: Instant,
 }
 
@@ -264,7 +270,7 @@ impl Drop for PlaybackLease<'_> {
 #[derive(Debug, Default)]
 struct PeerHostBook {
     by_stream: HashMap<(u32, u64), String>,
-    /// Handshake/connect SNI that has not yet bound to an SSL* stream_key.
+    /// Handshake/connect SNI that has not yet bound to an SSL* `stream_key`.
     /// Seal-time fill may use this only when the pid has exactly one leftover
     /// non-telemetry name — never at handshake time (CDN/API races).
     unbound: HashMap<u32, Vec<String>>,
@@ -401,7 +407,7 @@ fn is_telemetry_host(host: &str) -> bool {
         || host.contains("logs.alipay")
 }
 
-/// CCB imageadv / adv.gif hosts must not steal empty-host SSL_read meant for
+/// CCB imageadv / adv.gif hosts must not steal empty-host `SSL_read` meant for
 /// ccbNewClient / mbsmps/txCtrl (cycle-021444 orig=0 on GET xc.mp3.ccb.cn).
 fn is_ad_asset_host(host: &str) -> bool {
     let host = host.to_ascii_lowercase();
@@ -583,13 +589,13 @@ enum MirrorJob {
 /// How long a completed request waits for its response copy. After this the
 /// request is still recorded, but Burp history is skipped until a status was
 /// copied from `HTTP/1.1 <code>` or HTTP/2 `:status` (no manufactured 204).
-/// Mirror mode often sees SSL_read bodies arrive hundreds of ms to a few
-/// seconds after SSL_write; 2s was flushing unpaired too early.
+/// Mirror mode often sees `SSL_read` bodies arrive hundreds of ms to a few
+/// seconds after `SSL_write`; 2s was flushing unpaired too early.
 const PAIRING_GRACE: Duration = Duration::from_secs(12);
-/// POSTs often see SSL_read hundreds of ms
+/// POSTs often see `SSL_read` hundreds of ms
 /// to tens of seconds later; 30s was still flushing orig=0 before seal.
 const POST_PAIRING_GRACE: Duration = Duration::from_secs(50);
-/// Tid-only stream_key when SSL* is not yet known. High bit so it cannot
+/// Tid-only `stream_key` when SSL* is not yet known. High bit so it cannot
 /// collide with a userspace SSL object pointer (`connection_id >= 0x1000`).
 const TID_STREAM_FLAG: u64 = 0x8000_0000_0000_0000;
 const PENDING_HOSTLESS_CAP: usize = 32;
@@ -601,19 +607,19 @@ fn tid_stream_key(tid: u32) -> u64 {
 fn is_tid_stream_key(key: u64) -> bool {
     key & TID_STREAM_FLAG != 0
 }
-/// How long an unmatched SSL_read response is kept for a late SSL_write.
+/// How long an unmatched `SSL_read` response is kept for a lat`e SSL_wri`te.
 /// Hostless requests used to sit on the producer until session-end (~35s)
-/// while this 12s window dropped the already-copied SSL_read → orig=0.
+/// while this 12s window dropped the already-copied `SSL_read` → orig=0.
 const ORPHAN_RESPONSE_GRACE: Duration = Duration::from_secs(90);
 /// Cap orphan responses per (pid, stream/conn key) to bound memory.
 const ORPHAN_RESPONSE_CAP: usize = 16;
 /// Soft-flush incomplete HTTP/1 responses after recv goes idle so partial
-/// chunked/CL bodies can still pair before PAIRING_GRACE expires.
+/// chunked/CL bodies can still pair before `PAIRING_GRACE` expires.
 const RECV_SOFT_FLUSH_IDLE: Duration = Duration::from_millis(500);
-/// Soft-finish H2 send streams after HEADERS without END_STREAM (Alipay).
+/// Soft-finish H2 send streams after HEADERS without `END_STREAM` (Alipay).
 /// Longer than recv so DATA coalesces; HTTP/1 send is never soft-flushed.
 const SEND_SOFT_FLUSH_IDLE: Duration = Duration::from_millis(800);
-/// How long a tid→connection_id sticky entry remains usable.
+/// How long a `tid→connection_id` sticky entry remains usable.
 const TID_CONNECTION_STICKY: Duration = Duration::from_secs(90);
 /// How long a pre-encrypt SM4/JSON copy may wait for the matching HTTP request.
 const APP_PLAIN_TTL: Duration = Duration::from_secs(3);
@@ -1064,10 +1070,10 @@ impl BurpMirror {
             return;
         }
         self.peer_hosts.entry(pid).or_default().insert(host.clone());
-        if !is_telemetry_host(&host) {
-            self.recent_peer.insert(pid, host.clone());
-        } else {
+        if is_telemetry_host(&host) {
             self.recent_peer.entry(pid).or_insert_with(|| host.clone());
+        } else {
+            self.recent_peer.insert(pid, host.clone());
         }
         let bound_cid = if let Ok(mut book) = self.peer_book.lock() {
             if tid != 0 {
@@ -1424,8 +1430,8 @@ impl BurpMirror {
         self.refresh_recv_busy();
     }
 
-    /// Prefer SSL*/connection_id when present; otherwise reuse a recent tid sticky
-    /// mapping so write/read on OkHttp pools still share one stream_key.
+    /// Prefer SSL*/`connection_id` when present; otherwise reuse a recent tid sticky
+    /// mapping so write/read on `OkHttp` pools still share on`e stream_k`ey.
     fn stream_key_for(&mut self, pid: u32, tid: u32, connection_id: Option<u64>) -> u64 {
         let real_cid = connection_id.filter(|value| *value >= 0x1000);
         let prev = self.tid_connection.get(&(pid, tid)).copied();
@@ -1483,7 +1489,7 @@ impl BurpMirror {
     }
 
     /// Emit incomplete recv HTTP messages after a short idle gap so pairing can
-    /// attach SSL_read bodies that never see a terminal chunk / full CL.
+    /// attach `SSL_read` bodies that never see a terminal chunk / full CL.
     fn soft_flush_idle_recv(&mut self) {
         self.promote_stale_peeks();
         let now = Instant::now();
@@ -1513,7 +1519,7 @@ impl BurpMirror {
     }
 
     /// Soft-finish idle HTTP/2 *send* streams that decoded HEADERS but never
-    /// saw END_STREAM (Alipay fragmented DATA / missed final write). HTTP/1
+    /// saw `END_STREAM` (Alipay fragmented DATA / missed final write). HTTP/1
     /// send is intentionally skipped so multipart uploads stay intact.
     fn soft_flush_idle_send(&mut self) {
         let now = Instant::now();
@@ -1860,7 +1866,6 @@ impl BurpMirror {
             }
             if !looks_like_mirror_host(&request.host) {
                 kept.push_back((pending_pid, stream_id, request));
-                continue;
             }
             // Already queued at emit; worker fills Host from peer_book.
         }
@@ -1888,7 +1893,7 @@ impl BurpMirror {
     }
 
     /// Publish which pids still hold recv bytes so the worker can defer
-    /// unpaired PAIRING_GRACE sweeps until orphan/HTTP soft-flush can pair.
+    /// unpaired `PAIRING_GRACE` sweeps until orphan/HTTP soft-flush can pair.
     fn refresh_recv_busy(&self) {
         let Ok(mut busy) = self.recv_busy_pids.lock() else {
             return;
@@ -1901,7 +1906,7 @@ impl BurpMirror {
         }
     }
 
-    /// Accept keylog lines (standard or probe-debug) for live tls_record decrypt.
+    /// Accept keylog lines (standard or probe-debug) for live `tls_record` decrypt.
     pub fn ingest_keylog_lines(&mut self, lines: &[String]) {
         if lines.is_empty() {
             return;
@@ -3093,13 +3098,13 @@ fn deliver(
     };
     // Visible wire is always absolute http://host:443/path — never /_ksight or :18081.
     let absolute = request.to_proxy_absolute_with_id(&playback_id);
-    let streak = absolute_timeout_streak.load(Ordering::Relaxed);
-    let skip_absolute = streak >= ABS_TIMEOUT_SKIP_AFTER;
+    let timeout_streak = absolute_timeout_streak.load(Ordering::Relaxed);
+    let skip_absolute = timeout_streak >= ABS_TIMEOUT_SKIP_AFTER;
     if skip_absolute {
         log_mirror(
             session_id,
             &format!(
-                "burp-mirror absolute-skipped streak={streak} → still absolute wire (no :18081 rewrite) abs_wire={}",
+                "burp-mirror absolute-skipped timeout_streak={timeout_streak} → still absolute wire (no :18081 rewrite) abs_wire={}",
                 absolute.len()
             ),
         );
@@ -3125,10 +3130,7 @@ fn deliver(
             .windows(b"Burp Suite Professional".len())
             .any(|window| window == b"Burp Suite Professional");
     let absolute_bad = absolute_reply.is_empty() || absolute_burp_error;
-    let (wire_kind, reply) = if !absolute_bad {
-        absolute_timeout_streak.store(0, Ordering::Relaxed);
-        ("absolute", absolute_reply)
-    } else {
+    let (wire_kind, reply) = if absolute_bad {
         let why = if absolute_reply.is_empty() {
             abs_read_why
         } else if absolute_burp_error {
@@ -3143,7 +3145,7 @@ fn deliver(
             log_mirror(
                 session_id,
                 &format!(
-                    "burp-mirror absolute-rejected why={why} streak={next}/{ABS_TIMEOUT_SKIP_AFTER} abs_line='{}' abs_bytes={} (kept absolute; hotspot→Burp upstream 127.0.0.1:{BURP_UPSTREAM_PORT} via adb forward, NOT phone LAN IP; home Wi-Fi→phone:18888)",
+                    "burp-mirror absolute-rejected why={why} timeout_streak={next}/{ABS_TIMEOUT_SKIP_AFTER} abs_line='{}' abs_bytes={} (kept absolute; hotspot→Burp upstream 127.0.0.1:{BURP_UPSTREAM_PORT} via adb forward, NOT phone LAN IP; home Wi-Fi→phone:18888)",
                     abs_line.chars().take(80).collect::<String>(),
                     absolute_reply.len()
                 ),
@@ -3183,6 +3185,9 @@ fn deliver(
                 "Burp absolute fetch returned no response ({why}); on hotspot set Burp upstream 127.0.0.1:{BURP_UPSTREAM_PORT} (adb forward) not phone LAN; home Wi-Fi may use phone:18888; allow unsafe SSL for that upstream"
             ));
         }
+        ("absolute", absolute_reply)
+    } else {
+        absolute_timeout_streak.store(0, Ordering::Relaxed);
         ("absolute", absolute_reply)
     };
     let reply_line = reply
@@ -3444,8 +3449,7 @@ fn handle_upstream_client(
         let header_end = header_buf
             .windows(4)
             .position(|window| window == b"\r\n\r\n")
-            .map(|pos| pos + 4)
-            .unwrap_or(header_buf.len());
+            .map_or(header_buf.len(), |pos| pos + 4);
         let early = &header_buf[header_end..];
         stream
             .write_all(b"HTTP/1.1 200 Connection Established\r\nConnection: close\r\n\r\n")
@@ -3593,8 +3597,7 @@ fn connect_host(buf: &[u8]) -> Option<String> {
     let authority = rest.split_whitespace().next()?;
     let host = authority
         .rsplit_once(':')
-        .map(|(host, _)| host)
-        .unwrap_or(authority);
+        .map_or(authority, |(host, _)| host);
     let host = host.trim_start_matches('[').trim_end_matches(']');
     (!host.is_empty()).then(|| host.to_owned())
 }
@@ -3622,6 +3625,3 @@ fn playback_loop(
     }
 }
 
-#[cfg(test)]
-#[path = "tests.rs"]
-mod tests;

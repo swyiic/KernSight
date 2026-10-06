@@ -1,7 +1,7 @@
 //! Keylog probe: uprobe at per-ELF offsets to recover TLS traffic secrets.
 //!
 //! Stripped TLS stacks (Alibaba tnet/slightssl, vendor cronet forks) never set
-//! BoringSSL's keylog callback, so the line-formatter never runs. The internal
+//! `BoringSSL`'s keylog callback, so the line-formatter never runs. The internal
 //! `ssl_log_secret(ssl, label, secret, len)` call sites still exist and the
 //! keylog label strings survive in `.rodata`; offline xref analysis pins the
 //! call-site offset per build. At that address x1 is the label pointer, x2 the
@@ -109,6 +109,7 @@ impl KeylogProbe {
     /// then the unified stack-rules table embedded in the agent.
     ///
     /// Returns the probe plus status lines for the capture log.
+    #[must_use]
     pub fn attach_for_pids(uprobe_object: &Path, pids: &[u32]) -> (Self, Vec<String>) {
         let mut status = Vec::new();
         status.extend(ensure_device_stack_tables());
@@ -236,6 +237,7 @@ impl KeylogProbe {
     }
 
     /// Builds that this probe is armed for, for the session report.
+    #[must_use]
     pub fn matched_builds(&self) -> &[String] {
         &self.matched_builds
     }
@@ -306,6 +308,7 @@ fn rules_table_entries() -> Vec<KeylogEntry> {
 /// Write `tls_stacks.json` and `keylog_offsets.json` when missing or stale.
 /// Stale = schema/agent/content-hash mismatch against the embedded table.
 /// Local stacks (`source=local`) are merged after the embedded rows.
+#[must_use]
 pub fn ensure_device_stack_tables() -> Vec<String> {
     let mut status = Vec::new();
     let dir = Path::new("/data/local/tmp/ksight");
@@ -497,6 +500,7 @@ fn mapped_library_matching(pid: u32, entry: &KeylogEntry) -> Option<String> {
 }
 
 /// Default table path for status output.
+#[must_use]
 pub fn table_path() -> PathBuf {
     PathBuf::from(KEYLOG_TABLE_PATH)
 }

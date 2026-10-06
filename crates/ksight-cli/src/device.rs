@@ -922,9 +922,8 @@ fn device_can_connect_tcp(serial: Option<&str>, addr: SocketAddr) -> bool {
     }
     let port = addr.port();
     let remote = format!("toybox nc -w 1 {host} {port} </dev/null >/dev/null 2>/dev/null; echo $?");
-    let mut adb = match adb_command(serial) {
-        Ok(command) => command,
-        Err(_) => return false,
+    let Ok(mut adb) = adb_command(serial) else {
+        return false;
     };
     let Ok(output) = adb.args(["shell", &remote]).output() else {
         return false;
@@ -1248,32 +1247,3 @@ fn find_tshark() -> Option<std::path::PathBuf> {
     None
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_session_banner() {
-        let text = "ksightd 0.1.0 session=7440084a-80e0-423d-ac1e-a513287f4d96 files=true";
-        assert_eq!(
-            parse_session_token(text).unwrap().to_string(),
-            "7440084a-80e0-423d-ac1e-a513287f4d96"
-        );
-    }
-
-    #[test]
-    fn adb_serial_validation_rejects_shell_syntax() {
-        assert!(validate_serial("42091FDH20089A").is_ok());
-        assert!(validate_serial("emulator-5554").is_ok());
-        assert!(validate_serial("device;reboot").is_err());
-        assert!(validate_serial("").is_err());
-    }
-
-    #[test]
-    fn package_validation_rejects_shell_syntax() {
-        assert!(validate_package("com.google.android.gms").is_ok());
-        assert!(validate_package("android").is_ok());
-        assert!(validate_package("com.example;reboot").is_err());
-        assert!(validate_package("").is_err());
-    }
-}

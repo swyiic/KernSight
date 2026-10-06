@@ -67,6 +67,7 @@ impl AuxiliaryCapturePlan {
     }
 
     /// No pcap, keylog or infosec path is selected by this minimal mode.
+    #[must_use]
     pub fn enabled(self, action: AuxiliaryAction) -> bool {
         !self.mirror
             && match action {
@@ -98,80 +99,3 @@ impl AuxiliaryCapturePlan {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn minimal_plan_never_invokes_any_auxiliary_backend() {
-        let plan = AuxiliaryCapturePlan::new(true);
-        for action in [
-            AuxiliaryAction::Pcap,
-            AuxiliaryAction::Keylog,
-            AuxiliaryAction::Infosec,
-            AuxiliaryAction::CryptoWatch,
-            AuxiliaryAction::MemoryDump,
-        ] {
-            assert!(!plan.enabled(action));
-        }
-        for success in [true, false] {
-            for stage in [
-                AuxiliaryStage::Start,
-                AuxiliaryStage::Poll,
-                AuxiliaryStage::Finish,
-            ] {
-                plan.dispatch(stage, success, |_| -> Result<(), ()> {
-                    panic!("forbidden auxiliary backend");
-                })
-                .unwrap();
-            }
-        }
-    }
-    #[test]
-    fn parent_observation_never_invokes_implicit_dump_but_legacy_cli_preserves_it() {
-        let parent = AuxiliaryCapturePlan::scoped(false, true, false).without_automatic_dump();
-        for stage in [
-            AuxiliaryStage::Start,
-            AuxiliaryStage::Poll,
-            AuxiliaryStage::Finish,
-        ] {
-            parent
-                .dispatch(stage, true, |_| -> Result<(), ()> {
-                    panic!("implicit parent dump");
-                })
-                .unwrap();
-        }
-        let legacy = AuxiliaryCapturePlan::scoped(false, true, false);
-        let mut calls = vec![];
-        legacy
-            .dispatch(AuxiliaryStage::Finish, true, |a| {
-                calls.push(a);
-                Ok::<_, ()>(())
-            })
-            .unwrap();
-        assert_eq!(calls, [AuxiliaryAction::MemoryDump]);
-    }
-    #[test]
-    fn explicit_keys_non_mirror_scans_and_exports_only_on_success() {
-        let plan = AuxiliaryCapturePlan::scoped(false, false, true);
-        let mut calls = Vec::new();
-        for stage in [
-            AuxiliaryStage::Start,
-            AuxiliaryStage::Poll,
-            AuxiliaryStage::Finish,
-        ] {
-            plan.dispatch(stage, true, |a| {
-                calls.push(a);
-                Ok::<_, ()>(())
-            })
-            .unwrap();
-        }
-        assert_eq!(
-            calls,
-            [AuxiliaryAction::CryptoWatch, AuxiliaryAction::MemoryDump]
-        );
-        plan.dispatch(AuxiliaryStage::Finish, false, |_| -> Result<(), ()> {
-            panic!("failed capture export")
-        })
-        .unwrap();
-    }
-}

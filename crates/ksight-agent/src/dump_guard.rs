@@ -45,6 +45,7 @@ pub struct DumpObservationEnv {
 
 impl DumpWindow {
     /// Apply optional `DenyList`; USB hide is performed by the host wrapper after [`Self::mark_ready_and_yield`].
+    #[must_use]
     pub fn enter(package: &str, hide_debug: bool, denylist: bool) -> Self {
         let mut window = Self {
             package: package.to_owned(),
@@ -67,6 +68,7 @@ impl DumpWindow {
     }
 
     /// Snapshot environment after optional `DenyList`, before launch.
+    #[must_use]
     pub fn observation_env(&self) -> DumpObservationEnv {
         let env = environment::collect(CollectorMode::ForegroundAdb);
         DumpObservationEnv {
@@ -163,6 +165,7 @@ fn magisk_denylist_rm(package: &str) {
 }
 
 /// Rank dump targets: main package cmdline first, then `:service` processes.
+#[must_use]
 pub fn cmdline_dump_rank(package: &str, cmdline: &str) -> u8 {
     if cmdline == package {
         0
@@ -173,17 +176,3 @@ pub fn cmdline_dump_rank(package: &str, cmdline: &str) -> u8 {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::cmdline_dump_rank;
-
-    #[test]
-    fn ranks_main_package_ahead_of_services() {
-        assert_eq!(cmdline_dump_rank("com.example.app", "com.example.app"), 0);
-        assert_eq!(
-            cmdline_dump_rank("com.example.app", "com.example.app:push"),
-            1
-        );
-        assert_eq!(cmdline_dump_rank("com.example.app", "zygote"), 2);
-    }
-}

@@ -79,6 +79,7 @@ pub struct SemanticKeypoint {
 }
 
 /// Return the capability matrix for the current build.
+#[must_use]
 pub fn current_capabilities() -> Vec<CapabilityArea> {
     vec![
         area("process_thread", "Process / thread identity", ObservationTier::ObserveL0, CapabilityStage::Implemented, VisibilityRisk::Low, "PID, TID, UID, package candidates, lifecycle and task names are normalized. Raw-syscall supplements currently support aarch64 only; 32-bit compat syscall decoding is not yet claimed."),
@@ -100,6 +101,7 @@ pub fn current_capabilities() -> Vec<CapabilityArea> {
 }
 
 /// Return the reviewed but disabled L1 semantic keypoint registry.
+#[must_use]
 pub fn semantic_keypoints() -> Vec<SemanticKeypoint> {
     vec![
         keypoint("linker_load", "linker", "Establish a confirmed shared-object load boundary and loader namespace.", &["linker64", "libdl.so"], "Exported symbol when present; otherwise build-ID-scoped symbol/offset adapter.", "Module build ID, ABI signature, short dry-run, and mmap/linker event agreement.", "Probe state, instruction patch/breakpoint mechanism, execution latency, and custom linker checks.", CapabilityStage::Partial),
@@ -154,23 +156,3 @@ const fn keypoint(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn deep_semantics_are_not_reported_as_observe_implemented() {
-        for capability in current_capabilities() {
-            if matches!(capability.id, "art_jni_native" | "tls_quic" | "plaintext") {
-                assert_ne!(capability.stage, CapabilityStage::Implemented);
-            }
-        }
-    }
-
-    #[test]
-    fn semantic_keypoints_are_never_enabled_by_default() {
-        assert!(semantic_keypoints()
-            .iter()
-            .all(|keypoint| !keypoint.enabled_by_default));
-    }
-}

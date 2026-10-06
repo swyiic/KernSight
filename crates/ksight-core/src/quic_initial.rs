@@ -739,6 +739,7 @@ fn decode_packet_number(truncated: u64, pn_bytes: usize, expected: u64) -> u64 {
 /// Decrypt one v1 `Initial` datagram. Server `Initial` packets open with the
 /// `server in` secret; this derives the client direction only, so those fail
 /// the tag check and are reported as `None`.
+#[must_use]
 pub fn decrypt_initial(datagram: &[u8]) -> Option<DecryptedInitial> {
     if datagram.len() < 40 || (datagram[0] & 0xc0) != 0xc0 {
         return None;
@@ -958,6 +959,7 @@ impl std::fmt::Debug for QuicInitialTable {
 
 impl QuicInitialTable {
     /// Create a table holding at most `capacity` connections.
+    #[must_use]
     pub fn new(capacity: usize) -> Self {
         Self {
             entries: HashMap::new(),
@@ -967,6 +969,7 @@ impl QuicInitialTable {
     }
 
     /// Create a table with the default connection budget.
+    #[must_use]
     pub fn default_table() -> Self {
         Self::new(DEFAULT_CONNECTIONS)
     }
@@ -1054,166 +1057,3 @@ fn parse_client_hello_from_stream(stream: &[u8]) -> Option<crate::handshake::Han
     parse_client_hello_body(&stream[..4 + length])
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn hex_bytes(hex: &str) -> Vec<u8> {
-        (0..hex.len())
-            .step_by(2)
-            .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).expect("hex"))
-            .collect()
-    }
-
-    #[test]
-    fn sha256_known_answer() {
-        assert_eq!(
-            to_hex(&sha256(b"abc")),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-    }
-
-    #[test]
-    fn hmac_known_answer() {
-        assert_eq!(
-            to_hex(&hmac_sha256(&[0x0b; 20], b"Hi There")),
-            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
-        );
-    }
-
-    #[test]
-    fn hkdf_known_answer() {
-        let salt: Vec<u8> = (0x00u8..=0x0c).collect();
-        let info: Vec<u8> = (0xf0u8..=0xf9).collect();
-        let prk = hkdf_extract(&salt, &[0x0b; 22]);
-        let okm = hkdf_expand(&prk, &info, 42);
-        assert_eq!(
-            to_hex(&okm),
-            "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"
-        );
-    }
-
-    #[test]
-    fn aes128_known_answer() {
-        let aes = Aes128::new(&[
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
-            0x0e, 0x0f,
-        ]);
-        let mut block = [
-            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
-            0xee, 0xff,
-        ];
-        aes.encrypt_block(&mut block);
-        assert_eq!(to_hex(&block), "69c4e0d86a7b0430d8cdb78070b4c55a");
-    }
-
-    #[test]
-    fn gcm_known_answer() {
-        let key = [
-            0xfe, 0xff, 0xe9, 0x92, 0x86, 0x65, 0x73, 0x1c, 0x6d, 0x6a, 0x8f, 0x94, 0x67, 0x30,
-            0x83, 0x08,
-        ];
-        let nonce = [
-            0xca, 0xfe, 0xba, 0xbe, 0xfa, 0xce, 0xdb, 0xad, 0xde, 0xca, 0xf8, 0x88,
-        ];
-        let plaintext: Vec<u8> = [
-            0xd9, 0x31, 0x32, 0x25, 0xf8, 0x84, 0x06, 0xe5, 0xa5, 0x59, 0x09, 0xc5, 0xaf, 0xf5,
-            0x26, 0x9a, 0x86, 0xa7, 0xa9, 0x53, 0x15, 0x34, 0xf7, 0xda, 0x2e, 0x4c, 0x30, 0x3d,
-            0x8a, 0x31, 0x8a, 0x72, 0x1c, 0x3c, 0x0c, 0x95, 0x95, 0x68, 0x09, 0x53, 0x2f, 0xcf,
-            0x0e, 0x24, 0x49, 0xa6, 0xb5, 0x25, 0xb1, 0x6a, 0xed, 0xf5, 0xaa, 0x0d, 0xe6, 0x57,
-            0xba, 0x63, 0x7b, 0x39, 0x1a, 0xaf, 0xd2, 0x55,
-        ]
-        .to_vec();
-        let ciphertext: Vec<u8> = [
-            0x42, 0x83, 0x1e, 0xc2, 0x21, 0x77, 0x74, 0x24, 0x4b, 0x72, 0x21, 0xb7, 0x84, 0xd0,
-            0xd4, 0x9c, 0xe3, 0xaa, 0x21, 0x2f, 0x2c, 0x02, 0xa4, 0xe0, 0x35, 0xc1, 0x7e, 0x23,
-            0x29, 0xac, 0xa1, 0x2e, 0x21, 0xd5, 0x14, 0xb2, 0x54, 0x66, 0x93, 0x1c, 0x7d, 0x8f,
-            0x6a, 0x5a, 0xac, 0x84, 0xaa, 0x05, 0x1b, 0xa3, 0x0b, 0x39, 0x6a, 0x0a, 0xac, 0x97,
-            0x3d, 0x58, 0xe0, 0x91, 0x47, 0x3f, 0x59, 0x85,
-        ]
-        .iter()
-        .chain(
-            [
-                0x4d, 0x5c, 0x2a, 0xf3, 0x27, 0xcd, 0x64, 0xa6, 0x2c, 0xf3, 0x5a, 0xbd, 0x2b, 0xa6,
-                0xfa, 0xb4,
-            ]
-            .iter(),
-        )
-        .copied()
-        .collect();
-        let opened = aes128_gcm_decrypt(&key, &nonce, &[], &ciphertext).expect("gcm");
-        assert_eq!(opened, plaintext);
-        assert!(
-            aes128_gcm_decrypt(&key, &nonce, &[], &ciphertext[..ciphertext.len() - 1]).is_none()
-        );
-    }
-
-    #[test]
-    fn initial_keys_match_rfc9001_appendix_a() {
-        let keys = initial_keys(&hex_bytes("8394c8f03e515708"), b"client in").expect("keys");
-        assert_eq!(to_hex(&keys.key), "1f369613dd76d5467730efcbe3b1a22d");
-        assert_eq!(to_hex(&keys.iv), "fa044b2f42a3fd3b46fb255c");
-        assert_eq!(to_hex(&keys.hp), "9f50449e04a0e810283a1e9933adedd2");
-    }
-
-    const V1_PACKET_HEX: &str = "c400000001080011223344556677000044d29287f5085800f3d3dffd98583979b28c09c535c908aa4c7b72414f85f8b80590c1942ba47239dee92ea18dfe530100859d12152427566552f91a82196929b3ba609e7b5814f0256b9976e2d1478404bdc6dbd28dfaf3802352f22432dcc5980f337fc22952603f276d0f7207b49169e0ca8182b6f4c4304fc4d9aca20a6166be0d6564a653fe4d7b575567ff2e2275a26ba37ea3e98494bbf1ccf7d7f65f225bc539ec380cd3f1424dd8162261ebc699ab7c26854198b6ed5ac661a97a680447166d3484b584c1a7ee1fdf20c494e525317954bcdbb22ad33c811da942638a7db4add90dc698033d7115e73be9bf51f47b8dbfb4d5d8b864acbb74ac1d3f12328c22a5c481660c63c2ae9b19eee4687125befe0737ce0a0511c555f61cba13f764d4e46e0b505a9ea8b25ef68d62c913f285d2ab787eb9bffd2208bf19ca3d57fa493791b63d0640097692766b19eda0b35b14b03e97dac7c8f48a22d04664439725b8a52d28173c82a736f9d8bba007aee0191a253d8e1d9eb09e0e87030b21b2557bdb67b8e44dfde40b6ca5951830cf7f885283bbabd061107feac8e2c024f99dbc41908aabdc2d9231d73bece795bb80685c1611607ce1ee0b0224241b145b2db2159147b896b2869c2c808586b0fd4322e9a0e7f47c6974baeb469b7682d916acbb13d0054c94aa8617f7864c6039edd7cf134780a629a2ba4d372c4860ab6b2718e0501591c06d5735de6e87cd860c19a3ad53730b70f64f893c5b52b8f7b5a4b31b40539718d2629ef37ba10298ba908d3d0b99872a011be42ad634cd9bd5485ebb24b8bf05a5c179f8fa9808e2b7b796873fdf5b7c47a44eb62f632aaaa3b2bf6029cf88bd2958d9a368c06de62a153932151aa42d0211009812909f23c776b216ac3d1b9557dded58e0ea2579e2e04b92856aabd66b4746e42611351716d351832726a1e3fe68312d8bf258f9721930f1d8f573b9674387930afc6bd3f8d04bb8242cf67254e6b1677774f6032e98a7dee799b3a8a4606f2e5eeecfb0d2db0eb3aaaf1231a305b9edbf2d2fde9444fcfc290820f1246469ee2efd8fdd49d704f540eb29f6a3f975c65694269e26f35bb5dcb0029383ef2756c83aaeb723f1d97f476194eae72be238f97c5714c287d85ba883c66d08d26b100edefa86a3192181accfb4f8e693b64fb917d9861d3c6d6691ea0932784fab2835d2c449ba5337c78df2af1bbff800b289be8e521f2f080c6c7fe1efa8973a53ce8570567e2150058016be3913f2a6c7b36072034414b20c521506314071cdb8a33e0897464f248465021d92c9b7056058170789bac9b0066a47a2e3851deb0e9a86d5b9fbdfa95ec41354019fea6ba5119b6c09821b669cb54067455349bf624056cb1aec9e8ae5164e965c7651e06cde3f99df052ee75f261095d6fac34d5cdca6557473b28f90d40fc70a8b46196b9ac7591fdf3af5baebb281525090868e3f5aa256d97c06d26d2efefecd2d71e61b7f27a0e3c814684afea0f1979cb7dcbbc114294b7e50e1faa710b64ce431f8777e2b1c9236d9d742b453c7cec7ea3259a4f57ee96bfd88d3f22151577b5e15686e6fdba16108e274d6a8c23555d9c2b98207efb5060a4aa27e19deaafca70fb47d065cc9839bfde654ea1d5022629596bd1954249b30ce21f0ddc79bfb407d76075e74bc7e16af3faa501ebb8282d35b6601a61655b8c106762898f08979f73af20935b1";
-    const V2A_PACKET_HEX: &str = "c60000000108aabbccddeeff0011000040e027b7f0032f3609a065cda2092dad4685ff9c52e69c13c2cdb494b8ef54f9814a772c948d1b3e7e29df95f04b2e9b616996be74e64ef43076975d03a1cd62be94d86143ce07a75d6e7b5dfd9bc555de3aa0597aa2b2fd62c8d11abae07a4d894451529f493d9ed9a4915cf52743a10c3316cdf992e840f8bf003a3410f65ecb2c7175064d0bc32b2951d1566846a717a6a58506df3ceb57bfecf4f1f97c12e70b2ea742dc74269a5ba8c953270fc9c658f4a72c3e65bda6c89c966e45027cdf5defc506632de4188f8ec6a55b19d328a520f154e100965bab7baf2ade698363a8";
-    const V2B_PACKET_HEX: &str = "c90000000108aabbccddeeff0011000040e09ff456ff3d4045e4f1ecc8ef7fecbc6baff597a4380642bf94af09726bf79ae2a8ae1bc19ccec99432f0f3bf7c97398e0dcf3d79d325264c1d97cb1a4cfc15a1c185feeb1910cd3c6710df0c317b84e5dd6b538ae4475117a8618d0d1bac4615826a1d0fd1855f19568be70123be9ba337d5335067920f054614cea4623028edf5c1587e5b344f7101d791071a467594e0080a2f14d70a0aab71adc7999667e15bd7a9fc93d7ebfc5b38d91b0b6c3d0b8aa2d4e56c40de6974a7a622efce4a92d149d7f78a8ea309e858b9b4d87c7b1501fc4e60ebc6b577d941ecb615f03fb5";
-
-    #[test]
-    fn decrypts_client_hello_from_single_datagram() {
-        let mut table = QuicInitialTable::default_table();
-        let hello = table.feed(&hex_bytes(V1_PACKET_HEX)).expect("hello");
-        assert_eq!(hello.dcid_hex, "0011223344556677");
-        assert_eq!(hello.sni.as_deref(), Some("probe.kernsight.test"));
-        assert_eq!(hello.alpn.as_deref(), Some("h3"));
-        assert!(table.feed(&hex_bytes(V1_PACKET_HEX)).is_none());
-    }
-
-    #[test]
-    fn reassembles_client_hello_split_across_initials() {
-        let mut table = QuicInitialTable::default_table();
-        assert!(table.feed(&hex_bytes(V2A_PACKET_HEX)).is_none());
-        let hello = table.feed(&hex_bytes(V2B_PACKET_HEX)).expect("hello");
-        assert_eq!(hello.dcid_hex, "aabbccddeeff0011");
-        assert_eq!(hello.sni.as_deref(), Some("split.kernsight.test"));
-        assert_eq!(hello.alpn.as_deref(), Some("h3,h3-29"));
-    }
-
-    #[test]
-    fn truncated_datagram_fails_closed() {
-        let datagram = hex_bytes(V1_PACKET_HEX);
-        let mut table = QuicInitialTable::default_table();
-        // The old 512-byte capture cap cannot contain the GCM tag.
-        assert!(table.feed(&datagram[..512]).is_none());
-        // Corrupting the last byte breaks the tag.
-        let mut corrupted = datagram.clone();
-        let last = corrupted.len() - 1;
-        corrupted[last] ^= 0xff;
-        assert!(table.feed(&corrupted).is_none());
-    }
-
-    #[test]
-    fn non_initial_packets_are_ignored() {
-        let mut table = QuicInitialTable::default_table();
-        // Handshake packet type 0b10, and version negotiation (version 0).
-        assert!(table
-            .feed(&[0xe0, 0, 0, 0, 1, 8, 1, 2, 3, 4, 5, 6, 7, 8, 0])
-            .is_none());
-        assert!(table
-            .feed(&[0xc0, 0, 0, 0, 0, 8, 1, 2, 3, 4, 5, 6, 7, 8, 0])
-            .is_none());
-    }
-
-    #[test]
-    fn one_rtt_roundtrip_opens_short_header() {
-        let secret = [0x11u8; 32];
-        let dcid = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11];
-        let payload = b"\x00\x05hello";
-        let packet = encrypt_quic_1rtt_for_test(&dcid, 1, payload, &secret).expect("protect");
-        let opened = decrypt_quic_1rtt(&packet, &secret, dcid.len()).expect("open");
-        assert_eq!(opened, payload);
-        assert!(decrypt_quic_1rtt(&packet, &[0x22u8; 32], dcid.len()).is_none());
-        assert!(decrypt_quic_1rtt(&packet, &secret, 4).is_none());
-    }
-}

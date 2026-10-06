@@ -635,6 +635,7 @@ impl SessionSpoolWriter {
         });
     }
     /// Snapshot of current state; all strings/counts are bounded.
+    #[must_use] 
     pub fn diagnostics(&self) -> SpoolWriterDiagnostics {
         let mut d = self.diagnostics.clone();
         d.pending_json_bytes = self.buffered_json_bytes();
@@ -643,19 +644,23 @@ impl SessionSpoolWriter {
         d
     }
     /// Whether session capacity or age requires rotation.
+    #[must_use] 
     pub fn should_rotate(&self, max_age_secs: u64) -> bool {
         (max_age_secs != 0 && self.started.elapsed().as_secs() >= max_age_secs)
             || self.spool.event_capacity_exhausted()
     }
     /// Session directory.
+    #[must_use] 
     pub fn directory(&self) -> &Path {
         self.spool.directory()
     }
     /// Complete encoded batch bytes, excluding the fixed metadata allowance.
+    #[must_use] 
     pub fn used_bytes(&self) -> u64 {
         self.spool.used_bytes()
     }
     /// Batches committed by this instance.
+    #[must_use] 
     pub fn persisted_batches(&self) -> u64 {
         self.persisted_batches
     }

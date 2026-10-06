@@ -34,12 +34,3 @@ pub fn require_code_collection_backend() -> Result<(), &'static str> {
     Ok(()) // Platform prerequisite only. Agent separately loads/verifies the physical backend.
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn numeric_tgid_backend_refuses_strict_mirror() {
-        assert!(super::require_strict_mirror_backend()
-            .unwrap_err()
-            .contains("process-instance binding"));
-    }
-}

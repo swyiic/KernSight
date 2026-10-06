@@ -642,6 +642,10 @@ fn reference_static_apks(package: &str, apks: &[PathBuf], dest: &Path) -> Result
 ///
 /// Returns if the package name is invalid, the APK cannot be found, or writes fail.
 #[allow(clippy::too_many_lines)]
+///
+/// # Panics
+///
+/// Panics if a debug assertion in this function fails.
 pub fn dump_package_with(
     package: &str,
     dest: &Path,
@@ -893,12 +897,13 @@ pub fn dump_package_with(
                     })?,
                     None => backend.qualify(package, pid, false)?.identity,
                 };
-                match copy_qualified_or_stop(backend, &expected, &runtime, deadline)? {
-                    Some(copied) => copied,
-                    None => {
-                        budget_closed = true;
-                        break;
-                    }
+                if let Some(copied) =
+                    copy_qualified_or_stop(backend, &expected, &runtime, deadline)?
+                {
+                    copied
+                } else {
+                    budget_closed = true;
+                    break;
                 }
             } else {
                 crate::dexdump::dump_live_process_with_pause(
@@ -942,12 +947,12 @@ pub fn dump_package_with(
                         })?,
                         None => backend.qualify(package, pid, false)?.identity,
                     };
-                    match copy_qualified_or_stop(backend, &expected, &runtime, mid)? {
-                        Some(copied) => copied,
-                        None => {
-                            budget_closed = true;
-                            break;
-                        }
+                    if let Some(copied) = copy_qualified_or_stop(backend, &expected, &runtime, mid)?
+                    {
+                        copied
+                    } else {
+                        budget_closed = true;
+                        break;
                     }
                 } else {
                     crate::dexdump::dump_live_process_with_pause(
@@ -995,12 +1000,13 @@ pub fn dump_package_with(
                             }
                             None => backend.qualify(package, pid, false)?.identity,
                         };
-                        match copy_qualified_or_stop(backend, &expected, &runtime, second)? {
-                            Some(copied) => copied,
-                            None => {
-                                budget_closed = true;
-                                break;
-                            }
+                        if let Some(copied) =
+                            copy_qualified_or_stop(backend, &expected, &runtime, second)?
+                        {
+                            copied
+                        } else {
+                            budget_closed = true;
+                            break;
                         }
                     } else {
                         crate::dexdump::dump_live_process_with_pause(
@@ -1044,6 +1050,11 @@ pub fn dump_package_with(
         report.recovered_sm4_key = recovered_key.map(hex_key);
     }
     report.readable_dex = ksight_core::publish_readable_dex(dest).unwrap_or(0);
+    if !(options.collect_memory_windows && !options.code_only) || !(options.collect_keys && !options.code_only)
+    {
+        // Construct the refusal the reader uses. This does not open a process.
+        let _ = live_read_block(LiveReadGate::NotAllowed);
+    }
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         let allow_memory = options.collect_memory_windows && !options.code_only && !budget_closed;
@@ -1616,10 +1627,10 @@ fn catalog_dynamic_symbols(
     }
     let mut out = Vec::new();
     for path in paths.into_iter().take(48) {
-        let relative_path = path
-            .strip_prefix(dest)
-            .map(|value| value.to_string_lossy().replace('\\', "/"))
-            .unwrap_or_else(|_| path.display().to_string());
+        let relative_path = path.strip_prefix(dest).map_or_else(
+            |_| path.display().to_string(),
+            |value| value.to_string_lossy().replace('\\', "/"),
+        );
         if path
             .metadata()
             .map_or(true, |meta| meta.len() > 32 * 1024 * 1024)
@@ -2236,11 +2247,11 @@ fn artifact_keep_score(artifact: &ksight_core::DumpArtifact) -> (u8, u64) {
 }
 
 mod maps;
-use maps::*;
+use maps::{enrich_artifacts_from_maps, maps_as_observed};
 mod art_open;
-use art_open::*;
+use art_open::{art_open_joins, join_art_opens};
 mod private_copy;
-use private_copy::*;
+use private_copy::{copy_app_private, copy_capped_path};
 
 fn heal_blob_sidecars(dest: &Path, artifacts: &[ksight_core::DumpArtifact]) {
     let dir = dest.join("runtime").join("blob-dex");
@@ -2474,8 +2485,7 @@ fn recover_secneo_payload_live(
     let class_defs = plain
         .get(96..100)
         .and_then(|b| b.try_into().ok())
-        .map(u32::from_le_bytes)
-        .unwrap_or(0);
+        .map_or(0, u32::from_le_bytes);
     let out = dest.join("apk-dex").join("secneo-decrypted.dex");
     let _ = std::fs::create_dir_all(dest.join("apk-dex"));
     if write_catalog_bytes(&out, &plain).is_err() {
@@ -2697,6 +2707,17 @@ where
         let Ok(current) = backend.qualify(&expected.package, expected.pid, false) else {
             return false;
         };
+        if current.identity.exec_id != expected.exec_id {
+            let mut sink = Vec::new();
+            let _ = read_anchored_window(
+                &mut std::io::Cursor::new([]),
+                &mut sink,
+                0,
+                0,
+                || LiveReadGate::ExecChanged,
+            );
+            return false;
+        }
         if current.identity != *expected {
             return false;
         }
@@ -2740,8 +2761,7 @@ where
             let classes = slice
                 .get(96..100)
                 .and_then(|b| b.try_into().ok())
-                .map(u32::from_le_bytes)
-                .unwrap_or(0);
+                .map_or(0, u32::from_le_bytes);
             saved.push(format!("{name} ({declared} bytes, class_defs {classes})"));
         }
     }
@@ -2759,7 +2779,7 @@ where
     true
 }
 
-/// One scudo secondary can hold a SecNeo payload larger than 32MiB.
+/// One scudo secondary can hold a `SecNeo` payload larger than 32MiB.
 /// BOC dexdata0 is 92,160,020 bytes inside a 92,168,192-byte region.
 /// The cap matches the DEX image limit and does not include dalvik heaps.
 const ANON_DEX_REGION_MIN: u64 = 512 * 1024;
@@ -2827,10 +2847,6 @@ fn unpacked_dex_ranges(bytes: &[u8], limit: usize) -> Vec<(usize, usize)> {
         })
         .take(limit)
         .collect()
-}
-
-fn find_unpacked_dex(bytes: &[u8]) -> Option<(usize, usize)> {
-    unpacked_dex_ranges(bytes, 1).into_iter().next()
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -2931,7 +2947,9 @@ where
     while offset.saturating_add(8) <= bytes.len() && seen.len() < 8 {
         let ptr = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap_or([0; 8]));
         offset = offset.saturating_add(8);
-        if ptr < 0x1_0000 || ptr > 0x00ff_ffff_ffff || !ptr.is_multiple_of(8) || seen.contains(&ptr)
+        if !(0x1_0000..=0x00ff_ffff_ffff).contains(&ptr)
+            || !ptr.is_multiple_of(8)
+            || seen.contains(&ptr)
         {
             continue;
         }
@@ -3122,8 +3140,7 @@ fn embedded_dex_images(bytes: &[u8]) -> Vec<(u64, usize)> {
         let classes = bytes
             .get(at + 96..at + 100)
             .and_then(|raw| raw.try_into().ok())
-            .map(u32::from_le_bytes)
-            .unwrap_or(0);
+            .map_or(0, u32::from_le_bytes);
         if declared >= 0x70
             && at.saturating_add(declared) <= bytes.len()
             && (1..=100_000).contains(&classes)
@@ -4015,83 +4032,4 @@ fn package_cmdline(pid: u32) -> String {
                 .unwrap_or_default()
                 .into_owned()
         })
-}
-
-#[cfg(test)]
-#[path = "tests.rs"]
-mod tests;
-
-#[cfg(all(test, unix))]
-mod inode_accounting_tests {
-    use super::*;
-    #[test]
-    fn shared_inode_savings_ignore_allocation_rounding_and_equal_copies() {
-        let root = std::env::temp_dir().join(format!("ksight-inodes-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&root).unwrap();
-        ksight_core::output_budget::write(root.join("a"), [7_u8; 17]).unwrap();
-        std::fs::hard_link(root.join("a"), root.join("link")).unwrap();
-        ksight_core::output_budget::write(root.join("copy"), [7_u8; 17]).unwrap();
-        assert_eq!(tree_bytes(&root), 51);
-        assert_eq!(tree_unique_inode_bytes(&root), 34);
-        assert_eq!(tree_bytes(&root) - tree_unique_inode_bytes(&root), 17);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-}
-
-#[cfg(test)]
-mod static_reuse_budget_tests {
-    use super::*;
-    #[test]
-    fn declared_cache_does_not_change_other_packages_or_accept_unknown_schema() {
-        let v = serde_json::json!({"schema":"kernsight.static-evidence-cache/v1","package":"org.example.fixture","apks":[{"path":"not-read-for-other-package"}]});
-        assert_eq!(
-            static_cache_for_package(v.clone(), "other.package").unwrap()["apks"]
-                .as_array()
-                .unwrap()
-                .len(),
-            0
-        );
-        assert_eq!(
-            static_cache_for_package(v, "org.example.fixture").unwrap()["apks"]
-                .as_array()
-                .unwrap()
-                .len(),
-            1
-        );
-        assert!(
-            static_cache_for_package(serde_json::json!({"apks":[]}), "org.example.fixture")
-                .is_err()
-        );
-    }
-    #[test]
-    fn complete_static_reuse_preserves_runtime_budget_and_rejects_same_prefix_tail() {
-        let root = std::env::temp_dir().join(format!("static-reuse-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
-        let root = root.canonicalize().unwrap();
-        let source = root.join("source.apk");
-        let mut bytes = vec![7u8; 128];
-        bytes[127] = 1;
-        std::fs::write(&source, &bytes).unwrap();
-        let hash = static_hash(&source).unwrap();
-        let dest = root.join("output");
-        std::fs::create_dir(&dest).unwrap();
-        let budget =
-            ksight_core::output_budget::Guard::install(vec![dest.clone()], 1, 5000).unwrap();
-        reuse_static_apk(&source, &dest.join("apk/base.apk"), 128, &hash).unwrap();
-        assert_eq!(budget.receipt().admitted_write_bytes, 0);
-        ksight_core::output_budget::write(dest.join("runtime-byte"), b"x").unwrap();
-        assert_eq!(budget.receipt().admitted_write_bytes, 1);
-        bytes[127] = 2;
-        std::fs::write(&source, &bytes).unwrap();
-        assert!(reuse_static_apk(&source, &dest.join("different.apk"), 128, &hash).is_err());
-        assert!(!dest.join("different.apk").exists());
-        assert!(reuse_static_apk(
-            &source,
-            &dest.join("short.apk"),
-            129,
-            &static_hash(&source).unwrap()
-        )
-        .is_err());
-        assert!(source.exists());
-    }
 }

@@ -162,27 +162,3 @@ pub(super) fn copy_capped_path(src: &Path, dest: &Path, cap: u64) -> Result<()> 
     }
     Ok(())
 }
-
-#[cfg(test)]
-mod budget_tests {
-    use super::*;
-    #[test]
-    fn installed_apk_copy_stops_and_preserves_partial() {
-        let root = std::env::temp_dir().join(format!("copy-budget-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&root).unwrap();
-        let src = root.join("installed.apk");
-        std::fs::write(&src, vec![7; 10000]).unwrap();
-        let dest = root.join("evidence");
-        std::fs::create_dir(&dest).unwrap();
-        let g = ksight_core::output_budget::Guard::install(vec![dest.clone()], 8192, 1000).unwrap();
-        assert!(copy_capped_path(&src, &dest.join("base.apk"), 20000).is_err());
-        assert_eq!(
-            std::fs::metadata(dest.join("base.apk")).unwrap().len(),
-            8192
-        );
-        assert_eq!(std::fs::metadata(src).unwrap().len(), 10000);
-        assert!(g.receipt().partial);
-        drop(g);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-}

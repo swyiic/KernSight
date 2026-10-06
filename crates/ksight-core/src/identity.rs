@@ -15,6 +15,7 @@ impl IdentityRegistry {
     }
 
     /// Resolve an exact process instance.
+    #[must_use]
     pub fn get(&self, key: &ProcessKey) -> Option<&ProcessIdentity> {
         self.entries.get(key)
     }
@@ -25,11 +26,13 @@ impl IdentityRegistry {
     }
 
     /// Number of active process instances.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// Whether the registry is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }

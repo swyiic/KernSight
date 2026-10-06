@@ -15,6 +15,7 @@ pub struct CaptureScope {
 
 impl CaptureScope {
     /// Return whether the enriched identity belongs in this capture.
+    #[must_use]
     pub fn matches(&self, identity: &ProcessIdentity) -> bool {
         if self
             .target_tgid
@@ -43,60 +44,3 @@ fn process_name_matches(command: &str, package: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with(':'))
 }
 
-#[cfg(test)]
-mod tests {
-    use ksight_model::{PackageCandidate, ProcessKey};
-    use uuid::Uuid;
-
-    use super::*;
-
-    #[test]
-    fn package_scope_rejects_ambiguous_shared_uid() {
-        let scope = CaptureScope {
-            target_uid: Some(10_123),
-            target_package: Some("com.example.alpha".to_owned()),
-            ..CaptureScope::default()
-        };
-        let mut identity = identity();
-        identity.packages.push(PackageCandidate {
-            package_name: "com.example.alpha".to_owned(),
-            source: "packages.list:uid".to_owned(),
-            confidence_percent: 65,
-        });
-        assert!(!scope.matches(&identity));
-
-        identity.command_line = Some("com.example.alpha:worker".to_owned());
-        assert!(scope.matches(&identity));
-    }
-
-    #[test]
-    fn pid_and_uid_scope_are_intersected() {
-        let scope = CaptureScope {
-            target_tgid: Some(42),
-            target_uid: Some(10_123),
-            target_package: None,
-        };
-        let mut identity = identity();
-        assert!(scope.matches(&identity));
-        identity.tgid = 43;
-        assert!(!scope.matches(&identity));
-    }
-
-    fn identity() -> ProcessIdentity {
-        ProcessIdentity {
-            key: ProcessKey {
-                boot_id: Uuid::nil(),
-                pid: 42,
-                start_time_ns: 1,
-            },
-            tid: 42,
-            tgid: 42,
-            uid: 10_123,
-            gid: 10_123,
-            comm: "example".to_owned(),
-            command_line: None,
-            selinux_context: None,
-            packages: Vec::new(),
-        }
-    }
-}

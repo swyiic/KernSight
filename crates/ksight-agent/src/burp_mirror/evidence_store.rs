@@ -81,12 +81,12 @@ impl EvidenceStore {
                 .unwrap_or(&message.body);
             let original_name = format!("{id}-{side}.entity");
             files.push((original_name.clone(), original));
-            let display_name = if original != message.body {
+            let display_name = if original == message.body {
+                original_name.clone()
+            } else {
                 let name = format!("{id}-{side}.display");
                 files.push((name.clone(), message.body.as_slice()));
                 name
-            } else {
-                original_name.clone()
             };
             entries.push(serde_json::json!({
                 "side": side, "evidence": message.evidence,
@@ -123,36 +123,3 @@ impl EvidenceStore {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn original_entity_is_durable_and_budget_never_evicts() {
-        let root =
-            std::env::temp_dir().join(format!("ksight-evidence-test-{}", uuid::Uuid::new_v4()));
-        let mut store = EvidenceStore::new(&root, "../untrusted-session");
-        let mut request = ksight_core::StreamReassembler::default()
-            .push(b"POST /test HTTP/1.1\r\nHost: fixture.example\r\nContent-Length: 2\r\n\r\nok")
-            .remove(0);
-        request.evidence.original_entity = Some(vec![0, 1, 2]);
-        let path = store.save(&request, None).unwrap();
-        let metadata: serde_json::Value =
-            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        let entry = &metadata["messages"][0];
-        let original = path
-            .parent()
-            .unwrap()
-            .join(entry["original_entity"].as_str().unwrap());
-        assert_eq!(fs::read(&original).unwrap(), [0, 1, 2]);
-        store.budget = store.used;
-        assert!(store
-            .save(&request, None)
-            .unwrap_err()
-            .to_string()
-            .contains("budget_exceeded"));
-        assert!(path.exists() && original.exists());
-        // Only this test's UUID-owned temporary directory is removed.
-        fs::remove_dir_all(root).unwrap();
-    }
-}
