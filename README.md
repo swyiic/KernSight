@@ -1,13 +1,14 @@
 KernSight
 
-KernSight 是 Android 设备的内核观测项目。
+KernSight 是 Android 内核分析工具。
 基于 eBPF 采集进程、文件、内存映射、网络、Binder 和调度事实，由设备端 `ksightd` 归一化并持久化，
-再通过 `ksightctl` 完成控制、回放、聚合。
+再通过 `ksightctl` 完成控制、回放、聚合。G
 
 开发基线是 Pixel 6a、Android 16 (SDK 36) 、arm64-v8a。
 
 ## 覆盖范围
-- 通用规则覆盖常见 Android 应用栈；大陆四大行，政务类，购物类均可。
+- 覆盖常见 Android 应用栈；
+- 远超常规动态砸壳，抓取内存中各种Key，CE/DE，以及其他明文信息，可适用大部分金融类，政务类，购物类，短视频类app；
 
 ## 编译环境
 
