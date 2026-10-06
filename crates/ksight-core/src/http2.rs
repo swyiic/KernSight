@@ -405,7 +405,7 @@ pub(crate) struct H2Message {
     pub body: Vec<u8>,
     /// HTTP/2 stream identifier.
     pub stream_id: u32,
-    /// END_STREAM was observed; idle/session-end flushes are incomplete.
+    /// `END_STREAM` was observed; idle/session-end flushes are incomplete.
     pub complete: bool,
     /// DATA bytes omitted by the per-stream body limit.
     pub dropped_body_bytes: u64,
@@ -429,10 +429,10 @@ pub(crate) struct Http2Assembler {
     in_headers: bool,
     aligned: bool,
     headers_stream: u32,
-    /// END_STREAM seen on the initial HEADERS frame of the current block.
-    /// CONTINUATION must honor this when END_HEADERS finally arrives.
+    /// `END_STREAM` seen on the initial HEADERS frame of the current block.
+    /// CONTINUATION must honor this when `END_HEADERS` finally arrives.
     headers_end_stream: bool,
-    /// SETTINGS_MAX_FRAME_SIZE (default 16384).
+    /// `SETTINGS_MAX_FRAME_SIZE` (default 16384).
     max_frame_size: usize,
     streams: HashMap<u32, PartialH2>,
     h2_messages: Vec<H2Message>,
@@ -487,7 +487,7 @@ impl Http2Assembler {
         !bytes.is_empty() && self.buf.ends_with(bytes)
     }
 
-    /// Unparsed frame bytes + pending HPACK after seal_finish. Used so
+    /// Unparsed frame bytes + pending HPACK after `seal_finish`. Used so
     /// incomplete large DATA still becomes an orphan response.
     pub(crate) fn take_remainder(&mut self) -> Vec<u8> {
         let mut out = std::mem::take(&mut self.buf);
@@ -567,7 +567,7 @@ impl Http2Assembler {
     }
 
     /// Promote open streams that already decoded HEADERS but never saw
-    /// END_STREAM (common when the final DATA copy is missed / idle soft-flush).
+    /// `END_STREAM` (common when the final DATA copy is missed / idle soft-flush).
     pub(crate) fn soft_finish_open_streams(&mut self) {
         let open: Vec<u32> = self
             .streams
@@ -622,56 +622,31 @@ impl Http2Assembler {
                 break;
             }
             self.aligned = true;
-            let mut payload = &self.buf[header_end..frame_end];
+            let payload = &self.buf[header_end..frame_end];
             match frame_ty {
                 0x1 | 0x9 => {
-                    if frame_ty == 0x1 {
-                        self.pending.clear();
-                        self.in_headers = true;
-                        self.headers_stream = stream;
-                        // Remember END_STREAM from the initial HEADERS; CONTINUATION
-                        // carries END_HEADERS but must not clear this bit.
-                        self.headers_end_stream = flags & 0x01 != 0;
-                        if flags & 0x08 != 0 {
-                            let pad = usize::from(payload.first().copied().unwrap_or(0));
-                            payload = payload
-                                .get(1..payload.len().saturating_sub(pad))
-                                .unwrap_or(&[]);
+                    let mut header_state = HeaderBlockState {
+                        pending: &mut self.pending,
+                        in_headers: &mut self.in_headers,
+                        headers_stream: &mut self.headers_stream,
+                        headers_end_stream: &mut self.headers_end_stream,
+                        decoder: &mut self.decoder,
+                        streams: &mut self.streams,
+                    };
+                    match absorb_headers_frame(
+                        frame_ty,
+                        flags,
+                        stream,
+                        payload,
+                        &mut header_state,
+                        &mut out,
+                    ) {
+                        HeaderAbsorb::Skip => {
+                            index = frame_end;
+                            continue;
                         }
-                        if flags & 0x20 != 0 {
-                            payload = payload.get(5..).unwrap_or(&[]);
-                        }
-                    } else if !self.in_headers {
-                        index = frame_end;
-                        continue;
-                    }
-                    self.pending.extend_from_slice(payload);
-                    if flags & 0x04 != 0 {
-                        let headers = self.decoder.decode_block(&self.pending);
-                        self.pending.clear();
-                        self.in_headers = false;
-                        let end_stream = self.headers_end_stream || (flags & 0x01 != 0);
-                        self.headers_end_stream = false;
-                        if let Some(parsed) = headers_to_parsed(&headers) {
-                            out.push(parsed);
-                        }
-                        let entry = self.streams.entry(self.headers_stream).or_default();
-                        if entry.headers.is_empty() {
-                            entry.headers.clone_from(&headers);
-                        } else {
-                            // A later HEADERS block is a trailer. Preserve the
-                            // request/response pseudo-headers needed to identify
-                            // the message and append only normal trailer fields.
-                            entry.headers.extend(
-                                headers
-                                    .iter()
-                                    .filter(|(name, _)| !name.starts_with(':'))
-                                    .cloned(),
-                            );
-                        }
-                        if end_stream {
-                            self.finish_stream(self.headers_stream, true);
-                        }
+                        HeaderAbsorb::Finish(stream_id) => self.finish_stream(stream_id, true),
+                        HeaderAbsorb::Done => {}
                     }
                 }
                 0x4 => {
@@ -715,6 +690,85 @@ impl Http2Assembler {
         }
         out
     }
+}
+
+struct HeaderBlockState<'a> {
+    pending: &'a mut Vec<u8>,
+    in_headers: &'a mut bool,
+    headers_stream: &'a mut u32,
+    headers_end_stream: &'a mut bool,
+    decoder: &'a mut HpackDecoder,
+    streams: &'a mut HashMap<u32, PartialH2>,
+}
+
+enum HeaderAbsorb {
+    Skip,
+    Done,
+    Finish(u32),
+}
+
+/// Apply one HEADERS (`0x1`) or CONTINUATION (`0x9`) payload.
+///
+/// [`HeaderAbsorb::Skip`] means this CONTINUATION is outside a header block.
+fn absorb_headers_frame(
+    frame_ty: u8,
+    flags: u8,
+    stream: u32,
+    mut payload: &[u8],
+    state: &mut HeaderBlockState<'_>,
+    out: &mut Vec<ParsedHttpPlain>,
+) -> HeaderAbsorb {
+    if frame_ty == 0x1 {
+        state.pending.clear();
+        *state.in_headers = true;
+        *state.headers_stream = stream;
+        // Remember END_STREAM from the initial HEADERS; CONTINUATION
+        // carries END_HEADERS but must not clear this bit.
+        *state.headers_end_stream = flags & 0x01 != 0;
+        if flags & 0x08 != 0 {
+            let pad = usize::from(payload.first().copied().unwrap_or(0));
+            payload = payload
+                .get(1..payload.len().saturating_sub(pad))
+                .unwrap_or(&[]);
+        }
+        if flags & 0x20 != 0 {
+            payload = payload.get(5..).unwrap_or(&[]);
+        }
+    } else if !*state.in_headers {
+        return HeaderAbsorb::Skip;
+    }
+    state.pending.extend_from_slice(payload);
+    if flags & 0x04 != 0 {
+        let block = std::mem::take(state.pending);
+        let headers = state.decoder.decode_block(&block);
+        *state.pending = block;
+        state.pending.clear();
+        *state.in_headers = false;
+        let end_stream = *state.headers_end_stream || (flags & 0x01 != 0);
+        *state.headers_end_stream = false;
+        if let Some(parsed) = headers_to_parsed(&headers) {
+            out.push(parsed);
+        }
+        let headers_stream = *state.headers_stream;
+        let entry = state.streams.entry(headers_stream).or_default();
+        if entry.headers.is_empty() {
+            entry.headers.clone_from(&headers);
+        } else {
+            // A later HEADERS block is a trailer. Preserve the
+            // request/response pseudo-headers needed to identify
+            // the message and append only normal trailer fields.
+            entry.headers.extend(
+                headers
+                    .iter()
+                    .filter(|(name, _)| !name.starts_with(':'))
+                    .cloned(),
+            );
+        }
+        if end_stream {
+            return HeaderAbsorb::Finish(headers_stream);
+        }
+    }
+    HeaderAbsorb::Done
 }
 
 fn preface_row() -> ParsedHttpPlain {
@@ -781,7 +835,7 @@ fn frame_header_ok(
         0x2 | 0x3 | 0x5 | 0x8 => true,
         _ => false,
     };
-    let max_frame = max_frame_size.max(16 * 1024).min(16 * 1024 * 1024);
+    let max_frame = max_frame_size.clamp(16 * 1024, 16 * 1024 * 1024);
     if !known || !stream_ok || len > max_frame {
         return None;
     }
@@ -1466,7 +1520,7 @@ mod tests {
             0,
             1,
         ];
-        data.extend(std::iter::repeat(b'z').take(len));
+        data.extend(std::iter::repeat_n(b'z', len));
         // Seed stream headers so finish on END_STREAM yields a message.
         assembler.streams.insert(
             1,

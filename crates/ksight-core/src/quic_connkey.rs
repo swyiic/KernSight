@@ -53,6 +53,7 @@ impl ConnUserDataBook {
         }
     }
 
+    /// Counts of observed streams, return values, and shared keys.
     #[must_use]
     pub fn stats(&self) -> ConnUserDataStats {
         ConnUserDataStats {

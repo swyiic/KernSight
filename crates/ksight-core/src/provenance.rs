@@ -387,10 +387,8 @@ fn classify_dex_set(
         } else if inferred_internal_roots
             .iter()
             .any(|root| namespace_contains(root, &normalized))
-        {
-            internal += 1;
-        } else if organization_path.contains('/')
-            && namespace_contains(organization_path, &normalized)
+            || (organization_path.contains('/')
+                && namespace_contains(organization_path, &normalized))
         {
             internal += 1;
         } else {
@@ -868,7 +866,7 @@ mod tests {
         };
         let report = classify_dex_ownership_with_context(
             "com.example.shell",
-            &[enterprise_modules.clone()],
+            std::slice::from_ref(&enterprise_modules),
             &context,
         );
         assert_eq!(report.internal_components, 0);

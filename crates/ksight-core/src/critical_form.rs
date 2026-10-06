@@ -6,8 +6,11 @@
 /// Stable labels for mirror / report surfaces.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CriticalFormHit {
+    /// `sms` or `login`.
     pub kind: &'static str,
+    /// RPC method name when a marker carried one.
     pub method_rpc: Option<String>,
+    /// HTTP method, host, and path of the matched request.
     pub detail: String,
 }
 
@@ -34,7 +37,7 @@ pub fn classify_critical_form(
             return Some(CriticalFormHit {
                 kind: "sms",
                 method_rpc: None,
-                detail: format!("{} {}{}", http_method, host, path),
+                detail: format!("{http_method} {host}{path}"),
             });
         }
         if path_l.contains("login") || body_l.contains("\"password\"") || body_l.contains("passwd=")
@@ -42,7 +45,7 @@ pub fn classify_critical_form(
             return Some(CriticalFormHit {
                 kind: "login",
                 method_rpc: None,
-                detail: format!("{} {}{}", http_method, host, path),
+                detail: format!("{http_method} {host}{path}"),
             });
         }
     }

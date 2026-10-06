@@ -9,9 +9,15 @@ use uuid::Uuid;
 
 mod http_catalog;
 mod preview;
-use preview::*;
+use preview::{
+    absorb_plaintext_preview, decode_inspect_preview, inferred_content_class,
+    inspect_preview_bytes, preview_evidence_score,
+};
 mod helpers;
-use helpers::*;
+use helpers::{
+    apply_handshake, collapse_loopback_scans, merge_handshake, mode_name, path_category,
+    plaintext_graph_relation, report_limitations,
+};
 pub(crate) use http_catalog::{
     attach_http_call_graph, pair_http_replies, stamp_empty_hosts_from_sni,
 };

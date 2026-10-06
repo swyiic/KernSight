@@ -7,8 +7,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TlsDirection {
+    /// Outbound plaintext.
     #[default]
     Send,
+    /// Inbound plaintext.
     Recv,
 }
 
@@ -16,8 +18,11 @@ pub enum TlsDirection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CapturePhase {
+    /// Copy at function entry.
     Entry,
+    /// Copy at function return.
     Return,
+    /// Copy at entry and again at return.
     EntryAndReturn,
 }
 
@@ -34,7 +39,7 @@ pub enum ActualLengthSource {
 }
 
 impl ActualLengthSource {
-    /// Parse stack-rule / ProbeSpec string forms.
+    /// Parse stack-rule / `ProbeSpec` string forms.
     #[must_use]
     pub fn parse_label(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
@@ -52,23 +57,41 @@ impl ActualLengthSource {
 #[repr(u8)]
 #[serde(rename_all = "snake_case")]
 pub enum TlsAbiKind {
+    /// Plain `SSL_write`.
     OpensslWrite,
+    /// Plain `SSL_read`.
     OpensslRead,
+    /// `SSL_write_ex`.
     OpensslExWrite,
+    /// `SSL_read_ex`.
     OpensslExRead,
+    /// `SSL_write_ex2`.
     OpensslEx2Write,
+    /// `SSL_read_ex2`.
     OpensslEx2Read,
+    /// Plain `SSL_peek`.
     OpensslPeek,
+    /// `SSL_peek_ex`.
     OpensslExPeek,
+    /// `SSL_peek_ex2`.
     OpensslEx2Peek,
+    /// `SSL_write_early_data`.
     OpensslEarlyWrite,
+    /// `SSL_read_early_data`.
     OpensslEarlyRead,
+    /// `mbedtls_ssl_write`.
     MbedtlsWrite,
+    /// `mbedtls_ssl_read`.
     MbedtlsRead,
+    /// `wolfSSL_write`.
     WolfsslWrite,
+    /// `wolfSSL_read`.
     WolfsslRead,
+    /// Vendor send with the plain `SSL_write` layout.
     VendorWrite,
+    /// Vendor recv with the plain `SSL_read` layout.
     VendorRead,
+    /// Explicit vendor layout that is not auto-attached.
     #[default]
     VendorCustom,
 }
@@ -76,17 +99,25 @@ pub enum TlsAbiKind {
 /// Register / return layout for one ABI kind (ARM64 AAPCS64).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TlsAbiLayout {
+    /// ABI this layout describes.
     pub kind: TlsAbiKind,
+    /// Send or recv.
     pub direction: TlsDirection,
     /// False for peek: copies plaintext without consuming the stream.
     pub consumes: bool,
+    /// When bytes are copied.
     pub capture_phase: CapturePhase,
+    /// Register index of the buffer.
     pub buffer_arg: u8,
+    /// Register index of the requested length.
     pub requested_len_arg: u8,
+    /// Where the copied length comes from.
     pub actual_len_source: ActualLengthSource,
     /// Register holding `size_t *written` / `*readbytes` when `OutPtr`.
     pub out_len_arg: Option<u8>,
+    /// Register index of the connection.
     pub connection_arg: u8,
+    /// Register index of flags when the ABI has one.
     pub flags_arg: Option<u8>,
 }
 
@@ -178,14 +209,15 @@ impl TlsAbiKind {
             "wolfSSL_write" => Self::WolfsslWrite,
             "wolfSSL_read" => Self::WolfsslRead,
             // Known vendor exact names with the plain SSL_write/read layout.
-            "sslWrite" | "SLIGHT_SSL_write" => Self::VendorWrite,
-            "sslRead" | "SLIGHT_SSL_read" => Self::VendorRead,
             // QUIC STREAM C APIs: x0=stream, x1=buf, x2=len (same as SSL_write).
             // Attach only when dynsym DEFINES the name — never by size/RVA.
-            "quic_stream_write"
+            "sslWrite"
+            | "SLIGHT_SSL_write"
+            | "quic_stream_write"
             | "quic_stream_send"
             | "xqc_stream_send"
             | "lsquic_stream_write" => Self::VendorWrite,
+            "sslRead" | "SLIGHT_SSL_read" => Self::VendorRead,
             "quic_stream_read" | "quic_stream_recv" | "xqc_stream_recv" | "lsquic_stream_read" => {
                 Self::VendorRead
             }
@@ -202,8 +234,32 @@ impl TlsAbiKind {
         !matches!(self, Self::VendorCustom)
     }
 
+    /// Register layout for this ABI kind on ARM64 AAPCS64.
     #[must_use]
     pub fn layout(self) -> TlsAbiLayout {
+        match self {
+            Self::OpensslWrite
+            | Self::MbedtlsWrite
+            | Self::WolfsslWrite
+            | Self::VendorWrite
+            | Self::OpensslRead
+            | Self::MbedtlsRead
+            | Self::WolfsslRead
+            | Self::VendorRead
+            | Self::OpensslPeek
+            | Self::VendorCustom => self.plain_ssl_layout(),
+            Self::OpensslExWrite
+            | Self::OpensslEarlyWrite
+            | Self::OpensslExRead
+            | Self::OpensslEarlyRead
+            | Self::OpensslExPeek
+            | Self::OpensslEx2Write
+            | Self::OpensslEx2Read
+            | Self::OpensslEx2Peek => self.extended_ssl_layout(),
+        }
+    }
+
+    fn plain_ssl_layout(self) -> TlsAbiLayout {
         match self {
             Self::OpensslWrite | Self::MbedtlsWrite | Self::WolfsslWrite | Self::VendorWrite => {
                 TlsAbiLayout {
@@ -245,6 +301,34 @@ impl TlsAbiKind {
                 connection_arg: 0,
                 flags_arg: None,
             },
+            // Placeholder only for explicit VendorCustom + ProbeSpec overrides.
+            // Do NOT auto-attach with these x1/x2 defaults — layout is unknown
+            // until ProbeSpec.buffer_arg / requested_length_arg pin it.
+            Self::VendorCustom => TlsAbiLayout {
+                kind: self,
+                direction: TlsDirection::Send,
+                consumes: true,
+                capture_phase: CapturePhase::Entry,
+                buffer_arg: 1,
+                requested_len_arg: 2,
+                actual_len_source: ActualLengthSource::RequestedArg,
+                out_len_arg: None,
+                connection_arg: 0,
+                flags_arg: None,
+            },
+            Self::OpensslExWrite
+            | Self::OpensslEarlyWrite
+            | Self::OpensslExRead
+            | Self::OpensslEarlyRead
+            | Self::OpensslExPeek
+            | Self::OpensslEx2Write
+            | Self::OpensslEx2Read
+            | Self::OpensslEx2Peek => self.extended_ssl_layout(),
+        }
+    }
+
+    fn extended_ssl_layout(self) -> TlsAbiLayout {
+        match self {
             Self::OpensslExWrite | Self::OpensslEarlyWrite => TlsAbiLayout {
                 kind: self,
                 direction: TlsDirection::Send,
@@ -318,24 +402,20 @@ impl TlsAbiKind {
                 connection_arg: 0,
                 flags_arg: Some(3),
             },
-            // Placeholder only for explicit VendorCustom + ProbeSpec overrides.
-            // Do NOT auto-attach with these x1/x2 defaults — layout is unknown
-            // until ProbeSpec.buffer_arg / requested_length_arg pin it.
-            Self::VendorCustom => TlsAbiLayout {
-                kind: self,
-                direction: TlsDirection::Send,
-                consumes: true,
-                capture_phase: CapturePhase::Entry,
-                buffer_arg: 1,
-                requested_len_arg: 2,
-                actual_len_source: ActualLengthSource::RequestedArg,
-                out_len_arg: None,
-                connection_arg: 0,
-                flags_arg: None,
-            },
+            Self::OpensslWrite
+            | Self::MbedtlsWrite
+            | Self::WolfsslWrite
+            | Self::VendorWrite
+            | Self::OpensslRead
+            | Self::MbedtlsRead
+            | Self::WolfsslRead
+            | Self::VendorRead
+            | Self::OpensslPeek
+            | Self::VendorCustom => self.plain_ssl_layout(),
         }
     }
 
+    /// True when the copy happens on return and needs a uretprobe.
     #[must_use]
     pub fn needs_uretprobe(self) -> bool {
         matches!(
@@ -344,16 +424,19 @@ impl TlsAbiKind {
         )
     }
 
+    /// True when the call consumes stream bytes.
     #[must_use]
     pub fn consumes(self) -> bool {
         self.layout().consumes
     }
 
+    /// Send or recv for this ABI.
     #[must_use]
     pub fn direction(self) -> TlsDirection {
         self.layout().direction
     }
 
+    /// Stable `snake_case` name of this ABI.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -380,6 +463,7 @@ impl TlsAbiKind {
 }
 
 impl TlsDirection {
+    /// `send` or `recv`.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {

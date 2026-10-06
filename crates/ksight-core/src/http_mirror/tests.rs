@@ -483,7 +483,7 @@ fn h2_body_limit_cannot_claim_complete() {
     wire.extend(head);
     let mut messages = parser.push(&wire);
     for index in 0..65 {
-        let mut data = vec![0, 64, 0, 0, if index == 64 { 1 } else { 0 }, 0, 0, 0, 1];
+        let mut data = vec![0, 64, 0, 0, u8::from(index == 64), 0, 0, 0, 1];
         data.extend(vec![0u8; 16384]);
         messages.extend(parser.push(&data));
     }
@@ -732,7 +732,7 @@ fn chunked_terminal_plus_garbage_resyncs_to_next_response() {
         "incomplete chunked should wait"
     );
     let mut second = b"0\r\n\r\n".to_vec();
-    second.extend(std::iter::repeat(0xAAu8).take(64));
+    second.extend(std::iter::repeat_n(0xAAu8, 64));
     second.extend_from_slice(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
     let messages = stream.push(&second);
     assert_eq!(messages.len(), 2, "{messages:?}");
@@ -966,7 +966,7 @@ fn status_100_continue_has_empty_body_and_does_not_eat_following() {
     assert_eq!(messages[1].body, b"ping");
 }
 
-/// Chunked SSL_read: terminal chunk residue + status line that
+/// Chunked `SSL_read`: terminal chunk residue + status line that
 /// lost the leading `HTTP/` prefix (`1.1 200` instead of `HTTP/1.1 200`).
 #[test]
 fn truncated_status_prefix_after_chunk_terminal_resyncs() {
@@ -1166,7 +1166,7 @@ fn head_response_hint_forces_no_body_despite_content_length() {
 fn chunked_partial_under_8k_waits_for_terminal_or_flush() {
     let mut stream = StreamReassembler::default();
     let mut msg = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n64\r\n".to_vec();
-    msg.extend(std::iter::repeat(b'x').take(100));
+    msg.extend(std::iter::repeat_n(b'x', 100));
     assert!(stream.push(&msg).is_empty(), "incomplete chunked must wait");
     assert!(stream.push(b"more").is_empty());
     let messages = stream.flush();
@@ -1192,7 +1192,7 @@ fn chunked_over_8kib_waits_for_terminal() {
     let mut stream = StreamReassembler::default();
     let mut raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
     raw.extend_from_slice(b"4000\r\n"); // 16384-byte chunk
-    raw.extend(std::iter::repeat(b'A').take(9000));
+    raw.extend(std::iter::repeat_n(b'A', 9000));
     assert!(
         stream.push(&raw).is_empty(),
         "incomplete chunked must not emit at ~9KiB"
@@ -1342,7 +1342,7 @@ fn h2_incomplete_large_data_seal_salvages_remainder() {
         0,
         1,
     ]);
-    wire.extend(std::iter::repeat(b'y').take(60 * 1024));
+    wire.extend(std::iter::repeat_n(b'y', 60 * 1024));
     assert!(
         stream.push(&wire).is_empty(),
         "incomplete DATA must stay buffered"

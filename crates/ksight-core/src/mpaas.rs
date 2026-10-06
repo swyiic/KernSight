@@ -54,7 +54,7 @@ fn extract_json_object(bytes: &[u8], from: usize) -> Option<(usize, Vec<u8>)> {
             b'}' => {
                 depth = depth.saturating_sub(1);
                 if depth == 0 {
-                    return Some((start, bytes[start..start + index + 1].to_vec()));
+                    return Some((start, bytes[start..=(start + index)].to_vec()));
                 }
             }
             _ => {}
@@ -192,13 +192,10 @@ pub fn parse_mpaas_response(bytes: &[u8]) -> Option<MirroredMessage> {
     }
     let plain = maybe_inflate(bytes);
     let (_, json) = extract_json_object(&plain, 0)?;
-    if bytes_find(&json, b"\"status\"", 0).is_none() {
-        return None;
-    }
+    bytes_find(&json, b"\"status\"", 0)?;
     let status = json_string_field(&json, "status")
         .and_then(|value| value.parse::<u16>().ok())
-        .map(|code| if code == 1 { 200 } else { 500 })
-        .unwrap_or(200);
+        .map_or(200, |code| if code == 1 { 200 } else { 500 });
     Some(MirroredMessage {
         is_request: false,
         method: String::new(),

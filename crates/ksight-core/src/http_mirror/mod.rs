@@ -36,6 +36,71 @@ const HOP_BY_HOP: &[&str] = &[
     "transfer-encoding",
 ];
 
+struct H2PseudoHeaders {
+    method: String,
+    scheme: &'static str,
+    host: String,
+    path: String,
+    status: Option<u16>,
+    out_headers: Vec<(String, String)>,
+    websocket_upgrade: bool,
+}
+
+fn decode_h2_pseudo_headers(headers: &[(String, String)]) -> H2PseudoHeaders {
+    let mut method = String::new();
+    let mut scheme = "https";
+    let mut host = String::new();
+    let mut path = String::from("/");
+    let mut status = None;
+    let mut out_headers = Vec::new();
+    let mut websocket_upgrade = false;
+    for (name, value) in headers {
+        let lower = name.to_ascii_lowercase();
+        match lower.as_str() {
+            ":method" => method.clone_from(value),
+            ":scheme" => {
+                scheme = if value.eq_ignore_ascii_case("http") {
+                    "http"
+                } else {
+                    "https"
+                };
+            }
+            ":authority" | "host" => {
+                if host.is_empty() {
+                    host = host_from_token(value);
+                }
+                if lower == "host" {
+                    out_headers.push((name.clone(), value.clone()));
+                }
+            }
+            ":path" => {
+                path = ensure_absolute_path(value);
+            }
+            ":status" => status = value.parse().ok(),
+            ":protocol" => {
+                if value.eq_ignore_ascii_case("websocket") {
+                    websocket_upgrade = true;
+                }
+            }
+            _ => {
+                if lower == "upgrade" && value.to_ascii_lowercase().contains("websocket") {
+                    websocket_upgrade = true;
+                }
+                out_headers.push((name.clone(), value.clone()));
+            }
+        }
+    }
+    H2PseudoHeaders {
+        method,
+        scheme,
+        host,
+        path,
+        status,
+        out_headers,
+        websocket_upgrade,
+    }
+}
+
 /// One reconstructed HTTP/1.1 or HTTP/2-translated request or response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MirroredMessage {
@@ -322,8 +387,7 @@ impl MirroredMessage {
         if !self.is_request {
             let observed = self
                 .observed_status()
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "unknown".to_owned());
+                .map_or_else(|| "unknown".to_owned(), |value| value.to_string());
             out.extend_from_slice(
                 format!("X-KernSight-Observed-Status: {observed}\r\n").as_bytes(),
             );
@@ -346,49 +410,15 @@ impl MirroredMessage {
         outbound: bool,
         complete: bool,
     ) -> Option<Self> {
-        let mut method = String::new();
-        let mut scheme = "https";
-        let mut host = String::new();
-        let mut path = String::from("/");
-        let mut status = None;
-        let mut out_headers = Vec::new();
-        let mut websocket_upgrade = false;
-        for (name, value) in headers {
-            let lower = name.to_ascii_lowercase();
-            match lower.as_str() {
-                ":method" => method.clone_from(value),
-                ":scheme" => {
-                    scheme = if value.eq_ignore_ascii_case("http") {
-                        "http"
-                    } else {
-                        "https"
-                    };
-                }
-                ":authority" | "host" => {
-                    if host.is_empty() {
-                        host = host_from_token(value);
-                    }
-                    if lower == "host" {
-                        out_headers.push((name.clone(), value.clone()));
-                    }
-                }
-                ":path" => {
-                    path = ensure_absolute_path(value);
-                }
-                ":status" => status = value.parse().ok(),
-                ":protocol" => {
-                    if value.eq_ignore_ascii_case("websocket") {
-                        websocket_upgrade = true;
-                    }
-                }
-                _ => {
-                    if lower == "upgrade" && value.to_ascii_lowercase().contains("websocket") {
-                        websocket_upgrade = true;
-                    }
-                    out_headers.push((name.clone(), value.clone()));
-                }
-            }
-        }
+        let H2PseudoHeaders {
+            mut method,
+            scheme,
+            host,
+            path,
+            status,
+            out_headers,
+            websocket_upgrade,
+        } = decode_h2_pseudo_headers(headers);
         let grpc = out_headers.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case("content-type") && value.to_ascii_lowercase().contains("grpc")
         }) || headers
@@ -668,8 +698,7 @@ impl StreamReassembler {
     #[must_use]
     pub fn http3_outcome(&self) -> &'static str {
         self.http3_outcome
-            .map(crate::http3::Http3ParseOutcome::as_str)
-            .unwrap_or("none")
+            .map_or("none", crate::http3::Http3ParseOutcome::as_str)
     }
 
     /// Mark the next HTTP/1 response as body-less (RFC: response to HEAD).
@@ -688,18 +717,17 @@ impl StreamReassembler {
     #[must_use]
     pub fn buffered_bytes(&self) -> usize {
         match self.mode {
-            StreamMode::Unknown => self.protocol_probe.len(),
             StreamMode::Http1 => self.http1.buf.len(),
             StreamMode::Http2 => self.http2.buffered_bytes(),
-            StreamMode::Http3 => self.protocol_probe.len(),
+            StreamMode::Unknown | StreamMode::Http3 => self.protocol_probe.len(),
             StreamMode::Websocket => self.websocket.len(),
         }
     }
 
     /// True when `bytes` is already the trailing contents of the live buffer.
     ///
-    /// Used by burp_mirror debounce to detect probe duplicates that would not
-    /// advance reassembly (repeated SSL_write hits of an already-accepted
+    /// Used by `burp_mirror` debounce to detect probe duplicates that would not
+    /// advance reassembly (repeated `SSL_write` hits of an already-accepted
     /// fragment still sitting in the assembler).
     #[must_use]
     pub fn ends_with(&self, bytes: &[u8]) -> bool {
@@ -707,10 +735,9 @@ impl StreamReassembler {
             return false;
         }
         match self.mode {
-            StreamMode::Unknown => self.protocol_probe.ends_with(bytes),
             StreamMode::Http1 => self.http1.buf.ends_with(bytes),
             StreamMode::Http2 => self.http2.ends_with(bytes),
-            StreamMode::Http3 => self.protocol_probe.ends_with(bytes),
+            StreamMode::Unknown | StreamMode::Http3 => self.protocol_probe.ends_with(bytes),
             StreamMode::Websocket => self.websocket.ends_with(bytes),
         }
     }
@@ -781,9 +808,8 @@ impl StreamReassembler {
                 // bodies immediately so Burp pairing happens before
                 // PAIRING_GRACE sweeps the matching request unpaired.
                 return self.flush_unknown(false);
-            } else {
-                return Vec::new();
             }
+            return Vec::new();
         }
         Vec::new()
     }
@@ -851,7 +877,7 @@ impl StreamReassembler {
     /// Burp store the headers and partial body instead of waiting forever.
     ///
     /// `StreamMode::Unknown` used to clear `protocol_probe` and return nothing.
-    /// That silently dropped SSL_read bodies whose status-line fragment was
+    /// That silently dropped `SSL_read` bodies whose status-line fragment was
     /// missed (uretprobe gap / debounce), leaving Burp with unpaired 204s.
     /// Flush now late-promotes HTTP/1|/2 when possible and otherwise salvages
     /// printable orphan bodies as synthetic HTTP/1 responses.
@@ -887,7 +913,7 @@ impl StreamReassembler {
     }
 
     /// Recv-idle flush: HTTP/2 also salvages DATA-only streams (missed HEADERS)
-    /// so pairing can attach orig=status before PAIRING_GRACE. Send idle still
+    /// so pairing can attach orig=status before `PAIRING_GRACE`. Send idle still
     /// uses [`Self::soft_flush`] so DATA-only request bodies are not turned
     /// into fake 200 responses.
     pub fn recv_idle_flush(&mut self) -> Vec<MirroredMessage> {
@@ -898,7 +924,7 @@ impl StreamReassembler {
         self.soft_flush()
     }
 
-    /// Session-end recv salvage: soft_flush, then hard flush, then force-emit
+    /// Session-end recv salvage: `soft_flush`, then hard flush, then force-emit
     /// any leftover bytes (incomplete headers / non-orphan body) so Burp can
     /// still pair before unpaired Stop. Prefer this over bare `flush()` on seal.
     pub fn seal_flush(&mut self) -> Vec<MirroredMessage> {
@@ -940,10 +966,9 @@ impl StreamReassembler {
 
     fn remainder_bytes(&self) -> Vec<u8> {
         match self.mode {
-            StreamMode::Unknown => self.protocol_probe.clone(),
             StreamMode::Http1 => self.http1.buf.clone(),
             StreamMode::Http2 => Vec::new(),
-            StreamMode::Http3 => self.protocol_probe.clone(),
+            StreamMode::Unknown | StreamMode::Http3 => self.protocol_probe.clone(),
             StreamMode::Websocket => self.websocket.clone(),
         }
     }
@@ -1010,12 +1035,12 @@ impl StreamReassembler {
     }
 
     fn push_h2(&mut self, bytes: &[u8]) -> Vec<MirroredMessage> {
-        if !bytes.is_empty() {
-            let _ = self.http2.push(bytes);
-        } else {
+        if bytes.is_empty() {
             // soft_flush / flush: promote HEADERS-complete streams that never
             // saw END_STREAM so Alipay-like fragmented H2 still reconstructs.
             self.http2.soft_finish_open_streams();
+        } else {
+            let _ = self.http2.push(bytes);
         }
         let mut out = Vec::new();
         for message in self.http2.take_h2_messages() {
@@ -1052,7 +1077,7 @@ impl StreamReassembler {
 #[derive(Debug, Default)]
 struct Http1Assembler {
     buf: Vec<u8>,
-    /// Force the next parsed response to body_needed=0 (HEAD).
+    /// Force the next parsed response to `body_needed=0` (HEAD).
     force_no_body: bool,
 }
 
@@ -1079,7 +1104,8 @@ impl Http1Assembler {
         let mut out = Vec::new();
         loop {
             match take_http1(&mut self.buf, incomplete_ok, self.force_no_body) {
-                TakeResult::Message(mut message) => {
+                TakeResult::Message(message) => {
+                    let mut message = *message;
                     message.replace_display_entity(
                         crate::inflate_http_entity(&message.headers, &message.body),
                         "http_content_decode",
@@ -1108,12 +1134,97 @@ impl Http1Assembler {
 }
 
 enum TakeResult {
-    Message(MirroredMessage),
+    Message(Box<MirroredMessage>),
     NeedMore,
     Skip(usize),
 }
 
+fn taken(message: MirroredMessage) -> TakeResult {
+    TakeResult::Message(Box::new(message))
+}
+
+fn take_chunked_http1(
+    buf: &mut Vec<u8>,
+    message: MirroredMessage,
+    body_start: usize,
+    incomplete_ok: bool,
+) -> TakeResult {
+    match take_chunked_body(&buf[body_start..]) {
+        Some(body) => {
+            let consumed = body_start
+                .saturating_add(chunked_consumed(&buf[body_start..]).unwrap_or(body.len()));
+            if consumed > buf.len() {
+                return TakeResult::NeedMore;
+            }
+            buf.drain(..consumed);
+            let mut message = message;
+            message.body = body;
+            taken(message)
+        }
+        None if incomplete_ok && buf.len() > body_start => {
+            let mut message = message;
+            message.body = partial_chunked_body(&buf[body_start..]);
+            message.mark_incomplete("chunked_missing_terminal");
+            buf.clear();
+            taken(message)
+        }
+        None => {
+            // Keep-alive desync: after a chunked response the next SSL_read
+            // may be terminal-chunk residue (`0\r\n\r\n`) plus non-HTTP
+            // (or a huge bogus "chunk size" from binary). Prefer resyncing to
+            // the next HTTP/1 start over buffering forever.
+            let pending = &buf[body_start..];
+            if let Some(rel) = find_http1_start(pending) {
+                if rel > 0 {
+                    let mut message = message;
+                    message.body = partial_chunked_body(&pending[..rel]);
+                    message.mark_incomplete("chunked_resynchronized");
+                    buf.drain(..body_start.saturating_add(rel));
+                    return taken(message);
+                }
+            }
+            if let Some(end) = find_chunked_terminal(pending) {
+                let mut message = message;
+                message.body = partial_chunked_body(&pending[..end]);
+                message.mark_incomplete("chunked_salvaged");
+                let mut consumed = body_start.saturating_add(end);
+                // Drop contiguous non-HTTP residue until the next message.
+                if let Some(rel) = find_http1_start(&buf[consumed..]) {
+                    consumed = consumed.saturating_add(rel);
+                } else if buf.len().saturating_sub(consumed) > 8 {
+                    // Leave a tiny tail for overlap with the next push.
+                    consumed = buf.len().saturating_sub(4);
+                }
+                buf.drain(..consumed.min(buf.len()));
+                return taken(message);
+            }
+            // Do NOT commit a partial chunked body at an arbitrary 8KiB
+            // watermark — that desyncs keep-alive. Wait for terminal chunk,
+            // soft_flush/EOF (incomplete_ok), or ASSEMBLER_CAP pressure.
+            if incomplete_ok && (!pending.is_empty() || !message.is_request) {
+                // Responses: headers-only still emits on soft_flush so
+                // pairing can attach orig=status before PAIRING_GRACE.
+                // Requests: keep waiting until some chunk bytes arrive.
+                let mut message = message;
+                message.body = partial_chunked_body(pending);
+                message.mark_incomplete("chunked_missing_terminal");
+                buf.clear();
+                return taken(message);
+            }
+            if buf.len() >= ASSEMBLER_CAP {
+                let mut message = message;
+                message.mark_incomplete("assembler_limit");
+                message.body = partial_chunked_body(pending);
+                buf.clear();
+                return taken(message);
+            }
+            TakeResult::NeedMore
+        }
+    }
+}
+
 fn take_http1(buf: &mut Vec<u8>, incomplete_ok: bool, force_no_body: bool) -> TakeResult {
+    const UNTIL_CLOSE: usize = usize::MAX;
     let start = match find_http1_start(buf) {
         Some(0) => 0,
         Some(index) => return TakeResult::Skip(index),
@@ -1141,80 +1252,8 @@ fn take_http1(buf: &mut Vec<u8>, incomplete_ok: bool, force_no_body: bool) -> Ta
     }
     let body_start = header_end;
     if chunked {
-        match take_chunked_body(&buf[body_start..]) {
-            Some(body) => {
-                let consumed = body_start
-                    .saturating_add(chunked_consumed(&buf[body_start..]).unwrap_or(body.len()));
-                if consumed > buf.len() {
-                    return TakeResult::NeedMore;
-                }
-                buf.drain(..consumed);
-                let mut message = message;
-                message.body = body;
-                return TakeResult::Message(message);
-            }
-            None if incomplete_ok && buf.len() > body_start => {
-                let mut message = message;
-                message.body = partial_chunked_body(&buf[body_start..]);
-                message.mark_incomplete("chunked_missing_terminal");
-                buf.clear();
-                return TakeResult::Message(message);
-            }
-            None => {
-                // Keep-alive desync: after a chunked response the next SSL_read
-                // may be terminal-chunk residue (`0\r\n\r\n`) plus non-HTTP
-                // (or a huge bogus "chunk size" from binary). Prefer resyncing to
-                // the next HTTP/1 start over buffering forever.
-                let pending = &buf[body_start..];
-                if let Some(rel) = find_http1_start(pending) {
-                    if rel > 0 {
-                        let mut message = message;
-                        message.body = partial_chunked_body(&pending[..rel]);
-                        message.mark_incomplete("chunked_resynchronized");
-                        buf.drain(..body_start.saturating_add(rel));
-                        return TakeResult::Message(message);
-                    }
-                }
-                if let Some(end) = find_chunked_terminal(pending) {
-                    let mut message = message;
-                    message.body = partial_chunked_body(&pending[..end]);
-                    message.mark_incomplete("chunked_salvaged");
-                    let mut consumed = body_start.saturating_add(end);
-                    // Drop contiguous non-HTTP residue until the next message.
-                    if let Some(rel) = find_http1_start(&buf[consumed..]) {
-                        consumed = consumed.saturating_add(rel);
-                    } else if buf.len().saturating_sub(consumed) > 8 {
-                        // Leave a tiny tail for overlap with the next push.
-                        consumed = buf.len().saturating_sub(4);
-                    }
-                    buf.drain(..consumed.min(buf.len()));
-                    return TakeResult::Message(message);
-                }
-                // Do NOT commit a partial chunked body at an arbitrary 8KiB
-                // watermark — that desyncs keep-alive. Wait for terminal chunk,
-                // soft_flush/EOF (incomplete_ok), or ASSEMBLER_CAP pressure.
-                if incomplete_ok && (!pending.is_empty() || !message.is_request) {
-                    // Responses: headers-only still emits on soft_flush so
-                    // pairing can attach orig=status before PAIRING_GRACE.
-                    // Requests: keep waiting until some chunk bytes arrive.
-                    let mut message = message;
-                    message.body = partial_chunked_body(pending);
-                    message.mark_incomplete("chunked_missing_terminal");
-                    buf.clear();
-                    return TakeResult::Message(message);
-                }
-                if buf.len() >= ASSEMBLER_CAP {
-                    let mut message = message;
-                    message.mark_incomplete("assembler_limit");
-                    message.body = partial_chunked_body(pending);
-                    buf.clear();
-                    return TakeResult::Message(message);
-                }
-                return TakeResult::NeedMore;
-            }
-        }
+        return take_chunked_http1(buf, message, body_start, incomplete_ok);
     }
-    const UNTIL_CLOSE: usize = usize::MAX;
     let available = buf.len().saturating_sub(body_start);
     if body_needed == UNTIL_CLOSE {
         // Response with no Content-Length / not chunked: body ends on
@@ -1228,7 +1267,7 @@ fn take_http1(buf: &mut Vec<u8>, incomplete_ok: bool, force_no_body: bool) -> Ta
             });
             message.body = buf[body_start..].to_vec();
             buf.clear();
-            return TakeResult::Message(message);
+            return taken(message);
         }
         return TakeResult::NeedMore;
     }
@@ -1250,7 +1289,7 @@ fn take_http1(buf: &mut Vec<u8>, incomplete_ok: bool, force_no_body: bool) -> Ta
             });
             message.body = buf[body_start..].to_vec();
             buf.clear();
-            return TakeResult::Message(message);
+            return taken(message);
         }
         return TakeResult::NeedMore;
     }
@@ -1258,7 +1297,89 @@ fn take_http1(buf: &mut Vec<u8>, incomplete_ok: bool, force_no_body: bool) -> Ta
     let mut message = message;
     message.body = buf[body_start..body_end].to_vec();
     buf.drain(..body_end);
-    TakeResult::Message(message)
+    taken(message)
+}
+
+struct Http1HeaderFields {
+    host: String,
+    headers: Vec<(String, String)>,
+    content_length: Option<usize>,
+    chunked: bool,
+    websocket_upgrade: bool,
+}
+
+fn collect_http1_headers<'a>(lines: impl Iterator<Item = &'a str>) -> Http1HeaderFields {
+    let mut host = String::new();
+    let mut headers = Vec::new();
+    let mut content_length = None;
+    let mut chunked = false;
+    let mut websocket_upgrade = false;
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        let value = value.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let lower = name.to_ascii_lowercase();
+        match lower.as_str() {
+            "host" => host = host_from_token(value),
+            "content-length" => content_length = value.parse().ok(),
+            "transfer-encoding" => {
+                chunked = value
+                    .to_ascii_lowercase()
+                    .split(',')
+                    .any(|item| item.trim() == "chunked");
+            }
+            "upgrade" => {
+                if value.to_ascii_lowercase().contains("websocket") {
+                    websocket_upgrade = true;
+                }
+            }
+            _ => {}
+        }
+        headers.push((name.to_owned(), value.to_owned()));
+    }
+    Http1HeaderFields {
+        host,
+        headers,
+        content_length,
+        chunked,
+        websocket_upgrade,
+    }
+}
+
+fn http1_body_framing(
+    status: Option<u16>,
+    is_request: bool,
+    method: &str,
+    content_length: Option<usize>,
+    chunked: bool,
+) -> (usize, bool) {
+    // Body framing (RFC 7230 §3.3):
+    // - 1xx / 204 / 304: never a message body (ignore CL / TE)
+    // - HEAD requests: never a message body
+    // - responses without CL and not chunked: until connection close
+    // - GET/OPTIONS/CONNECT without CL: empty body
+    const UNTIL_CLOSE: usize = usize::MAX;
+    let no_body_status =
+        status.is_some_and(|code| (100..200).contains(&code) || code == 204 || code == 304);
+    let chunked = chunked && !no_body_status && !(is_request && method == "HEAD");
+    let body_needed = if no_body_status || (is_request && method == "HEAD") || chunked {
+        0
+    } else if !is_request && content_length.is_none() {
+        UNTIL_CLOSE
+    } else if is_request
+        && matches!(method, "GET" | "OPTIONS" | "CONNECT")
+        && content_length.is_none()
+    {
+        0
+    } else {
+        content_length.unwrap_or(0)
+    };
+    (body_needed, chunked)
 }
 
 fn parse_http1_head(head: &[u8]) -> Option<(MirroredMessage, usize, bool)> {
@@ -1295,40 +1416,14 @@ fn parse_http1_head(head: &[u8]) -> Option<(MirroredMessage, usize, bool)> {
         } else {
             return None;
         };
-    let mut host = String::new();
-    let mut headers = Vec::new();
-    let mut content_length = None;
-    let mut chunked = false;
-    let mut websocket_upgrade = false;
+    let Http1HeaderFields {
+        mut host,
+        mut headers,
+        content_length,
+        chunked,
+        websocket_upgrade,
+    } = collect_http1_headers(lines);
     let mut scheme = "https";
-    for line in lines {
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        let name = name.trim();
-        let value = value.trim();
-        if name.is_empty() {
-            continue;
-        }
-        let lower = name.to_ascii_lowercase();
-        match lower.as_str() {
-            "host" => host = host_from_token(value),
-            "content-length" => content_length = value.parse().ok(),
-            "transfer-encoding" => {
-                chunked = value
-                    .to_ascii_lowercase()
-                    .split(',')
-                    .any(|item| item.trim() == "chunked");
-            }
-            "upgrade" => {
-                if value.to_ascii_lowercase().contains("websocket") {
-                    websocket_upgrade = true;
-                }
-            }
-            _ => {}
-        }
-        headers.push((name.to_owned(), value.to_owned()));
-    }
     if truncated_status_prefix {
         headers.push((
             "X-KernSight-Truncated-Status-Prefix".to_owned(),
@@ -1342,29 +1437,8 @@ fn parse_http1_head(head: &[u8]) -> Option<(MirroredMessage, usize, bool)> {
         path = absolute.path;
         scheme = absolute.scheme;
     }
-    // Body framing (RFC 7230 §3.3):
-    // - 1xx / 204 / 304: never a message body (ignore CL / TE)
-    // - HEAD requests: never a message body
-    // - responses without CL and not chunked: until connection close
-    // - GET/OPTIONS/CONNECT without CL: empty body
-    const UNTIL_CLOSE: usize = usize::MAX;
-    let no_body_status =
-        status.is_some_and(|code| (100..200).contains(&code) || code == 204 || code == 304);
-    let chunked = chunked && !no_body_status && !(is_request && method == "HEAD");
-    let body_needed = if no_body_status || (is_request && method == "HEAD") {
-        0
-    } else if chunked {
-        0
-    } else if !is_request && content_length.is_none() {
-        UNTIL_CLOSE
-    } else if is_request
-        && matches!(method.as_str(), "GET" | "OPTIONS" | "CONNECT")
-        && content_length.is_none()
-    {
-        0
-    } else {
-        content_length.unwrap_or(0)
-    };
+    let (body_needed, chunked) =
+        http1_body_framing(status, is_request, method.as_str(), content_length, chunked);
     let mut message = MirroredMessage {
         is_request,
         method,
@@ -1569,13 +1643,13 @@ fn looks_like_http1(bytes: &[u8]) -> bool {
 }
 
 /// True when `bytes` look like an application-body fragment without an HTTP
-/// start line — e.g. mid-JSON from an SSL_read whose status-line copy was lost.
+/// start line — e.g. mid-JSON from an `SSL_read` whose status-line copy was lost.
 fn looks_like_orphan_http_body(bytes: &[u8]) -> bool {
     if bytes.len() < 16 {
         return false;
     }
     // Obvious TLS record headers are not HTTP bodies.
-    if bytes.len() >= 3 && matches!(bytes[0], 0x14 | 0x15 | 0x16 | 0x17) && bytes[1] == 0x03 {
+    if bytes.len() >= 3 && matches!(bytes[0], 0x14..=0x17) && bytes[1] == 0x03 {
         return false;
     }
     if looks_like_http1(bytes) || looks_like_http2(bytes) {
@@ -1602,7 +1676,11 @@ fn looks_like_orphan_http_body(bytes: &[u8]) -> bool {
                 || **byte >= 0x80
         })
         .count();
-    if (printable as f64) / (sample_len as f64) < 0.85 {
+    let (Ok(printable), Ok(sample_len)) = (u32::try_from(printable), u32::try_from(sample_len))
+    else {
+        return false;
+    };
+    if f64::from(printable) / f64::from(sample_len) < 0.85 {
         return false;
     }
     let text = String::from_utf8_lossy(sample);
@@ -1620,14 +1698,13 @@ fn orphan_body_looks_complete(bytes: &[u8]) -> bool {
     if !looks_like_orphan_http_body(bytes) {
         return false;
     }
-    let text = match std::str::from_utf8(bytes) {
-        Ok(text) => text.trim_end(),
-        Err(_) => {
-            let Some(last) = bytes.iter().rposition(|byte| !byte.is_ascii_whitespace()) else {
-                return false;
-            };
-            return matches!(bytes[last], b'}' | b']' | b'>') && bytes.len() >= 64;
-        }
+    let text = if let Ok(text) = std::str::from_utf8(bytes) {
+        text.trim_end()
+    } else {
+        let Some(last) = bytes.iter().rposition(|byte| !byte.is_ascii_whitespace()) else {
+            return false;
+        };
+        return matches!(bytes[last], b'}' | b']' | b'>') && bytes.len() >= 64;
     };
     if !(text.ends_with('}') || text.ends_with(']') || text.ends_with('>')) {
         return false;
@@ -1696,7 +1773,7 @@ fn remainder_as_orphan_response(bytes: &[u8]) -> Option<MirroredMessage> {
     if bytes.len() < 8 {
         return None;
     }
-    if bytes.len() >= 3 && matches!(bytes[0], 0x14 | 0x15 | 0x16 | 0x17) && bytes[1] == 0x03 {
+    if bytes.len() >= 3 && matches!(bytes[0], 0x14..=0x17) && bytes[1] == 0x03 {
         return None;
     }
     if let Some(message) = orphan_body_as_response(bytes) {
@@ -1826,7 +1903,7 @@ fn partial_chunked_body(bytes: &[u8]) -> Vec<u8> {
 /// Locate the end of a chunked body at/after an explicit `0` terminal chunk.
 ///
 /// Returns the index just past `0\r\n\r\n` (or `0\n\n`) when present. This
-/// recovers when SSL_read delivers the terminal chunk glued to non-HTTP bytes
+/// recovers when `SSL_read` delivers the terminal chunk glued to non-HTTP bytes
 /// that would otherwise keep `take_chunked_body` waiting forever.
 fn find_chunked_terminal(bytes: &[u8]) -> Option<usize> {
     for (index, window) in bytes.windows(5).enumerate() {

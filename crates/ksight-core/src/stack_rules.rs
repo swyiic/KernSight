@@ -16,6 +16,7 @@ use crate::tls_abi::{CapturePhase, TlsAbiKind, TlsDirection};
 
 /// Default on-device rule override; diagnostics must not silently hide read errors.
 pub const DEVICE_TABLE_PATH: &str = "/data/local/tmp/ksight/tls_stacks.json";
+/// Schema string stored in embedded and on-device rules files.
 pub const SCHEMA_VERSION: &str = "1.3";
 
 /// Root of the rules document.
@@ -209,8 +210,10 @@ fn path_matches_architecture(path: &str, architecture: &str) -> bool {
 /// Exported-symbol sets the sweeps and probes should target.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SymbolSets {
+    /// Outbound plaintext-copy symbols.
     #[serde(default)]
     pub write: Vec<String>,
+    /// Inbound plaintext-copy symbols.
     #[serde(default)]
     pub read: Vec<String>,
     /// Functions that receive keylog material (label, secret) in registers.
@@ -222,28 +225,40 @@ pub struct SymbolSets {
 /// synthesizes this from `symbols.write` / `symbols.read` via [`TlsAbiKind::from_exported_symbol`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProbeSpec {
+    /// Exported symbol this probe attaches to.
     #[serde(default)]
     pub symbol: String,
+    /// File offset when the symbol name is stripped.
     #[serde(default)]
     pub file_offset: Option<u64>,
+    /// Send or recv override for the ABI default.
     #[serde(default)]
     pub direction: Option<TlsDirection>,
+    /// Calling-convention override; omitted means the symbol name selects it.
     #[serde(default)]
     pub abi: Option<TlsAbiKind>,
+    /// When the probe copies bytes.
     #[serde(default)]
     pub capture_phase: Option<CapturePhase>,
+    /// Register index of the plaintext buffer.
     #[serde(default)]
     pub buffer_arg: Option<u8>,
+    /// Register index of the requested length.
     #[serde(default)]
     pub requested_length_arg: Option<u8>,
+    /// Where the copied length is read from.
     #[serde(default)]
     pub actual_length_source: Option<String>,
+    /// Register index of the TLS connection or stream.
     #[serde(default)]
     pub connection_arg: Option<u8>,
+    /// ELF build-id this row is pinned to.
     #[serde(default)]
     pub build_id: Option<String>,
+    /// ELF file size this row is pinned to.
     #[serde(default)]
     pub size: Option<u64>,
+    /// ABI architecture this row applies to.
     #[serde(default)]
     pub architecture: Option<String>,
     /// `enabled` | `experimental` | `disabled`. Numeric offsets without
@@ -255,30 +270,43 @@ pub struct ProbeSpec {
 /// Local / stripped plaintext boundary (not an exported SSL_* name, not keylog).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PlaintextProbe {
+    /// ELF build-id this probe is pinned to.
     #[serde(default)]
     pub build_id: Option<String>,
+    /// ELF file size this probe is pinned to.
     #[serde(default)]
     pub size: Option<u64>,
+    /// ABI architecture this probe applies to.
     #[serde(default)]
     pub architecture: Option<String>,
+    /// File offset of the stripped plaintext boundary.
     #[serde(default)]
     pub file_offset: Option<u64>,
+    /// Send or recv for this boundary.
     #[serde(default)]
     pub direction: TlsDirection,
+    /// Calling convention used at this boundary.
     #[serde(default)]
     pub abi: TlsAbiKind,
+    /// When the probe copies bytes.
     #[serde(default)]
     pub capture_phase: Option<CapturePhase>,
+    /// Register index of the plaintext buffer.
     #[serde(default)]
     pub buffer_arg: Option<u8>,
+    /// Register index of the requested length.
     #[serde(default)]
     pub requested_length_arg: Option<u8>,
+    /// Where the copied length is read from.
     #[serde(default)]
     pub actual_length_source: Option<String>,
+    /// Maximum plaintext bytes to copy.
     #[serde(default)]
     pub max_bytes: Option<u32>,
+    /// When this row was verified.
     #[serde(default)]
     pub verified_at: Option<String>,
+    /// SHA-256 of the sample used to verify the row.
     #[serde(default)]
     pub sample_sha256: Option<String>,
     /// `enabled` | `experimental` | `disabled`. Default disabled.
@@ -289,37 +317,52 @@ pub struct PlaintextProbe {
 /// Per-function vendor JNI/TLS boundary. Shared layout on a stack is not assumed.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BoundaryFunction {
+    /// JNI or vendor function name.
     #[serde(default)]
     pub symbol: String,
+    /// Send or recv when known.
     #[serde(default)]
     pub direction: Option<TlsDirection>,
+    /// Calling convention when known.
     #[serde(default)]
     pub abi: Option<TlsAbiKind>,
+    /// When the probe copies bytes.
     #[serde(default)]
     pub capture_phase: Option<CapturePhase>,
+    /// How the function return value is interpreted.
     #[serde(default)]
     pub return_semantics: Option<String>,
+    /// Register index of the plaintext buffer.
     #[serde(default)]
     pub buffer_arg: Option<u8>,
+    /// Register index of the length argument.
     #[serde(default)]
     pub length_arg: Option<u8>,
+    /// Register index of the out-length pointer.
     #[serde(default)]
     pub output_length_arg: Option<u8>,
+    /// Register index of the connection.
     #[serde(default)]
     pub connection_arg: Option<u8>,
+    /// Register index of the stream.
     #[serde(default)]
     pub stream_arg: Option<u8>,
+    /// True when this function copies header bytes.
     #[serde(default)]
     pub is_header: Option<bool>,
+    /// True when this function copies body bytes.
     #[serde(default)]
     pub is_body: Option<bool>,
     /// `empirical` | `pinned`.
     #[serde(default)]
     pub layout: String,
+    /// How strongly this layout was confirmed.
     #[serde(default)]
     pub confidence: Option<String>,
+    /// ELF build-id this row is pinned to.
     #[serde(default)]
     pub build_id: Option<String>,
+    /// Maximum plaintext bytes to copy.
     #[serde(default)]
     pub max_bytes: Option<u32>,
     /// `enabled` | `experimental` | `disabled`.
@@ -404,7 +447,7 @@ pub struct StackVersion {
     /// Android API / apex when relevant
     #[serde(default)]
     pub api_level: Option<u32>,
-    /// Canonical build-id (may mirror match_rules)
+    /// Canonical build-id (may mirror `match_rules`)
     #[serde(default)]
     pub build_id: Option<String>,
     #[serde(default)]
@@ -754,11 +797,11 @@ pub fn enabled_plaintext_probes() -> Vec<(String, PlaintextProbe)> {
     out
 }
 
-/// ProbeSpec rows for the concrete ELF matched by path/size/build-id.
+/// `ProbeSpec` rows for the concrete ELF matched by path/size/build-id.
 ///
 /// Returns attachable (`enabled` / `experimental`) probes from the winning
-/// stack (and any equally specific co-matches). Callers build InspectPlans
-/// from these rows — file_offset / abi / buffer_arg / capture_phase are the
+/// stack (and any equally specific co-matches). Callers build `InspectPlans`
+/// from these rows — `file_offset` / abi / `buffer_arg` / `capture_phase` are the
 /// source of truth over Rust fixed-name arrays + name→ABI re-inference.
 #[must_use]
 pub fn probe_specs_for_path(
@@ -1294,22 +1337,21 @@ mod tests {
         assert_eq!(pinned.coverage.keylog, Some(false));
         assert_eq!(
             pinned.keylog.as_ref().and_then(|k| k.offset),
-            Some(0x19bf70),
+            Some(0x0019_bf70),
             "soft-demote retains documented keylog offset 0x19bf70"
         );
         assert!(
             pinned
                 .keylog
                 .as_ref()
-                .map(|k| k.anchors.iter().any(|a| a == "CLIENT_RANDOM"))
-                .unwrap_or(false),
+                .is_some_and(|k| k.anchors.iter().any(|a| a == "CLIENT_RANDOM")),
             "anchors recorded for future on-device derivation"
         );
         assert!(pinned.symbols.write.is_empty());
         // Attach gate: keylog_entries() must skip demoted pins even when offset present.
         assert!(
             !keylog_entries().iter().any(|e| {
-                e.offset == Some(0x19bf70)
+                e.offset == Some(0x0019_bf70)
                     || e.build_id.as_deref() == Some("2916c4a0a606c37082127aacf169a9ff26fbd20e")
             }),
             "soft-demoted tquic_dlxx must not appear in keylog_entries()"
@@ -1375,7 +1417,7 @@ mod tests {
         assert_eq!(pinned.coverage.keylog, Some(true));
         assert_eq!(
             pinned.keylog.as_ref().and_then(|k| k.offset),
-            Some(0x716dbc)
+            Some(0x0071_6dbc)
         );
         // Unknown build-id → generic flutter; crash-safe gap (no offset / keylog false)
         let generic = stack_for_path(

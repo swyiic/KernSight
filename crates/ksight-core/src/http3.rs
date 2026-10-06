@@ -230,10 +230,10 @@ impl QpackDecoder {
                     return false;
                 };
                 bytes = &bytes[used..];
-                let Some((value, vused)) = qpack_string(bytes) else {
+                let Some((value, value_len)) = qpack_string(bytes) else {
                     return false;
                 };
-                bytes = &bytes[vused..];
+                bytes = &bytes[value_len..];
                 let name = if static_name {
                     let Some((name, _)) = qpack_static(index) else {
                         return false;
@@ -382,16 +382,16 @@ impl QpackDecoder {
                     self.get_absolute(abs)?.0.clone()
                 };
                 offset += used;
-                let (value, vused) = qpack_string(&payload[offset..])?;
+                let (value, value_len) = qpack_string(&payload[offset..])?;
                 headers.push((name, value));
-                offset += vused;
+                offset += value_len;
             } else if first & 0xe0 == 0x20 {
                 // Literal Field Line With Literal Name: 001 N H namelen(3).
                 let (name, nused) = qpack_string_prefix(&payload[offset..], 3)?;
                 offset += nused;
-                let (value, vused) = qpack_string(&payload[offset..])?;
+                let (value, value_len) = qpack_string(&payload[offset..])?;
                 headers.push((name, value));
-                offset += vused;
+                offset += value_len;
             } else {
                 return None;
             }
@@ -423,11 +423,7 @@ pub fn looks_like_http3(bytes: &[u8]) -> bool {
     let Some((kind, _payload, _)) = take_frame(bytes) else {
         return false;
     };
-    match kind {
-        FRAME_DATA => true,
-        FRAME_HEADERS => true,
-        _ => false,
-    }
+    matches!(kind, FRAME_DATA | FRAME_HEADERS)
 }
 
 /// Leading empty DATA / HEADERS frames (`0x00 0x00`, `0x01 0x00`).

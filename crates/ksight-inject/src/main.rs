@@ -704,31 +704,6 @@ fn attach_main(pid: i32) -> Result<Vec<i32>, String> {
 }
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
-fn attach_all(pid: i32) -> Result<Vec<i32>, String> {
-    let mut tids = attach_main(pid)?;
-    let Ok(dir) = fs::read_dir(format!("/proc/{pid}/task")) else {
-        return Ok(tids);
-    };
-    for entry in dir.flatten() {
-        let Ok(tid) = entry.file_name().to_string_lossy().parse::<i32>() else {
-            continue;
-        };
-        if tids.contains(&tid) {
-            continue;
-        }
-        unsafe {
-            if libc::ptrace(libc::PTRACE_ATTACH, tid, 0, 0) != 0 {
-                continue;
-            }
-        }
-        let _ = wait_stop(tid, Duration::from_millis(40));
-        tids.push(tid);
-    }
-    eprintln!("ksight-inject attached {} threads", tids.len());
-    Ok(tids)
-}
-
-#[cfg(any(target_os = "android", target_os = "linux"))]
 fn detach_all(tids: &[i32]) {
     for tid in tids {
         unsafe {
@@ -1244,7 +1219,7 @@ fn remote_call32(pid: i32, func: u64, brk: u64, args: [u32; 4]) -> Result<u32, S
 fn inject_attached32(
     pid: i32,
     so: &[u8],
-    lib_path: &str,
+    _lib_path: &str,
     dlopen_ext: Option<u64>,
     dlopen: Option<u64>,
     caller: u64,
@@ -1334,11 +1309,11 @@ fn poke_word(pid: i32, addr: u64, word: u64) -> Result<(), String> {
 #[cfg(any(target_os = "android", target_os = "linux"))]
 fn process_vm_rw(pid: i32, addr: u64, buf: &[u8], write: bool) -> Result<(), String> {
     unsafe {
-        let mut local = libc::iovec {
+        let local = libc::iovec {
             iov_base: buf.as_ptr().cast::<libc::c_void>().cast_mut(),
             iov_len: buf.len(),
         };
-        let mut remote = libc::iovec {
+        let remote = libc::iovec {
             iov_base: addr as *mut libc::c_void,
             iov_len: buf.len(),
         };

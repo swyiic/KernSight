@@ -644,7 +644,8 @@ pub fn encrypt_quic_1rtt_for_test(
     let keys = quic_application_keys(traffic_secret)?;
     let pn_len = 1usize;
     let pn_bytes = [(packet_number & 0xff) as u8];
-    let first = 0x40u8 | (pn_len as u8 - 1);
+    let pn_len_u8 = u8::try_from(pn_len).ok()?;
+    let first = 0x40u8 | (pn_len_u8 - 1);
     let mut header = Vec::with_capacity(1 + dcid.len() + pn_len);
     header.push(first);
     header.extend_from_slice(dcid);

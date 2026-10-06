@@ -299,6 +299,7 @@ pub struct KeylogSecret {
     pub label: String,
     /// Client random when the line carried one (standard form, hex).
     pub random: Option<String>,
+    /// Secret bytes decoded from the keylog line.
     pub secret: Vec<u8>,
 }
 

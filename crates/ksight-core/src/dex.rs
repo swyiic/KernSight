@@ -915,8 +915,7 @@ pub fn plaintext_type_descriptors(bytes: &[u8], limit: usize) -> PlaintextTypeDe
         }
         let desc_len = relative_end.saturating_add(2);
         let end = index.saturating_add(desc_len);
-        if desc_len < 8
-            || desc_len > 240
+        if !(8..=240).contains(&desc_len)
             || end >= bytes.len()
             || bytes[end] != 0
             || !type_descriptor_bytes(&bytes[index..end])
@@ -981,7 +980,7 @@ pub fn locate_dexdata0(bytes: &[u8]) -> Option<DexDataSpot> {
         if at >= 12 {
             let header = &bytes[at - 12..at];
             let count = u32::from_le_bytes(header[0..4].try_into().ok()?);
-            let declared = u32::from_le_bytes(header[4..8].try_into().ok()?) as u64;
+            let declared = u64::from(u32::from_le_bytes(header[4..8].try_into().ok()?));
             let name_len = u32::from_le_bytes(header[8..12].try_into().ok()?);
             if (1..=8).contains(&count)
                 && name_len == 8
@@ -1010,7 +1009,7 @@ pub fn peek_declared_dex_len(bytes: &[u8]) -> Option<usize> {
         return None;
     }
     let declared = u32::from_le_bytes(bytes[32..36].try_into().ok()?) as usize;
-    if declared < 0x70 || declared > DEX_IMAGE_LIMIT {
+    if !(0x70..=DEX_IMAGE_LIMIT).contains(&declared) {
         return None;
     }
     Some(declared)
@@ -1481,7 +1480,7 @@ mod tests {
     #[test]
     fn plaintext_descriptors_require_a_matching_uleb_length() {
         let splash = b"Lcom/boc/bocsoft/mobile/bocmobile/buss/system/splash/SplashActivity;";
-        let mut bytes = vec![splash.len() as u8];
+        let mut bytes = vec![u8::try_from(splash.len()).unwrap()];
         bytes.extend_from_slice(splash);
         bytes.push(0);
         bytes.push(b'L');
@@ -1528,7 +1527,12 @@ mod tests {
         assert_eq!(peek_declared_dex_len(&bytes), Some(92_319_172));
         assert!(split_concatenated_dex(&bytes).is_empty());
         let mut over = header_with(0x70, 0x70, 0, 0x70);
-        over[32..36].copy_from_slice(&((DEX_IMAGE_LIMIT as u32).saturating_add(1)).to_le_bytes());
+        over[32..36].copy_from_slice(
+            &u32::try_from(DEX_IMAGE_LIMIT)
+                .unwrap()
+                .saturating_add(1)
+                .to_le_bytes(),
+        );
         assert_eq!(peek_declared_dex_len(&over), None);
     }
 
