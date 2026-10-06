@@ -170,10 +170,7 @@ fn candidate_ledger(rows: &[crate::dexdump::MapRow]) -> serde_json::Value {
 }
 
 fn write_candidate_ledger(dir: &Path, stem: &str, mut note: serde_json::Value) -> Result<()> {
-    let candidates = note["candidates"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
+    let candidates = note["candidates"].as_array().cloned().unwrap_or_default();
     let eligible = candidates.len();
     note["eligible_count"] = serde_json::json!(eligible);
     let mut start = 0_usize;
@@ -225,10 +222,7 @@ fn write_candidate_ledger(dir: &Path, stem: &str, mut note: serde_json::Value) -
         if bytes.len() > 256 * 1024 {
             bail!("candidate metadata size bound");
         }
-        ksight_core::output_budget::write(
-            dir.join(format!("{stem}-{shard:02}.json")),
-            &bytes,
-        )?;
+        ksight_core::output_budget::write(dir.join(format!("{stem}-{shard:02}.json")), &bytes)?;
         if eligible == 0 || chosen >= eligible {
             break;
         }
@@ -616,11 +610,8 @@ mod physical {
             let mut candidates = candidate_ledger(&rows);
             candidates["order"] =
                 serde_json::json!("app_install_dex_then_elf_then_other_original_maps_order");
-            let candidate_name = format!(
-                "bound-candidates-{}-{}",
-                expected.pid,
-                uuid::Uuid::new_v4()
-            );
+            let candidate_name =
+                format!("bound-candidates-{}-{}", expected.pid, uuid::Uuid::new_v4());
             write_candidate_ledger(out, &candidate_name, candidates)?;
             let mut records = Vec::new();
             let mut partial = false;
@@ -828,7 +819,10 @@ mod tests {
             code_range_cap("/data/app/p/oat/arm64/base.vdex"),
             128 * 1024 * 1024
         );
-        assert_eq!(code_range_cap("/memfd:jit-cache (deleted)"), 16 * 1024 * 1024);
+        assert_eq!(
+            code_range_cap("/memfd:jit-cache (deleted)"),
+            16 * 1024 * 1024
+        );
         assert_eq!(code_range_cap("/data/app/p/base.apk"), 16 * 1024 * 1024);
     }
 

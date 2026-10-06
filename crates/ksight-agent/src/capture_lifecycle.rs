@@ -1248,7 +1248,10 @@ mod tests {
             .unwrap();
         startup.retain_timing().unwrap();
         let receipt: serde_json::Value = read(&root, "startup.json").unwrap();
-        assert_eq!(receipt["timing"]["force_stop_status"], "remaining_after_wait");
+        assert_eq!(
+            receipt["timing"]["force_stop_status"],
+            "remaining_after_wait"
+        );
         assert!(receipt["timing"]["previous_instance_exit_observed_ms"].is_null());
         assert!(receipt["timing"]["launcher_started_ms"].is_null());
     }

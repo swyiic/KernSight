@@ -400,9 +400,7 @@ fn classify_dex_set(
     let total = descriptors.len();
     let secneo_classes = descriptors
         .iter()
-        .filter(|descriptor| {
-            normalize_class_name(descriptor).starts_with("com/secneo/apkwrapper/")
-        })
+        .filter(|descriptor| normalize_class_name(descriptor).starts_with("com/secneo/apkwrapper/"))
         .count();
     let packer_shell = total > 0 && total <= 512 && business == 0 && secneo_classes > 0;
     let classified = business + internal + sdk;
@@ -831,7 +829,10 @@ mod tests {
             &["memory-dex"],
         );
         let report = classify_dex_ownership("cn.gov.tax.its", &[shell]);
-        assert_eq!(report.entries[0].category, DexOwnershipCategory::DynamicPayload);
+        assert_eq!(
+            report.entries[0].category,
+            DexOwnershipCategory::DynamicPayload
+        );
         assert_eq!(report.business_class_samples, 0);
         assert!(report.entries[0]
             .reasons

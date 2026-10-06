@@ -660,8 +660,16 @@ fn shell_declared_size_does_not_hide_a_later_dex() {
 
 #[test]
 fn unpacked_dex_requires_a_real_class_table_inside_the_buffer() {
-    assert!(!anonymous_dex_region("/system/lib64/libc.so", "rw-p", 2 * 1024 * 1024));
-    assert!(anonymous_dex_region("[anon:scudo:secondary]", "rw-p", 18 * 1024 * 1024));
+    assert!(!anonymous_dex_region(
+        "/system/lib64/libc.so",
+        "rw-p",
+        2 * 1024 * 1024
+    ));
+    assert!(anonymous_dex_region(
+        "[anon:scudo:secondary]",
+        "rw-p",
+        18 * 1024 * 1024
+    ));
     assert!(anonymous_dex_region(
         "[anon:scudo:secondary]",
         "rw-p",
@@ -730,7 +738,12 @@ fn dexhelper_bss_next_to_the_library_is_a_key_region() {
         inode: 0,
     };
     let rows = [helper, bss, far];
-    assert!(dexhelper_key_region(&rows[1].path, &rows[1].perms, rows[1].start, &rows));
+    assert!(dexhelper_key_region(
+        &rows[1].path,
+        &rows[1].perms,
+        rows[1].start,
+        &rows
+    ));
     assert!(!dexhelper_key_region(
         &rows[2].path,
         &rows[2].perms,
@@ -762,7 +775,9 @@ fn retained_dexdata0_is_named_in_the_catalog_notes() {
     )
     .unwrap();
     assert!(notes.iter().any(|note| {
-        note.contains("dexdata0") && note.contains("declared 92192788") && note.contains("offset 64")
+        note.contains("dexdata0")
+            && note.contains("declared 92192788")
+            && note.contains("offset 64")
     }));
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -793,7 +808,9 @@ fn truncated_vdex_prefix_is_named_and_not_catalogued_as_dex() {
     )
     .unwrap();
     assert!(notes.iter().any(|note| {
-        note.contains("declared 92319172") && note.contains("retained 112") && note.contains("not a complete DEX")
+        note.contains("declared 92319172")
+            && note.contains("retained 112")
+            && note.contains("not a complete DEX")
     }));
     std::fs::remove_dir_all(dir).unwrap();
 }

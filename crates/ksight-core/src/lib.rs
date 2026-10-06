@@ -34,13 +34,12 @@ pub use capability::{
 pub use critical_form::{classify_critical_form, CriticalFormHit};
 pub use dex::{
     decrypt_secneo_dexdata, extract_apk_dex, extract_apk_native_libs, extract_apk_packed_native,
-    find_secneo_key, is_dex_magic, is_vdex_magic, key_unlocks_secneo, parse_dex_semantics,
-    locate_dexdata0, parse_secneo_dexdata, peek_declared_dex_len, plaintext_type_descriptors,
-    publish_readable_dex, repair_dex, PlaintextTypeDescriptors,
-    repair_dex_dir,
-    repair_package_dir, scan_sm4_haystack, scan_sm4_one_block, secneo_cipher_probes,
-    split_concatenated_dex, try_decrypt_secneo, ApkPackedFile, DexExtract, DexRepair,
-    DexDataSpot, DexSemanticSummary, DexSlice, SecNeoDexData, DEX_IMAGE_LIMIT,
+    find_secneo_key, is_dex_magic, is_vdex_magic, key_unlocks_secneo, locate_dexdata0,
+    parse_dex_semantics, parse_secneo_dexdata, peek_declared_dex_len, plaintext_type_descriptors,
+    publish_readable_dex, repair_dex, repair_dex_dir, repair_package_dir, scan_sm4_haystack,
+    scan_sm4_one_block, secneo_cipher_probes, split_concatenated_dex, try_decrypt_secneo,
+    ApkPackedFile, DexDataSpot, DexExtract, DexRepair, DexSemanticSummary, DexSlice,
+    PlaintextTypeDescriptors, SecNeoDexData, DEX_IMAGE_LIMIT,
 };
 pub use dns::{parse_dns_message, DnsRecord};
 pub use graph::{

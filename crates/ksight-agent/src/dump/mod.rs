@@ -976,52 +976,56 @@ pub fn dump_package_with(
         if budget_closed {
             // Payload budget is closed. The next pass would only read more memory.
         } else {
-        std::thread::sleep(Duration::from_secs(2));
-        let second = Instant::now() + Duration::from_secs(15);
-        for pid in pids.iter().copied().take(8) {
-            if Instant::now() >= second {
-                break;
-            }
-            let live = {
-                #[cfg(any(target_os = "linux", target_os = "android"))]
-                if let Some(backend) = &qualified_backend {
-                    let expected = match &options.expected_code_sources {
-                        Some(s) => s.iter().find(|s| s.pid == pid).cloned().ok_or_else(|| {
-                            anyhow::anyhow!("dump PID absent from preceding qualified source")
-                        })?,
-                        None => backend.qualify(package, pid, false)?.identity,
-                    };
-                    match copy_qualified_or_stop(backend, &expected, &runtime, second)? {
-                        Some(copied) => copied,
-                        None => {
-                            budget_closed = true;
-                            break;
+            std::thread::sleep(Duration::from_secs(2));
+            let second = Instant::now() + Duration::from_secs(15);
+            for pid in pids.iter().copied().take(8) {
+                if Instant::now() >= second {
+                    break;
+                }
+                let live = {
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    if let Some(backend) = &qualified_backend {
+                        let expected = match &options.expected_code_sources {
+                            Some(s) => {
+                                s.iter().find(|s| s.pid == pid).cloned().ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "dump PID absent from preceding qualified source"
+                                    )
+                                })?
+                            }
+                            None => backend.qualify(package, pid, false)?.identity,
+                        };
+                        match copy_qualified_or_stop(backend, &expected, &runtime, second)? {
+                            Some(copied) => copied,
+                            None => {
+                                budget_closed = true;
+                                break;
+                            }
                         }
+                    } else {
+                        crate::dexdump::dump_live_process_with_pause(
+                            pid,
+                            &runtime,
+                            second,
+                            options.collect_keys,
+                            options.collect_memory_windows,
+                            !(options.code_only || options.parent_owned),
+                        )
                     }
-                } else {
-                    crate::dexdump::dump_live_process_with_pause(
-                        pid,
-                        &runtime,
-                        second,
-                        options.collect_keys,
-                        options.collect_memory_windows,
-                        !(options.code_only || options.parent_owned),
-                    )
-                }
-                #[cfg(not(any(target_os = "linux", target_os = "android")))]
-                {
-                    crate::dexdump::dump_live_process_with_pause(
-                        pid,
-                        &runtime,
-                        second,
-                        options.collect_keys,
-                        options.collect_memory_windows,
-                        !(options.code_only || options.parent_owned),
-                    )
-                }
-            };
-            accumulate_live(&mut report, live);
-        }
+                    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                    {
+                        crate::dexdump::dump_live_process_with_pause(
+                            pid,
+                            &runtime,
+                            second,
+                            options.collect_keys,
+                            options.collect_memory_windows,
+                            !(options.code_only || options.parent_owned),
+                        )
+                    }
+                };
+                accumulate_live(&mut report, live);
+            }
         }
     }
     if let Some(watch) = art_watch {
@@ -1368,17 +1372,21 @@ fn build_dex_sets(
             .collect::<Vec<_>>();
         sources.sort();
         sources.dedup();
-        let semantic = std::fs::read(dest.join(&canonical)).ok().and_then(|content| {
-            let body = if let Some(offset) = observations.first().and_then(|artifact| artifact.dex_offset)
-            {
-                let start = usize::try_from(offset).ok()?;
-                let end = start.checked_add(usize::try_from(bytes).ok()?)?;
-                content.get(start..end)?
-            } else {
-                content.as_slice()
-            };
-            ksight_core::parse_dex_semantics(body)
-        });
+        let semantic = std::fs::read(dest.join(&canonical))
+            .ok()
+            .and_then(|content| {
+                let body = if let Some(offset) = observations
+                    .first()
+                    .and_then(|artifact| artifact.dex_offset)
+                {
+                    let start = usize::try_from(offset).ok()?;
+                    let end = start.checked_add(usize::try_from(bytes).ok()?)?;
+                    content.get(start..end)?
+                } else {
+                    content.as_slice()
+                };
+                ksight_core::parse_dex_semantics(body)
+            });
         sets.push(ksight_core::DexArtifactSet {
             sha256,
             bytes,
@@ -1573,13 +1581,16 @@ fn catalog_dynamic_symbols(
     if let Ok(entries) = std::fs::read_dir(dest.join("runtime")) {
         for entry in entries.flatten() {
             let path = entry.path();
-            let name = path.file_name().and_then(|value| value.to_str()).unwrap_or("");
+            let name = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("");
             if !name.ends_with(".code") || paths.contains(&path) {
                 continue;
             }
-            let too_big = path
-                .metadata()
-                .map_or(true, |meta| meta.len() > 32 * 1024 * 1024 || meta.len() < 64);
+            let too_big = path.metadata().map_or(true, |meta| {
+                meta.len() > 32 * 1024 * 1024 || meta.len() < 64
+            });
             if too_big || peek_magic(&path) != "elf" {
                 continue;
             }
@@ -1592,7 +1603,10 @@ fn catalog_dynamic_symbols(
             .strip_prefix(dest)
             .map(|value| value.to_string_lossy().replace('\\', "/"))
             .unwrap_or_else(|_| path.display().to_string());
-        if path.metadata().map_or(true, |meta| meta.len() > 32 * 1024 * 1024) {
+        if path
+            .metadata()
+            .map_or(true, |meta| meta.len() > 32 * 1024 * 1024)
+        {
             continue;
         }
         let Ok(elf) = crate::elf::inspect_elf(&path) else {
@@ -2378,9 +2392,7 @@ fn recover_secneo_payload_live(dest: &Path, package: &str, recorded: &[u32]) {
     let Some(pid) = secneo_probe_pid(package, recorded) else {
         write_live_note(
             dest,
-            format!(
-                "dexdata0 payload has no live {package} process; DexHelper BSS was not read"
-            ),
+            format!("dexdata0 payload has no live {package} process; DexHelper BSS was not read"),
         );
         return;
     };
@@ -2399,7 +2411,9 @@ fn recover_secneo_payload_live(dest: &Path, package: &str, recorded: &[u32]) {
     let Some(plain) = decrypt_retained_dexdata(&path, &spot, &key) else {
         write_live_note(
             dest,
-            format!("SM4 key from pid {pid} DexHelper BSS did not decrypt the retained dexdata0 body"),
+            format!(
+                "SM4 key from pid {pid} DexHelper BSS did not decrypt the retained dexdata0 body"
+            ),
         );
         return;
     };
@@ -2481,7 +2495,9 @@ fn decrypt_retained_dexdata(
         return None;
     }
     let plain = ksight_core::try_decrypt_secneo(&bytes[start..end], &[*key])?;
-    if plain.len() < 0x70 || plain.len() > ksight_core::DEX_IMAGE_LIMIT || !plain.starts_with(b"dex\n")
+    if plain.len() < 0x70
+        || plain.len() > ksight_core::DEX_IMAGE_LIMIT
+        || !plain.starts_with(b"dex\n")
     {
         return None;
     }
@@ -2507,9 +2523,9 @@ fn secneo_probe_pid(package: &str, recorded: &[u32]) -> Option<u32> {
             return Some(pid);
         }
     }
-    pids_for_package(package).into_iter().find(|pid| {
-        cmdline_is_package(*pid, package) && maps_have_dexhelper(*pid)
-    })
+    pids_for_package(package)
+        .into_iter()
+        .find(|pid| cmdline_is_package(*pid, package) && maps_have_dexhelper(*pid))
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -2533,7 +2549,9 @@ fn harvest_anonymous_dex(dest: &Path, pid: u32) -> Option<String> {
         return None;
     }
     let mut rows = crate::dexdump::parse_maps(&text);
-    rows.retain(|row| anonymous_dex_region(&row.path, &row.perms, row.end.saturating_sub(row.start)));
+    rows.retain(|row| {
+        anonymous_dex_region(&row.path, &row.perms, row.end.saturating_sub(row.start))
+    });
     rows.sort_by_key(|row| std::cmp::Reverse(row.end.saturating_sub(row.start)));
     let mut mem = File::open(format!("/proc/{pid}/mem")).ok()?;
     let mut saved = Vec::new();
@@ -2575,9 +2593,7 @@ fn harvest_anonymous_dex(dest: &Path, pid: u32) -> Option<String> {
                 .map(u32::from_le_bytes)
                 .unwrap_or(0);
             saved.push(format!("{name} ({declared} bytes, class_defs {classes})"));
-            eprintln!(
-                "anonymous dex pid={pid} vma={vma:#x} bytes={declared} class_defs={classes}"
-            );
+            eprintln!("anonymous dex pid={pid} vma={vma:#x} bytes={declared} class_defs={classes}");
         }
     }
     if saved.is_empty() {
@@ -2596,10 +2612,7 @@ fn harvest_anonymous_dex(dest: &Path, pid: u32) -> Option<String> {
 /// The cap matches the DEX image limit and does not include dalvik heaps.
 const ANON_DEX_REGION_MIN: u64 = 512 * 1024;
 const ANON_DEX_REGION_MAX: u64 = 128 * 1024 * 1024;
-#[cfg_attr(
-    not(any(target_os = "linux", target_os = "android")),
-    allow(dead_code)
-)]
+#[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
 const ANON_DEX_READ_CAP: u64 = 128 * 1024 * 1024;
 
 fn anonymous_dex_region(path: &str, perms: &str, len: u64) -> bool {
@@ -2647,7 +2660,10 @@ fn unpacked_dex_ranges(bytes: &[u8], limit: usize) -> Vec<(usize, usize)> {
 fn find_unpacked_dex(bytes: &[u8]) -> Option<(usize, usize)> {
     let mut from = 0_usize;
     while from.saturating_add(0x70) <= bytes.len() {
-        let Some(rel) = bytes[from..].windows(4).position(|window| window == b"dex\n") else {
+        let Some(rel) = bytes[from..]
+            .windows(4)
+            .position(|window| window == b"dex\n")
+        else {
             break;
         };
         let at = from.saturating_add(rel);
@@ -2861,7 +2877,10 @@ fn embedded_dex_images(bytes: &[u8]) -> Vec<(u64, usize)> {
     let mut found = Vec::new();
     let mut search = 0_usize;
     while search.saturating_add(0x70) <= bytes.len() && found.len() < 32 {
-        let Some(rel) = bytes[search..].windows(8).position(|window| window == b"dex\n035\0") else {
+        let Some(rel) = bytes[search..]
+            .windows(8)
+            .position(|window| window == b"dex\n035\0")
+        else {
             break;
         };
         let at = search.saturating_add(rel);
@@ -2889,7 +2908,10 @@ fn embedded_dex_images(bytes: &[u8]) -> Vec<(u64, usize)> {
 fn note_truncated_dex(bytes: &[u8], name: &str, notes: &mut Vec<String>) {
     let mut search = 0_usize;
     while search.saturating_add(0x70) <= bytes.len() && notes.len() < 32 {
-        let Some(rel) = bytes[search..].windows(4).position(|window| window == b"dex\n") else {
+        let Some(rel) = bytes[search..]
+            .windows(4)
+            .position(|window| window == b"dex\n")
+        else {
             break;
         };
         let at = search.saturating_add(rel);

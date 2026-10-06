@@ -971,7 +971,10 @@ pub fn locate_dexdata0(bytes: &[u8]) -> Option<DexDataSpot> {
     let needle = b"dexdata0";
     let mut from = 0_usize;
     while from.saturating_add(needle.len()) <= bytes.len() {
-        let Some(rel) = bytes[from..].windows(needle.len()).position(|window| window == needle) else {
+        let Some(rel) = bytes[from..]
+            .windows(needle.len())
+            .position(|window| window == needle)
+        else {
             break;
         };
         let at = from.saturating_add(rel);
@@ -1485,7 +1488,10 @@ mod tests {
         bytes.extend_from_slice(&splash[1..]);
         bytes.push(0);
         let found = plaintext_type_descriptors(&bytes, 8);
-        assert_eq!(found.names, vec![String::from_utf8(splash.to_vec()).unwrap()]);
+        assert_eq!(
+            found.names,
+            vec![String::from_utf8(splash.to_vec()).unwrap()]
+        );
         assert!(!found.truncated);
     }
 
