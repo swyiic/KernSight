@@ -15,14 +15,14 @@ use crate::cpu_list::online_cpu_ids;
 /// Held per-CPU kprobe perf events. Dropping detaches.
 #[derive(Debug)]
 pub struct KprobeSession {
-    _events: Vec<OwnedFd>,
+    events: Vec<OwnedFd>,
 }
 
 impl KprobeSession {
     /// How many CPUs the probe is armed on.
     #[must_use]
     pub fn cpu_count(&self) -> usize {
-        self._events.len()
+        self.events.len()
     }
 }
 
@@ -50,7 +50,7 @@ pub fn attach_kprobe_all_cpus(prog_fd: i32, symbol: &str) -> Result<KprobeSessio
     if attached.is_empty() {
         return Err(last_error.unwrap_or_else(|| anyhow::anyhow!("kprobe attached on no CPUs")));
     }
-    Ok(KprobeSession { _events: attached })
+    Ok(KprobeSession { events: attached })
 }
 
 fn open_kprobe_on_cpu(
@@ -59,6 +59,12 @@ fn open_kprobe_on_cpu(
     prog_fd: i32,
     cpu: i32,
 ) -> Result<OwnedFd> {
+    // PERF_EVENT_IOC_SET_BPF = _IOW('$', 8, __u32); ENABLE = _IO('$', 0).
+    // libc models ioctl's request differently for glibc (`c_ulong`) and musl
+    // (`c_int`). Calling the Linux syscall directly keeps cross builds typed
+    // consistently while preserving the exact request bits.
+    const PERF_EVENT_IOC_SET_BPF: libc::c_ulong = 0x4004_2408;
+    const PERF_EVENT_IOC_ENABLE: libc::c_ulong = 0x2400;
     #[repr(C)]
     struct PerfEventAttr {
         type_: u32,
@@ -103,12 +109,6 @@ fn open_kprobe_on_cpu(
             .with_context(|| format!("perf_event_open kprobe cpu={cpu}"));
     }
     let owned = unsafe { OwnedFd::from_raw_fd(i32::try_from(fd).context("perf fd")?) };
-    // PERF_EVENT_IOC_SET_BPF = _IOW('$', 8, __u32); ENABLE = _IO('$', 0)
-    // libc models ioctl's request differently for glibc (`c_ulong`) and musl
-    // (`c_int`). Calling the Linux syscall directly keeps cross builds typed
-    // consistently while preserving the exact request bits.
-    const PERF_EVENT_IOC_SET_BPF: libc::c_ulong = 0x4004_2408;
-    const PERF_EVENT_IOC_ENABLE: libc::c_ulong = 0x2400;
     let set = unsafe {
         libc::syscall(
             libc::SYS_ioctl,

@@ -141,6 +141,50 @@ pub struct UprobeSession {
     pub lost_total: u64,
 }
 
+/// Arguments that used to trail `start_configured`. Grouped so the attach
+/// entry points stay within Clippy's argument limit. This does not add a
+/// capture mode.
+#[derive(Debug, Clone, Copy)]
+pub struct UprobeAttach<'a> {
+    pub offset: u64,
+    pub pid: Option<i32>,
+    pub hit_once: bool,
+    pub tgids: Option<&'a [u32]>,
+    pub snapshot: Option<[u64; 6]>,
+}
+
+fn instance_context_value_size() -> Result<u32> {
+    u32::try_from(crate::registers::INSTANCE_CONTEXT_SIZE)
+        .context("instance context size exceeds u32")
+}
+
+fn reject_wrong_instance_maps(bpf: &Ebpf) -> Result<()> {
+    for (name, map) in bpf.maps() {
+        if matches!(map, aya::maps::Map::Unsupported(_)) && name != "scope_task_v1" {
+            anyhow::bail!("unexpected unsupported map {name}; instance attach refused");
+        }
+    }
+    let Some(aya::maps::Map::PerCpuArray(map)) = bpf.map("hwbp_ctx") else {
+        anyhow::bail!("instance context map missing; legacy object refused before attach");
+    };
+    if map.info()?.value_size() != instance_context_value_size()? {
+        anyhow::bail!("instance context ABI mismatch; legacy object refused before attach");
+    }
+    crate::task_storage::checked_map(
+        bpf.map("scope_task_v1")
+            .context("exact pidfd task-storage map missing; raw-only object refused")?,
+    )?;
+    let _: Array<&MapData, u32> = Array::try_from(
+        bpf.map("scope_epoch_v1")
+            .context("instance epoch map missing")?,
+    )?;
+    let _: HashMap<&MapData, ScopeKey, AllowValue> = HashMap::try_from(
+        bpf.map("scope_allow_v1")
+            .context("instance allow map missing")?,
+    )?;
+    Ok(())
+}
+
 impl UprobeSession {
     /// 挂载 uprobe 到目标 ELF 的指定文件偏移处。
     ///
@@ -229,19 +273,18 @@ impl UprobeSession {
 
     /// Load and configure a TLS ABI and TGID scope before attaching any link.
     /// mode: 1 byte return, 2 output pointer, 3 attempted bytes only.
+    ///
+    /// # Errors
+    ///
+    /// Returns when the object cannot be loaded, a requested program is missing,
+    /// or the uprobe cannot be attached. A snapshot request is refused.
     pub fn start_configured(
         object: &Path,
         programs: &[&str],
         target: &Path,
-        offset: u64,
-        pid: Option<i32>,
-        hit_once: bool,
-        tgids: Option<&[u32]>,
-        snapshot: Option<[u64; 6]>,
+        attach: UprobeAttach<'_>,
     ) -> Result<Self> {
-        Self::start_programs_configured(
-            object, programs, target, offset, pid, hit_once, tgids, snapshot, None,
-        )
+        Self::start_programs_configured(object, programs, target, attach, None)
     }
 
     fn start_programs(
@@ -254,13 +297,28 @@ impl UprobeSession {
         tgids: Option<&[u32]>,
     ) -> Result<Self> {
         Self::start_programs_configured(
-            object, programs, target, offset, pid, hit_once, tgids, None, None,
+            object,
+            programs,
+            target,
+            UprobeAttach {
+                offset,
+                pid,
+                hit_once,
+                tgids,
+                snapshot: None,
+            },
+            None,
         )
     }
 
     /// Low-level candidate backend. Requires trusted exact metadata and local
     /// target BTF; does not bootstrap authorization or enable strict mirror.
     /// Verify actual target BTF, task-storage ABI and every uprobe program without attaching or granting a task.
+    ///
+    /// # Errors
+    ///
+    /// Returns when kernel BTF, the object, the task-storage map, the context
+    /// ABI, or an uprobe program cannot be loaded. Nothing is attached.
     pub fn verify_instance_backend(object: &Path) -> Result<()> {
         let btf = Btf::from_sys_fs().context("qualified backend requires real kernel BTF")?;
         let bytes = std::fs::read(object)?;
@@ -275,7 +333,7 @@ impl UprobeSession {
         let Some(aya::maps::Map::PerCpuArray(map)) = bpf.map("hwbp_ctx") else {
             anyhow::bail!("qualified context map absent");
         };
-        if map.info()?.value_size() != crate::registers::INSTANCE_CONTEXT_SIZE as u32 {
+        if map.info()?.value_size() != instance_context_value_size()? {
             anyhow::bail!("qualified context ABI mismatch");
         }
         let mut loaded = 0usize;
@@ -291,6 +349,10 @@ impl UprobeSession {
         Ok(()) // Local handles drop; no attach, pins, target grants or payload reads.
     }
     /// Missing BTF, old objects, relocation, verifier or map errors attach nothing.
+    ///
+    /// # Errors
+    ///
+    /// Always returns. A raw identity list is not an owned pidfd binding.
     pub fn start_instance_scoped(
         object: &Path,
         programs: &[&str],
@@ -309,6 +371,11 @@ impl UprobeSession {
     /// Candidate backend with mandatory pidfd/task-storage binding. Caller must
     /// supply sealed metadata leases retained from qualification against each
     /// owned group-leader pidfd and package policy. This does not enable strict mirror by itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns when a lease is missing, the object is refused, or attach fails.
+    /// A snapshot request is refused before any link is created.
     pub fn start_bound_instances(
         object: &Path,
         programs: &[&str],
@@ -322,11 +389,13 @@ impl UprobeSession {
             object,
             programs,
             target,
-            offset,
-            None,
-            hit_once,
-            None,
-            snapshot,
+            UprobeAttach {
+                offset,
+                pid: None,
+                hit_once,
+                tgids: None,
+                snapshot,
+            },
             Some(instances),
         )
     }
@@ -335,15 +404,18 @@ impl UprobeSession {
         object: &Path,
         programs: &[&str],
         target: &Path,
-        offset: u64,
-        pid: Option<i32>,
-        hit_once: bool,
-        tgids: Option<&[u32]>,
-        snapshot: Option<[u64; 6]>,
+        attach: UprobeAttach<'_>,
         instances: Option<&[BoundInstance]>,
     ) -> Result<Self> {
         // Warm attaches can burst across TLS stacks; keep 4 MiB per CPU at 4 KiB/page.
         const PERF_RING_PAGES: usize = 1024;
+        let UprobeAttach {
+            offset,
+            pid,
+            hit_once,
+            tgids,
+            snapshot,
+        } = attach;
 
         if let Some(targets) = instances {
             instance_scope::require_metadata_leases(targets)?;
@@ -362,29 +434,7 @@ impl UprobeSession {
             Ebpf::load_file(object).context("加载 uprobe BPF 对象")?
         };
         if instances.is_some() {
-            for (name, map) in bpf.maps() {
-                if matches!(map, aya::maps::Map::Unsupported(_)) && name != "scope_task_v1" {
-                    anyhow::bail!("unexpected unsupported map {name}; instance attach refused");
-                }
-            }
-            let Some(aya::maps::Map::PerCpuArray(map)) = bpf.map("hwbp_ctx") else {
-                anyhow::bail!("instance context map missing; legacy object refused before attach");
-            };
-            if map.info()?.value_size() != crate::registers::INSTANCE_CONTEXT_SIZE as u32 {
-                anyhow::bail!("instance context ABI mismatch; legacy object refused before attach");
-            }
-            crate::task_storage::checked_map(
-                bpf.map("scope_task_v1")
-                    .context("exact pidfd task-storage map missing; raw-only object refused")?,
-            )?;
-            let _: Array<&MapData, u32> = Array::try_from(
-                bpf.map("scope_epoch_v1")
-                    .context("instance epoch map missing")?,
-            )?;
-            let _: HashMap<&MapData, ScopeKey, AllowValue> = HashMap::try_from(
-                bpf.map("scope_allow_v1")
-                    .context("instance allow map missing")?,
-            )?;
+            reject_wrong_instance_maps(&bpf)?;
         } else if bpf.map("scope_epoch_v1").is_some()
             || bpf.map("scope_allow_v1").is_some()
             || bpf.map("scope_task_v1").is_some()
@@ -492,12 +542,22 @@ impl UprobeSession {
 
     /// Advance an exact scope transaction. Every error detaches and discards
     /// the object; retries need a fresh object, never a rolled-back generation.
+    ///
+    /// # Errors
+    ///
+    /// Always returns after detaching. Raw identities are not owned pidfds.
     pub fn apply_instance_scope(&mut self, identities: &[InstanceIdentity]) -> Result<()> {
         let _ = identities;
         self.detach();
         anyhow::bail!("raw-only scope update refused; detached; owned pidfds required")
     }
 
+    /// Replace the bound instances on an already attached session.
+    ///
+    /// # Errors
+    ///
+    /// Returns when the session is detached, a lease is missing, or the
+    /// transaction fails. A failed transaction detaches the session.
     pub fn apply_bound_instances(&mut self, instances: &[BoundInstance]) -> Result<()> {
         if self.finished {
             anyhow::bail!("cannot update detached instance session");
@@ -678,7 +738,7 @@ fn monotonic_ns() -> Option<u64> {
         tv_sec: 0,
         tv_nsec: 0,
     };
-    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) } != 0 {
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut time) } != 0 {
         return None;
     }
     u64::try_from(time.tv_sec)

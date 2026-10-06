@@ -23,7 +23,7 @@ mod uprobe;
 #[cfg(any(target_os = "android", target_os = "linux"))]
 pub use kprobe::{attach_kprobe_all_cpus, KprobeSession};
 #[cfg(any(target_os = "android", target_os = "linux"))]
-pub use uprobe::UprobeSession;
+pub use uprobe::{UprobeAttach, UprobeSession};
 
 /// Inclusive `close_range(2)` for the on-device FD probe. Safe wrapper around
 /// the syscall so the agent crate can keep `forbid(unsafe_code)`.

@@ -1,4 +1,4 @@
-//! Published Linux UAPI only: TASK_STORAGE keys are pidfds, not TGIDs.
+//! Published Linux UAPI only: `TASK_STORAGE` keys are pidfds, not TGIDs.
 use super::instance_scope::AllowValue;
 use anyhow::{bail, Context, Result};
 use aya::maps::{Map, MapData, MapType};
@@ -37,13 +37,19 @@ fn element(
     value: Option<&AllowValue>,
 ) -> std::io::Result<()> {
     let key = pidfd.as_raw_fd();
+    let map_fd = u32::try_from(map.fd().as_fd().as_raw_fd()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "task-storage map descriptor",
+        )
+    })?;
     let attr = ElemAttr {
-        map_fd: map.fd().as_fd().as_raw_fd() as u32,
+        map_fd,
         padding: 0,
-        key: (&key as *const i32) as u64,
-        value: value.map_or(0, |v| (v as *const AllowValue) as u64),
-        flags: if value.is_some() { 1 } else { 0 },
-    }; // BPF_NOEXIST
+        key: (&raw const key) as u64,
+        value: value.map_or(0, |item| std::ptr::from_ref(item) as u64),
+        flags: u64::from(value.is_some()),
+    }; // BPF_NOEXIST when a value is inserted.
        // SAFETY: kernel synchronously copies this initialized UAPI prefix and the
        // live key/value; both borrowed map/pidfd handles remain owned by callers.
     let result = unsafe {
@@ -78,7 +84,7 @@ pub(crate) fn alive(pidfd: BorrowedFd<'_>) -> Result<bool> {
         revents: 0,
     };
     // SAFETY: a single initialized pollfd, zero timeout, no handle mutation.
-    let rc = unsafe { libc::poll(&mut p, 1, 0) };
+    let rc = unsafe { libc::poll(&raw mut p, 1, 0) };
     if rc < 0 {
         return Err(std::io::Error::last_os_error()).context("pidfd poll");
     }

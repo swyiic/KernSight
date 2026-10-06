@@ -87,7 +87,8 @@ mod device {
     fn allowed_cpus() -> Result<Vec<usize>> {
         // SAFETY: cpu_set_t is plain C storage; libc receives its exact size.
         let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-        let result = unsafe { libc::sched_getaffinity(0, std::mem::size_of_val(&set), &mut set) };
+        let result =
+            unsafe { libc::sched_getaffinity(0, std::mem::size_of_val(&set), &raw mut set) };
         ensure!(
             result == 0,
             "get affinity: {}",
@@ -107,8 +108,9 @@ mod device {
         unsafe {
             libc::CPU_SET(cpu, &mut set);
         }
-        let result =
-            unsafe { libc::sched_setaffinity(pid.try_into()?, std::mem::size_of_val(&set), &set) };
+        let result = unsafe {
+            libc::sched_setaffinity(pid.try_into()?, std::mem::size_of_val(&set), &raw const set)
+        };
         ensure!(
             result == 0,
             "pin fixture to CPU {cpu}: {}",
@@ -169,6 +171,50 @@ mod device {
             rounds * CALLS,
             rounds * CALLS
         );
+        Ok(())
+    }
+
+    fn check_paired(
+        object: &str,
+        exe: &std::path::Path,
+        offset: u64,
+        pid: u32,
+        child: &mut ChildGuard,
+        output: &mut BufReader<std::process::ChildStdout>,
+        soak_seconds: Option<u64>,
+    ) -> Result<()> {
+        // Both parent and child only call the fixture on explicit instructions,
+        // so no fixture calls occur before this filter is installed.
+        let mut paired = UprobeSession::start_entry_return(
+            std::path::Path::new(object),
+            exe,
+            offset,
+            None,
+            false,
+        )?;
+        paired.apply_tgid_filter(Some(&[pid]))?;
+        let hits = exercise(&mut paired, child, output)?;
+        let entries = hits.iter().filter(|hit| !hit.snapshot_at_return).count();
+        let returns = hits.iter().filter(|hit| hit.snapshot_at_return).count();
+        println!(
+            "paired entry={entries} return={returns} lost={}",
+            paired.lost_total
+        );
+        ensure!(
+            entries == CALLS && returns == CALLS,
+            "entry/return transport lost events"
+        );
+        ensure!(
+            hits.iter().all(|hit| hit.pid == pid && hit.aux_bytes == 0),
+            "paired scope leaked or read a payload"
+        );
+        if let Some(seconds) = soak_seconds {
+            soak(&mut paired, child, output, seconds)?;
+        }
+        paired.apply_tgid_filter(Some(&[]))?;
+        let hits = exercise(&mut paired, child, output)?;
+        ensure!(hits.is_empty(), "empty paired scope leaked events");
+        println!("paired_empty_scope hits=0; kernel_scope_smoke PASS");
         Ok(())
     }
 
@@ -252,39 +298,14 @@ mod device {
         ensure!(hits.is_empty(), "detached session emitted events");
         println!("invalid_update detached=true");
         drop(session);
-
-        // Both parent and child only call the fixture on explicit instructions,
-        // so no fixture calls occur before this filter is installed.
-        let mut paired = UprobeSession::start_entry_return(
-            std::path::Path::new(&args[1]),
+        check_paired(
+            &args[1],
             &exe,
             offset,
-            None,
-            false,
-        )?;
-        paired.apply_tgid_filter(Some(&[pid]))?;
-        let hits = exercise(&mut paired, &mut child, &mut output)?;
-        let entries = hits.iter().filter(|hit| !hit.snapshot_at_return).count();
-        let returns = hits.iter().filter(|hit| hit.snapshot_at_return).count();
-        println!(
-            "paired entry={entries} return={returns} lost={}",
-            paired.lost_total
-        );
-        ensure!(
-            entries == CALLS && returns == CALLS,
-            "entry/return transport lost events"
-        );
-        ensure!(
-            hits.iter().all(|hit| hit.pid == pid && hit.aux_bytes == 0),
-            "paired scope leaked or read a payload"
-        );
-        if let Some(seconds) = soak_seconds {
-            soak(&mut paired, &mut child, &mut output, seconds)?;
-        }
-        paired.apply_tgid_filter(Some(&[]))?;
-        let hits = exercise(&mut paired, &mut child, &mut output)?;
-        ensure!(hits.is_empty(), "empty paired scope leaked events");
-        println!("paired_empty_scope hits=0; kernel_scope_smoke PASS");
-        Ok(())
+            pid,
+            &mut child,
+            &mut output,
+            soak_seconds,
+        )
     }
 }

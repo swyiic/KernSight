@@ -4,6 +4,18 @@
 use crate::metadata_scope::Token;
 use anyhow::Result;
 use std::os::fd::OwnedFd;
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[repr(C)]
+struct TaskLookup {
+    map_fd: u32,
+    pad: u32,
+    key: u64,
+    value: u64,
+    flags: u64,
+}
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const _: () = assert!(std::mem::size_of::<TaskLookup>() == 32);
 #[derive(Debug)]
 pub(crate) struct MetadataLease {
     map: OwnedFd,
@@ -39,27 +51,19 @@ impl MetadataLease {
         if !self.admission_valid() {
             bail!("metadata lease expired before sampler binding");
         }
-        #[repr(C)]
-        struct Lookup {
-            map_fd: u32,
-            pad: u32,
-            key: u64,
-            value: u64,
-            flags: u64,
-        }
-        const _: () = assert!(std::mem::size_of::<Lookup>() == 32);
         let key = pidfd.as_raw_fd();
         let mut token = Token { nonce: 0, round: 0 };
-        let attr = Lookup {
-            map_fd: self.map.as_raw_fd() as u32,
+        let attr = TaskLookup {
+            map_fd: u32::try_from(self.map.as_raw_fd()).context("metadata map descriptor")?,
             pad: 0,
-            key: (&key as *const i32) as u64,
-            value: (&mut token as *mut Token) as u64,
+            key: (&raw const key) as u64,
+            value: (&raw mut token) as u64,
             flags: 0,
         };
         // SAFETY: initialized published UAPI prefix and live borrowed key/map;
         // sixteen writable token bytes. Lookup cannot mint a replacement grant.
-        let rc = unsafe { libc::syscall(libc::SYS_bpf, 1, &attr, std::mem::size_of::<Lookup>()) };
+        let rc =
+            unsafe { libc::syscall(libc::SYS_bpf, 1, &attr, std::mem::size_of::<TaskLookup>()) };
         if rc != 0 {
             return Err(std::io::Error::last_os_error())
                 .context("qualification task mark absent/retargeted");

@@ -44,6 +44,10 @@ impl BoundInstance {
         self.metadata_lease.is_some()
     }
     /// Check current retained task and physical metadata admission before a read or scope update.
+    ///
+    /// # Errors
+    ///
+    /// Returns when the metadata lease is missing, the task mark changed, or the pidfd is no longer alive.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     pub fn check_current(&self) -> anyhow::Result<()> {
         self.metadata_lease

@@ -3638,11 +3638,13 @@ fn start_uprobe_session(
         object,
         &[program],
         elf,
-        offset,
-        None,
-        hit_once,
-        tgids,
-        None,
+        ksight_hwbp::UprobeAttach {
+            offset,
+            pid: None,
+            hit_once,
+            tgids,
+            snapshot: None,
+        },
     ) {
         Ok(session) => Ok(session),
         Err(error) if pointer_width == 4 && uprobe_attach_unsupported(&error) => {
@@ -3692,7 +3694,16 @@ fn start_uprobe_entry_return_session(
         );
     }
     match ksight_hwbp::UprobeSession::start_configured(
-        object, programs, elf, offset, None, hit_once, tgids, None,
+        object,
+        programs,
+        elf,
+        ksight_hwbp::UprobeAttach {
+            offset,
+            pid: None,
+            hit_once,
+            tgids,
+            snapshot: None,
+        },
     ) {
         Ok(session) => Ok(session),
         Err(error) if pointer_width == 4 && uprobe_attach_unsupported(&error) => {
