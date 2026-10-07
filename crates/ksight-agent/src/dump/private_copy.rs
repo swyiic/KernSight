@@ -141,3 +141,25 @@ pub(super) fn copy_capped_path(src: &Path, dest: &Path, cap: u64) -> Result<()> 
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod installed_apk_bound_tests {
+    use super::*;
+    #[test]
+    fn observed_large_apk_raw_copy_is_skipped_without_failing_or_spending_budget() {
+        let root = std::env::temp_dir().join(format!("ksight-raw-apk-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let source = root.join("base.apk");
+        File::create(&source).unwrap().set_len(653_556_074).unwrap();
+        let dest = root.join("evidence/apk/base.apk");
+        let guard =
+            ksight_core::output_budget::Guard::install(vec![root.join("evidence")], 1024, 30000)
+                .unwrap();
+        copy_capped_path(&source, &dest, super::super::MAX_APK_BYTES).unwrap();
+        assert!(!dest.exists());
+        assert_eq!(guard.receipt().admitted_write_bytes, 0);
+        assert!(!guard.receipt().partial);
+        drop(guard);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

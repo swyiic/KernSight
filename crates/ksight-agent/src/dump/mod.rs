@@ -769,8 +769,15 @@ pub fn dump_package_with(
                 .file_name()
                 .and_then(|value| value.to_str())
                 .unwrap_or("base.apk");
-            copy_capped_path(apk, &apk_dir.join(name), MAX_APK_BYTES)?;
-            report.apk_files = report.apk_files.saturating_add(1);
+            let bytes = std::fs::metadata(apk)?.len();
+            if bytes <= MAX_APK_BYTES {
+                copy_capped_path(apk, &apk_dir.join(name), MAX_APK_BYTES)?;
+                report.apk_files = report.apk_files.saturating_add(1);
+            } else {
+                report.warnings.push(format!(
+                    "raw_apk_retention=partial: installed APK {name} ({bytes} bytes) exceeds {MAX_APK_BYTES}-byte raw copy bound; original not retained; complete-byte fingerprint and bounded DEX/native extraction continue"
+                ));
+            }
             if let Some(parent) = apk.parent() {
                 if !install_dirs.iter().any(|existing| existing == parent) {
                     install_dirs.push(parent.to_path_buf());
