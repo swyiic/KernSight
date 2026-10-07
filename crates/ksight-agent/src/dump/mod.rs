@@ -4616,7 +4616,7 @@ mod preceding_source_refresh_tests {
         assert_eq!(warnings.len(), 8);
         let mut replacements = vec![43, 44];
         retain_preceding_source_pids(&mut replacements, &sources, &mut warnings);
-        assert!(replacements.is_empty());
+        assert_eq!(replacements, [] as [u32; 0]);
         assert_eq!(sources[0], source()); // Enumeration never edits the physical grant.
     }
     #[test]
@@ -4628,7 +4628,7 @@ mod preceding_source_refresh_tests {
             ksight_core::output_budget::Guard::install(vec![root.clone()], 16 * 1024 * 1024, 30000)
                 .unwrap();
         ksight_core::output_budget::write(
-            &root.join("runtime/retained.code"),
+            root.join("runtime/retained.code"),
             b"retained source bytes",
         )
         .unwrap();

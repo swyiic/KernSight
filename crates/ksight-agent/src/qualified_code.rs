@@ -1066,7 +1066,7 @@ mod preceding_source_identity_tests {
             });
             assert_eq!(receipt.actual_length, 0);
             assert_eq!(receipt.admission, "rejected_identity");
-            assert!(sink.is_empty());
+            assert_eq!(sink, [] as [u8; 0]);
             assert_eq!(source.position(), 0);
         }
         let mut source = Cursor::new(b"original task bytes".to_vec());
