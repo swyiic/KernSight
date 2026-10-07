@@ -1379,6 +1379,18 @@ fn write_complete_catalog_report(report: &PackageDumpReport, dest: &Path) -> Res
 }
 
 fn write_catalog_report(report: &PackageDumpReport, dest: &Path, recatalog: bool) -> Result<()> {
+    let result = write_catalog_report_inner(report, dest, recatalog);
+    if result.is_err() {
+        ksight_core::output_budget::record_failure(dest, "catalog_incomplete");
+    }
+    result
+}
+
+fn write_catalog_report_inner(
+    report: &PackageDumpReport,
+    dest: &Path,
+    recatalog: bool,
+) -> Result<()> {
     use std::io::Write as _;
     const MAX_REPORT_BYTES: u64 = 64 * 1024 * 1024;
     const FAILURE_RESERVE: u64 = 64 * 1024;
@@ -4713,6 +4725,63 @@ mod catalog_reserve_tests {
             .unwrap();
         assert_eq!(std::fs::read(backup.path()).unwrap(), previous);
         assert!(root.join("runtime/retained.bin").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn cancellation_preserves_existing_recatalog_report() {
+        let (root, report) = fixture();
+        std::fs::write(root.join("dump-report.json"), b"original").unwrap();
+        let guard =
+            ksight_core::output_budget::Guard::install(vec![root.clone()], 1024 * 1024, 30000)
+                .unwrap();
+        ksight_core::output_budget::interrupt(&root, "parent_cancelled");
+        assert!(write_catalog_report(&report, &root, true).is_err());
+        assert_eq!(
+            std::fs::read(root.join("dump-report.json")).unwrap(),
+            b"original"
+        );
+        assert_eq!(guard.receipt().reason.as_deref(), Some("parent_cancelled"));
+        assert_eq!(guard.receipt().admitted_write_bytes, 0);
+        assert!(root.join("runtime/retained.bin").exists());
+        drop(guard);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn pending_file_io_failure_is_partial_without_publishing() {
+        let (root, report) = fixture();
+        let blocked = root.join("blocked");
+        std::fs::write(&blocked, b"original blocker").unwrap();
+        let guard =
+            ksight_core::output_budget::Guard::install(vec![root.clone()], 1024 * 1024, 30000)
+                .unwrap();
+        assert!(write_complete_catalog_report(&report, &blocked).is_err());
+        assert!(guard.receipt().partial);
+        assert_eq!(
+            guard.receipt().reason.as_deref(),
+            Some("catalog_incomplete")
+        );
+        assert_eq!(std::fs::read(&blocked).unwrap(), b"original blocker");
+        assert!(root.join("runtime/retained.bin").exists());
+        drop(guard);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn failed_recatalog_preserves_previous_report_and_reserve() {
+        let (root, mut report) = fixture();
+        report.warnings.push("x".repeat(128 * 1024));
+        std::fs::write(root.join("dump-report.json"), b"original").unwrap();
+        let guard =
+            ksight_core::output_budget::Guard::install(vec![root.clone()], 96 * 1024, 30000)
+                .unwrap();
+        assert!(write_catalog_report(&report, &root, true).is_err());
+        assert_eq!(
+            std::fs::read(root.join("dump-report.json")).unwrap(),
+            b"original"
+        );
+        assert!(guard.receipt().partial);
+        assert!(guard.receipt().admitted_write_bytes < 32 * 1024);
+        assert!(root.join("runtime/retained.bin").exists());
+        drop(guard);
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
