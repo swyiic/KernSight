@@ -4789,9 +4789,7 @@ mod catalog_reserve_tests {
         std::fs::write(&blocker, b"original").unwrap();
         assert!(catalog_mapped_code(&blocker).is_err());
         assert_eq!(std::fs::read(&blocker).unwrap(), b"original");
-        assert!(catalog_mapped_code(&root.join("missing"))
-            .unwrap()
-            .is_empty());
+        assert_eq!(catalog_mapped_code(&root.join("missing")).unwrap().len(), 0);
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
