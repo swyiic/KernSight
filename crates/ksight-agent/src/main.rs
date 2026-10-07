@@ -14,7 +14,7 @@ use ksight_agent::{
 use uuid::Uuid;
 
 #[derive(Debug, Parser)]
-#[command(name = "ksightd", version, about = "KernSight device agent")]
+#[command(name = "ksightd", version = ksight_core::build_info::VERSION, about = "KernSight device agent")]
 struct Args {
     /// Explicit isolated runtime directory; legacy CLI defaults are unchanged.
     #[arg(long, global = true)]
@@ -553,7 +553,7 @@ fn main() -> Result<()> {
             let status = ksight_agent::qualified_code::capability();
             println!(
                 "{}",
-                serde_json::json!({"schema":"kernsight.code-capabilities/v1","supported":status.is_ok(),"reason":status.as_ref().err().map(|e|format!("{e:#}")),"failure":status.as_ref().err().map(capability_failure),"instance_state":"not-yet-qualified","code_scope":"main process; registered named/executable mappings only; unregistered anonymous/FD scans not-supported","agent_version":env!("CARGO_PKG_VERSION"),"lifecycle_schema":"kernsight.capture-lifecycle/v1","code_copy_pause":"forbidden","runtime_paths_schema":"kernsight.runtime-paths/v1","runtime_root":ksight_agent::runtime_paths::root(),"agent_sha256":runtime_agent_hash(),"agent_path":std::env::current_exe().ok(),"parent_lifecycle_supported":cfg!(any(target_os="linux",target_os="android")) && std::fs::read_to_string("/proc/sys/kernel/random/boot_id").is_ok() && std::fs::read_to_string("/proc/self/stat").is_ok()})
+                serde_json::json!({"schema":"kernsight.code-capabilities/v1","supported":status.is_ok(),"reason":status.as_ref().err().map(|e|format!("{e:#}")),"failure":status.as_ref().err().map(capability_failure),"instance_state":"not-yet-qualified","code_scope":"main process; registered named/executable mappings only; unregistered anonymous/FD scans not-supported","agent_version":env!("CARGO_PKG_VERSION"),"agent_build_version":ksight_core::build_info::VERSION,"agent_git_commit":ksight_core::build_info::git_commit(),"agent_git_dirty":ksight_core::build_info::git_dirty(),"agent_build_identity_source":ksight_core::build_info::SOURCE,"lifecycle_schema":"kernsight.capture-lifecycle/v1","code_copy_pause":"forbidden","runtime_paths_schema":"kernsight.runtime-paths/v1","runtime_root":ksight_agent::runtime_paths::root(),"agent_sha256":runtime_agent_hash(),"agent_path":std::env::current_exe().ok(),"parent_lifecycle_supported":cfg!(any(target_os="linux",target_os="android")) && std::fs::read_to_string("/proc/sys/kernel/random/boot_id").is_ok() && std::fs::read_to_string("/proc/self/stat").is_ok()})
             );
             Ok(())
         }

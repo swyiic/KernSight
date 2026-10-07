@@ -23,7 +23,7 @@ use crate::{
 };
 
 #[derive(Debug, Parser)]
-#[command(name = "ksightctl", version, about = "KernSight command-line client")]
+#[command(name = "ksightctl", version = ksight_core::build_info::VERSION, about = "KernSight command-line client")]
 struct Args {
     #[command(subcommand)]
     command: Command,

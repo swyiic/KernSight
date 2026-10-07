@@ -1,5 +1,6 @@
 //! Platform-independent `KernSight` logic.
 
+pub mod build_info;
 mod capability;
 mod critical_form;
 mod dex;

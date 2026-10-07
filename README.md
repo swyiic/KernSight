@@ -60,6 +60,7 @@ cd KernSight
 ```bash
 cargo check --workspace --all-targets
 cargo test --workspace
+python3 scripts/test_build_identity.py
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo run -p xtask -- architecture
@@ -68,6 +69,36 @@ cargo run -p xtask -- architecture
 也可以使用 `make check`、`make test`、`make fmt`、`make lint` 和 `make architecture`。
 
 ## 编译
+
+### 构建身份
+
+`ksightd --version` 和 `ksightctl --version` 在基础版本后追加编译时的 Git 短提交号，例如
+`0.2.12+03e97b4`；相关源码有未提交修改时显示 `0.2.12+03e97b4.dirty`。
+版本标记保存在二进制中，查询版本不需要 Git，也不会触发编译。短提交号用于人工辨认，
+精确核对部署仍应使用完整提交号和实际二进制 SHA-256。
+
+`ksightd code-capabilities` 保留 `kernsight.code-capabilities/v1` 和纯基础版本
+`agent_version`，并增加 `agent_build_version`、`agent_git_commit`（完整 SHA 或 null）、
+`agent_git_dirty`（true / false / null）、`agent_build_identity_source`（git / override / unknown）。
+现有 `agent_sha256` 仍是当前运行二进制的 SHA-256；协议握手和兼容性版本不变。
+旧代理没有新增字段时，客户端应显示构建身份未知，不应拿本机仓库版本代替设备版本。
+
+Dirty 检查包含 Cargo 清单/锁文件、Makefile、工具链配置，以及 `.cargo`、`crates`、`bpf`、
+`native`、`android`、`rules`、`xtask`、`scripts` 下的已跟踪修改、暂存修改和未忽略的新文件。
+Markdown/reStructuredText 文档、其他本地笔记、Git 忽略的构建产物不计入 dirty。
+Cargo 会监视源码目录和 Git 元数据（包含 HEAD、refs、index、packed refs 和 worktree）；
+更改后下次构建会更新标记，未更改时复用缓存。完整 checkout 保留 `.cargo/.gitkeep`，
+确保新 Cargo 配置也能触发更新；根 `.gitignore` 的变更同样会重新检查。
+若 Git checkout 缺失声明的输入路径，会保守地每次重新检查，恢复路径后继续复用缓存。
+标记不含时间戳或主机信息。
+
+源码压缩包或无法读取 Git 时默认显示 `0.2.12+unknown`，不猜测提交号；若仅 dirty 状态
+无法读取，则显示 `0.2.12+<短提交号>.dirty-unknown`。可复现发布流水线若已验证源码，
+可同时显式设置 `KERNSIGHT_BUILD_GIT_COMMIT=<完整提交 SHA>` 和
+`KERNSIGHT_BUILD_GIT_DIRTY=false`（有修改则 true）；覆盖来源会标记为 override。
+缺失其中一个变量、无效 SHA 或非 true/false 的 dirty 值会使构建失败。覆盖值是发布者声明，
+不是脚本对源码的独立验证；常规 Git checkout 发布无需设置它们。
+
 
 ### PC 端 CLI
 
