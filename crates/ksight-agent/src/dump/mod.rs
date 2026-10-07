@@ -1280,7 +1280,7 @@ fn finalize_catalog(report: &mut PackageDumpReport, dest: &Path, recatalog: bool
     report.packed_plaintext_names = write_packed_plaintext_names(dest, &report.dex_sets);
     report.dynamic_symbols = catalog_dynamic_symbols(dest, &report.artifacts);
     report.snapshots = catalog_snapshots(dest);
-    report.mapped_code = catalog_mapped_code(dest);
+    report.mapped_code = catalog_mapped_code(dest)?;
     report.code_loaders = catalog_code_loaders(dest);
     report.tls_stacks = catalog_tls_stacks(&report.mapped_code, &report.artifacts);
     if report
@@ -1378,28 +1378,52 @@ fn write_complete_catalog_report(report: &PackageDumpReport, dest: &Path) -> Res
     write_catalog_report(report, dest, false)
 }
 
+trait CatalogSink: std::io::Write {
+    fn sync_all(&self) -> std::io::Result<()>;
+}
+impl CatalogSink for File {
+    fn sync_all(&self) -> std::io::Result<()> {
+        File::sync_all(self)
+    }
+}
+
 fn write_catalog_report(report: &PackageDumpReport, dest: &Path, recatalog: bool) -> Result<()> {
-    let result = write_catalog_report_inner(report, dest, recatalog);
+    write_catalog_report_with(report, dest, recatalog, |pending| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(pending)
+    })
+}
+
+fn write_catalog_report_with<S: CatalogSink>(
+    report: &PackageDumpReport,
+    dest: &Path,
+    recatalog: bool,
+    open: impl FnOnce(&Path) -> std::io::Result<S>,
+) -> Result<()> {
+    let result = write_catalog_report_inner(report, dest, recatalog, open);
     if result.is_err() {
         ksight_core::output_budget::record_failure(dest, "catalog_incomplete");
     }
     result
 }
 
-fn write_catalog_report_inner(
+fn write_catalog_report_inner<S: CatalogSink>(
     report: &PackageDumpReport,
     dest: &Path,
     recatalog: bool,
+    open: impl FnOnce(&Path) -> std::io::Result<S>,
 ) -> Result<()> {
     use std::io::Write as _;
     const MAX_REPORT_BYTES: u64 = 64 * 1024 * 1024;
     const FAILURE_RESERVE: u64 = 64 * 1024;
-    struct ReportWriter {
-        file: File,
+    struct ReportWriter<S> {
+        file: S,
         logical_path: PathBuf,
         remaining: u64,
     }
-    impl std::io::Write for ReportWriter {
+    impl<S: CatalogSink> std::io::Write for ReportWriter<S> {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
             if bytes.len() as u64 > self.remaining {
                 return Err(std::io::Error::other(
@@ -1428,10 +1452,7 @@ fn write_catalog_report_inner(
     }
     ksight_core::output_budget::charge(&logical_path, 0)?;
     let pending = dest.join(format!(".catalog-{}.incomplete", uuid::Uuid::new_v4()));
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&pending)?;
+    let file = open(&pending)?;
     let mut writer = std::io::BufWriter::with_capacity(
         64 * 1024,
         ReportWriter {
@@ -2348,16 +2369,64 @@ fn catalog_tls_stacks(
     out
 }
 
-fn catalog_mapped_code(dest: &Path) -> Vec<MappedCodeEntry> {
+const MAX_MAPPED_CATALOG_ROWS: usize = 65536;
+
+fn deserialize_mapped_entries<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Vec<MappedCodeEntry>, D::Error> {
+    struct Entries;
+    impl<'de> serde::de::Visitor<'de> for Entries {
+        type Value = Vec<MappedCodeEntry>;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a bounded mapped-code entry array")
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut sequence: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let mut entries = Vec::new();
+            while let Some(entry) = sequence.next_element()? {
+                if entries.len() == MAX_MAPPED_CATALOG_ROWS {
+                    return Err(serde::de::Error::custom(
+                        "mapped-code per-file row bound exceeded",
+                    ));
+                }
+                entries.push(entry);
+            }
+            Ok(entries)
+        }
+    }
+    deserializer.deserialize_seq(Entries)
+}
+
+fn catalog_mapped_code(dest: &Path) -> Result<Vec<MappedCodeEntry>> {
+    // Match the consumer's finite JSON bound; aggregate across every sidecar.
+    let result = catalog_mapped_code_with_limits(dest, 64 * 1024 * 1024, MAX_MAPPED_CATALOG_ROWS);
+    if result.is_err() {
+        ksight_core::output_budget::record_failure(dest, "catalog_incomplete");
+    }
+    result
+}
+
+fn catalog_mapped_code_with_limits(
+    dest: &Path,
+    input_limit: u64,
+    row_limit: usize,
+) -> Result<Vec<MappedCodeEntry>> {
     #[derive(Deserialize)]
     struct MappedCodeFile {
+        #[serde(deserialize_with = "deserialize_mapped_entries")]
         entries: Vec<MappedCodeEntry>,
     }
-    let Ok(entries) = std::fs::read_dir(dest.join("runtime")) else {
-        return Vec::new();
+    let entries = match std::fs::read_dir(dest.join("runtime")) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).context("mapped-code catalog directory read failed"),
     };
     let mut out = Vec::new();
-    for entry in entries.flatten() {
+    let mut admitted_input_bytes = 0_u64;
+    for entry in entries {
+        let entry = entry.context("mapped-code catalog directory iteration failed")?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
             continue;
@@ -2369,19 +2438,34 @@ fn catalog_mapped_code(dest: &Path) -> Vec<MappedCodeEntry> {
         {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(entry.path()) else {
-            continue;
-        };
-        if let Ok(file) = serde_json::from_str::<MappedCodeFile>(&text) {
-            out.extend(file.entries);
+        // Metadata construction is inside the same invocation deadline; a
+        // partial copy reason alone permits cataloging, cancellation does not.
+        ksight_core::output_budget::charge(&dest.join("dump-report.json"), 0)?;
+        let remaining = input_limit.saturating_sub(admitted_input_bytes);
+        if entry.metadata()?.len() > remaining {
+            bail!("mapped-code catalog aggregate input bound exceeded; raw metadata retained");
         }
+        let mut text = String::new();
+        File::open(entry.path())?
+            .take(remaining.saturating_add(1))
+            .read_to_string(&mut text)?;
+        if text.len() as u64 > remaining {
+            bail!("mapped-code catalog input grew beyond aggregate bound; raw metadata retained");
+        }
+        admitted_input_bytes += text.len() as u64;
+        let file: MappedCodeFile = serde_json::from_str(&text)
+            .context("mapped-code catalog parse failed; raw metadata retained")?;
+        if file.entries.len() > row_limit.saturating_sub(out.len()) {
+            bail!("mapped-code catalog aggregate row bound exceeded; raw metadata retained");
+        }
+        out.extend(file.entries);
     }
     out.sort_by(|left, right| {
         left.pid
             .cmp(&right.pid)
             .then_with(|| left.order.cmp(&right.order))
     });
-    out
+    Ok(out)
 }
 
 fn catalog_dump(dest: &Path) -> Vec<ksight_core::DumpArtifact> {
@@ -4626,6 +4710,141 @@ mod catalog_reserve_tests {
         (root, report)
     }
     #[test]
+    fn synthetic_mapped_catalog_measures_pre_serialization_growth() {
+        let (root, _) = fixture();
+        for count in [512_u32, 2048, 8192] {
+            let rows = (0..count)
+                .map(|order| MappedCodeEntry {
+                    pid: 42,
+                    order,
+                    start: u64::from(order) * 4096,
+                    end: u64::from(order + 1) * 4096,
+                    path: format!("/fixture/lib/module-{order:08}.so"),
+                })
+                .collect::<Vec<_>>();
+            let path = root.join("runtime/mapped-code-42.json");
+            let input = serde_json::to_vec(&serde_json::json!({"entries":rows})).unwrap();
+            std::fs::write(&path, &input).unwrap();
+            drop(rows);
+            let catalog = catalog_mapped_code(&root).unwrap();
+            assert_eq!(catalog.len(), count as usize);
+            let retained_owned_bytes = catalog.capacity() * std::mem::size_of::<MappedCodeEntry>()
+                + catalog.iter().map(|row| row.path.capacity()).sum::<usize>();
+            println!("catalog_growth rows={count} input_bytes={} retained_mapped_owned_bytes={retained_owned_bytes}; input text, parse temporaries and other report fields excluded", input.len());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn mapped_catalog_aggregate_limits_do_not_discard_original_metadata() {
+        let (root, _) = fixture();
+        let row = MappedCodeEntry {
+            pid: 42,
+            order: 1,
+            start: 0,
+            end: 4096,
+            path: "/fixture/a.so".into(),
+        };
+        let bytes = serde_json::to_vec(&serde_json::json!({"entries":[row]})).unwrap();
+        for pid in [42, 43] {
+            std::fs::write(root.join(format!("runtime/mapped-code-{pid}.json")), &bytes).unwrap();
+        }
+        assert!(catalog_mapped_code_with_limits(&root, bytes.len() as u64, 8).is_err());
+        assert!(catalog_mapped_code_with_limits(&root, 4096, 1).is_err());
+        assert_eq!(
+            catalog_mapped_code_with_limits(&root, 4096, 2)
+                .unwrap()
+                .len(),
+            2
+        );
+        for pid in [42, 43] {
+            assert_eq!(
+                std::fs::read(root.join(format!("runtime/mapped-code-{pid}.json"))).unwrap(),
+                bytes
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn mapped_catalog_parser_refuses_rows_before_unbounded_accumulation() {
+        let (root, _) = fixture();
+        let row =
+            serde_json::json!({"pid":42,"order":1,"start":0,"end":4096,"path":"a"}).to_string();
+        let path = root.join("runtime/mapped-code-42.json");
+        let input = format!(
+            "{{\"entries\":[{}]}}",
+            std::iter::repeat_n(row, MAX_MAPPED_CATALOG_ROWS + 1)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        std::fs::write(&path, input.as_bytes()).unwrap();
+        let error = catalog_mapped_code(&root).unwrap_err();
+        assert!(format!("{error:#}").contains("per-file row bound exceeded"));
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), input.len() as u64);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn mapped_catalog_directory_io_error_is_not_empty_coverage() {
+        let (root, _) = fixture();
+        let blocker = root.join("blocker");
+        std::fs::write(&blocker, b"original").unwrap();
+        assert!(catalog_mapped_code(&blocker).is_err());
+        assert_eq!(std::fs::read(&blocker).unwrap(), b"original");
+        assert!(catalog_mapped_code(&root.join("missing"))
+            .unwrap()
+            .is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn recatalog_metadata_failure_marks_partial_and_keeps_original_report() {
+        let (root, report) = fixture();
+        let original = serde_json::to_vec(&report).unwrap();
+        std::fs::write(root.join("dump-report.json"), &original).unwrap();
+        let metadata = root.join("runtime/mapped-code-42.json");
+        std::fs::write(&metadata, b"invalid metadata").unwrap();
+        let guard =
+            ksight_core::output_budget::Guard::install(vec![root.clone()], 16 * 1024 * 1024, 30000)
+                .unwrap();
+        assert!(recatalog_package(&root).is_err());
+        assert!(guard.receipt().partial);
+        assert_eq!(
+            guard.receipt().reason.as_deref(),
+            Some("catalog_incomplete")
+        );
+        assert_eq!(
+            std::fs::read(root.join("dump-report.json")).unwrap(),
+            original
+        );
+        assert_eq!(std::fs::read(&metadata).unwrap(), b"invalid metadata");
+        assert!(root.join("runtime/retained.bin").exists());
+        drop(guard);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn mapped_catalog_cancel_and_parse_failure_are_explicit() {
+        let (root, mut report) = fixture();
+        let path = root.join("runtime/mapped-code-42.json");
+        std::fs::write(&path, b"not JSON").unwrap();
+        let guard =
+            ksight_core::output_budget::Guard::install(vec![root.clone()], 16 * 1024 * 1024, 30000)
+                .unwrap();
+        assert!(finalize_with_reserved_report(&mut report, &root).is_err());
+        let summary: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("dump-report.json")).unwrap()).unwrap();
+        assert_eq!(summary["catalog_status"], "incomplete");
+        assert_eq!(summary["collection_status"], "partial");
+        assert_eq!(std::fs::read(&path).unwrap(), b"not JSON");
+        ksight_core::output_budget::interrupt(&root, "parent_cancelled");
+        assert!(catalog_mapped_code(&root).is_err());
+        assert!(guard.receipt().partial);
+        // The earlier catalog failure is the retained first reason.
+        assert_eq!(
+            guard.receipt().reason.as_deref(),
+            Some("catalog_incomplete")
+        );
+        drop(guard);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     fn full_catalog_and_report_keep_static_partial_warning_within_eight_mib_reserve() {
         let (root, mut report) = fixture();
         let guard = ksight_core::output_budget::Guard::install(
@@ -4725,6 +4944,179 @@ mod catalog_reserve_tests {
             .unwrap();
         assert_eq!(std::fs::read(backup.path()).unwrap(), previous);
         assert!(root.join("runtime/retained.bin").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    struct FaultSink {
+        file: File,
+        remaining_before_error: Option<usize>,
+        fail_sync: bool,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        syncs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl std::io::Write for FaultSink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(remaining) = self.remaining_before_error.as_mut() {
+                if *remaining == 0 {
+                    return Err(std::io::Error::other("injected mid-file write failure"));
+                }
+                let count = bytes.len().min(*remaining);
+                let written = std::io::Write::write(&mut self.file, &bytes[..count])?;
+                *remaining -= written;
+                return Ok(written);
+            }
+            std::io::Write::write(&mut self.file, bytes)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            std::io::Write::flush(&mut self.file)
+        }
+    }
+    impl CatalogSink for FaultSink {
+        fn sync_all(&self) -> std::io::Result<()> {
+            self.syncs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail_sync {
+                return Err(std::io::Error::other("injected sync failure"));
+            }
+            self.file.sync_all()
+        }
+    }
+    fn injected_failure_case(fail_write: bool, prior_partial: bool, recatalog: bool) {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let (root, mut report) = fixture();
+        report.warnings.push("x".repeat(192 * 1024));
+        if recatalog {
+            std::fs::write(root.join("dump-report.json"), b"original report").unwrap();
+        }
+        let guard =
+            ksight_core::output_budget::Guard::install(vec![root.clone()], 1024 * 1024, 30000)
+                .unwrap();
+        if prior_partial {
+            ksight_core::output_budget::record_failure(&root, "bound_code_copy_partial");
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let syncs = Arc::new(AtomicUsize::new(0));
+        let result = write_catalog_report_with(&report, &root, recatalog, |path| {
+            Ok(FaultSink {
+                file: std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(path)?,
+                remaining_before_error: fail_write.then_some(8192),
+                fail_sync: !fail_write,
+                calls: calls.clone(),
+                syncs: syncs.clone(),
+            })
+        });
+        assert!(result.is_err());
+        let receipt = guard.receipt();
+        assert!(receipt.partial);
+        assert_eq!(
+            receipt.reason.as_deref(),
+            Some(if prior_partial {
+                "bound_code_copy_partial"
+            } else {
+                "catalog_incomplete"
+            })
+        );
+        assert!(receipt.admitted_write_bytes <= receipt.limit_bytes - 64 * 1024);
+        if recatalog {
+            assert_eq!(
+                std::fs::read(root.join("dump-report.json")).unwrap(),
+                b"original report"
+            );
+        } else {
+            assert!(!root.join("dump-report.json").exists());
+        }
+        let entries = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
+        assert!(!entries.iter().any(|entry| entry
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".previous.json")));
+        let pending = entries
+            .iter()
+            .find(|entry| entry.file_name().to_string_lossy().ends_with(".incomplete"))
+            .unwrap();
+        let bytes = std::fs::read(pending.path()).unwrap();
+        if fail_write {
+            assert_eq!(bytes.len(), 8192);
+            assert!(serde_json::from_slice::<serde_json::Value>(&bytes).is_err());
+            assert_eq!(syncs.load(Ordering::SeqCst), 0);
+            // One initial buffer, one short payload write, one rejection. Drop
+            // must not make another call or consume the fallback reserve.
+            assert_eq!(calls.load(Ordering::SeqCst), 3);
+            assert!(receipt.admitted_write_bytes >= bytes.len() as u64);
+        } else {
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+                serde_json::to_value(&report).unwrap()
+            );
+            assert_eq!(syncs.load(Ordering::SeqCst), 1);
+            assert_eq!(receipt.admitted_write_bytes, bytes.len() as u64);
+        }
+        println!("catalog_fault write={fail_write} recatalog={recatalog} prior_partial={prior_partial} pending_bytes={} admitted_bytes={} write_calls={} sync_calls={} first_reason={:?}", bytes.len(), receipt.admitted_write_bytes, calls.load(Ordering::SeqCst), syncs.load(Ordering::SeqCst), receipt.reason);
+        assert_eq!(
+            std::fs::read(root.join("runtime/retained.bin")).unwrap(),
+            b"retained raw"
+        );
+        drop(guard);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn injected_mid_write_failure_keeps_old_report_and_partial_first_reason() {
+        injected_failure_case(true, true, true);
+    }
+    #[test]
+    fn injected_sync_failure_keeps_complete_pending_without_publishing() {
+        injected_failure_case(false, false, true);
+    }
+    #[test]
+    fn injected_write_and_sync_failures_do_not_publish_new_reports() {
+        injected_failure_case(true, false, false);
+        injected_failure_case(false, true, false);
+    }
+    #[test]
+    fn publication_collision_preserves_other_report_and_complete_pending() {
+        let (root, report) = fixture();
+        let guard =
+            ksight_core::output_budget::Guard::install(vec![root.clone()], 1024 * 1024, 30000)
+                .unwrap();
+        let result = write_catalog_report_with(&report, &root, false, |pending| {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(pending)?;
+            // Simulate another owner publishing after the initial existence check.
+            std::fs::write(root.join("dump-report.json"), b"other owner's report")?;
+            Ok(file)
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read(root.join("dump-report.json")).unwrap(),
+            b"other owner's report"
+        );
+        let pending = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().ends_with(".incomplete"))
+            .unwrap();
+        let bytes = std::fs::read(pending.path()).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+            serde_json::to_value(&report).unwrap()
+        );
+        assert_eq!(guard.receipt().admitted_write_bytes, bytes.len() as u64);
+        assert_eq!(
+            guard.receipt().reason.as_deref(),
+            Some("catalog_incomplete")
+        );
+        assert!(root.join("runtime/retained.bin").exists());
+        drop(guard);
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
