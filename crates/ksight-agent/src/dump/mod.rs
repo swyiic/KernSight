@@ -1239,7 +1239,7 @@ pub fn recatalog_package(dest: &Path) -> Result<PackageDumpReport> {
         report.dump_id = uuid::Uuid::new_v4().to_string();
     }
     deduplicate_code_evidence(dest)?;
-    finalize_catalog(&mut report, dest)?;
+    finalize_catalog(&mut report, dest, true)?;
     Ok(report)
 }
 
@@ -1247,7 +1247,7 @@ pub fn recatalog_package(dest: &Path) -> Result<PackageDumpReport> {
     clippy::too_many_lines,
     reason = "Keep the admission or lifecycle transaction together for review."
 )]
-fn finalize_catalog(report: &mut PackageDumpReport, dest: &Path) -> Result<()> {
+fn finalize_catalog(report: &mut PackageDumpReport, dest: &Path, recatalog: bool) -> Result<()> {
     recount_static_trees(report, dest);
     report.artifacts = catalog_dump(dest);
     attach_artifact_hashes(dest, &mut report.artifacts);
@@ -1368,25 +1368,91 @@ fn finalize_catalog(report: &mut PackageDumpReport, dest: &Path) -> Result<()> {
     );
     report.graph = graph;
     write_dump_howto(dest, &report.package);
-    let report_path = dest.join("dump-report.json");
-    let body = serde_json::to_vec_pretty(&report)?;
-    if body.len() > 8 * 1024 * 1024 {
-        write_partial_report(
-            report,
-            dest,
-            "catalog report exceeds 8MiB bound; raw evidence retained; detailed catalog omitted",
-        )?;
-        bail!("catalog report exceeds reserved report bound");
+    write_catalog_report(report, dest, recatalog)
+}
+
+/// Stream the complete catalog into an owned pending file. The reserved report
+/// allowance is a floor for catalog admission, not a maximum document size.
+#[cfg(test)]
+fn write_complete_catalog_report(report: &PackageDumpReport, dest: &Path) -> Result<()> {
+    write_catalog_report(report, dest, false)
+}
+
+fn write_catalog_report(report: &PackageDumpReport, dest: &Path, recatalog: bool) -> Result<()> {
+    use std::io::Write as _;
+    const MAX_REPORT_BYTES: u64 = 64 * 1024 * 1024;
+    const FAILURE_RESERVE: u64 = 64 * 1024;
+    struct ReportWriter {
+        file: File,
+        logical_path: PathBuf,
+        remaining: u64,
     }
-    // A closed parent quota or deadline still refuses the report; never bypass it.
-    ksight_core::output_budget::write(&report_path, &body)?;
+    impl std::io::Write for ReportWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() as u64 > self.remaining {
+                return Err(std::io::Error::other(
+                    "catalog report exceeds bounded allowance",
+                ));
+            }
+            // Charge the final report destination, including the original parent
+            // deadline. Only this exact destination has the catalog reservation.
+            ksight_core::output_budget::charge(&self.logical_path, bytes.len() as u64)?;
+            self.remaining -= bytes.len() as u64;
+            let written = std::io::Write::write(&mut self.file, bytes)?;
+            Ok(written)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            std::io::Write::flush(&mut self.file)
+        }
+    }
+    let logical_path = dest.join("dump-report.json");
+    let maximum = ksight_core::output_budget::remaining(&logical_path)
+        .map_or(MAX_REPORT_BYTES, |remaining| {
+            remaining.saturating_sub(FAILURE_RESERVE)
+        })
+        .min(MAX_REPORT_BYTES);
+    if logical_path.exists() && !recatalog {
+        bail!("existing catalog report preserved; use a fresh output directory");
+    }
+    ksight_core::output_budget::charge(&logical_path, 0)?;
+    let pending = dest.join(format!(".catalog-{}.incomplete", uuid::Uuid::new_v4()));
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&pending)?;
+    let mut writer = std::io::BufWriter::with_capacity(
+        64 * 1024,
+        ReportWriter {
+            file,
+            logical_path: logical_path.clone(),
+            remaining: maximum,
+        },
+    );
+    // Disarm BufWriter on every error: Drop must not retry writes after rejection.
+    let result = serde_json::to_writer(&mut writer, report)
+        .map_err(anyhow::Error::from)
+        .and_then(|()| writer.flush().map_err(anyhow::Error::from));
+    let (writer, _) = writer.into_parts();
+    result?;
+    writer.file.sync_all()?;
+    ksight_core::output_budget::charge(&logical_path, 0)?;
+    if recatalog && logical_path.exists() {
+        // Explicit recatalog preserves the old inode before replacing its report.
+        let previous = dest.join(format!(".catalog-{}.previous.json", uuid::Uuid::new_v4()));
+        std::fs::hard_link(&logical_path, &previous)?;
+        std::fs::rename(&pending, &logical_path)?;
+    } else {
+        std::fs::hard_link(&pending, &logical_path)?;
+        std::fs::remove_file(&pending)?; // Only our own fully published pending inode.
+    }
+
     Ok(())
 }
 
 fn finalize_with_reserved_report(report: &mut PackageDumpReport, dest: &Path) -> Result<()> {
     let catalog_scope =
         ksight_core::output_budget::StaticScope::install_catalog(dest.to_owned(), 8 * 1024 * 1024)?;
-    let catalog_result = finalize_catalog(report, dest);
+    let catalog_result = finalize_catalog(report, dest, false);
     drop(catalog_scope);
     if let Err(error) = catalog_result {
         if !dest.join("dump-report.json").exists() {
@@ -4565,6 +4631,123 @@ mod catalog_reserve_tests {
             .iter()
             .any(|v| v.as_str().unwrap().starts_with("static_retention=partial")));
         assert!(root.join("runtime/retained.bin").exists());
+        assert!(guard.receipt().admitted_write_bytes <= guard.receipt().limit_bytes);
+        drop(guard);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn report_above_eight_mib_round_trips_without_losing_fields() {
+        let (root, mut report) = fixture();
+        report.pids = vec![42];
+        report.warnings.push("x".repeat(9 * 1024 * 1024));
+        let expected = serde_json::to_value(&report).unwrap();
+        let guard =
+            ksight_core::output_budget::Guard::install(vec![root.clone()], 16 * 1024 * 1024, 30000)
+                .unwrap();
+        ksight_core::output_budget::record_failure(&root, "bound_code_copy_partial");
+        let scope =
+            ksight_core::output_budget::StaticScope::install_catalog(root.clone(), 8 * 1024 * 1024)
+                .unwrap();
+        write_complete_catalog_report(&report, &root).unwrap();
+        let bytes = std::fs::read(root.join("dump-report.json")).unwrap();
+        assert!(bytes.len() > 8 * 1024 * 1024);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+            expected
+        );
+        assert_eq!(guard.receipt().admitted_write_bytes, bytes.len() as u64);
+        assert!(guard.receipt().partial);
+        assert_eq!(
+            guard.receipt().reason.as_deref(),
+            Some("bound_code_copy_partial")
+        );
+        drop(scope);
+        drop(guard);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn bounded_failure_does_not_flush_buffer_or_publish_prefix() {
+        let (root, mut report) = fixture();
+        report.warnings.push("x".repeat(128 * 1024));
+        let guard =
+            ksight_core::output_budget::Guard::install(vec![root.clone()], 96 * 1024, 30000)
+                .unwrap();
+        assert!(write_complete_catalog_report(&report, &root).is_err());
+        assert!(!root.join("dump-report.json").exists());
+        let admitted = guard.receipt().admitted_write_bytes;
+        assert!(admitted < 32 * 1024);
+        let pending = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().ends_with(".incomplete"))
+            .unwrap();
+        assert_eq!(pending.metadata().unwrap().len(), admitted);
+        assert!(root.join("runtime/retained.bin").exists());
+        drop(guard);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn report_above_consumer_limit_is_not_published() {
+        let (root, mut report) = fixture();
+        report.warnings.push("x".repeat(64 * 1024 * 1024));
+        assert!(write_complete_catalog_report(&report, &root).is_err());
+        assert!(!root.join("dump-report.json").exists());
+        assert!(root.join("runtime/retained.bin").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn explicit_recatalog_preserves_recoverable_previous_report() {
+        let (root, report) = fixture();
+        let previous = serde_json::to_vec(&report).unwrap();
+        std::fs::write(root.join("dump-report.json"), &previous).unwrap();
+        recatalog_package(&root).unwrap();
+        let backup = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".previous.json")
+            })
+            .unwrap();
+        assert_eq!(std::fs::read(backup.path()).unwrap(), previous);
+        assert!(root.join("runtime/retained.bin").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn original_deadline_rejects_report_publication() {
+        let (root, report) = fixture();
+        let guard =
+            ksight_core::output_budget::Guard::install(vec![root.clone()], 1024 * 1024, 1).unwrap();
+        std::thread::sleep(Duration::from_millis(3));
+        assert!(write_complete_catalog_report(&report, &root).is_err());
+        assert!(!root.join("dump-report.json").exists());
+        assert_eq!(
+            guard.receipt().reason.as_deref(),
+            Some("time_budget_exhausted")
+        );
+        assert!(root.join("runtime/retained.bin").exists());
+        drop(guard);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn rejected_report_preserves_previous_report_and_raw_evidence() {
+        let (root, mut report) = fixture();
+        report.warnings.push("x".repeat(128 * 1024));
+        std::fs::write(root.join("dump-report.json"), b"previous report").unwrap();
+        let guard =
+            ksight_core::output_budget::Guard::install(vec![root.clone()], 96 * 1024, 30000)
+                .unwrap();
+        assert!(write_complete_catalog_report(&report, &root).is_err());
+        assert_eq!(
+            std::fs::read(root.join("dump-report.json")).unwrap(),
+            b"previous report"
+        );
+        assert_eq!(
+            std::fs::read(root.join("runtime/retained.bin")).unwrap(),
+            b"retained raw"
+        );
         assert!(guard.receipt().admitted_write_bytes <= guard.receipt().limit_bytes);
         drop(guard);
         std::fs::remove_dir_all(root).unwrap();
