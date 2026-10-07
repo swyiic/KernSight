@@ -1,7 +1,11 @@
 //! Inspect adapter orchestration. Default-off, auditable, exported-symbol only.
 
 #[cfg(any(test, target_os = "android", target_os = "linux"))]
+mod attach_admission;
+#[cfg(any(test, target_os = "android", target_os = "linux"))]
 mod instance_backend;
+#[cfg(any(test, target_os = "android", target_os = "linux"))]
+mod probe_renewal;
 
 #[cfg(any(test, target_os = "android", target_os = "linux"))]
 mod scope_state;
@@ -1240,9 +1244,15 @@ impl InspectRuntime {
                     "qualified generation changed; producer must stop, not reuse pending frames"
                 );
             }
-            for live in &mut self.sessions {
-                live.session.apply_bound_instances(&next)?;
-            }
+            probe_renewal::renew_active(
+                &mut self.sessions,
+                |live| {
+                    live.session.finished()
+                        && live.plan.adapter.hit_once()
+                        && !live.plan.policy.whole_device
+                },
+                |live| live.session.apply_bound_instances(&next),
+            )?;
             self.tls_pending.drop_all_incomplete();
             self.scoped_tgids = next.iter().map(|t| t.identity.tgid).collect();
             self.bound_instance_targets = Some(next);
@@ -1574,44 +1584,8 @@ impl InspectRuntime {
             // attached while /proc had no cmdline stay deny-all until this runs.
             sync_live_tgid_allowlist(self);
             let mut observations = self.rescan_tls_exports_maybe();
-            if !self.sessions.is_empty() {
-                // Successful probes are skipped by identity; failed probes are
-                // retried on their throttle so one live Conscrypt probe does
-                // not permanently suppress a later vendor-stack recovery.
-                observations.extend(attach_all(self));
-                return observations;
-            }
-            // Audited stub plans (classification-only) do not patch ART; the
-            // grace is only required when an ART-patching probe is selected.
-            let art_patching_selected = self.selected_adapters.iter().any(|adapter| {
-                matches!(
-                    adapter,
-                    InspectAdapterKind::JniPlaintext
-                        | InspectAdapterKind::JniNewString
-                        | InspectAdapterKind::JniGetStringUtfChars
-                        | InspectAdapterKind::JniGetStringUtfLength
-                        | InspectAdapterKind::JniGetStringUtfRegion
-                        | InspectAdapterKind::JniGetArrayLength
-                        | InspectAdapterKind::JniGetByteArrayElements
-                        | InspectAdapterKind::JniGetByteArrayRegion
-                        | InspectAdapterKind::JniSetByteArrayRegion
-                        | InspectAdapterKind::JniRegistration
-                )
-            });
-            if art_patching_selected && !inspect_target_survived_packer(&self.plans) {
-                // The packer grace protects ART-patching probes (JNI) from
-                // packed-process init crashes. TLS uprobes live on libssl and
-                // never touch ART, so they attach immediately — the launch
-                // burst is exactly the traffic a mirror session must not miss.
-                if !self.delay_notice_emitted {
-                    self.delay_notice_emitted = true;
-                    eprintln!(
-                        "inspect waiting for package process to stay up >= {}s (packer init)",
-                        PACKER_ATTACH_GRACE.as_secs()
-                    );
-                }
-                return Vec::new();
-            }
+            // Every entry path (initial, rescan, and existing TLS sessions) is
+            // gated per plan inside attach_all. TLS never grants early ART admission.
             observations.extend(attach_all(self));
             observations
         }
@@ -1643,15 +1617,16 @@ impl InspectRuntime {
         }
         #[cfg(any(target_os = "android", target_os = "linux"))]
         {
-            if self
+            if let Some(error) = self
                 .bound_instance_targets
                 .as_ref()
-                .is_some_and(|targets| targets.iter().any(|t| t.check_current().is_err()))
+                .and_then(|targets| targets.iter().find_map(|t| t.recheck_task_mark().err()))
             {
                 clear_scope_state(self, None);
                 self.scope_revoked_poll = true;
-                self.scope_diagnostics
-                    .push("physical qualification expired/exited; no payload admitted".into());
+                self.scope_diagnostics.push(format!(
+                    "physical qualification invalidated; no payload admitted: {error:#}"
+                ));
                 return scope_observations(self);
             }
             self.scope_revoked_poll = false;
@@ -2851,12 +2826,16 @@ fn finish_scope_poll(
     mut outputs: Vec<InspectOutput>,
 ) -> Vec<InspectOutput> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    if runtime
-        .bound_instance_targets
-        .as_ref()
-        .is_some_and(|targets| targets.iter().any(|target| target.check_current().is_err()))
-    {
-        revoke_scope(runtime, None, "qualification_invalid_before_publication");
+    if let Some(error) = runtime.bound_instance_targets.as_ref().and_then(|targets| {
+        targets
+            .iter()
+            .find_map(|target| target.recheck_task_mark().err())
+    }) {
+        revoke_scope(
+            runtime,
+            None,
+            &format!("qualification_invalid_before_publication:{error:#}"),
+        );
     }
     if runtime.scope_revoked_poll {
         clear_scope_state(runtime, None);
@@ -3761,6 +3740,22 @@ fn attach_all(runtime: &mut InspectRuntime) -> Vec<InspectObservation> {
             eprintln!("inspect attach stopped; window elapsed");
             break;
         }
+        if !attach_admission::allowed(
+            plan.adapter,
+            plan.policy.whole_device,
+            bound_attach.as_deref(),
+            || inspect_target_survived_packer(std::slice::from_ref(&plan)),
+            process_age,
+        ) {
+            if !runtime.delay_notice_emitted {
+                runtime.delay_notice_emitted = true;
+                eprintln!(
+                    "inspect deferring JNI/ART attach until every qualified source is >= {}s old (packer init); TLS/Binder continue",
+                    PACKER_ATTACH_GRACE.as_secs()
+                );
+            }
+            continue;
+        }
         // Kernel uprobe `pid` is a thread id. Attach globally and drop other TGIDs
         // in BPF before perf_output so busy Binder apps are not drowned.
         let Some(elf) = plan.elf_path.as_ref().map(PathBuf::from) else {
@@ -3839,7 +3834,7 @@ fn attach_all(runtime: &mut InspectRuntime) -> Vec<InspectObservation> {
                 hit_once,
                 plan.pointer_width,
                 tgids_attach.as_deref(),
-                runtime.bound_instance_targets.as_deref(),
+                bound_attach.as_deref(),
             ) {
                 Ok(mut session) => {
                     let filter_status = if runtime.bound_instance_targets.is_some() {
@@ -3921,7 +3916,7 @@ fn attach_all(runtime: &mut InspectRuntime) -> Vec<InspectObservation> {
                 hit_once,
                 plan.pointer_width,
                 tgids_attach.as_deref(),
-                runtime.bound_instance_targets.as_deref(),
+                bound_attach.as_deref(),
             ) {
                 Ok(mut session) => {
                     let filter_status = if runtime.bound_instance_targets.is_some() {
@@ -3995,11 +3990,17 @@ fn poll_all(runtime: &mut InspectRuntime) -> Vec<InspectOutput> {
     for probe in &mut runtime.sessions {
         let before_drained = probe.session.drained_total;
         let before_lost = probe.session.lost_total;
-        let polled = probe.session.poll_hits();
+        // A successful one-shot poll detaches and clears the session's live
+        // scope. Retain the committed epoch for only this returned batch.
+        let polled = probe_renewal::poll_with_epoch(
+            &mut probe.session,
+            ksight_hwbp::UprobeSession::instance_epoch,
+            ksight_hwbp::UprobeSession::poll_hits,
+        );
         runtime.raw_drained += probe.session.drained_total.saturating_sub(before_drained);
         runtime.perf_lost += probe.session.lost_total.saturating_sub(before_lost);
-        let hits = match polled {
-            Ok(hits) => hits,
+        let (epoch, hits) = match polled {
+            Ok(batch) => batch,
             Err(error) => {
                 if runtime.bound_instance_targets.is_some() {
                     bound_failure = Some(format!("bound_backend_read_error:{error:#}"));
@@ -4009,9 +4010,14 @@ fn poll_all(runtime: &mut InspectRuntime) -> Vec<InspectOutput> {
         };
         for hit in hits {
             if let Some(targets) = &runtime.bound_instance_targets {
-                if targets.iter().any(|target| target.check_current().is_err())
-                    || !instance_backend::accepts(&hit, targets, probe.session.instance_epoch())
+                if let Some(error) = targets
+                    .iter()
+                    .find_map(|target| target.recheck_task_mark().err())
                 {
+                    bound_failure = Some(format!("bound_live_source_invalid:{error:#}"));
+                    continue;
+                }
+                if !instance_backend::accepts(&hit, targets, epoch) {
                     bound_failure =
                         Some("bound_consumer_generation_or_identity_mismatch".to_owned());
                     continue;

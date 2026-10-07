@@ -64,11 +64,9 @@ impl MetadataLease {
     }
     #[cfg(any(target_os = "linux", target_os = "android"))]
     pub(crate) fn check(&self, pidfd: std::os::fd::BorrowedFd<'_>) -> Result<()> {
-        use anyhow::bail;
-        if !self.admission_valid() {
-            bail!("metadata lease expired before sampler binding");
-        }
-        self.task_mark_matches(pidfd)
+        validate_use(LeaseUse::Admission, self.admission_valid(), || {
+            self.observe_task_mark(pidfd)
+        })
     }
 
     /// Compare the kernel task mark on this pidfd. The sampler admission
@@ -76,6 +74,13 @@ impl MetadataLease {
     /// retarget. Lookup does not mint a replacement grant.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     pub(crate) fn task_mark_matches(&self, pidfd: std::os::fd::BorrowedFd<'_>) -> Result<()> {
+        validate_use(LeaseUse::Live, self.admission_valid(), || {
+            self.observe_task_mark(pidfd)
+        })
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn observe_task_mark(&self, pidfd: std::os::fd::BorrowedFd<'_>) -> Result<()> {
         use anyhow::{bail, Context};
         use std::os::fd::{AsFd, AsRawFd};
         let key = pidfd.as_raw_fd();
@@ -109,11 +114,31 @@ impl MetadataLease {
             &live,
         )?;
         if !crate::task_storage::alive(pidfd)? {
-            bail!("qualified task exited before sampler binding");
+            bail!("qualified task exited during live metadata check");
         }
         Ok(())
     }
 }
+#[derive(Clone, Copy)]
+enum LeaseUse {
+    Admission,
+    Live,
+}
+
+// Shared decision boundary for admission versus an already-bound live source.
+// Live use still executes the full token/identity/pidfd check; it never issues
+// a grant, extends a deadline, or permits a new sampler binding.
+fn validate_use(
+    purpose: LeaseUse,
+    admission_valid: bool,
+    observe: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    if matches!(purpose, LeaseUse::Admission) && !admission_valid {
+        anyhow::bail!("metadata lease expired before sampler binding");
+    }
+    observe()
+}
+
 /// Used by the production sampler with its deny gate already set. A pidfd
 /// retarget between precheck and insertion fails postcheck; caller revokes the
 /// whole uncommitted sampler before any hook can read application memory.
@@ -165,5 +190,73 @@ mod retained_lease_regressions {
         assert!(clone.btf.as_fd().try_clone_to_owned().is_ok());
         assert_eq!(clone.deadline, deadline);
         assert!(!clone.admission_valid());
+    }
+}
+
+#[cfg(test)]
+mod live_use_regressions {
+    use super::{validate_use, LeaseUse};
+    use crate::{
+        instance_scope::InstanceIdentity,
+        metadata_scope::{accept_live_identity, live_metadata_record},
+    };
+    use std::cell::Cell;
+
+    fn identity() -> InstanceIdentity {
+        InstanceIdentity {
+            tgid: 7,
+            uid: 10_001,
+            birth_ns: 123,
+            exec_id: 4,
+        }
+    }
+
+    #[test]
+    fn expired_admission_still_blocks_new_bind_but_not_live_identity_observation() {
+        let source = identity();
+        let record = live_metadata_record(&source, 19, 2);
+        let calls = Cell::new(0);
+        let check = || {
+            calls.set(calls.get() + 1);
+            accept_live_identity(&source, 19, 2, &record)
+        };
+        let error = validate_use(LeaseUse::Admission, false, check).expect_err("expired admission");
+        assert!(error.to_string().contains("expired before sampler binding"));
+        assert_eq!(calls.get(), 0);
+        validate_use(LeaseUse::Live, false, check).expect("same live task after admission window");
+        assert_eq!(calls.get(), 1);
+        // Live observation did not renew the admission window.
+        assert!(validate_use(LeaseUse::Admission, false, check).is_err());
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn live_checks_after_admission_expiry_still_reject_exec_token_and_empty_records() {
+        let source = identity();
+        let mut replaced = source;
+        replaced.exec_id += 1;
+        for record in [
+            live_metadata_record(&replaced, 19, 2).to_vec(),
+            live_metadata_record(&source, 20, 2).to_vec(),
+            Vec::new(),
+        ] {
+            assert!(validate_use(LeaseUse::Live, false, || accept_live_identity(
+                &source, 19, 2, &record
+            ))
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn live_exit_and_observer_errors_are_preserved_in_both_time_states() {
+        for still_admissible in [false, true] {
+            for reason in ["qualified task exited", "metadata iterator denied"] {
+                let error = validate_use(LeaseUse::Live, still_admissible, || {
+                    anyhow::bail!("{reason}")
+                })
+                .expect_err("live observation failure");
+                assert_eq!(error.to_string(), reason);
+            }
+        }
     }
 }
