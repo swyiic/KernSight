@@ -813,7 +813,7 @@ pub fn dump_package_with(
                 bail!("cross-package qualified dump source");
             }
         }
-        pids.retain(|pid| sources.iter().any(|s| s.pid == *pid));
+        retain_preceding_source_pids(&mut pids, sources, &mut report.warnings);
         if pids.is_empty() {
             bail!("previous qualified task absent; no numeric replacement");
         }
@@ -834,6 +834,10 @@ pub fn dump_package_with(
     let mut budget_closed = false;
     let deadline = Instant::now() + Duration::from_secs(30);
     for pid in pids.iter().copied().take(8) {
+        if ksight_core::output_budget::should_stop(&runtime) {
+            budget_closed = true;
+            break;
+        }
         if Instant::now() >= deadline {
             break;
         }
@@ -876,14 +880,25 @@ pub fn dump_package_with(
                 )
             }
         };
-        accumulate_live(&mut report, live);
+        if accumulate_live_or_close(&mut report, live, &runtime) {
+            budget_closed = true;
+            break;
+        }
     }
     if !budget_closed && !pids.is_empty() {
         std::thread::sleep(Duration::from_millis(500));
         pids = merge_live_package_pids(package, pids);
+        // Package membership does not extend the preceding physical source grant.
+        if let Some(sources) = &options.expected_code_sources {
+            retain_preceding_source_pids(&mut pids, sources, &mut report.warnings);
+        }
         report.pids.clone_from(&pids);
         let mid = Instant::now() + Duration::from_secs(8);
         for pid in pids.iter().copied().take(8) {
+            if ksight_core::output_budget::should_stop(&runtime) {
+                budget_closed = true;
+                break;
+            }
             if Instant::now() >= mid {
                 break;
             }
@@ -925,7 +940,10 @@ pub fn dump_package_with(
                     )
                 }
             };
-            accumulate_live(&mut report, live);
+            if accumulate_live_or_close(&mut report, live, &runtime) {
+                budget_closed = true;
+                break;
+            }
         }
         if budget_closed {
             // Payload budget is closed. The next pass would only read more memory.
@@ -933,6 +951,10 @@ pub fn dump_package_with(
             std::thread::sleep(Duration::from_secs(2));
             let second = Instant::now() + Duration::from_secs(15);
             for pid in pids.iter().copied().take(8) {
+                if ksight_core::output_budget::should_stop(&runtime) {
+                    budget_closed = true;
+                    break;
+                }
                 if Instant::now() >= second {
                     break;
                 }
@@ -979,7 +1001,10 @@ pub fn dump_package_with(
                         )
                     }
                 };
-                accumulate_live(&mut report, live);
+                if accumulate_live_or_close(&mut report, live, &runtime) {
+                    budget_closed = true;
+                    break;
+                }
             }
         }
     }
@@ -1025,8 +1050,9 @@ pub fn dump_package_with(
         }
     }
     // Current-instance evidence is acquired before optional installed/static payloads.
-    let static_referenced = options.parent_owned && options.code_only && !runtime_only;
-    if !runtime_only {
+    let collect_static = static_batch_allowed(&mut report, dest, runtime_only, budget_closed);
+    let static_referenced = options.parent_owned && options.code_only && collect_static;
+    if collect_static {
         let static_scope = ksight_core::output_budget::StaticScope::install(
             dest.to_owned(),
             256 * 1024 * 1024,
@@ -3551,6 +3577,33 @@ fn hex_key(key: [u8; 16]) -> String {
     out
 }
 
+fn static_batch_allowed(
+    report: &mut PackageDumpReport,
+    dest: &Path,
+    runtime_only: bool,
+    budget_closed: bool,
+) -> bool {
+    if runtime_only {
+        return false;
+    }
+    if budget_closed || ksight_core::output_budget::should_stop(dest) {
+        report.warnings.push("static_omissions: parent live copy stopped; APK raw/DEX/assets/native and install lib/oat/data-cache not attempted; retained runtime evidence remains partial".into());
+        return false;
+    }
+    true
+}
+
+fn accumulate_live_or_close(
+    report: &mut PackageDumpReport,
+    live: crate::dexdump::LiveDump,
+    runtime: &Path,
+) -> bool {
+    // A successful return can already carry a partial/closed parent receipt.
+    // Preserve its counters and files, then stop before refresh or another read.
+    accumulate_live(report, live);
+    ksight_core::output_budget::should_stop(runtime)
+}
+
 fn accumulate_live(report: &mut PackageDumpReport, live: crate::dexdump::LiveDump) {
     report.memory_images = report.memory_images.saturating_add(live.memory_images);
     report.vdex_images = report.vdex_images.saturating_add(live.vdex_images);
@@ -4099,6 +4152,28 @@ fn rank_package_pids(package: &str, mut pids: Vec<u32>) -> Vec<u32> {
     pids
 }
 
+/// Enumeration is only a candidate list. Never qualify a newly discovered PID
+/// under a preceding source grant; the retained source still undergoes pidfd/mm
+/// revalidation in `copy_qualified_or_stop` before any payload read.
+fn retain_preceding_source_pids(
+    pids: &mut Vec<u32>,
+    sources: &[crate::qualified_code::SourceIdentity],
+    warnings: &mut Vec<String>,
+) {
+    pids.retain(|pid| {
+        if sources.iter().any(|source| source.pid == *pid) {
+            return true;
+        }
+        let warning = format!(
+            "code_scope_skip: enumerated PID {pid} is absent from preceding qualified sources; no payload read or replacement"
+        );
+        if !warnings.contains(&warning) {
+            warnings.push(warning);
+        }
+        false
+    });
+}
+
 fn merge_live_package_pids(package: &str, mut pids: Vec<u32>) -> Vec<u32> {
     for pid in pids_for_package(package) {
         if !pids.contains(&pid) {
@@ -4506,6 +4581,92 @@ mod catalog_reserve_tests {
         assert_eq!(value["catalog_status"], "incomplete");
         assert!(root.join("runtime/retained.bin").exists());
         assert!(guard.receipt().admitted_write_bytes <= 8192);
+        drop(guard);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod preceding_source_refresh_tests {
+    use super::*;
+    fn source() -> crate::qualified_code::SourceIdentity {
+        crate::qualified_code::SourceIdentity {
+            package: "com.example.fixture".into(),
+            pid: 42,
+            uid: 10001,
+            birth_ns: 123,
+            exec_id: 4,
+            boot_id: "fixture-boot".into(),
+        }
+    }
+    #[test]
+    fn unqualified_candidates_cannot_displace_or_replace_the_preceding_source() {
+        let sources = vec![source()];
+        let mut warnings = Vec::new();
+        let mut candidates = vec![43, 44, 45, 46, 47, 48, 49, 50, 42];
+        retain_preceding_source_pids(&mut candidates, &sources, &mut warnings);
+        assert_eq!(candidates, vec![42]);
+        assert_eq!(warnings.len(), 8);
+        assert!(warnings
+            .iter()
+            .all(|w| w.contains("no payload read or replacement")));
+        candidates.extend([43, 44]);
+        retain_preceding_source_pids(&mut candidates, &sources, &mut warnings);
+        assert_eq!(candidates, vec![42]);
+        assert_eq!(warnings.len(), 8);
+        let mut replacements = vec![43, 44];
+        retain_preceding_source_pids(&mut replacements, &sources, &mut warnings);
+        assert!(replacements.is_empty());
+        assert_eq!(sources[0], source()); // Enumeration never edits the physical grant.
+    }
+    #[test]
+    fn successful_partial_copy_keeps_stats_and_catalog_without_another_read() {
+        let root =
+            std::env::temp_dir().join(format!("ksight-partial-refresh-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("runtime")).unwrap();
+        let guard =
+            ksight_core::output_budget::Guard::install(vec![root.clone()], 16 * 1024 * 1024, 30000)
+                .unwrap();
+        ksight_core::output_budget::write(
+            &root.join("runtime/retained.code"),
+            b"retained source bytes",
+        )
+        .unwrap();
+        ksight_core::output_budget::record_failure(
+            &root.join("runtime"),
+            "bound_code_copy_partial",
+        );
+        let mut report = PackageDumpReport {
+            package: source().package,
+            ..PackageDumpReport::default()
+        };
+        assert!(accumulate_live_or_close(
+            &mut report,
+            crate::dexdump::LiveDump {
+                memory_images: 1,
+                native_libs: 2,
+                ..crate::dexdump::LiveDump::default()
+            },
+            &root.join("runtime")
+        ));
+        assert_eq!(report.memory_images, 1);
+        assert_eq!(report.runtime_libs, 2);
+        assert!(!static_batch_allowed(&mut report, &root, false, true));
+        assert!(report
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("static_omissions:")));
+        finalize_with_reserved_report(&mut report, &root).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("dump-report.json")).unwrap()).unwrap();
+        assert!(guard.receipt().partial);
+        assert_eq!(value["memory_images"], 1);
+        assert_eq!(value["runtime_libs"], 2);
+        assert_eq!(
+            std::fs::read(root.join("runtime/retained.code")).unwrap(),
+            b"retained source bytes"
+        );
+        assert!(root.join("dump-report.json").is_file());
         drop(guard);
         std::fs::remove_dir_all(root).unwrap();
     }

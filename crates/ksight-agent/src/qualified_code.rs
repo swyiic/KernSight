@@ -331,6 +331,14 @@ impl SourceIdentity {
         Ok(())
     }
 }
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+fn require_same_source(actual: &SourceIdentity, expected: &SourceIdentity) -> Result<()> {
+    if actual != expected {
+        bail!("source generation changed; no numeric retry");
+    }
+    Ok(())
+}
+
 /// Capability checks only the available physical backend, not a not-yet-started App.
 ///
 /// # Errors
@@ -659,9 +667,8 @@ mod physical {
         pub fn record_candidates(&self, expected: &SourceIdentity, out: &Path) -> Result<()> {
             expected.validate()?;
             let mut target = self.qualify(&expected.package, expected.pid, true)?;
-            if target.identity != *expected {
-                bail!("candidate source generation changed");
-            }
+            super::require_same_source(&target.identity, expected)
+                .context("candidate source generation changed")?;
             let mut text = String::new();
             target
                 .maps
@@ -705,9 +712,8 @@ mod physical {
             row: &crate::dexdump::MapRow,
         ) -> Result<BoundRangeStep> {
             let current = self.qualify(&expected.package, expected.pid, false)?;
-            if current.identity != *expected {
-                bail!("source generation changed before next range");
-            }
+            super::require_same_source(&current.identity, expected)
+                .context("source generation changed before next range")?;
             let binding = current.qualified.into_bound()?;
             let requested = row.end.saturating_sub(row.start);
             let range_cap = code_range_cap(&row.path);
@@ -809,9 +815,8 @@ mod physical {
         ) -> Result<crate::dexdump::LiveDump> {
             expected.validate()?;
             let mut target = self.qualify(&expected.package, expected.pid, true)?;
-            if target.identity != *expected {
-                bail!("source generation changed before live-copy; no numeric retry");
-            }
+            super::require_same_source(&target.identity, expected)
+                .context("source generation changed before live-copy; no numeric retry")?;
 
             let mut text = String::new();
             target
@@ -1029,5 +1034,47 @@ mod range_receipt_regressions {
             receipt.write_error.as_deref(),
             Some("injected write failure")
         );
+    }
+}
+
+#[cfg(test)]
+mod preceding_source_identity_tests {
+    use super::*;
+    use std::io::Cursor;
+    #[test]
+    fn next_copy_rejects_pid_reuse_exec_change_or_exit_before_reading() {
+        let expected = SourceIdentity {
+            package: "com.example.fixture".into(),
+            pid: 42,
+            uid: 10001,
+            birth_ns: 123,
+            exec_id: 4,
+            boot_id: "fixture-boot".into(),
+        };
+        let mut reused = expected.clone();
+        reused.birth_ns += 1;
+        let mut exec = expected.clone();
+        exec.exec_id += 1;
+        for observed in [Some(reused), Some(exec), None] {
+            let mut source = Cursor::new(b"original task bytes".to_vec());
+            let mut sink = Vec::new();
+            let receipt = copy_range(&mut source, &mut sink, 0, 19, || {
+                let actual = observed
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("qualified task exited"))?;
+                require_same_source(actual, &expected)
+            });
+            assert_eq!(receipt.actual_length, 0);
+            assert_eq!(receipt.admission, "rejected_identity");
+            assert!(sink.is_empty());
+            assert_eq!(source.position(), 0);
+        }
+        let mut source = Cursor::new(b"original task bytes".to_vec());
+        let mut sink = Vec::new();
+        let receipt = copy_range(&mut source, &mut sink, 0, 19, || {
+            require_same_source(&expected, &expected)
+        });
+        assert_eq!(receipt.admission, "qualified_live_copy");
+        assert_eq!(sink, b"original task bytes");
     }
 }
