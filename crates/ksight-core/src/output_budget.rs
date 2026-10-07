@@ -38,6 +38,71 @@ static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1)
 fn states() -> &'static Mutex<BTreeMap<u64, State>> {
     STATES.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
+struct StaticState {
+    root: PathBuf,
+    limit: u64,
+    spent: u64,
+    reserved_report: Option<PathBuf>,
+}
+static STATIC_SCOPES: OnceLock<Mutex<BTreeMap<u64, StaticState>>> = OnceLock::new();
+fn static_scopes() -> &'static Mutex<BTreeMap<u64, StaticState>> {
+    STATIC_SCOPES.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+/// Additional static-output admission limit; the invocation guard remains authoritative.
+pub struct StaticScope(u64);
+impl StaticScope {
+    /// Bound catalog sidecars while reserving capacity for the exact final report path.
+    /// The report still passes the original invocation quota and deadline checks.
+    /// # Errors
+    /// Returns an invalid or overlapping scope error.
+    pub fn install_catalog(root: PathBuf, reserve: u64) -> io::Result<Self> {
+        let report = root.join("dump-report.json");
+        let scope = Self::install(root, 64 * 1024 * 1024, reserve)?;
+        static_scopes()
+            .lock()
+            .map_err(|_| io::Error::other("static scope lock"))?
+            .get_mut(&scope.0)
+            .ok_or_else(|| io::Error::other("missing catalog scope"))?
+            .reserved_report = Some(report);
+        Ok(scope)
+    }
+    /// Reserve report space from the parent's remaining allowance and bound static output.
+    /// # Errors
+    /// Returns an invalid or overlapping scope error.
+    pub fn install(root: PathBuf, cap: u64, reserve: u64) -> io::Result<Self> {
+        if !root.is_absolute() || root.components().any(|c| matches!(c, Component::ParentDir)) {
+            return Err(io::Error::other("invalid static scope"));
+        }
+        let available = remaining(&root).unwrap_or(cap).saturating_sub(reserve);
+        let mut scopes = static_scopes()
+            .lock()
+            .map_err(|_| io::Error::other("static scope lock"))?;
+        if scopes
+            .values()
+            .any(|s| root.starts_with(&s.root) || s.root.starts_with(&root))
+        {
+            return Err(io::Error::other("overlapping static scope"));
+        }
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        scopes.insert(
+            id,
+            StaticState {
+                root,
+                limit: cap.min(available),
+                spent: 0,
+                reserved_report: None,
+            },
+        );
+        Ok(Self(id))
+    }
+}
+impl Drop for StaticScope {
+    fn drop(&mut self) {
+        if let Ok(mut scopes) = static_scopes().lock() {
+            scopes.remove(&self.0);
+        }
+    }
+}
 /// Guard retained by this evidence operation.
 pub struct Guard(u64);
 impl Guard {
@@ -139,6 +204,18 @@ fn write_kind(path: &Path) -> &'static str {
 /// Returns the validation or required operation error; no successful result is fabricated.
 /// Charge retained by this evidence operation.
 pub fn charge(path: &Path, n: u64) -> io::Result<()> {
+    // Admission checks the child first, without spending or exhausting the parent.
+    let mut scopes = static_scopes()
+        .lock()
+        .map_err(|_| io::Error::other("static scope lock"))?;
+    for scope in scopes
+        .values()
+        .filter(|s| path.starts_with(&s.root) && s.reserved_report.as_deref() != Some(path))
+    {
+        if n > scope.limit.saturating_sub(scope.spent) {
+            return Err(io::Error::other("static_output_budget_exhausted"));
+        }
+    }
     let mut all = states()
         .lock()
         .map_err(|_| io::Error::other("budget lock"))?;
@@ -180,6 +257,12 @@ pub fn charge(path: &Path, n: u64) -> io::Result<()> {
         let kind = write_kind(path);
         *s.receipt.admitted_by_kind.entry(kind).or_default() += n;
         *s.receipt.admission_calls_by_kind.entry(kind).or_default() += 1;
+    }
+    for scope in scopes
+        .values_mut()
+        .filter(|s| path.starts_with(&s.root) && s.reserved_report.as_deref() != Some(path))
+    {
+        scope.spent = scope.spent.saturating_add(n);
     }
     Ok(())
 }
@@ -365,4 +448,23 @@ pub fn should_stop(path: &Path) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod static_tests {
+    use super::*;
+    #[test]
+    fn static_rejection_preserves_parent_report_allowance() {
+        let root = std::env::temp_dir().join(format!("ksight-static-{}", uuid::Uuid::new_v4()));
+        let parent = Guard::install(vec![root.clone()], 100, 30000).unwrap();
+        charge(&root.join("runtime"), 20).unwrap();
+        let child = StaticScope::install(root.clone(), 60, 30).unwrap();
+        charge(&root.join("lib"), 50).unwrap();
+        assert!(charge(&root.join("lib"), 1).is_err());
+        assert_eq!(parent.receipt().admitted_write_bytes, 70);
+        assert!(!parent.receipt().partial);
+        drop(child);
+        charge(&root.join("dump-report.json"), 30).unwrap();
+        assert_eq!(parent.receipt().admitted_write_bytes, 100);
+    }
 }

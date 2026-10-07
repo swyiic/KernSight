@@ -755,61 +755,6 @@ pub fn dump_package_with(
             backend.record_candidates(source, &dest.join("runtime"))?;
         }
     }
-    let static_referenced = options.parent_owned && options.code_only && !runtime_only;
-    if static_referenced {
-        report.apk_files = reference_static_apks(package, &apk_paths, dest)?;
-        report.warnings.push("Static DEX/SO members referenced, not bulk-extracted; runtime payload budget preserved; references are not memory recovery".into());
-    }
-    if !runtime_only && !static_referenced {
-        let apk_dir = dest.join("apk");
-        std::fs::create_dir_all(&apk_dir)?;
-        let mut install_dirs = Vec::<PathBuf>::new();
-        for apk in &apk_paths {
-            let name = apk
-                .file_name()
-                .and_then(|value| value.to_str())
-                .unwrap_or("base.apk");
-            let bytes = std::fs::metadata(apk)?.len();
-            if bytes <= MAX_APK_BYTES {
-                copy_capped_path(apk, &apk_dir.join(name), MAX_APK_BYTES)?;
-                report.apk_files = report.apk_files.saturating_add(1);
-            } else {
-                report.warnings.push(format!(
-                    "raw_apk_retention=partial: installed APK {name} ({bytes} bytes) exceeds {MAX_APK_BYTES}-byte raw copy bound; original not retained; complete-byte fingerprint and bounded DEX/native extraction continue"
-                ));
-            }
-            if let Some(parent) = apk.parent() {
-                if !install_dirs.iter().any(|existing| existing == parent) {
-                    install_dirs.push(parent.to_path_buf());
-                }
-            }
-            let extracted = ksight_core::extract_apk_dex(apk, &dest.join("apk-dex"))?;
-            report.apk_dex = report.apk_dex.saturating_add(extracted.len());
-            let packed = ksight_core::extract_apk_packed_native(apk, &dest.join("apk-assets"))?;
-            report.asset_files = report.asset_files.saturating_add(packed.len());
-        }
-        for dir in &install_dirs {
-            report.native_libs = report.native_libs.saturating_add(copy_tree(
-                &dir.join("lib"),
-                &dest.join("lib"),
-                MAX_TREE_FILE_BYTES,
-            )?);
-            report.oat_files = report.oat_files.saturating_add(copy_tree(
-                &dir.join("oat"),
-                &dest.join("oat"),
-                MAX_TREE_FILE_BYTES,
-            )?);
-        }
-        // After the install tree so split-APK `lib/<abi>` fills gaps instead of
-        // duplicating `arm64-v8a/` next to the extracted `arm64/` ISA dir.
-        for apk in &apk_paths {
-            let from_apk = ksight_core::extract_apk_native_libs(apk, &dest.join("lib"))?;
-            report.native_libs = report.native_libs.saturating_add(from_apk.len());
-        }
-        report.native_libs = report
-            .native_libs
-            .saturating_add(copy_data_code_cache(package, &dest.join("data-cache"))?);
-    }
 
     let runtime = dest.join("runtime");
     let _ = std::fs::remove_dir_all(runtime.join("packer-keys"));
@@ -1079,11 +1024,95 @@ pub fn dump_package_with(
             );
         }
     }
+    // Current-instance evidence is acquired before optional installed/static payloads.
+    let static_referenced = options.parent_owned && options.code_only && !runtime_only;
+    if !runtime_only {
+        let static_scope = ksight_core::output_budget::StaticScope::install(
+            dest.to_owned(),
+            256 * 1024 * 1024,
+            8 * 1024 * 1024,
+        )?;
+        let static_result = (|| -> Result<()> {
+            if static_referenced {
+                report.apk_files = reference_static_apks(package, &apk_paths, dest)?;
+                report.warnings.push("Static DEX/SO members referenced, not bulk-extracted; runtime payload budget preserved; references are not memory recovery".into());
+            }
+            if !runtime_only && !static_referenced {
+                let apk_dir = dest.join("apk");
+                std::fs::create_dir_all(&apk_dir)?;
+                let mut install_dirs = Vec::<PathBuf>::new();
+                for apk in &apk_paths {
+                    let name = apk
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("base.apk");
+                    let bytes = std::fs::metadata(apk)?.len();
+                    if bytes <= MAX_APK_BYTES {
+                        copy_capped_path(apk, &apk_dir.join(name), MAX_APK_BYTES)?;
+                        report.apk_files = report.apk_files.saturating_add(1);
+                    } else {
+                        report.warnings.push(format!(
+                    "raw_apk_retention=partial: installed APK {name} ({bytes} bytes) exceeds {MAX_APK_BYTES}-byte raw copy bound; original not retained; complete-byte fingerprint and bounded DEX/native extraction continue"
+                ));
+                    }
+                    if let Some(parent) = apk.parent() {
+                        if !install_dirs.iter().any(|existing| existing == parent) {
+                            install_dirs.push(parent.to_path_buf());
+                        }
+                    }
+                    let extracted = ksight_core::extract_apk_dex(apk, &dest.join("apk-dex"))?;
+                    report.apk_dex = report.apk_dex.saturating_add(extracted.len());
+                    let packed =
+                        ksight_core::extract_apk_packed_native(apk, &dest.join("apk-assets"))?;
+                    report.asset_files = report.asset_files.saturating_add(packed.len());
+                }
+                // Installed paths retain source priority and each directory is scanned once.
+                for dir in &install_dirs {
+                    report.native_libs = report.native_libs.saturating_add(copy_tree(
+                        &dir.join("lib"),
+                        &dest.join("lib"),
+                        MAX_TREE_FILE_BYTES,
+                    )?);
+                    report.oat_files = report.oat_files.saturating_add(copy_tree(
+                        &dir.join("oat"),
+                        &dest.join("oat"),
+                        MAX_TREE_FILE_BYTES,
+                    )?);
+                }
+                // APK members fill gaps; identical installed targets become content objects
+                // without another payload write. Different content is rejected, never replaced.
+                for apk in &apk_paths {
+                    let from_apk = ksight_core::extract_apk_native_libs(apk, &dest.join("lib"))?;
+                    report.native_libs = report.native_libs.saturating_add(from_apk.len());
+                }
+                report.native_libs = report
+                    .native_libs
+                    .saturating_add(copy_data_code_cache(package, &dest.join("data-cache"))?);
+            }
+
+            Ok(())
+        })();
+        drop(static_scope);
+        if let Err(error) = static_result {
+            if error.to_string().contains("static_output_budget_exhausted") {
+                report.warnings.push("static_retention=partial: bounded static allowance exhausted after runtime acquisition; omitted payloads are not retained".into());
+                report.warnings.push(format!(
+                    "static_omissions: static batch interrupted; coverage unknown for APK raw/DEX/assets/native and install lib/oat/data-cache; source APKs={:?}; listed_sources_bounded={}",
+                    apk_paths.iter().take(32).map(|p| p.to_string_lossy()).collect::<Vec<_>>(),
+                    apk_paths.len() > 32,
+                ));
+                ksight_core::output_budget::record_failure(dest, "static_output_budget_exhausted");
+            } else {
+                return Err(error);
+            }
+        }
+    }
     deduplicate_code_evidence(dest)?;
     if runtime_only {
         prune_install_trees(dest);
     }
-    finalize_catalog(&mut report, dest)?;
+    finalize_with_reserved_report(&mut report, dest)?;
+    // Optional human-readable indexes cannot consume the final report's reserved capacity.
     write_evidence_index(dest, &report);
     if !report.observation_env.denylist_detail.is_empty() {
         report
@@ -1284,7 +1313,11 @@ fn finalize_catalog(report: &mut PackageDumpReport, dest: &Path) -> Result<()> {
     if report.created_unix_ms == 0 {
         report.created_unix_ms = unix_ms();
     }
-    report.warnings = default_dump_warnings();
+    for warning in default_dump_warnings() {
+        if !report.warnings.contains(&warning) {
+            report.warnings.push(warning);
+        }
+    }
     for name in ["truncated-dex.json", "dexdata-live.json"] {
         if let Ok(text) = std::fs::read_to_string(dest.join("runtime").join(name)) {
             if let Ok(notes) = serde_json::from_str::<Vec<String>>(&text) {
@@ -1311,8 +1344,45 @@ fn finalize_catalog(report: &mut PackageDumpReport, dest: &Path) -> Result<()> {
     write_dump_howto(dest, &report.package);
     let report_path = dest.join("dump-report.json");
     let body = serde_json::to_vec_pretty(&report)?;
-    // A closed budget refuses the catalog write. Do not fall back to an unbudgeted write.
+    if body.len() > 8 * 1024 * 1024 {
+        write_partial_report(
+            report,
+            dest,
+            "catalog report exceeds 8MiB bound; raw evidence retained; detailed catalog omitted",
+        )?;
+        bail!("catalog report exceeds reserved report bound");
+    }
+    // A closed parent quota or deadline still refuses the report; never bypass it.
     ksight_core::output_budget::write(&report_path, &body)?;
+    Ok(())
+}
+
+fn finalize_with_reserved_report(report: &mut PackageDumpReport, dest: &Path) -> Result<()> {
+    let catalog_scope =
+        ksight_core::output_budget::StaticScope::install_catalog(dest.to_owned(), 8 * 1024 * 1024)?;
+    let catalog_result = finalize_catalog(report, dest);
+    drop(catalog_scope);
+    if let Err(error) = catalog_result {
+        if !dest.join("dump-report.json").exists() {
+            write_partial_report(report, dest, &format!("catalog incomplete: {error}"))?;
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn write_partial_report(report: &PackageDumpReport, dest: &Path, reason: &str) -> Result<()> {
+    ksight_core::output_budget::record_failure(dest, "catalog_incomplete");
+    let body = serde_json::to_vec(&serde_json::json!({
+        "schema_version": PACKAGE_DUMP_SCHEMA, "package": report.package,
+        "dump_id": report.dump_id, "agent_version": report.agent_version,
+        "collection_status": "partial", "artifacts": [],
+        "catalog_status": "incomplete", "retained_artifact_count": report.artifacts.len(),
+        "raw_evidence_preserved": true,
+        "warnings": [reason, "Detailed catalog omitted; retained files are not discarded or represented as complete coverage"],
+        "static_omissions": report.warnings.iter().filter(|w| w.starts_with("static_") || w.starts_with("raw_apk_")).take(32).collect::<Vec<_>>()
+    }))?;
+    ksight_core::output_budget::write(dest.join("dump-report.json"), body)?;
     Ok(())
 }
 
@@ -4384,5 +4454,59 @@ mod anchored_control_regressions {
         assert_eq!(status.collection_status.as_deref(), Some("partial"));
         assert_eq!(status.stop_reason.as_deref(), Some("parent_cancelled"));
         assert!(guard.receipt().partial);
+    }
+}
+
+#[cfg(test)]
+mod catalog_reserve_tests {
+    use super::*;
+    fn fixture() -> (PathBuf, PackageDumpReport) {
+        let root = std::env::temp_dir().join(format!("ksight-catalog-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("runtime")).unwrap();
+        std::fs::write(root.join("runtime/retained.bin"), b"retained raw").unwrap();
+        let report = PackageDumpReport {
+            package: "com.example.fixture".into(),
+            dump_id: uuid::Uuid::new_v4().to_string(),
+            warnings: vec!["static_retention=partial: fixture interruption".into()],
+            ..PackageDumpReport::default()
+        };
+        (root, report)
+    }
+    #[test]
+    fn full_catalog_and_report_keep_static_partial_warning_within_eight_mib_reserve() {
+        let (root, mut report) = fixture();
+        let guard = ksight_core::output_budget::Guard::install(
+            vec![root.clone()],
+            8 * 1024 * 1024 + 65536,
+            30000,
+        )
+        .unwrap();
+        finalize_with_reserved_report(&mut report, &root).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("dump-report.json")).unwrap()).unwrap();
+        assert!(value["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str().unwrap().starts_with("static_retention=partial")));
+        assert!(root.join("runtime/retained.bin").exists());
+        assert!(guard.receipt().admitted_write_bytes <= guard.receipt().limit_bytes);
+        drop(guard);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn sidecar_allowance_exhaustion_still_writes_truthful_partial_report() {
+        let (root, mut report) = fixture();
+        let guard =
+            ksight_core::output_budget::Guard::install(vec![root.clone()], 8192, 30000).unwrap();
+        assert!(finalize_with_reserved_report(&mut report, &root).is_err());
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("dump-report.json")).unwrap()).unwrap();
+        assert_eq!(value["collection_status"], "partial");
+        assert_eq!(value["catalog_status"], "incomplete");
+        assert!(root.join("runtime/retained.bin").exists());
+        assert!(guard.receipt().admitted_write_bytes <= 8192);
+        drop(guard);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

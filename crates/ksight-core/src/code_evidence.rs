@@ -151,6 +151,14 @@ pub(crate) fn retain(
     let object_relative = format!("code-objects/{digest}.bin");
     let object = root.join(&object_relative);
     let reused = object.exists();
+    // Reuse an already retained, byte-verified target before admitting payload again.
+    if !object.exists() && target.exists() && same_file(target, bytes)? {
+        match fs::hard_link(target, &object) {
+            Ok(()) => (),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (),
+            Err(error) => return Err(error),
+        }
+    }
     exclusive(&object, bytes)?;
     let result = if target.exists() {
         if same_file(target, bytes)? {
@@ -196,6 +204,36 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+    #[test]
+    fn existing_identical_target_becomes_object_without_payload_charge() {
+        let f = Fixture::new();
+        let target = f.0.join("lib/fixture.so");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, b"abc").unwrap();
+        let guard = crate::output_budget::Guard::install(vec![f.0.clone()], 10000, 30000).unwrap();
+        retain(
+            &f.0,
+            &target,
+            b"abc",
+            &json!({"kind":"installed"}),
+            &hash(b"abc"),
+            "identity",
+        )
+        .unwrap();
+        let object = f.0.join(format!("code-objects/{}.bin", hash(b"abc")));
+        assert_eq!(fs::read(object).unwrap(), b"abc");
+        assert!(guard.receipt().admitted_write_bytes < 1000);
+        assert!(retain(
+            &f.0,
+            &target,
+            b"different",
+            &json!({}),
+            &hash(b"different"),
+            "identity"
+        )
+        .is_err());
+        assert_eq!(fs::read(target).unwrap(), b"abc");
     }
     #[test]
     fn apk_hash_includes_the_byte_beyond_old_512mib_limit() {

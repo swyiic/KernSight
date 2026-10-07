@@ -124,27 +124,259 @@ pub(super) fn copy_capped_path(src: &Path, dest: &Path, cap: u64) -> Result<()> 
     if meta.len() > cap {
         return Ok(());
     }
+    if reuse_static_object(src, dest, cap)? {
+        return Ok(());
+    }
+    if dest.exists() {
+        if files_equal(src, dest)? {
+            return Ok(());
+        }
+        anyhow::bail!("static target content conflict");
+    }
+    let temporary = dest.with_extension(format!("pending-{}", uuid::Uuid::new_v4()));
+    let result = (|| -> Result<()> {
+        let mut input = File::open(src)?;
+        let before = input.metadata()?;
+        let mut output = ksight_core::output_budget::BudgetFile::create(&temporary)?;
+        let mut buffer = [0_u8; 8192];
+        let mut total = 0_u64;
+        loop {
+            let read = input.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            total = total.saturating_add(read as u64);
+            if total > cap || total > before.len() {
+                anyhow::bail!("static source changed or exceeds bound");
+            }
+            output.write_all(&buffer[..read])?;
+        }
+        let after = input.metadata()?;
+        if total != before.len() || !same_identity(&before, &after) {
+            anyhow::bail!("static source changed");
+        }
+        output.sync_all()?;
+        if !files_equal(src, &temporary)? {
+            anyhow::bail!("static completed copy mismatch");
+        }
+        // Atomic publication never overwrites existing evidence.
+        std::fs::hard_link(&temporary, dest)?;
+        if !files_equal(&temporary, dest)? {
+            anyhow::bail!("static published copy mismatch");
+        }
+        Ok(())
+    })();
+    // Only this invocation's own temporary file is removed.
+    let _ = std::fs::remove_file(&temporary);
+    result
+}
+
+fn same_identity(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
+    let same = before.len() == after.len() && before.modified().ok() == after.modified().ok();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        same && before.dev() == after.dev()
+            && before.ino() == after.ino()
+            && before.ctime() == after.ctime()
+            && before.ctime_nsec() == after.ctime_nsec()
+    }
+    #[cfg(not(unix))]
+    {
+        same
+    }
+}
+
+fn files_equal(first: &Path, second: &Path) -> Result<bool> {
+    let check_first = first;
+    let check_second = second;
+    let mut first = File::open(first)?;
+    let mut second = File::open(second)?;
+    let first_before = first.metadata()?;
+    let second_before = second.metadata()?;
+    if first_before.len() != second_before.len() {
+        return Ok(false);
+    }
+    let mut first_block = [0_u8; 8192];
+    let mut second_block = [0_u8; 8192];
+    let mut total = 0_u64;
+    loop {
+        if ksight_core::output_budget::should_stop(check_first)
+            || ksight_core::output_budget::should_stop(check_second)
+        {
+            anyhow::bail!("static comparison budget interrupted");
+        }
+        let read = first.read(&mut first_block)?;
+        if read == 0 {
+            return Ok(second.read(&mut second_block)? == 0
+                && total == first_before.len()
+                && same_identity(&first_before, &first.metadata()?)
+                && same_identity(&second_before, &second.metadata()?));
+        }
+        total = total.saturating_add(read as u64);
+        if total > first_before.len() {
+            return Ok(false);
+        }
+        second.read_exact(&mut second_block[..read])?;
+        if first_block[..read] != second_block[..read] {
+            return Ok(false);
+        }
+    }
+}
+
+// Reuse only complete, byte-verified content; never truncate an existing hard link.
+fn reuse_static_object(src: &Path, dest: &Path, cap: u64) -> Result<bool> {
+    use sha2::{Digest, Sha256};
+    let Some(root) = dest.ancestors().find(|p| p.join("code-objects").is_dir()) else {
+        return Ok(false);
+    };
     let mut input = File::open(src)?;
-    let mut output = ksight_core::output_budget::BudgetFile::create(dest)?;
+    let before = input.metadata()?;
+    if !before.is_file() || before.len() > cap {
+        return Ok(false);
+    }
+    let mut hash = Sha256::new();
     let mut buffer = [0_u8; 8192];
     let mut total = 0_u64;
     loop {
-        let read = input.read(&mut buffer)?;
+        if ksight_core::output_budget::should_stop(dest) {
+            anyhow::bail!("static source budget interrupted");
+        }
+        let n = input.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        total = total.saturating_add(n as u64);
+        if total > before.len() || total > cap {
+            anyhow::bail!("static source changed");
+        }
+        hash.update(&buffer[..n]);
+    }
+    let after = input.metadata()?;
+    if total != before.len() || !same_identity(&before, &after) {
+        anyhow::bail!("static source changed");
+    }
+    let object = root
+        .join("code-objects")
+        .join(format!("{:x}.bin", hash.finalize()));
+    if !object.is_file() {
+        return Ok(false);
+    }
+    // Do not trust an object name alone.
+    if !files_equal(src, &object)? {
+        anyhow::bail!("static content object conflict");
+    }
+    ksight_core::output_budget::charge(dest, 0)?;
+    if dest.exists() {
+        if !files_equal(dest, &object)? {
+            anyhow::bail!("static target content conflict");
+        }
+    } else {
+        std::fs::hard_link(&object, dest)?;
+    }
+    if !files_equal(src, dest)? || !files_equal(&object, dest)? {
+        anyhow::bail!("static object changed during publication");
+    }
+    // Verify the published bytes against the content-addressed name, not merely equality.
+    let mut published = File::open(dest)?;
+    let before = published.metadata()?;
+    let mut published_hash = Sha256::new();
+    let mut published_bytes = 0_u64;
+    loop {
+        if ksight_core::output_budget::should_stop(dest) {
+            anyhow::bail!("static published digest budget interrupted");
+        }
+        let read = published.read(&mut buffer)?;
         if read == 0 {
             break;
         }
-        if total.saturating_add(u64::try_from(read).unwrap_or(0)) > cap {
-            break;
+        published_bytes = published_bytes.saturating_add(read as u64);
+        if published_bytes > before.len() || published_bytes > cap {
+            anyhow::bail!("static published file changed or exceeds bound");
         }
-        output.write_all(&buffer[..read])?;
-        total = total.saturating_add(u64::try_from(read).unwrap_or(0));
+        published_hash.update(&buffer[..read]);
     }
-    Ok(())
+    let expected = object.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    if published_bytes != before.len()
+        || format!("{:x}", published_hash.finalize()) != expected
+        || !same_identity(&before, &published.metadata()?)
+    {
+        anyhow::bail!("static published digest mismatch");
+    }
+    Ok(true)
 }
 
 #[cfg(test)]
 mod installed_apk_bound_tests {
     use super::*;
+    #[test]
+    fn static_comparison_obeys_parent_cancellation() {
+        let root = std::env::temp_dir().join(format!("ksight-compare-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let first = root.join("first");
+        let second = root.join("second");
+        std::fs::write(&first, b"abc").unwrap();
+        std::fs::write(&second, b"abc").unwrap();
+        let guard =
+            ksight_core::output_budget::Guard::install(vec![root.clone()], 1024, 30000).unwrap();
+        ksight_core::output_budget::interrupt(&root, "parent_cancelled");
+        assert!(files_equal(&first, &second)
+            .unwrap_err()
+            .to_string()
+            .contains("interrupted"));
+        assert_eq!(guard.receipt().admitted_write_bytes, 0);
+        drop(guard);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn static_quota_interruption_never_publishes_a_prefix() {
+        let root = std::env::temp_dir().join(format!("ksight-atomic-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.so");
+        std::fs::write(&source, vec![1_u8; 16384]).unwrap();
+        let dest = root.join("lib/fixture.so");
+        let guard =
+            ksight_core::output_budget::Guard::install(vec![root.clone()], 32768, 30000).unwrap();
+        let child =
+            ksight_core::output_budget::StaticScope::install(root.clone(), 8192, 0).unwrap();
+        assert!(copy_capped_path(&source, &dest, 32768)
+            .unwrap_err()
+            .to_string()
+            .contains("static_output_budget_exhausted"));
+        assert!(!dest.exists());
+        assert_eq!(
+            std::fs::read_dir(dest.parent().unwrap()).unwrap().count(),
+            0
+        );
+        assert_eq!(guard.receipt().admitted_write_bytes, 8192);
+        drop(child);
+        ksight_core::output_budget::write(root.join("dump-report.json"), b"partial").unwrap();
+        drop(guard);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn installed_so_reuses_verified_object_without_payload_charge() {
+        let root = std::env::temp_dir().join(format!("ksight-reuse-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("code-objects")).unwrap();
+        let source = root.join("source.so");
+        std::fs::write(&source, b"abc").unwrap();
+        let object = root.join(
+            "code-objects/ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad.bin",
+        );
+        std::fs::write(&object, b"abc").unwrap();
+        let dest = root.join("lib/fixture.so");
+        let guard =
+            ksight_core::output_budget::Guard::install(vec![root.clone()], 1024, 30000).unwrap();
+        copy_capped_path(&source, &dest, 128 * 1024 * 1024).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"abc");
+        assert_eq!(guard.receipt().admitted_write_bytes, 0);
+        std::fs::write(&source, b"xyz").unwrap();
+        // A conflicting existing evidence target is never overwritten.
+        assert!(copy_capped_path(&source, &dest, 1024).is_err());
+        assert_eq!(std::fs::read(&dest).unwrap(), b"abc");
+        drop(guard);
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn observed_large_apk_raw_copy_is_skipped_without_failing_or_spending_budget() {
         let root = std::env::temp_dir().join(format!("ksight-raw-apk-{}", uuid::Uuid::new_v4()));
