@@ -1,6 +1,8 @@
 //! Foreground multi-sensor capture orchestration.
 
 mod auxiliary;
+#[cfg(any(target_os = "android", target_os = "linux"))]
+pub(crate) mod qualification;
 pub use auxiliary::{AuxiliaryAction, AuxiliaryCapturePlan, AuxiliaryStage};
 
 use std::path::PathBuf;
@@ -866,15 +868,41 @@ fn stream_events(
                 if Instant::now() >= next_qualification {
                     let package = request.package.as_deref().unwrap();
                     if let Some(existing) = qualified_source.clone() {
-                        match backend.qualify(package, existing.pid, false) {
-                            Ok(target) if target.identity == existing => {
-                                inspect.refresh_qualified(vec![target.qualified])?;
-                                next_qualification = Instant::now() + Duration::from_secs(2);
+                        let refreshed = qualification::refresh(
+                            &existing,
+                            || {
+                                let target = backend.qualify(package, existing.pid, false)?;
+                                Ok((target.identity, target.qualified))
+                            },
+                            |target| inspect.refresh_qualified(vec![target]),
+                        );
+                        if let Err(failure) = refreshed {
+                            eprintln!(
+                                "{}",
+                                serde_json::json!({
+                                    "schema": "kernsight.qualified-source-failure/v1",
+                                    "failure": failure,
+                                })
+                            );
+                            if let Some(relation) = &request.storage.capture_relation {
+                                let root = crate::capture_lifecycle::control_root(
+                                    &crate::runtime_paths::captures(),
+                                    relation,
+                                );
+                                if let Err(error) =
+                                    crate::capture_lifecycle::retain_qualification_failure(
+                                        &root, relation, &failure,
+                                    )
+                                {
+                                    // Diagnostic storage must not hide the original refusal.
+                                    eprintln!(
+                                        "qualification failure receipt not retained: {error:#}"
+                                    );
+                                }
                             }
-                            _ => {
-                                bail!("qualified capture task exited; no numeric replacement");
-                            }
+                            return Err(failure.into());
                         }
+                        next_qualification = Instant::now() + Duration::from_secs(2);
                     } else if let Some(pid) = backend.main_pid(package)? {
                         let target = backend.qualify(package, pid, false)?;
                         qualified_source = Some(target.identity.clone());

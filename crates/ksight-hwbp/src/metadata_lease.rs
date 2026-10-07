@@ -126,3 +126,44 @@ pub(crate) fn guarded_bind(
     check()?;
     Ok(())
 }
+
+#[cfg(test)]
+mod retained_lease_regressions {
+    use super::{InstanceIdentity, MetadataLease, Token};
+    use std::{
+        fs::File,
+        os::fd::AsFd,
+        time::{Duration, Instant},
+    };
+
+    #[test]
+    fn clone_keeps_all_owned_resources_without_renewing_admission() {
+        let deadline = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("past instant");
+        let lease = MetadataLease::new(
+            File::open("/dev/null").expect("map stand-in").into(),
+            File::open("/dev/null").expect("program stand-in").into(),
+            File::open("/dev/null").expect("BTF stand-in").into(),
+            Token {
+                nonce: 19,
+                round: 2,
+            },
+            InstanceIdentity {
+                tgid: 7,
+                uid: 10_001,
+                birth_ns: 123,
+                exec_id: 2,
+            },
+        )
+        .with_deadline(deadline);
+        let clone = lease.try_clone().expect("clone");
+        drop(lease);
+        // Duplication here exercises ownership only, not a BPF task-storage claim.
+        assert!(clone.map.as_fd().try_clone_to_owned().is_ok());
+        assert!(clone.program.as_fd().try_clone_to_owned().is_ok());
+        assert!(clone.btf.as_fd().try_clone_to_owned().is_ok());
+        assert_eq!(clone.deadline, deadline);
+        assert!(!clone.admission_valid());
+    }
+}

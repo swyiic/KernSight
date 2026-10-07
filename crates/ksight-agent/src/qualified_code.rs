@@ -541,17 +541,23 @@ mod physical {
             if crate::retention::boot_id().as_deref() != Some(self.boot_id.as_str()) {
                 bail!("boot identity changed");
             }
-            let uid = self.uid(package)?;
+            let uid = self
+                .uid(package)
+                .context("resolve exclusive package UID for qualification")?;
             let pidfd = pidfd_open(
                 Pid::from_raw(i32::try_from(pid).context("target PID")?).context("target PID")?,
                 PidfdFlags::empty(),
-            )?;
+            )
+            .with_context(|| format!("open qualification pidfd for pid={pid}"))?;
             // Proc directory retained through qualification; mem belongs to this original task/mm, not a later numeric PID.
-            let dir = File::open(format!("/proc/{pid}"))?;
+            let dir = File::open(format!("/proc/{pid}")).with_context(|| {
+                format!("open anchored qualification proc directory for pid={pid}")
+            })?;
             let mut maps = None;
             let mut mem = None;
-            let qualified =
-                MetadataObserver::load(&self.metadata, self.object_hash, self.btf_hash)?.qualify(
+            let qualified = MetadataObserver::load(&self.metadata, self.object_hash, self.btf_hash)
+                .context("load physical metadata observer for qualification")?
+                .qualify(
                     &QualificationPolicy {
                         package: package.into(),
                         tgid: pid,
@@ -559,13 +565,17 @@ mod physical {
                     },
                     pidfd,
                     |_, identity| {
-                        let name = read_at(&dir, "cmdline", 65536)?;
+                        let name = read_at(&dir, "cmdline", 65536)
+                            .context("read anchored qualification cmdline")?;
                         if name.split(|b| *b == 0).next() != Some(package.as_bytes()) {
                             bail!(
                                 "not-supported: only explicitly enrolled main process is qualified"
                             );
                         }
-                        let status = String::from_utf8(read_at(&dir, "status", 65536)?)?;
+                        let status = String::from_utf8(
+                            read_at(&dir, "status", 65536)
+                                .context("read anchored qualification status")?,
+                        )?;
                         let observed = status
                             .lines()
                             .find(|l| l.starts_with("Uid:"))
@@ -585,7 +595,8 @@ mod physical {
                             uid,
                         })
                     },
-                )?;
+                )
+                .context("qualify physical metadata and anchored package witness")?;
             let raw = qualified.identity();
             Ok(Target {
                 identity: SourceIdentity {
@@ -943,3 +954,80 @@ mod physical {
 }
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use physical::{Backend, Target};
+
+#[cfg(test)]
+mod range_receipt_regressions {
+    use super::copy_range;
+    use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
+
+    #[test]
+    fn short_read_keeps_actual_bytes_distinct_from_requested_bytes() {
+        let mut source = Cursor::new(vec![1, 2, 3]);
+        let mut sink = Vec::new();
+        let receipt = copy_range(&mut source, &mut sink, 0, 8, || Ok(()));
+        assert_eq!(receipt.requested_length, 8);
+        assert_eq!(receipt.actual_length, 3);
+        assert_eq!(receipt.read_status, "short_read");
+        assert_eq!(receipt.write_status, "complete");
+        assert_eq!(receipt.admission, "qualified_live_copy");
+        assert_eq!(sink, [1, 2, 3]);
+        assert!(receipt.torn);
+        assert!(!receipt.paused);
+    }
+
+    struct ReadFailure {
+        source: Cursor<Vec<u8>>,
+        reads: usize,
+    }
+    impl Read for ReadFailure {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            self.reads += 1;
+            if self.reads == 1 {
+                self.source.read(&mut bytes[..3])
+            } else {
+                Err(io::Error::other("injected read failure"))
+            }
+        }
+    }
+    impl Seek for ReadFailure {
+        fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+            self.source.seek(position)
+        }
+    }
+    #[test]
+    fn read_failure_retains_only_prefix_and_never_claims_complete() {
+        let mut source = ReadFailure {
+            source: Cursor::new(vec![1; 8]),
+            reads: 0,
+        };
+        let mut sink = Vec::new();
+        let receipt = copy_range(&mut source, &mut sink, 0, 8, || Ok(()));
+        assert_eq!(receipt.actual_length, 3);
+        assert_eq!(sink.len(), 3);
+        assert_eq!(receipt.read_status, "read_failed");
+        assert_eq!(receipt.read_error.as_deref(), Some("injected read failure"));
+        assert_eq!(receipt.write_status, "complete");
+    }
+
+    struct WriteFailure;
+    impl Write for WriteFailure {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("injected write failure"))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    #[test]
+    fn read_success_does_not_hide_destination_failure() {
+        let mut source = Cursor::new(vec![1; 8]);
+        let receipt = copy_range(&mut source, &mut WriteFailure, 0, 8, || Ok(()));
+        assert_eq!(receipt.actual_length, 8);
+        assert_eq!(receipt.read_status, "complete");
+        assert_eq!(receipt.write_status, "write_failed");
+        assert_eq!(
+            receipt.write_error.as_deref(),
+            Some("injected write failure")
+        );
+    }
+}

@@ -250,3 +250,74 @@ mod live_identity {
         );
     }
 }
+
+#[cfg(test)]
+mod live_metadata_rejections {
+    use super::{accept_live_identity, live_metadata_record};
+    use crate::instance_scope::InstanceIdentity;
+
+    fn identity() -> InstanceIdentity {
+        InstanceIdentity {
+            tgid: 7,
+            uid: 10_001,
+            birth_ns: 12_345_678_901,
+            exec_id: 2,
+        }
+    }
+
+    #[test]
+    fn every_truncated_and_overlong_record_is_refused() {
+        let task = identity();
+        let record = live_metadata_record(&task, 19, 2);
+        for len in 0..48 {
+            assert!(
+                accept_live_identity(&task, 19, 2, &record[..len]).is_err(),
+                "length {len}"
+            );
+        }
+        let mut extended = record.to_vec();
+        extended.push(0);
+        assert!(accept_live_identity(&task, 19, 2, &extended).is_err());
+        extended.extend_from_slice(&record);
+        assert!(accept_live_identity(&task, 19, 2, &extended).is_err());
+    }
+
+    #[test]
+    fn framing_nonce_round_and_each_identity_field_are_checked() {
+        let task = identity();
+        let record = live_metadata_record(&task, 19, 2);
+        // First byte of ABI, length, nonce, round, TGID, UID, birth and exec.
+        for offset in [0, 4, 8, 16, 24, 28, 32, 40] {
+            let mut changed = record;
+            changed[offset] ^= 1;
+            assert!(
+                accept_live_identity(&task, 19, 2, &changed).is_err(),
+                "offset {offset}"
+            );
+        }
+        for (nonce, round) in [(0, 2), (19, 0), (20, 2), (19, 3)] {
+            assert!(accept_live_identity(&task, nonce, round, &record).is_err());
+        }
+    }
+
+    #[test]
+    fn invalid_identity_cannot_pass_even_when_anchor_matches() {
+        for task in [
+            InstanceIdentity {
+                tgid: 0,
+                ..identity()
+            },
+            InstanceIdentity {
+                birth_ns: 0,
+                ..identity()
+            },
+            InstanceIdentity {
+                exec_id: u64::MAX,
+                ..identity()
+            },
+        ] {
+            let record = live_metadata_record(&task, 19, 2);
+            assert!(accept_live_identity(&task, 19, 2, &record).is_err());
+        }
+    }
+}

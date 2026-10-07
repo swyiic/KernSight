@@ -1418,3 +1418,82 @@ fn probe(json: bool) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod auxiliary_route_guards {
+    use super::{dump_package, validate_isolated_command, Args};
+    use clap::Parser;
+
+    #[test]
+    fn isolated_dump_cannot_enable_auxiliary_or_launch_operations() {
+        for flag in [
+            "--collect-keys",
+            "--collect-private",
+            "--collect-memory-windows",
+            "--launch",
+            "--hide-debug",
+            "--denylist",
+        ] {
+            let args = Args::try_parse_from([
+                "ksightd",
+                "dump-package",
+                "--package",
+                "com.example.fixture",
+                "--dest",
+                "/tmp/ksight-never-created",
+                "--parent-session",
+                "11111111-1111-4111-8111-111111111111",
+                flag,
+            ])
+            .expect("CLI parses before validation");
+            let error =
+                validate_isolated_command(&args.command).expect_err("isolated auxiliary refused");
+            assert!(
+                error
+                    .to_string()
+                    .contains("auxiliary scans/launch not-supported"),
+                "{flag}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn parent_dump_refuses_auxiliary_before_any_device_or_filesystem_operation() {
+        let relation = ksight_agent::capture_relation::CaptureRelation::parse(
+            Some(uuid::Uuid::new_v4()),
+            Some(uuid::Uuid::new_v4()),
+            Some(uuid::Uuid::new_v4()),
+            Some(1),
+            Some("dump".into()),
+        )
+        .expect("relation")
+        .expect("present");
+        for selected in 0..5 {
+            let dest =
+                std::env::temp_dir().join(format!("ksight-route-test-{}", uuid::Uuid::new_v4()));
+            let error = dump_package(
+                "com.example.fixture",
+                &dest,
+                false,
+                true,
+                selected == 3,
+                selected == 4,
+                false,
+                false,
+                selected == 0,
+                selected == 1,
+                selected == 2,
+                None,
+                None,
+                Some(&relation),
+                None,
+            )
+            .expect_err("parent auxiliary refused");
+            assert_eq!(
+                error.to_string(),
+                "parent lifecycle cannot attest optional auxiliary cleanup"
+            );
+            assert!(!dest.exists(), "rejected route must not start work");
+        }
+    }
+}

@@ -16,6 +16,9 @@ use std::{
 use uuid::Uuid;
 const SCHEMA: &str = "kernsight.capture-lifecycle/v1";
 const MAX_RECORD: u64 = 16384;
+const MAX_FAILURE_RECORD: u64 = 4096;
+// capture-control prints one trailing newline; legacy RPC caps count it.
+const MAX_STATUS_JSON: u64 = MAX_RECORD - 1;
 
 /// Immutable identity and no-pause contract of one collection attempt.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -84,6 +87,11 @@ pub struct Status {
     pub startup: Option<serde_json::Value>,
     /// Physical qualified source identities; absent remains unknown.
     pub qualification: Option<serde_json::Value>,
+    /// Source revalidation refusal, shortened or omitted to preserve the legacy
+    /// status-size bound. The independent receipt and full stderr remain retained.
+    /// Absence is unknown, never inferred exit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qualification_failure: Option<serde_json::Value>,
 }
 fn same(a: &CaptureRelation, b: &CaptureRelation) -> bool {
     a.parent_id == b.parent_id
@@ -276,8 +284,21 @@ fn inspect_with(
     } else {
         None
     };
+    let qualification_failure = if root.join("qualification-failure.json").exists() {
+        let note: serde_json::Value = read(root, "qualification-failure.json")?;
+        let relation: CaptureRelation = serde_json::from_value(note["relation"].clone())?;
+        if note["schema"] != "kernsight.qualified-source-failure/v1"
+            || !same(&relation, r)
+            || note["token"] != o.token.to_string()
+        {
+            bail!("foreign qualification failure receipt");
+        }
+        Some(note)
+    } else {
+        None
+    };
     let exited = probe(&o).map(|alive| !alive);
-    Ok(Status {
+    let mut status = Status {
         schema: SCHEMA,
         relation: o.relation.clone(),
         token: o.token,
@@ -296,7 +317,32 @@ fn inspect_with(
         target_pause: o.target_pause,
         startup,
         qualification,
-    })
+        qualification_failure,
+    };
+    // Existing controllers bound the entire status RPC at 16 KiB, not each
+    // nested receipt. Never make an otherwise valid status unreadable merely
+    // by adding a diagnostic. The immutable on-disk receipt is unchanged.
+    while status.qualification_failure.is_some()
+        && serde_json::to_vec(&status)?.len() as u64 > MAX_STATUS_JSON
+    {
+        if !shorten_failure_cause(status.qualification_failure.as_mut().unwrap()) {
+            status.qualification_failure = None;
+        }
+    }
+    Ok(status)
+}
+fn shorten_failure_cause(note: &mut serde_json::Value) -> bool {
+    let cause = note["failure"]["cause"].as_str().unwrap_or_default();
+    if cause.is_empty() {
+        return false;
+    }
+    let mut end = cause.len() / 2;
+    while !cause.is_char_boundary(end) {
+        end -= 1;
+    }
+    note["failure"]["cause"] = serde_json::json!(&cause[..end]);
+    note["cause_truncated"] = serde_json::json!(true);
+    true
 }
 /// Preserve physical source evidence only; the controller cannot mint a qualification by passing raw tuples.
 ///
@@ -317,6 +363,31 @@ pub fn retain_qualification(
         &serde_json::json!({"schema":"kernsight.qualified-source/v1","relation":r,"token":o.token,"sources":sources,"source":"MetadataObserver physical pidfd lease","l0_scope":"legacy numeric UID metadata; not a qualified payload proof"}),
     )
 }
+/// Retain the actual refusal separately from producer exit and source receipts.
+#[cfg(any(target_os = "android", target_os = "linux"))]
+pub(crate) fn retain_qualification_failure(
+    root: &Path,
+    r: &CaptureRelation,
+    failure: &crate::capture::qualification::Failure,
+) -> Result<()> {
+    let o = owner(root, r)?;
+    let mut note = serde_json::json!({
+        "schema": "kernsight.qualified-source-failure/v1",
+        "relation": r,
+        "token": o.token,
+        "failure": failure,
+        "cause_truncated": false,
+    });
+    // A verifier can return a large error log. Keep a bounded durable prefix;
+    // stderr still receives the full error. Never silently discard the receipt.
+    while serde_json::to_vec(&note)?.len() as u64 > MAX_FAILURE_RECORD {
+        if !shorten_failure_cause(&mut note) {
+            bail!("qualification failure identity exceeds lifecycle record bound");
+        }
+    }
+    retain(root, "qualification-failure.json", &note)
+}
+
 /// Scope around a no-pause producer. Finish only after the producer returns and drops resources.
 pub struct Lease {
     root: PathBuf,
@@ -968,4 +1039,266 @@ fn script_command(
     let mut command = std::process::Command::new(shell);
     command.arg(script);
     command
+}
+
+#[cfg(all(test, any(target_os = "android", target_os = "linux")))]
+mod qualification_failure_tests {
+    use super::*;
+    use crate::{capture::qualification, qualified_code::SourceIdentity};
+
+    struct Fixture {
+        root: PathBuf,
+        relation: CaptureRelation,
+        token: Uuid,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!("ksight-failure-{}", Uuid::new_v4()));
+            fs::create_dir(&root).expect("test root");
+            let relation = CaptureRelation::parse(
+                Some(Uuid::new_v4()),
+                Some(Uuid::new_v4()),
+                Some(Uuid::new_v4()),
+                Some(1),
+                Some("l1".into()),
+            )
+            .expect("relation")
+            .expect("present");
+            let token = Uuid::new_v4();
+            retain(
+                &root,
+                "owner.json",
+                &Owner {
+                    schema: SCHEMA.into(),
+                    relation: relation.clone(),
+                    token,
+                    pid: std::process::id(),
+                    process_start_ticks: None,
+                    boot_id: Some("test-boot".into()),
+                    max_ms: 90_000,
+                    target_pause: "forbidden".into(),
+                },
+            )
+            .expect("owner");
+            Self {
+                root,
+                relation,
+                token,
+            }
+        }
+        fn failure(cause: &str) -> Box<qualification::Failure> {
+            let source = SourceIdentity {
+                package: "com.example.app".into(),
+                pid: 5249,
+                uid: 10_123,
+                birth_ns: 526_537_675_433_199,
+                exec_id: 4,
+                boot_id: "test-boot".into(),
+            };
+            qualification::refresh::<()>(
+                &source,
+                || anyhow::bail!("{cause}"),
+                |()| panic!("install"),
+            )
+            .expect_err("fixture refusal")
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn legacy_absence_stays_unknown() {
+        let fixture = Fixture::new();
+        let status =
+            inspect_with(&fixture.root, &fixture.relation, |_| Some(true)).expect("status");
+        assert!(status.qualification_failure.is_none());
+        assert_eq!(status.agent_exited_confirmed, Some(false));
+        assert!(!status.collection_returned);
+    }
+
+    #[test]
+    fn refusal_receipt_is_retained_separately_from_producer_exit() {
+        let fixture = Fixture::new();
+        let failure = Fixture::failure("metadata iterator observation empty");
+        retain_qualification_failure(&fixture.root, &fixture.relation, &failure).expect("receipt");
+        retain(
+            &fixture.root,
+            "returned.json",
+            &Returned {
+                token: fixture.token,
+                result: "partial".into(),
+                stop_reason: None,
+                cleanup: "producer_scope_returned".into(),
+            },
+        )
+        .expect("producer return");
+        let status =
+            inspect_with(&fixture.root, &fixture.relation, |_| Some(true)).expect("status");
+        assert!(status.collection_returned);
+        assert_eq!(status.collection_status.as_deref(), Some("partial"));
+        assert_eq!(status.agent_exited_confirmed, Some(false));
+        assert!(!status.stop_acknowledged);
+        assert_eq!(status.target_pause, "forbidden");
+        let note = status
+            .qualification_failure
+            .expect("receipt available through status");
+        assert_eq!(note["failure"]["kind"], "requalification_failed");
+        assert_eq!(note["failure"]["expected"]["pid"], 5249);
+        assert!(note["failure"]["target_exit_confirmed"].is_null());
+        assert_eq!(note["cause_truncated"], false);
+    }
+
+    #[test]
+    fn foreign_failure_token_or_ancestry_is_refused() {
+        for field in ["token", "relation"] {
+            let fixture = Fixture::new();
+            retain_qualification_failure(
+                &fixture.root,
+                &fixture.relation,
+                &Fixture::failure("test"),
+            )
+            .expect("receipt");
+            let path = fixture.root.join("qualification-failure.json");
+            let mut note: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).expect("read")).expect("JSON");
+            if field == "token" {
+                note["token"] = serde_json::json!(Uuid::new_v4());
+            } else {
+                note["relation"]["attempt_id"] = serde_json::json!(Uuid::new_v4());
+            }
+            fs::write(path, serde_json::to_vec(&note).expect("JSON")).expect("fixture change");
+            let error = inspect_with(&fixture.root, &fixture.relation, |_| Some(true))
+                .expect_err("foreign receipt");
+            assert!(error
+                .to_string()
+                .contains("foreign qualification failure receipt"));
+        }
+    }
+
+    #[test]
+    fn large_unicode_verifier_error_has_a_marked_bounded_receipt() {
+        let fixture = Fixture::new();
+        let cause = "metadata verifier error: \n内核".repeat(10_000);
+        retain_qualification_failure(&fixture.root, &fixture.relation, &Fixture::failure(&cause))
+            .expect("large diagnostic retained");
+        let path = fixture.root.join("qualification-failure.json");
+        assert!(fs::metadata(path).expect("metadata").len() <= MAX_FAILURE_RECORD);
+        let status = inspect_with(&fixture.root, &fixture.relation, |_| None).expect("status");
+        let note = status.qualification_failure.expect("receipt");
+        assert_eq!(note["cause_truncated"], true);
+        let retained = note["failure"]["cause"].as_str().expect("retained cause");
+        assert_ne!(retained, "");
+        assert!(cause.starts_with(retained));
+        assert!(note["failure"]["target_exit_confirmed"].is_null());
+    }
+
+    fn startup_padding(fixture: &Fixture, bytes: usize) {
+        let note = serde_json::json!({
+            "schema": "kernsight.startup/v1", "relation": fixture.relation,
+            "token": fixture.token, "padding": "x".repeat(bytes),
+        });
+        fs::write(
+            fixture.root.join("startup.json"),
+            serde_json::to_vec(&note).expect("JSON"),
+        )
+        .expect("fixture startup");
+    }
+
+    #[test]
+    fn added_failure_cannot_exceed_legacy_aggregate_status_rpc_limit() {
+        let fixture = Fixture::new();
+        startup_padding(&fixture, 14_000);
+        let before =
+            inspect_with(&fixture.root, &fixture.relation, |_| Some(true)).expect("legacy status");
+        assert!(serde_json::to_vec(&before).expect("JSON").len() as u64 <= MAX_RECORD);
+        retain_qualification_failure(
+            &fixture.root,
+            &fixture.relation,
+            &Fixture::failure(&"failure ".repeat(1500)),
+        )
+        .expect("receipt");
+        let saved =
+            fs::read(fixture.root.join("qualification-failure.json")).expect("receipt bytes");
+        let after =
+            inspect_with(&fixture.root, &fixture.relation, |_| Some(true)).expect("new status");
+        assert!(
+            format!("{}\n", serde_json::to_string(&after).expect("JSON")).len() as u64
+                <= MAX_RECORD
+        );
+        assert!(after.qualification_failure.is_some());
+        assert_eq!(
+            after.qualification_failure.unwrap()["cause_truncated"],
+            true
+        );
+        assert_eq!(
+            saved,
+            fs::read(fixture.root.join("qualification-failure.json")).expect("immutable receipt")
+        );
+    }
+
+    #[test]
+    fn full_legacy_status_omits_only_optional_diagnostic_without_erasing_receipt() {
+        let fixture = Fixture::new();
+        startup_padding(&fixture, 0);
+        let before =
+            inspect_with(&fixture.root, &fixture.relation, |_| Some(true)).expect("legacy status");
+        let overhead = serde_json::to_vec(&before).expect("JSON").len();
+        startup_padding(
+            &fixture,
+            usize::try_from(MAX_RECORD).expect("bound") - overhead - 1,
+        );
+        retain_qualification_failure(
+            &fixture.root,
+            &fixture.relation,
+            &Fixture::failure("denied"),
+        )
+        .expect("receipt");
+        let after =
+            inspect_with(&fixture.root, &fixture.relation, |_| Some(true)).expect("new status");
+        assert!(
+            format!("{}\n", serde_json::to_string(&after).expect("JSON")).len() as u64
+                <= MAX_RECORD
+        );
+        assert!(after.qualification_failure.is_none());
+        assert!(serde_json::to_value(&after)
+            .expect("JSON")
+            .get("qualification_failure")
+            .is_none());
+        assert!(fixture.root.join("qualification-failure.json").exists());
+        assert_eq!(after.agent_exited_confirmed, Some(false));
+    }
+
+    #[test]
+    fn exact_json_boundary_reserves_the_control_cli_trailing_newline() {
+        let fixture = Fixture::new();
+        startup_padding(&fixture, 0);
+        retain_qualification_failure(
+            &fixture.root,
+            &fixture.relation,
+            &Fixture::failure(&"cause".repeat(256)),
+        )
+        .expect("receipt");
+        let before =
+            inspect_with(&fixture.root, &fixture.relation, |_| Some(true)).expect("small status");
+        let overhead = serde_json::to_vec(&before).expect("JSON").len();
+        // Without the newline reservation the JSON would be exactly 16 KiB,
+        // but the actual CLI response would be one byte over the receiver cap.
+        startup_padding(
+            &fixture,
+            usize::try_from(MAX_RECORD).expect("bound") - overhead,
+        );
+        let after =
+            inspect_with(&fixture.root, &fixture.relation, |_| Some(true)).expect("bounded status");
+        assert!(
+            format!("{}\n", serde_json::to_string(&after).expect("JSON")).len() as u64
+                <= MAX_RECORD
+        );
+        assert_eq!(
+            after.qualification_failure.expect("shortened receipt")["cause_truncated"],
+            true
+        );
+    }
 }

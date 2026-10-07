@@ -2680,10 +2680,21 @@ fn observe_anchored_read(
     deadline: Instant,
     cancelled: &std::sync::atomic::AtomicBool,
 ) -> Result<()> {
+    observe_read_control(dest, deadline, cancelled)?;
+    bound.recheck_task_mark()
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn observe_read_control(
+    dest: &Path,
+    deadline: Instant,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<()> {
     use std::sync::atomic::Ordering;
     if cancelled.load(Ordering::SeqCst) {
         bail!("cancelled");
     }
+    let budget_stopped = ksight_core::output_budget::should_stop(dest);
     if let Some(reason) = ksight_core::output_budget::stop_reason(dest) {
         if reason.contains("cancel") {
             bail!("cancelled");
@@ -2696,10 +2707,10 @@ fn observe_anchored_read(
     if Instant::now() >= deadline {
         bail!("deadline_reached");
     }
-    if ksight_core::output_budget::should_stop(dest) {
+    if budget_stopped {
         bail!("budget_exhausted");
     }
-    bound.recheck_task_mark()
+    Ok(())
 }
 
 fn store_anchored_note(dest: &Path, note: &serde_json::Value) -> bool {
@@ -4209,5 +4220,162 @@ mod anchored_read_stops {
         let reason = receipt.read_error.expect("exec reason");
         assert!(reason.contains("anchored exec_id changed"), "{reason}");
         assert_ne!(receipt.admission, "qualified_live_copy");
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+mod anchored_control_regressions {
+    use super::{observe_read_control, read_anchored_window, trusted_anchored};
+    use std::{
+        io::{self, Cursor, Write},
+        path::{Path, PathBuf},
+        sync::atomic::AtomicBool,
+        time::{Duration, Instant},
+    };
+
+    struct Scope(PathBuf);
+    impl Scope {
+        fn new() -> Self {
+            Self(std::env::temp_dir().join(format!("ksight-read-test-{}", uuid::Uuid::new_v4())))
+        }
+    }
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn newly_expired_registered_deadline_is_not_reported_as_byte_exhaustion() {
+        let scope = Scope::new();
+        let guard = ksight_core::output_budget::Guard::install(vec![scope.0.clone()], 1024, 1)
+            .expect("budget");
+        let requested = Instant::now() + Duration::from_secs(10);
+        let registered = ksight_core::output_budget::deadline(&scope.0, requested);
+        while Instant::now() < registered {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let error = observe_read_control(&scope.0, requested, &AtomicBool::new(false))
+            .expect_err("registered deadline must stop the read");
+        assert_eq!(error.to_string(), "deadline_reached");
+        assert_eq!(
+            guard.receipt().reason.as_deref(),
+            Some("time_budget_exhausted")
+        );
+    }
+
+    #[test]
+    fn zero_byte_budget_and_atomic_cancel_refuse_before_reading() {
+        for cancelled in [false, true] {
+            let scope = Scope::new();
+            let _guard = ksight_core::output_budget::Guard::install(vec![scope.0.clone()], 0, 1000)
+                .expect("budget");
+            let mut source = Cursor::new(vec![0x11; 32]);
+            let mut bytes = Vec::new();
+            let receipt = read_anchored_window(&mut source, &mut bytes, 8, 16, || {
+                observe_read_control(
+                    &scope.0,
+                    Instant::now() + Duration::from_secs(1),
+                    &AtomicBool::new(cancelled),
+                )
+            });
+            assert_eq!(source.position(), 0, "refusal must precede seek");
+            assert_eq!(bytes.len(), 0);
+            assert_eq!(receipt.actual_length, 0);
+            assert_eq!(receipt.read_status, "not_attempted");
+            assert_eq!(
+                receipt.read_error.as_deref(),
+                Some(if cancelled {
+                    "cancelled"
+                } else {
+                    "budget_exhausted"
+                })
+            );
+            assert!(trusted_anchored(&receipt, bytes).is_none());
+        }
+    }
+
+    struct InterruptingWriter<'a> {
+        scope: &'a Path,
+        bytes: Vec<u8>,
+    }
+    impl Write for InterruptingWriter<'_> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(bytes);
+            ksight_core::output_budget::interrupt(self.scope, "parent_cancelled");
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn real_budget_interrupt_revokes_next_chunk_and_final_buffer() {
+        for len in [65_536, 200_000] {
+            let scope = Scope::new();
+            let guard =
+                ksight_core::output_budget::Guard::install(vec![scope.0.clone()], 1_000_000, 1000)
+                    .expect("budget");
+            let mut source = Cursor::new(vec![0x11; len]);
+            let mut sink = InterruptingWriter {
+                scope: &scope.0,
+                bytes: Vec::new(),
+            };
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let cancelled = AtomicBool::new(false);
+            let receipt = read_anchored_window(&mut source, &mut sink, 0, len as u64, || {
+                observe_read_control(&scope.0, deadline, &cancelled)
+            });
+            assert_eq!(source.position(), 65_536);
+            assert_eq!(receipt.actual_length, 65_536);
+            assert_eq!(receipt.read_error.as_deref(), Some("cancelled"));
+            assert!(trusted_anchored(&receipt, sink.bytes).is_none());
+            assert!(guard.receipt().partial);
+        }
+    }
+
+    #[test]
+    fn stop_file_watcher_reaches_real_read_control_and_partial_receipt() {
+        let scope = Scope::new();
+        let control = scope.0.join("control");
+        let output = scope.0.join("output");
+        let guard = ksight_core::output_budget::Guard::install(vec![output.clone()], 1024, 10_000)
+            .expect("budget");
+        let relation = crate::capture_relation::CaptureRelation::parse(
+            Some(uuid::Uuid::new_v4()),
+            Some(uuid::Uuid::new_v4()),
+            Some(uuid::Uuid::new_v4()),
+            Some(1),
+            Some("dump".into()),
+        )
+        .expect("relation")
+        .expect("present relation");
+        let lease = crate::capture_lifecycle::Lease::begin(
+            &control,
+            &relation,
+            vec![output.clone()],
+            10_000,
+            true,
+        )
+        .expect("lifecycle");
+        crate::capture_lifecycle::request_stop(&control, &relation, "parent_cancelled")
+            .expect("durable cancellation");
+        let timeout = Instant::now() + Duration::from_secs(5);
+        while ksight_core::output_budget::stop_reason(&output).is_none() {
+            assert!(
+                Instant::now() < timeout,
+                "watcher never interrupted the output scope"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let error = observe_read_control(&output, timeout, &AtomicBool::new(false))
+            .expect_err("watcher cancellation");
+        assert_eq!(error.to_string(), "cancelled");
+        let status = lease.finish(true).expect("finish");
+        assert!(status.stop_acknowledged);
+        assert_eq!(status.collection_status.as_deref(), Some("partial"));
+        assert_eq!(status.stop_reason.as_deref(), Some("parent_cancelled"));
+        assert!(guard.receipt().partial);
     }
 }
