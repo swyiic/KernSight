@@ -464,9 +464,8 @@ pub fn repair_dex_dir(dir: &std::path::Path) -> std::io::Result<usize> {
     reason = "Raw and derived members share one admission transaction."
 )]
 pub fn extract_apk_dex(apk: &Path, dest: &Path) -> std::io::Result<Vec<DexExtract>> {
-    let apk_sha256 = crate::code_evidence::apk_hash(apk)?;
     let evidence_root = dest.parent().unwrap_or(dest);
-    let file = std::fs::File::open(apk)?;
+    let (apk_sha256, file, apk_identity) = crate::code_evidence::apk_hash(apk, evidence_root)?;
     let mut archive = zip::ZipArchive::new(file)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     std::fs::create_dir_all(dest)?;
@@ -607,6 +606,7 @@ pub fn extract_apk_dex(apk: &Path, dest: &Path) -> std::io::Result<Vec<DexExtrac
             payload_bytes,
         });
     }
+    crate::code_evidence::verify_apk_identity(&archive.into_inner(), &apk_identity)?;
     Ok(extracted)
 }
 
@@ -619,9 +619,8 @@ pub fn extract_apk_dex(apk: &Path, dest: &Path) -> std::io::Result<Vec<DexExtrac
 ///
 /// Returns filesystem or zip errors. Oversized or non-file entries are skipped.
 pub fn extract_apk_packed_native(apk: &Path, dest: &Path) -> std::io::Result<Vec<ApkPackedFile>> {
-    let apk_sha256 = crate::code_evidence::apk_hash(apk)?;
     let evidence_root = dest.parent().unwrap_or(dest);
-    let file = std::fs::File::open(apk)?;
+    let (apk_sha256, file, apk_identity) = crate::code_evidence::apk_hash(apk, evidence_root)?;
     let mut archive = zip::ZipArchive::new(file)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     std::fs::create_dir_all(dest)?;
@@ -673,6 +672,7 @@ pub fn extract_apk_packed_native(apk: &Path, dest: &Path) -> std::io::Result<Vec
             bytes: u64::try_from(bytes.len()).unwrap_or(0),
         });
     }
+    crate::code_evidence::verify_apk_identity(&archive.into_inner(), &apk_identity)?;
     Ok(extracted)
 }
 
@@ -685,9 +685,8 @@ pub fn extract_apk_packed_native(apk: &Path, dest: &Path) -> std::io::Result<Vec
 ///
 /// Returns filesystem or zip errors. Existing files are left unchanged.
 pub fn extract_apk_native_libs(apk: &Path, dest: &Path) -> std::io::Result<Vec<ApkPackedFile>> {
-    let apk_sha256 = crate::code_evidence::apk_hash(apk)?;
     let evidence_root = dest.parent().unwrap_or(dest);
-    let file = std::fs::File::open(apk)?;
+    let (apk_sha256, file, apk_identity) = crate::code_evidence::apk_hash(apk, evidence_root)?;
     let mut archive = zip::ZipArchive::new(file)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     let mut extracted = Vec::new();
@@ -748,6 +747,7 @@ pub fn extract_apk_native_libs(apk: &Path, dest: &Path) -> std::io::Result<Vec<A
             bytes: u64::try_from(bytes.len()).unwrap_or(0),
         });
     }
+    crate::code_evidence::verify_apk_identity(&archive.into_inner(), &apk_identity)?;
     Ok(extracted)
 }
 
