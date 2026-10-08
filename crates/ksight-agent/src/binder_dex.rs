@@ -1269,7 +1269,10 @@ mod budget_tests {
         let guard = ScanGuard::start(std::time::Duration::ZERO, usize::MAX);
         assert_eq!(find_bytes(&vec![0u8; 1024 * 1024], b"absent"), None);
         assert!(guard.exhausted());
-        assert!(parse_maps("1000-2000 r--p 0 0 0 example").is_empty());
+        assert_eq!(
+            parse_maps("1000-2000 r--p 0 0 0 example"),
+            Vec::<MapSpan>::new()
+        );
     }
 
     #[test]
