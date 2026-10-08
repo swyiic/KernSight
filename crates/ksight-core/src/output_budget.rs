@@ -458,7 +458,7 @@ pub fn should_stop(path: &Path) -> bool {
 /// True only for a bound-copy coverage gap with no other recorded failure.
 #[must_use]
 pub fn bound_coverage_only(path: &Path) -> bool {
-    states().lock().ok().is_some_and(|all| {
+    states().lock().is_ok_and(|all| {
         all.values().any(|s| {
             s.roots.iter().any(|r| path.starts_with(r))
                 && !s.non_coverage_failure
