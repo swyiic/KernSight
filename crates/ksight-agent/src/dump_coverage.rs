@@ -9,6 +9,28 @@ use std::{
     path::Path,
 };
 
+const BOUND_NOTE_LIMIT: usize = 2 * 1024 * 1024;
+const BOUND_NOTES_TOTAL_LIMIT: usize = 8 * 1024 * 1024;
+
+fn read_bound_note(reader: impl Read, total: &mut usize) -> Result<Vec<u8>> {
+    let remaining = BOUND_NOTES_TOTAL_LIMIT
+        .checked_sub(*total)
+        .ok_or_else(|| anyhow::anyhow!("bound notes total size"))?;
+    let read_limit = BOUND_NOTE_LIMIT.min(remaining);
+    let mut bytes = Vec::new();
+    reader
+        .take((read_limit as u64) + 1)
+        .read_to_end(&mut bytes)?;
+    let next = total
+        .checked_add(bytes.len())
+        .ok_or_else(|| anyhow::anyhow!("bound notes length overflow"))?;
+    if bytes.len() > BOUND_NOTE_LIMIT || next > BOUND_NOTES_TOTAL_LIMIT {
+        bail!("bound note size or total size");
+    }
+    *total = next;
+    Ok(bytes)
+}
+
 fn check_note(
     note: &Value,
     package: &str,
@@ -187,14 +209,9 @@ pub fn proof(
     let mut ranges = 0usize;
     let mut excluded = 0usize;
     let mut excluded_bytes = 0u64;
+    let mut note_bytes = 0usize;
     for path in &notes {
-        let mut bytes = Vec::new();
-        fs::File::open(path)?
-            .take(256 * 1024 + 1)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() > 256 * 1024 {
-            bail!("bound note size");
-        }
+        let bytes = read_bound_note(fs::File::open(path)?, &mut note_bytes)?;
         let note: Value = serde_json::from_slice(&bytes)?;
         let counts = check_note(&note, package, expected)?;
         ranges += counts.0;
@@ -449,5 +466,116 @@ mod zero_window_tests {
             (166, 1, 0)
         );
         assert_eq!(fs::read(&path).unwrap(), before);
+    }
+}
+
+#[cfg(test)]
+mod note_cap_tests {
+    use super::*;
+    #[test]
+    fn per_note_and_aggregate_bounds_are_inclusive_and_fail_closed() {
+        let bytes = vec![b' '; BOUND_NOTE_LIMIT + 1];
+        let mut total = 0;
+        for _ in 0..4 {
+            assert_eq!(
+                read_bound_note(&bytes[..BOUND_NOTE_LIMIT], &mut total)
+                    .unwrap()
+                    .len(),
+                BOUND_NOTE_LIMIT
+            );
+        }
+        assert_eq!(total, BOUND_NOTES_TOTAL_LIMIT);
+        assert!(read_bound_note(&bytes[..1], &mut total).is_err());
+        assert_eq!(total, BOUND_NOTES_TOTAL_LIMIT);
+        total = 0;
+        assert!(read_bound_note(bytes.as_slice(), &mut total).is_err());
+        assert_eq!(total, 0);
+        total = BOUND_NOTES_TOTAL_LIMIT - 10;
+        assert!(read_bound_note(&bytes[..11], &mut total).is_err());
+        assert_eq!(total, BOUND_NOTES_TOTAL_LIMIT - 10);
+        total = usize::MAX;
+        assert!(read_bound_note(&bytes[..1], &mut total).is_err());
+        assert_eq!(total, usize::MAX);
+    }
+    #[test]
+    fn input_io_failure_is_not_a_valid_note() {
+        struct Broken;
+        impl Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("fixture IO failure"))
+            }
+        }
+        let mut total = 123;
+        assert!(read_bound_note(Broken, &mut total).is_err());
+        assert_eq!(total, 123);
+    }
+    #[test]
+    #[ignore = "explicit retained local zero-tail note; no device"]
+    fn retained_175_ranges_note_uses_bounded_production_reader_and_predicates() {
+        let path = std::env::var_os("KSIGHT_RETAINED_175_NOTE").unwrap();
+        let before = fs::read(&path).unwrap();
+        assert_eq!(before.len(), 268776);
+        let mut total = 0;
+        let bytes = read_bound_note(fs::File::open(&path).unwrap(), &mut total).unwrap();
+        assert_eq!(total, before.len());
+        let note: Value = serde_json::from_slice(&bytes).unwrap();
+        let expected = vec![serde_json::from_value(note["source"].clone()).unwrap()];
+        assert_eq!(
+            check_note(&note, "com.dlxx.mam.Internal", &expected).unwrap(),
+            (175, 1, 0)
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+}
+
+#[cfg(test)]
+mod retained_full_proof_test {
+    use super::*;
+    #[test]
+    #[ignore = "explicit preserved metadata and enrollment paths; offline validator only, no device"]
+    fn preserved_catalog_and_175_ranges_use_full_production_proof() {
+        let root = std::path::PathBuf::from(std::env::var_os("KSIGHT_OFFLINE_PROOF_ROOT").unwrap());
+        let sources =
+            std::path::PathBuf::from(std::env::var_os("KSIGHT_OFFLINE_PROOF_SOURCES").unwrap());
+        let expected: Vec<crate::qualified_code::SourceIdentity> =
+            serde_json::from_slice(&fs::read(&sources).unwrap()).unwrap();
+        let mut inputs = vec![root.join("dump-report.json"), sources];
+        for e in fs::read_dir(root.join("runtime")).unwrap() {
+            let path = e.unwrap().path();
+            if path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("bound-source-")
+            {
+                inputs.push(path);
+            }
+        }
+        let before: Vec<_> = inputs
+            .iter()
+            .map(|path| {
+                let bytes = fs::read(path).unwrap();
+                (bytes.len(), format!("{:x}", Sha256::digest(&bytes)))
+            })
+            .collect();
+        // Guard/failure live only in host process memory. No input or receipt writes.
+        // This models the recorded coverage-only reason; it never renews capture.
+        let guard =
+            ksight_core::output_budget::Guard::install(vec![root.clone()], 8 * 1024 * 1024, 60000)
+                .unwrap();
+        ksight_core::output_budget::record_failure(&root, "bound_code_copy_partial");
+        let result = proof(&root, "com.dlxx.mam.Internal", &expected).unwrap();
+        assert_eq!(result["admitted_ranges"], 175);
+        assert_eq!(result["excluded_local_window_ranges"], 1);
+        assert_eq!(result["excluded_local_window_bytes"], 0);
+        assert_eq!(guard.receipt().admitted_write_bytes, 0);
+        for (path, expected_hash) in inputs.iter().zip(before) {
+            let bytes = fs::read(path).unwrap();
+            assert_eq!(
+                (bytes.len(), format!("{:x}", Sha256::digest(bytes))),
+                expected_hash
+            );
+        }
+        println!("OFFLINE_FULL_PROOF {}",serde_json::to_string(&json!({"scope":"independent offline validator; does not upgrade historical physical result or renew parent","proof":result,"input_hashes_unchanged":true,"written_bytes":0})).unwrap());
     }
 }
