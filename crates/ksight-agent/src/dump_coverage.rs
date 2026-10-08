@@ -514,7 +514,7 @@ mod note_cap_tests {
     fn retained_175_ranges_note_uses_bounded_production_reader_and_predicates() {
         let path = std::env::var_os("KSIGHT_RETAINED_175_NOTE").unwrap();
         let before = fs::read(&path).unwrap();
-        assert_eq!(before.len(), 268776);
+        assert_eq!(before.len(), 268_776);
         let mut total = 0;
         let bytes = read_bound_note(fs::File::open(&path).unwrap(), &mut total).unwrap();
         assert_eq!(total, before.len());
