@@ -1350,7 +1350,7 @@ fn stream_events(
         serde_json::json!({
             "schema":"kernsight.perf-poll-budget/v1", "bounded_slice_yields":poll_budget_yields,
             "unread_tail_possible":unread_perf_possible, "unread_tail_count":null, "scope_failures":scope_failures,
-            "perf_read_failures":perf_read_failures, "coverage_partial":coverage_gap
+            "perf_read_failures":perf_read_failures, "budget_skipped_raw":inspect.budget_skipped_raw(), "coverage_partial":coverage_gap
         })
     );
     let mut stage_evidence_error = None;

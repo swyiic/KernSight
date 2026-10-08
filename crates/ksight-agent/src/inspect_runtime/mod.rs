@@ -794,6 +794,7 @@ pub struct InspectRuntime {
     hits: u32,
     /// Raw uprobe records drained from perf buffers, before decode.
     raw_drained: u64,
+    budget_skipped_raw: u64,
     poll_budget_yields: u64,
     perf_read_failures: u64,
     unread_perf_possible: bool,
@@ -1422,6 +1423,7 @@ impl InspectRuntime {
             max_hits,
             hits: 0,
             raw_drained: 0,
+            budget_skipped_raw: 0,
             poll_budget_yields: 0,
             perf_read_failures: 0,
             unread_perf_possible: false,
@@ -1691,6 +1693,11 @@ impl InspectRuntime {
     #[must_use]
     pub fn drain_totals(&self) -> (u64, u64, u64) {
         (self.raw_drained, self.decoded_hits, self.perf_lost)
+    }
+
+    /// Already-drained records omitted only after the existing adapter budget was exhausted.
+    pub fn budget_skipped_raw(&self) -> u64 {
+        self.budget_skipped_raw
     }
 
     /// Physical scope/read failure count, retained independently of raw loss counters.
@@ -4095,7 +4102,22 @@ fn poll_all(runtime: &mut InspectRuntime) -> Vec<InspectOutput> {
     .min(MAX_PAYLOAD_BYTES);
     let mut batch = Vec::new();
     let mut bound_failure = None;
+    // These records were already unconditionally omitted by the later budget guard.
+    // Keep draining and counting them, but avoid creating one live metadata iterator
+    // and cloning/sorting one plan per record that cannot produce a payload.
+    let exhausted_adapters: Vec<_> = runtime
+        .sessions
+        .iter()
+        .filter(|probe| {
+            !plan_is_connkey(&probe.plan)
+                && adapter_hits(runtime, probe.plan.adapter)
+                    >= adapter_hit_cap(runtime, probe.plan.adapter)
+        })
+        .map(|probe| probe.plan.adapter)
+        .collect();
     for probe in &mut runtime.sessions {
+        let skip_exhausted =
+            !plan_is_connkey(&probe.plan) && exhausted_adapters.contains(&probe.plan.adapter);
         let before_drained = probe.session.drained_total;
         let before_yields = probe.session.budget_yields_total;
         let before_lost = probe.session.lost_total;
@@ -4175,18 +4197,27 @@ fn poll_all(runtime: &mut InspectRuntime) -> Vec<InspectOutput> {
         crate::capture_timing::set(crate::capture_timing::Phase::PollProcess);
         for hit in hits {
             if let Some(targets) = &runtime.bound_instance_targets {
-                if let Some(error) = targets
-                    .iter()
-                    .find_map(|target| target.recheck_task_mark().err())
-                {
-                    bound_failure = Some(format!("bound_live_source_invalid:{error:#}"));
+                if let Err(error) = instance_backend::check_budgeted_hit(
+                    &hit,
+                    targets,
+                    epoch,
+                    skip_exhausted,
+                    || {
+                        targets
+                            .iter()
+                            .find_map(|target| target.recheck_task_mark().err())
+                            .map_or(Ok(()), |error| {
+                                Err(format!("bound_live_source_invalid:{error:#}"))
+                            })
+                    },
+                ) {
+                    bound_failure = Some(error);
                     continue;
                 }
-                if !instance_backend::accepts(&hit, targets, epoch) {
-                    bound_failure =
-                        Some("bound_consumer_generation_or_identity_mismatch".to_owned());
-                    continue;
-                }
+            }
+            if skip_exhausted {
+                runtime.budget_skipped_raw = runtime.budget_skipped_raw.saturating_add(1);
+                continue;
             }
             let retprobe = if probe.paired_entry_return {
                 hit.snapshot_at_return

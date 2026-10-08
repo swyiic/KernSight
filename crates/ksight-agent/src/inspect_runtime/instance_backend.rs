@@ -37,3 +37,76 @@ pub(super) fn accepts(
         _ => false,
     }
 }
+
+/// Validate every returned identity, even when no further payload may be decoded.
+pub(super) fn check_budgeted_hit(
+    hit: &RegisterContext,
+    targets: &[BoundInstance],
+    epoch: Option<u32>,
+    exhausted: bool,
+    live_check: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    if !exhausted {
+        live_check()?;
+    }
+    if !accepts(hit, targets, epoch) {
+        return Err("bound_consumer_generation_or_identity_mismatch".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    use ksight_hwbp::instance_scope::{InstanceIdentity, InstanceStamp};
+    fn fixture() -> (RegisterContext, Vec<BoundInstance>) {
+        let identity = InstanceIdentity {
+            tgid: 10,
+            uid: 20,
+            birth_ns: 30,
+            exec_id: 40,
+        };
+        let target = BoundInstance::trusted_candidate(
+            identity,
+            std::fs::File::open("/dev/null").unwrap().into(),
+        );
+        let hit = RegisterContext {
+            pid: 10,
+            instance: Some(InstanceStamp {
+                identity,
+                epoch: 2,
+                thread_birth_ns: 50,
+            }),
+            ..RegisterContext::default()
+        };
+        (hit, vec![target])
+    }
+    #[test]
+    fn exhausted_records_skip_live_work_but_not_exact_identity() {
+        let (mut hit, targets) = fixture();
+        assert!(check_budgeted_hit(&hit, &targets, Some(2), true, || panic!(
+            "unreachable payload work"
+        ))
+        .is_ok());
+        hit.instance.as_mut().unwrap().epoch = 3;
+        assert!(check_budgeted_hit(&hit, &targets, Some(2), true, || panic!(
+            "unreachable payload work"
+        ))
+        .is_err());
+        hit.instance = None;
+        assert!(check_budgeted_hit(&hit, &targets, Some(2), true, || panic!(
+            "unreachable payload work"
+        ))
+        .is_err());
+    }
+    #[test]
+    fn payload_eligible_records_keep_original_live_failure() {
+        let (hit, targets) = fixture();
+        assert_eq!(
+            check_budgeted_hit(&hit, &targets, Some(2), false, || Err(
+                "source exited".to_owned()
+            )),
+            Err("source exited".to_owned())
+        );
+    }
+}
