@@ -154,6 +154,9 @@ fn read_u64(bytes: &[u8], offset: usize) -> u64 {
 /// No rejected register payload is retained and no admission rule is relaxed.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DecodeCounters {
+    pub perf_min_size: u64,
+    pub perf_max_size: u64,
+    pub perf_padding_removed: u64,
     pub bad_size: u64,
     pub bad_abi: u64,
     pub malformed: u64,
@@ -162,6 +165,34 @@ pub struct DecodeCounters {
     pub accepted: u64,
 }
 impl DecodeCounters {
+    /// Aya returns `PERF_SAMPLE_RAW`'s aligned size, including transport padding.
+    /// Only this perf ingress removes the exact four-byte framing tail. The
+    /// identity decoder still requires an exact 4448-byte payload.
+    pub fn admit_perf_sample(
+        &mut self,
+        bytes: &[u8],
+        scope: Option<(u32, &[InstanceIdentity])>,
+    ) -> Option<RegisterContext> {
+        let size = bytes.len() as u64;
+        if self.perf_min_size == 0 || size < self.perf_min_size {
+            self.perf_min_size = size;
+        }
+        self.perf_max_size = self.perf_max_size.max(size);
+        if scope.is_some() {
+            // perf_prepare_sample: round_up(payload_size + sizeof(u32), 8) - sizeof(u32).
+            // Padding is transport storage, not ABI data and need not be zero.
+            const FRAMED_SIZE: usize = (INSTANCE_CONTEXT_SIZE + 4).next_multiple_of(8) - 4;
+            if bytes.len() != FRAMED_SIZE {
+                self.bad_size = self.bad_size.saturating_add(1);
+                return None;
+            }
+            self.perf_padding_removed = self.perf_padding_removed.saturating_add(1);
+            self.admit(&bytes[..INSTANCE_CONTEXT_SIZE], scope)
+        } else {
+            self.admit(bytes, scope)
+        }
+    }
+
     pub fn admit(
         &mut self,
         bytes: &[u8],
@@ -214,6 +245,42 @@ mod admission_tests {
             b[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
         }
         b
+    }
+    #[test]
+    fn perf_alignment_is_removed_only_at_transport_ingress() {
+        let ids = [InstanceIdentity {
+            tgid: 7,
+            uid: 10285,
+            birth_ns: 9,
+            exec_id: 4,
+        }];
+        let b = record();
+        let mut c = DecodeCounters::default();
+        let mut framed = b.clone();
+        framed.extend_from_slice(&[0xa5; 4]);
+        assert!(RegisterContext::decode_instance(&framed).is_none());
+        assert!(c.admit_perf_sample(&framed, Some((3, &ids))).is_some());
+        for size in [4408, 4448, 4449, 4451, 4453, 4460] {
+            let mut bad = framed.clone();
+            bad.resize(size, 0);
+            assert!(c.admit_perf_sample(&bad, Some((3, &ids))).is_none());
+        }
+        let mut bad = framed.clone();
+        bad[4420..4424].fill(0);
+        assert!(c.admit_perf_sample(&bad, Some((3, &ids))).is_none());
+        assert!(c.admit_perf_sample(&framed, Some((4, &ids))).is_none());
+        assert!(c.admit_perf_sample(&framed, Some((3, &[]))).is_none());
+        assert_eq!(
+            (
+                c.accepted,
+                c.bad_size,
+                c.bad_abi,
+                c.scope_epoch,
+                c.scope_identity
+            ),
+            (1, 6, 1, 1, 1)
+        );
+        assert_eq!(c.perf_padding_removed, 4);
     }
     #[test]
     fn strict_record_funnel_classifies_without_granting_invalid_payloads() {

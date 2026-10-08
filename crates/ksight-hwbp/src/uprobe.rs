@@ -631,7 +631,7 @@ impl UprobeSession {
                         .iter()
                         .take(read.read)
                         .filter_map(|slot| {
-                            let hit = counters.admit(
+                            let hit = counters.admit_perf_sample(
                                 slot,
                                 instance_scope.map(|s| (s.epoch, s.identities.as_slice())),
                             )?;

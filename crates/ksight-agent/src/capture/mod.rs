@@ -1089,6 +1089,9 @@ fn stream_events(
             }
             if Instant::now() >= next_inspect_stats {
                 let (raw, decoded, lost) = inspect.drain_totals();
+                let [perf_min_size, perf_max_size, perf_padding_removed] =
+                    inspect.perf_record_framing_totals();
+                eprintln!("inspect perf framing: min_size={perf_min_size} max_size={perf_max_size} padding_removed={perf_padding_removed}");
                 let [bad_size, bad_abi, malformed, scope_epoch, scope_identity, accepted] =
                     inspect.record_admission_totals();
                 eprintln!("inspect record admission: bad_size={bad_size} bad_abi={bad_abi} malformed={malformed} scope_epoch={scope_epoch} scope_identity={scope_identity} accepted={accepted}");
@@ -1318,6 +1321,9 @@ fn stream_events(
             mirror.seal();
         }
         let (raw, decoded, lost) = inspect.drain_totals();
+        let [perf_min_size, perf_max_size, perf_padding_removed] =
+            inspect.perf_record_framing_totals();
+        eprintln!("inspect perf framing: min_size={perf_min_size} max_size={perf_max_size} padding_removed={perf_padding_removed}");
         let [bad_size, bad_abi, malformed, scope_epoch, scope_identity, accepted] =
             inspect.record_admission_totals();
         eprintln!("inspect record admission: bad_size={bad_size} bad_abi={bad_abi} malformed={malformed} scope_epoch={scope_epoch} scope_identity={scope_identity} accepted={accepted}");

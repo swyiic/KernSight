@@ -794,6 +794,7 @@ pub struct InspectRuntime {
     /// Raw uprobe records drained from perf buffers, before decode.
     raw_drained: u64,
     decode_rejections: [u64; 6],
+    perf_record_framing: [u64; 3],
     /// Records the kernel reported lost to ring-buffer overflow.
     perf_lost: u64,
     /// Hits `decode_hit` turned into outputs.
@@ -1403,6 +1404,7 @@ impl InspectRuntime {
             hits: 0,
             raw_drained: 0,
             decode_rejections: [0; 6],
+            perf_record_framing: [0; 3],
             perf_lost: 0,
             decoded_hits: 0,
             ssl_read_entry: 0,
@@ -1667,6 +1669,11 @@ impl InspectRuntime {
     #[must_use]
     pub fn record_admission_totals(&self) -> [u64; 6] {
         self.decode_rejections
+    }
+    #[must_use]
+    /// Raw perf size bounds and count of exact framing tails removed.
+    pub fn perf_record_framing_totals(&self) -> [u64; 3] {
+        self.perf_record_framing
     }
 
     /// `TlsSslRead` funnel: (entry, uret`, plaintext_``ok, uret_``fail, want_read_``or_neg`).
@@ -4025,6 +4032,7 @@ fn poll_all(runtime: &mut InspectRuntime) -> Vec<InspectOutput> {
         let before_drained = probe.session.drained_total;
         let before_lost = probe.session.lost_total;
         let before = probe.session.decode_counters;
+        let before_padding = before.perf_padding_removed;
         let before = [
             before.bad_size,
             before.bad_abi,
@@ -4043,6 +4051,15 @@ fn poll_all(runtime: &mut InspectRuntime) -> Vec<InspectOutput> {
         runtime.raw_drained += probe.session.drained_total.saturating_sub(before_drained);
         runtime.perf_lost += probe.session.lost_total.saturating_sub(before_lost);
         let after = probe.session.decode_counters;
+        if after.perf_min_size != 0
+            && (runtime.perf_record_framing[0] == 0
+                || after.perf_min_size < runtime.perf_record_framing[0])
+        {
+            runtime.perf_record_framing[0] = after.perf_min_size;
+        }
+        runtime.perf_record_framing[1] = runtime.perf_record_framing[1].max(after.perf_max_size);
+        runtime.perf_record_framing[2] = runtime.perf_record_framing[2]
+            .saturating_add(after.perf_padding_removed.saturating_sub(before_padding));
         let after = [
             after.bad_size,
             after.bad_abi,
