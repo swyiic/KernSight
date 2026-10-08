@@ -284,7 +284,7 @@ mod stopped_batch_tests {
             || {
                 count += 1;
                 Ok::<_, ((), Option<u64>)>(PerfRead {
-                    samples: if count <= 20 { 1 } else { 0 },
+                    samples: u64::from(count <= 20),
                     records: if count <= 20 { vec![count] } else { vec![] },
                     lost_samples: if count == 2 { 7 } else { 0 },
                     notification_monotonic_ns: None,
