@@ -3327,7 +3327,7 @@ fn qualified_scan_pids(mut scanned: Vec<u32>, qualified: Option<&[u32]>) -> Vec<
 #[test]
 fn qualified_scan_excludes_helper_before_epoch_bookkeeping() {
     assert_eq!(qualified_scan_pids(vec![10, 11, 12], Some(&[10])), vec![10]);
-    assert!(qualified_scan_pids(vec![10, 11], Some(&[])).is_empty());
+    assert_eq!(qualified_scan_pids(vec![10, 11], Some(&[])), [] as [u32; 0]);
     assert_eq!(qualified_scan_pids(vec![10, 11], None), vec![10, 11]);
 }
 
