@@ -421,7 +421,7 @@ mod one_shot_tail_integration {
             |v| *v,
         );
         assert_eq!(invalid.error, Some("original identity invalidated"));
-        assert!(invalid.records.is_empty());
+        assert_eq!(invalid.records, [] as [u64; 0]);
         assert_eq!(first.records, vec![10]);
     }
 }
