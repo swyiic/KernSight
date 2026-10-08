@@ -2764,9 +2764,9 @@ fn revoke_scope(runtime: &mut InspectRuntime, pid: Option<u32>, reason: &str) {
     runtime.scope_failures = runtime.scope_failures.saturating_add(1);
     runtime.scope_revoked_poll = true;
     runtime.scope_diagnostics.push(format!(
-        "scope_fail_closed reason={reason}; owned hooks dropped; pending payload revoked"
+        "scope_fail_closed reason={reason} pid={pid:?}; owned hooks dropped; pending payload revoked"
     ));
-    eprintln!("scope_fail_closed reason={reason}; owned hooks dropped; pending payload revoked");
+    eprintln!("scope_fail_closed reason={reason} pid={pid:?}; owned hooks dropped; pending payload revoked");
 }
 
 #[cfg(any(test, target_os = "android", target_os = "linux"))]
@@ -3316,6 +3316,21 @@ fn join_tgids(tgids: &[u32]) -> String {
         .join(",")
 }
 
+#[cfg(any(test, target_os = "android", target_os = "linux"))]
+fn qualified_scan_pids(mut scanned: Vec<u32>, qualified: Option<&[u32]>) -> Vec<u32> {
+    if let Some(grants) = qualified {
+        scanned.retain(|pid| grants.contains(pid));
+    }
+    scanned
+}
+
+#[test]
+fn qualified_scan_excludes_helper_before_epoch_bookkeeping() {
+    assert_eq!(qualified_scan_pids(vec![10, 11, 12], Some(&[10])), vec![10]);
+    assert!(qualified_scan_pids(vec![10, 11], Some(&[])).is_empty());
+    assert_eq!(qualified_scan_pids(vec![10, 11], None), vec![10, 11]);
+}
+
 #[cfg(any(target_os = "android", target_os = "linux"))]
 fn refresh_tgid_filter(runtime: &mut InspectRuntime) {
     if runtime.scope_revoked_poll {
@@ -3327,7 +3342,18 @@ fn refresh_tgid_filter(runtime: &mut InspectRuntime) {
     if policy.whole_device {
         return;
     }
-    let scanned = active_tgid_filter(&policy).unwrap_or_default();
+    // Filter sealed grants before observing epochs. A same-package helper's
+    // exit must never enter the qualified main task's revocation bookkeeping.
+    let qualified = runtime.bound_instance_targets.as_ref().map(|targets| {
+        targets
+            .iter()
+            .map(|target| target.identity.tgid)
+            .collect::<Vec<_>>()
+    });
+    let scanned = qualified_scan_pids(
+        active_tgid_filter(&policy).unwrap_or_default(),
+        qualified.as_deref(),
+    );
     let mut next = Vec::new();
     for pid in scanned {
         let identity = process_identity(pid, pid, Uuid::nil());
