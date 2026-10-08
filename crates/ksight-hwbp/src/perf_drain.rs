@@ -47,6 +47,8 @@ pub struct PerfDrainReport<T, E> {
     pub lost_only_reads: u64,
     /// Measured wall time in this drain, not CPU time or kernel-record age.
     pub elapsed_us: u64,
+    /// Poll yielded with unread ring data; not a loss or a failed read.
+    pub budget_yielded: bool,
 }
 
 impl<T, E> Default for PerfDrainReport<T, E> {
@@ -61,11 +63,13 @@ impl<T, E> Default for PerfDrainReport<T, E> {
             read_calls: 0,
             lost_only_reads: 0,
             elapsed_us: 0,
+            budget_yielded: false,
         }
     }
 }
 
-/// Drain until genuinely empty or an explicit error. The caller owns reusable
+/// Drain a bounded slice until empty, an error or the poll allowance expires.
+/// Unread data stays in the kernel ring for the next poll. The caller owns reusable
 /// read slots. No successful read or loss counter is discarded on error.
 pub fn drain_reads<T, E>(
     mut read: impl FnMut() -> Result<PerfRead<T>, (E, Option<u64>)>,
@@ -74,6 +78,12 @@ pub fn drain_reads<T, E>(
     let start = std::time::Instant::now();
     let mut report = PerfDrainReport::default();
     loop {
+        // A continuously replenished (including lost-only) ring need never empty.
+        // Return to the capture loop so its original observation/lease can be checked.
+        if report.read_calls >= 8 || (report.read_calls > 0 && start.elapsed().as_millis() >= 2) {
+            report.budget_yielded = true;
+            break;
+        }
         report.read_calls += 1;
         let batch = match read() {
             Ok(batch) => batch,
@@ -103,4 +113,69 @@ pub fn drain_reads<T, E>(
     }
     report.elapsed_us = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
     report
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn continuous_producer_yields_without_discarding_consumed_records() {
+        let mut sequence = 0;
+        let mut read = || {
+            sequence += 1;
+            Ok::<_, ((), Option<u64>)>(PerfRead {
+                samples: 1,
+                records: vec![sequence],
+                lost_samples: 0,
+                notification_monotonic_ns: Some(sequence),
+            })
+        };
+        let first = drain_reads(&mut read, |v| *v);
+        assert!(first.budget_yielded);
+        assert!((1..=8).contains(&first.read_calls));
+        assert_eq!(first.records.len() as u64, first.raw_samples);
+        assert_eq!(first.error, None);
+        let next = drain_reads(&mut read, |v| *v);
+        assert_eq!(next.records[0], first.records.last().unwrap() + 1);
+    }
+
+    #[test]
+    fn continuous_lost_only_notifications_cannot_starve_deadline_checks() {
+        let r = drain_reads(
+            || {
+                Ok::<_, ((), Option<u64>)>(PerfRead::<u64> {
+                    samples: 0,
+                    records: vec![],
+                    lost_samples: 3,
+                    notification_monotonic_ns: Some(7),
+                })
+            },
+            |v| *v,
+        );
+        assert!(r.budget_yielded);
+        assert_eq!(r.lost_only_reads, r.read_calls);
+        assert_eq!(r.lost_samples, r.read_calls * 3);
+        assert_eq!(r.notifications.len() as u64, r.read_calls);
+    }
+
+    #[test]
+    fn slow_read_yields_before_another_read_and_preserves_its_result() {
+        let r = drain_reads(
+            || {
+                std::thread::sleep(std::time::Duration::from_millis(3));
+                Ok::<_, ((), Option<u64>)>(PerfRead {
+                    samples: 1,
+                    records: vec![9],
+                    lost_samples: 2,
+                    notification_monotonic_ns: Some(5),
+                })
+            },
+            |v| *v,
+        );
+        assert!(r.budget_yielded);
+        assert_eq!(r.read_calls, 1);
+        assert_eq!(r.records, vec![9]);
+        assert_eq!(r.lost_samples, 2);
+    }
 }

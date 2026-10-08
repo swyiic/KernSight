@@ -1140,6 +1140,12 @@ struct LiveProbe {
     paired_entry_return: bool,
 }
 
+impl Drop for InspectRuntime {
+    fn drop(&mut self) {
+        take_attached_sessions(self);
+    }
+}
+
 impl InspectRuntime {
     /// Low-level candidate only. No CLI/capture entry selects this until the
     /// exact metadata issuer, package qualification and target verifier pass.
@@ -3577,6 +3583,7 @@ fn refresh_package_tgids(runtime: &mut InspectRuntime) {
 }
 
 fn take_attached_sessions(runtime: &mut InspectRuntime) -> bool {
+    let _phase = crate::capture_timing::enter(crate::capture_timing::Phase::Detach);
     #[cfg(any(target_os = "android", target_os = "linux"))]
     {
         let had = !runtime.sessions.is_empty();

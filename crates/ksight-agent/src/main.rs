@@ -982,7 +982,9 @@ fn run_capture(args: CaptureArgs) -> Result<()> {
         // All target operations happen after immutable lease acquisition.
         request.startup = Some(startup);
     }
+    ksight_agent::capture_timing::set(ksight_agent::capture_timing::Phase::Prepare);
     let result = ksight_agent::capture::run(request);
+    ksight_agent::capture_timing::set(ksight_agent::capture_timing::Phase::Returned);
     if let Some(g) = guard.as_ref() {
         eprintln!("{}", serde_json::to_string(&g.receipt())?);
     }

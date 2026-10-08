@@ -100,3 +100,6 @@ pub mod runtime_paths;
 
 /// Positive proof for independent cold Linker after a coverage-only Dump.
 pub mod dump_coverage;
+
+/// Payload-free monotonic capture phase diagnostics.
+pub mod capture_timing;

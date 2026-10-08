@@ -461,6 +461,7 @@ impl Lease {
                     None
                 };
                 if let Some(cause) = request {
+                    let phase_snapshot = crate::capture_timing::snapshot();
                     for scope in &monitored {
                         ksight_core::output_budget::interrupt(scope, &cause);
                     }
@@ -472,6 +473,8 @@ impl Lease {
                             cause: cause.clone(),
                         },
                     );
+                    // Diagnostic I/O must not delay interruption of payload admission.
+                    let _ = retain(&path, "deadline-clock.json", &phase_snapshot);
                     return Some(cause);
                 }
                 std::thread::sleep(Duration::from_millis(5));
@@ -558,6 +561,11 @@ impl Lease {
                 },
             )?;
         }
+        let _ = retain(
+            &self.root,
+            "returned-clock.json",
+            &crate::capture_timing::snapshot(),
+        );
         retain(
             &self.root,
             "returned.json",

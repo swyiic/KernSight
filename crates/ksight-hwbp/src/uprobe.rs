@@ -656,6 +656,7 @@ impl UprobeSession {
             result.raw_samples = result.raw_samples.saturating_add(report.raw_samples);
             result.lost_samples = result.lost_samples.saturating_add(report.lost_samples);
             result.read_calls = result.read_calls.saturating_add(report.read_calls);
+            result.budget_yielded |= report.budget_yielded;
             result.lost_only_reads = result
                 .lost_only_reads
                 .saturating_add(report.lost_only_reads);

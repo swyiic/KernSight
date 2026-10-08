@@ -390,6 +390,7 @@ impl SessionSpoolWriter {
     /// # Errors
     /// Returns the validation or required operation error; no successful result is fabricated.
     pub fn flush(&mut self) -> Result<(), SpoolError> {
+        let _phase = crate::capture_timing::enter(crate::capture_timing::Phase::Flush);
         let result = self.flush_inner();
         if let Err(error) = &result {
             self.blocked = true;
@@ -566,6 +567,7 @@ impl SessionSpoolWriter {
         state: DurableSessionState,
         reason: Option<CaptureStopReason>,
     ) -> Result<(), SpoolError> {
+        let _phase = crate::capture_timing::enter(crate::capture_timing::Phase::Manifest);
         let mut manifest = self.spool.manifest(self.session_id, state, reason)?;
         manifest.writer = Some(self.diagnostics());
         write_manifest(&self.spool.directory, &manifest)

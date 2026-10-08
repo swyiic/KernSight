@@ -679,6 +679,7 @@ fn stream_events(
         time::{Duration, Instant},
     };
 
+    let _phase = crate::capture_timing::enter(crate::capture_timing::Phase::Observe);
     let started = Instant::now();
     let deadline =
         (request.duration_seconds != 0).then(|| Duration::from_secs(request.duration_seconds));
@@ -798,6 +799,7 @@ fn stream_events(
     } else {
         request.inspect_adapters.clone()
     };
+    let prepare_phase = crate::capture_timing::enter(crate::capture_timing::Phase::InspectPrepare);
     let mut inspect = if let Some(backend) = &qualified_backend {
         crate::inspect_runtime::InspectRuntime::prepare_qualified_candidate(
             &inspect_policy,
@@ -812,6 +814,7 @@ fn stream_events(
             &request.uprobe_object,
         )
     };
+    drop(prepare_phase);
     let mut qualified_source: Option<crate::qualified_code::SourceIdentity> = None;
     let mut next_qualification = Instant::now();
     if request.inspect.enabled {
@@ -864,6 +867,14 @@ fn stream_events(
             && (request.count == 0 || pipeline.stats.live_emitted < request.count)
             && deadline.is_none_or(|duration| started.elapsed() < duration)
         {
+            if request
+                .storage
+                .spool_root
+                .as_ref()
+                .is_some_and(|root| ksight_core::output_budget::should_stop(root))
+            {
+                bail!("phase lease exhausted before next capture poll; original evidence retained");
+            }
             if let Some(backend) = &qualified_backend {
                 if Instant::now() >= next_qualification {
                     let package = request.package.as_deref().unwrap();
@@ -1064,7 +1075,10 @@ fn stream_events(
                         }
                     }
                 }
-                let outputs = inspect.poll();
+                let outputs = {
+                    let _phase = crate::capture_timing::enter(crate::capture_timing::Phase::Poll);
+                    inspect.poll()
+                };
                 let output_count = outputs.len();
                 for (output_index, output) in outputs.into_iter().enumerate() {
                     if let Some(mirror) = pipeline.burp_mirror.as_mut() {
@@ -2159,6 +2173,7 @@ impl EventPipeline {
     }
 
     fn seal(&mut self, reason: ksight_model::CaptureStopReason) -> Result<()> {
+        let _phase = crate::capture_timing::enter(crate::capture_timing::Phase::Seal);
         if let Some(spool) = self.spool.as_mut() {
             let state = match reason {
                 ksight_model::CaptureStopReason::SessionRotated => {
