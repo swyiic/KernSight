@@ -1080,6 +1080,8 @@ fn stream_events(
                     inspect.poll()
                 };
                 let output_count = outputs.len();
+                let _output_phase =
+                    crate::capture_timing::enter(crate::capture_timing::Phase::PollOutput);
                 for (output_index, output) in outputs.into_iter().enumerate() {
                     if let Some(mirror) = pipeline.burp_mirror.as_mut() {
                         route_inspect_to_mirror(mirror, &output);
@@ -1250,6 +1252,24 @@ fn stream_events(
 
         Ok(())
     })();
+    let (poll_budget_yields, unread_perf_possible) = inspect.poll_budget_status();
+    let scope_failures = inspect.scope_failure_count();
+    let perf_read_failures = inspect.perf_read_failure_count();
+    let coverage_gap = unread_perf_possible || scope_failures != 0 || perf_read_failures != 0;
+    let pending_perf_tail = capture_loop_result.is_ok() && coverage_gap;
+    let capture_loop_result = if pending_perf_tail {
+        Err(anyhow::anyhow!("capture coverage partial: perf_poll_backlog_or_scope_gap_at_observation_end; raw coverage incomplete"))
+    } else {
+        capture_loop_result
+    };
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "schema":"kernsight.perf-poll-budget/v1", "bounded_slice_yields":poll_budget_yields,
+            "unread_tail_possible":unread_perf_possible, "unread_tail_count":null, "scope_failures":scope_failures,
+            "perf_read_failures":perf_read_failures, "coverage_partial":coverage_gap
+        })
+    );
     let mut stage_evidence_error = None;
     if let Some(cursor) = &stage_cursor {
         if !cursor.finished {
@@ -1461,6 +1481,16 @@ fn stream_events(
     if let Err(error) = capture_loop_result {
         if let Some(spool) = pipeline.spool.as_mut() {
             report_spool_failure(spool); // idempotent: never retries the tail twice
+        }
+        // Flush already accepted records before revoking further writes. A sliced
+        // ring tail is unknown, not zero loss or a completed observation receipt.
+        if pending_perf_tail {
+            if let Some(root) = request.storage.spool_root.as_ref() {
+                ksight_core::output_budget::record_failure(
+                    root,
+                    "perf_poll_backlog_or_scope_gap_at_observation_end",
+                );
+            }
         }
         std::io::stdout().flush()?;
         return Err(error); // no false DurationElapsed / capture_complete receipt

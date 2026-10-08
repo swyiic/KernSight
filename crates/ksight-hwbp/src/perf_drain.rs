@@ -133,6 +133,8 @@ mod tests {
         };
         let first = drain_reads(&mut read, |v| *v);
         assert!(first.budget_yielded);
+        // Returning successfully is not proof of an empty ring at observation end.
+        assert!(first.error.is_none() && first.budget_yielded);
         assert!((1..=8).contains(&first.read_calls));
         assert_eq!(first.records.len() as u64, first.raw_samples);
         assert_eq!(first.error, None);
@@ -177,5 +179,56 @@ mod tests {
         assert_eq!(r.read_calls, 1);
         assert_eq!(r.records, vec![9]);
         assert_eq!(r.lost_samples, 2);
+    }
+}
+
+/// Status of a completed bounded read slice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PollDrainState {
+    /// Empty was observed, without claiming later arrivals are impossible.
+    Empty,
+    /// The allowance ended before empty could be established.
+    Yielded,
+}
+/// Payload-free progress callback from the synchronous reader.
+#[derive(Clone, Copy)]
+pub enum PollPhase {
+    /// Physical scope validation.
+    Scope,
+    /// Aya ring read.
+    Read,
+    /// Raw record decoding.
+    Decode,
+    /// Owned probe detachment.
+    Detach,
+    /// Return to the enclosing poll.
+    Poll,
+}
+static OBSERVER: std::sync::OnceLock<fn(PollPhase)> = std::sync::OnceLock::new();
+/// Install diagnostic observation once; this grants no scope and alters no deadline.
+pub fn observe_phases(observer: fn(PollPhase)) {
+    let _ = OBSERVER.set(observer);
+}
+pub(crate) fn phase(phase: PollPhase) {
+    if let Some(observer) = OBSERVER.get() {
+        observer(phase);
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+mod inner_reader_tests {
+    #[test]
+    fn production_guard_rejects_non_progressing_and_oversized_ring_records() {
+        for (size, available, ring) in [
+            (0, 64, 4096),
+            (7, 64, 4096),
+            (128, 64, 4096),
+            (8192, 8192, 4096),
+        ] {
+            assert!(aya::maps::perf::validate_record_size(size, available, ring).is_err());
+        }
+        for size in [8, 16, 32, 64] {
+            aya::maps::perf::validate_record_size(size, 64, 4096).unwrap();
+        }
     }
 }

@@ -1,0 +1,5 @@
+{
+  "upstream": "crates.io aya 0.13.1 exact cached registry source",
+  "originalPerfBufferSHA256": "824962d5d5bb348fedb87bfe58ca66cb495fe7aca9601ae60dd84a4ef51cf393",
+  "changes": "Acquire fence after producer head; bounded progress/size validation before parsing a perf record. Published API otherwise unchanged."
+}

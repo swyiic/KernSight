@@ -25,6 +25,16 @@ pub enum Phase {
     Seal,
     /// Capture returned including its owned destructors.
     Returned,
+    /// Physical poll scope revalidation.
+    PollScope,
+    /// One synchronous Aya perf ring read.
+    PerfRead,
+    /// Raw perf record decoding.
+    PerfDecode,
+    /// Consumer admission, sorting and adapter processing.
+    PollProcess,
+    /// Writing inspect outputs and mirrors.
+    PollOutput,
 }
 
 /// One monotonic-domain diagnostic snapshot, containing no payload or paths.
@@ -34,16 +44,16 @@ pub struct Snapshot {
     active_phase: Phase,
     entered_ms: u64,
     elapsed_ms: u64,
-    exclusive_ms: [u64; 9],
+    exclusive_ms: [u64; 14],
 }
 impl Snapshot {
     fn new() -> Self {
         Self {
-            schema: "kernsight.capture-clock/v1",
+            schema: "kernsight.capture-clock/v2",
             active_phase: Phase::Prepare,
             entered_ms: 0,
             elapsed_ms: 0,
-            exclusive_ms: [0; 9],
+            exclusive_ms: [0; 14],
         }
     }
     fn transition(&mut self, phase: Phase, now: u64) -> Phase {
@@ -89,6 +99,21 @@ impl Drop for Span {
     fn drop(&mut self) {
         set(self.0);
     }
+}
+
+/// Bind the lower-level reader's fixed progress vocabulary to the same agent clock.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn observe_perf_reader() {
+    ksight_hwbp::perf_drain::observe_phases(|phase| {
+        use ksight_hwbp::perf_drain::PollPhase;
+        set(match phase {
+            PollPhase::Scope => Phase::PollScope,
+            PollPhase::Read => Phase::PerfRead,
+            PollPhase::Decode => Phase::PerfDecode,
+            PollPhase::Detach => Phase::Detach,
+            PollPhase::Poll => Phase::Poll,
+        });
+    });
 }
 
 #[cfg(test)]

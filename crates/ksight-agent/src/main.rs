@@ -982,6 +982,8 @@ fn run_capture(args: CaptureArgs) -> Result<()> {
         // All target operations happen after immutable lease acquisition.
         request.startup = Some(startup);
     }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    ksight_agent::capture_timing::observe_perf_reader();
     ksight_agent::capture_timing::set(ksight_agent::capture_timing::Phase::Prepare);
     let result = ksight_agent::capture::run(request);
     ksight_agent::capture_timing::set(ksight_agent::capture_timing::Phase::Returned);

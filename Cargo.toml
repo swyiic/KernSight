@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["vendor/aya"]
 members = [
     "crates/ksight-abi",
     "crates/ksight-model",
@@ -59,3 +60,7 @@ all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 module_name_repetitions = "allow"
 must_use_candidate = "allow"
+
+[patch.crates-io]
+# Preserve the pinned Aya API while rejecting non-progressing perf headers.
+aya = { path = "vendor/aya" }

@@ -793,6 +793,9 @@ pub struct InspectRuntime {
     hits: u32,
     /// Raw uprobe records drained from perf buffers, before decode.
     raw_drained: u64,
+    poll_budget_yields: u64,
+    perf_read_failures: u64,
+    unread_perf_possible: bool,
     decode_rejections: [u64; 6],
     perf_record_framing: [u64; 3],
     /// Records the kernel reported lost to ring-buffer overflow.
@@ -1417,6 +1420,9 @@ impl InspectRuntime {
             max_hits,
             hits: 0,
             raw_drained: 0,
+            poll_budget_yields: 0,
+            perf_read_failures: 0,
+            unread_perf_possible: false,
             decode_rejections: [0; 6],
             perf_record_framing: [0; 3],
             perf_lost: 0,
@@ -1677,6 +1683,22 @@ impl InspectRuntime {
     #[must_use]
     pub fn drain_totals(&self) -> (u64, u64, u64) {
         (self.raw_drained, self.decoded_hits, self.perf_lost)
+    }
+
+    /// Physical scope/read failure count, retained independently of raw loss counters.
+    #[must_use]
+    pub fn scope_failure_count(&self) -> u64 {
+        self.scope_failures
+    }
+
+    /// Number of reader failures; any nonzero value invalidates complete coverage.
+    pub fn perf_read_failure_count(&self) -> u64 {
+        self.perf_read_failures
+    }
+
+    /// Bounded slice yields and possible unread tail at the latest poll.
+    pub fn poll_budget_status(&self) -> (u64, bool) {
+        (self.poll_budget_yields, self.unread_perf_possible)
     }
 
     /// Fixed counters at the raw-record boundary, before adapter decoding.
@@ -4026,8 +4048,10 @@ fn attach_all(_runtime: &mut InspectRuntime) -> Vec<InspectObservation> {
     reason = "Keep this admission or delivery transaction together for review."
 )]
 fn poll_all(runtime: &mut InspectRuntime) -> Vec<InspectOutput> {
+    let refresh_phase = crate::capture_timing::enter(crate::capture_timing::Phase::PollScope);
     let _ = refresh_process_epochs(runtime);
     refresh_tgid_filter(runtime);
+    drop(refresh_phase);
     if runtime.scope_revoked_poll {
         return finish_scope_poll(runtime, Vec::new());
     }
@@ -4045,6 +4069,7 @@ fn poll_all(runtime: &mut InspectRuntime) -> Vec<InspectOutput> {
     let mut bound_failure = None;
     for probe in &mut runtime.sessions {
         let before_drained = probe.session.drained_total;
+        let before_yields = probe.session.budget_yields_total;
         let before_lost = probe.session.lost_total;
         let before = probe.session.decode_counters;
         let before_padding = before.perf_padding_removed;
@@ -4058,12 +4083,25 @@ fn poll_all(runtime: &mut InspectRuntime) -> Vec<InspectOutput> {
         ];
         // A successful one-shot poll detaches and clears the session's live
         // scope. Retain the committed epoch for only this returned batch.
-        let polled = probe_renewal::poll_with_epoch(
+        let (epoch, report) = probe_renewal::poll_with_epoch(
             &mut probe.session,
             ksight_hwbp::UprobeSession::instance_epoch,
-            ksight_hwbp::UprobeSession::poll_hits,
-        );
+            |session| Ok(session.poll_hits_report()),
+        )
+        .expect("report polling is infallible; errors travel inside the report");
+        if let Some(error) = &report.error {
+            runtime.perf_read_failures = runtime.perf_read_failures.saturating_add(1);
+            if runtime.bound_instance_targets.is_some() {
+                bound_failure = Some(format!("bound_backend_read_error:{error}"));
+            }
+        }
         runtime.raw_drained += probe.session.drained_total.saturating_sub(before_drained);
+        runtime.poll_budget_yields = runtime.poll_budget_yields.saturating_add(
+            probe
+                .session
+                .budget_yields_total
+                .saturating_sub(before_yields),
+        );
         runtime.perf_lost += probe.session.lost_total.saturating_sub(before_lost);
         let after = probe.session.decode_counters;
         if after.perf_min_size != 0
@@ -4090,15 +4128,8 @@ fn poll_all(runtime: &mut InspectRuntime) -> Vec<InspectOutput> {
         {
             *total = total.saturating_add(after.saturating_sub(before));
         }
-        let (epoch, hits) = match polled {
-            Ok(batch) => batch,
-            Err(error) => {
-                if runtime.bound_instance_targets.is_some() {
-                    bound_failure = Some(format!("bound_backend_read_error:{error:#}"));
-                }
-                continue;
-            }
-        };
+        let hits = report.records;
+        crate::capture_timing::set(crate::capture_timing::Phase::PollProcess);
         for hit in hits {
             if let Some(targets) = &runtime.bound_instance_targets {
                 if let Some(error) = targets
@@ -4126,6 +4157,7 @@ fn poll_all(runtime: &mut InspectRuntime) -> Vec<InspectOutput> {
         revoke_scope(runtime, None, &error);
         return finish_scope_poll(runtime, Vec::new());
     }
+    crate::capture_timing::set(crate::capture_timing::Phase::PollProcess);
     batch.sort_by_key(|(_, _, hit)| hit.time_ns);
     for (plan, retprobe, hit) in batch {
         if plan_is_connkey(&plan) {
@@ -4219,6 +4251,10 @@ fn poll_all(runtime: &mut InspectRuntime) -> Vec<InspectOutput> {
             }
         }
     }
+    runtime.unread_perf_possible = runtime
+        .sessions
+        .iter()
+        .any(|p| p.session.last_poll_drain == ksight_hwbp::perf_drain::PollDrainState::Yielded);
     finish_scope_poll(runtime, out)
 }
 

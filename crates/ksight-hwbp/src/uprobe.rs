@@ -140,6 +140,10 @@ pub struct UprobeSession {
     pub decode_counters: crate::registers::DecodeCounters,
     /// Total records the kernel reports as lost (ring overflow).
     pub lost_total: u64,
+    /// Per-buffer slices that yielded without proving the ring empty.
+    pub budget_yields_total: u64,
+    /// Last poll left possible unread samples; never a measured loss count.
+    pub last_poll_drain: crate::perf_drain::PollDrainState,
 }
 
 /// Arguments that used to trail `start_configured`. Grouped so the attach
@@ -510,6 +514,8 @@ impl UprobeSession {
             drained_total: 0,
             decode_counters: crate::registers::DecodeCounters::default(),
             lost_total: 0,
+            budget_yields_total: 0,
+            last_poll_drain: crate::perf_drain::PollDrainState::Empty,
         })
     }
 
@@ -602,9 +608,11 @@ impl UprobeSession {
     pub fn poll_hits_report(&mut self) -> PerfDrainReport<RegisterContext, String> {
         let started = std::time::Instant::now();
         let mut result = PerfDrainReport::default();
+        self.last_poll_drain = crate::perf_drain::PollDrainState::Empty;
         if self.finished {
             return result;
         }
+        crate::perf_drain::phase(crate::perf_drain::PollPhase::Scope);
         if let Err(error) = self.check_instance_handles() {
             self.detach();
             result.error = Some(format!("instance handle invalidated: {error:#}"));
@@ -616,6 +624,7 @@ impl UprobeSession {
             let slots = &mut self.read_slots;
             let report = drain_reads(
                 || {
+                    crate::perf_drain::phase(crate::perf_drain::PollPhase::Read);
                     let read = match buffer.read_events(slots) {
                         Ok(read) => read,
                         Err(error) => {
@@ -627,6 +636,7 @@ impl UprobeSession {
                     };
                     // Capture the notification instant BEFORE record decoding.
                     let observed = monotonic_ns();
+                    crate::perf_drain::phase(crate::perf_drain::PollPhase::Decode);
                     let records = slots
                         .iter()
                         .take(read.read)
@@ -657,6 +667,9 @@ impl UprobeSession {
             result.lost_samples = result.lost_samples.saturating_add(report.lost_samples);
             result.read_calls = result.read_calls.saturating_add(report.read_calls);
             result.budget_yielded |= report.budget_yielded;
+            self.budget_yields_total = self
+                .budget_yields_total
+                .saturating_add(u64::from(report.budget_yielded));
             result.lost_only_reads = result
                 .lost_only_reads
                 .saturating_add(report.lost_only_reads);
@@ -671,6 +684,7 @@ impl UprobeSession {
                 break;
             }
         }
+        crate::perf_drain::phase(crate::perf_drain::PollPhase::Scope);
         if let Err(error) = self.check_instance_handles() {
             result.records.clear();
             result.error = Some(format!(
@@ -681,6 +695,12 @@ impl UprobeSession {
         if self.hit_once && !result.records.is_empty() {
             self.detach();
         }
+        self.last_poll_drain = if result.budget_yielded {
+            crate::perf_drain::PollDrainState::Yielded
+        } else {
+            crate::perf_drain::PollDrainState::Empty
+        };
+        crate::perf_drain::phase(crate::perf_drain::PollPhase::Poll);
         result.elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
         result
     }
@@ -716,6 +736,7 @@ impl UprobeSession {
 
     /// 解除 uprobe。
     fn detach(&mut self) {
+        crate::perf_drain::phase(crate::perf_drain::PollPhase::Detach);
         self.finished = true;
         if self.instance_scope.is_some() {
             let _ = BpfFilterMaps(&mut self.bpf).gate(2);

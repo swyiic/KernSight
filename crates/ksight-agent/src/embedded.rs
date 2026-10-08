@@ -66,6 +66,9 @@ const ASSETS: &[(&str, &[u8], u32)] = &[
 ];
 
 /// Dedicated qualified objects; legacy objects and CLI selections are preserved.
+///
+/// # Errors
+/// Returns an error for unsafe paths, directory creation or asset publication failures.
 #[cfg(feature = "embedded-assets")]
 pub fn qualified_objects() -> anyhow::Result<(PathBuf, PathBuf)> {
     let inputs: &[(&str, &[u8])] = &[
