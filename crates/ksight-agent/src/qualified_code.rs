@@ -745,8 +745,11 @@ mod physical {
                 row.start,
                 want,
                 || {
-                    if Instant::now() >= deadline || ksight_core::output_budget::should_stop(out) {
+                    if ksight_core::output_budget::should_stop(out) {
                         bail!("parent_deadline_or_output_exhausted");
+                    }
+                    if Instant::now() >= deadline {
+                        bail!("local_copy_window_exhausted");
                     }
                     binding.check_current()
                 },
@@ -759,18 +762,22 @@ mod physical {
                     }
                 }
             }
-            let stable_mapping = read_at(&target.dir, "maps", 2 * 1024 * 1024)
-                .ok()
-                .and_then(|bytes| String::from_utf8(bytes).ok())
-                .is_some_and(|text| {
-                    crate::dexdump::parse_maps(&text).iter().any(|now| {
-                        now.start == row.start
-                            && now.end == row.end
-                            && now.path == row.path
-                            && now.inode == row.inode
-                            && now.perms == row.perms
-                    })
-                });
+            // The partial file stays unadmitted. A separate positive end check
+            // only establishes that this gap was local time, never code coverage.
+            let local_window = receipt.read_error.as_deref() == Some("local_copy_window_exhausted");
+            let post_copy_source_verified = local_window
+                && !ksight_core::output_budget::should_stop(out)
+                && binding.check_current().is_ok()
+                && self
+                    .qualify(&expected.package, expected.pid, false)
+                    .is_ok_and(|current| current.identity == *expected)
+                && !ksight_core::output_budget::should_stop(out);
+            let stable_mapping = same_bound_mapping(target, row);
+            let post_copy_source_verified = post_copy_source_verified
+                && stable_mapping
+                && !ksight_core::output_budget::should_stop(out)
+                && binding.check_current().is_ok()
+                && !ksight_core::output_budget::should_stop(out);
             if !stable_mapping {
                 receipt.admission = "rejected_mapping_changed_or_unknown".into();
             }
@@ -789,7 +796,13 @@ mod physical {
                 receipt.admission = "rejected_publish_failure".into();
             }
             let admitted_now = admitted && receipt.write_status == "complete";
-            let record = serde_json::json!({"source":expected,"mapping":{"start":row.start,"end":row.end,"path":row.path,"inode":row.inode,"perms":row.perms},"requested_mapping_bytes":requested,"selection_limit_bytes":want,"selection_limit_reason":if saw_budget_reserve {"runtime_payload_budget_metadata_reserve"} else if saw_range_cap {"per_range_cap"} else {"full_mapping_selected"},"read":receipt,"raw_evidence":final_path.file_name().and_then(|n|n.to_str()),"derived":[],"selection_policy":"app_install_dex_then_elf_then_other_original_maps_order","scope":"anchored original task/mm; named code or executable mappings","admitted":admitted_now});
+            let excluded_local_window = local_window
+                && post_copy_source_verified
+                && stable_mapping
+                && receipt.write_status == "complete"
+                && receipt.write_error.is_none()
+                && !ksight_core::output_budget::should_stop(out);
+            let record = serde_json::json!({"source":expected,"excluded_local_window":excluded_local_window,"post_copy_source_verified":post_copy_source_verified,"mapping_revalidated":stable_mapping,"mapping":{"start":row.start,"end":row.end,"path":row.path,"inode":row.inode,"perms":row.perms},"requested_mapping_bytes":requested,"selection_limit_bytes":want,"selection_limit_reason":if saw_budget_reserve {"runtime_payload_budget_metadata_reserve"} else if saw_range_cap {"per_range_cap"} else {"full_mapping_selected"},"read":receipt,"raw_evidence":final_path.file_name().and_then(|n|n.to_str()),"derived":[],"selection_policy":"app_install_dex_then_elf_then_other_original_maps_order","scope":"anchored original task/mm; named code or executable mappings","admitted":admitted_now});
             Ok(BoundRangeStep::Copied {
                 record,
                 partial: !admitted_now || want < requested,
@@ -906,6 +919,20 @@ mod physical {
             let _ = target.dir.as_fd(); // Retain original directory to the end of this producer scope.
             Ok(stats)
         }
+    }
+    fn same_bound_mapping(target: &Target, row: &crate::dexdump::MapRow) -> bool {
+        read_at(&target.dir, "maps", 2 * 1024 * 1024)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .is_some_and(|text| {
+                crate::dexdump::parse_maps(&text).iter().any(|now| {
+                    now.start == row.start
+                        && now.end == row.end
+                        && now.path == row.path
+                        && now.inode == row.inode
+                        && now.perms == row.perms
+                })
+            })
     }
     /// `Target`.
     pub struct Target {
