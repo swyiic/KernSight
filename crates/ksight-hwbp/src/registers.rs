@@ -149,3 +149,128 @@ fn read_u32(bytes: &[u8], offset: usize) -> u32 {
 fn read_u64(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(bytes[offset..offset + 8].try_into().expect("fixed offset"))
 }
+
+/// Bounded mutually exclusive reasons at the raw perf-record admission boundary.
+/// No rejected register payload is retained and no admission rule is relaxed.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DecodeCounters {
+    pub bad_size: u64,
+    pub bad_abi: u64,
+    pub malformed: u64,
+    pub scope_epoch: u64,
+    pub scope_identity: u64,
+    pub accepted: u64,
+}
+impl DecodeCounters {
+    pub fn admit(
+        &mut self,
+        bytes: &[u8],
+        scope: Option<(u32, &[InstanceIdentity])>,
+    ) -> Option<RegisterContext> {
+        let reason;
+        if let Some((epoch, identities)) = scope {
+            if bytes.len() != INSTANCE_CONTEXT_SIZE {
+                reason = &mut self.bad_size;
+            } else if read_u32(bytes, 4420) != INSTANCE_ABI_V1 {
+                reason = &mut self.bad_abi;
+            } else if let Some(hit) = RegisterContext::decode_instance(bytes) {
+                let stamp = hit.instance?;
+                if epoch == 0 || stamp.epoch != epoch {
+                    reason = &mut self.scope_epoch;
+                } else if !identities.contains(&stamp.identity) {
+                    reason = &mut self.scope_identity;
+                } else {
+                    self.accepted = self.accepted.saturating_add(1);
+                    return Some(hit);
+                }
+            } else {
+                reason = &mut self.malformed;
+            }
+        } else if let Some(hit) = RegisterContext::decode(bytes) {
+            self.accepted = self.accepted.saturating_add(1);
+            return Some(hit);
+        } else {
+            reason = &mut self.malformed;
+        }
+        *reason = reason.saturating_add(1);
+        None
+    }
+}
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    fn record() -> Vec<u8> {
+        let mut b = vec![0; INSTANCE_CONTEXT_SIZE];
+        for (offset, value) in [
+            (0, 7u32),
+            (4408, 7),
+            (4412, 10285),
+            (4416, 3),
+            (4420, INSTANCE_ABI_V1),
+        ] {
+            b[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        for (offset, value) in [(4424, 9u64), (4432, 4), (4440, 10)] {
+            b[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        b
+    }
+    #[test]
+    fn strict_record_funnel_classifies_without_granting_invalid_payloads() {
+        let identity = InstanceIdentity {
+            tgid: 7,
+            uid: 10285,
+            birth_ns: 9,
+            exec_id: 4,
+        };
+        let ids = [identity];
+        let mut c = DecodeCounters::default();
+        let b = record();
+        assert!(c.admit(&b, Some((3, &ids))).is_some());
+        for size in [4408, 4447, 4449] {
+            let mut bad = b.clone();
+            bad.resize(size, 0);
+            assert!(c.admit(&bad, Some((3, &ids))).is_none());
+        }
+        let mut bad = b.clone();
+        bad[4420..4424].fill(0);
+        assert!(c.admit(&bad, Some((3, &ids))).is_none());
+        for offset in [0, 4408, 4424, 4440] {
+            let mut bad = b.clone();
+            bad[offset..offset + 4].fill(0);
+            assert!(c.admit(&bad, Some((3, &ids))).is_none());
+        }
+        let mut bad = b.clone();
+        bad[288..292].copy_from_slice(&4097u32.to_le_bytes());
+        assert!(c.admit(&bad, Some((3, &ids))).is_none());
+        assert!(c.admit(&b, Some((4, &ids))).is_none());
+        for identity in [
+            InstanceIdentity { uid: 1, ..identity },
+            InstanceIdentity {
+                birth_ns: 11,
+                ..identity
+            },
+            InstanceIdentity {
+                exec_id: 5,
+                ..identity
+            },
+            InstanceIdentity {
+                tgid: 8,
+                ..identity
+            },
+        ] {
+            assert!(c.admit(&b, Some((3, &[identity]))).is_none());
+        }
+        assert_eq!(
+            (
+                c.accepted,
+                c.bad_size,
+                c.bad_abi,
+                c.malformed,
+                c.scope_epoch,
+                c.scope_identity
+            ),
+            (1, 3, 1, 5, 1, 4)
+        );
+    }
+}

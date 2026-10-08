@@ -1089,6 +1089,9 @@ fn stream_events(
             }
             if Instant::now() >= next_inspect_stats {
                 let (raw, decoded, lost) = inspect.drain_totals();
+                let [bad_size, bad_abi, malformed, scope_epoch, scope_identity, accepted] =
+                    inspect.record_admission_totals();
+                eprintln!("inspect record admission: bad_size={bad_size} bad_abi={bad_abi} malformed={malformed} scope_epoch={scope_epoch} scope_identity={scope_identity} accepted={accepted}");
                 let (read_entry, read_return, read_success, read_failure, read_wanted) =
                     inspect.ssl_read_funnel();
                 let (
@@ -1315,6 +1318,9 @@ fn stream_events(
             mirror.seal();
         }
         let (raw, decoded, lost) = inspect.drain_totals();
+        let [bad_size, bad_abi, malformed, scope_epoch, scope_identity, accepted] =
+            inspect.record_admission_totals();
+        eprintln!("inspect record admission: bad_size={bad_size} bad_abi={bad_abi} malformed={malformed} scope_epoch={scope_epoch} scope_identity={scope_identity} accepted={accepted}");
         let (read_entry, read_return, read_success, read_failure, read_wanted) =
             inspect.ssl_read_funnel();
         let (

@@ -137,6 +137,7 @@ pub struct UprobeSession {
     pub paired_entry_return: bool,
     /// Total valid records drained from the perf buffers.
     pub drained_total: u64,
+    pub decode_counters: crate::registers::DecodeCounters,
     /// Total records the kernel reports as lost (ring overflow).
     pub lost_total: u64,
 }
@@ -507,6 +508,7 @@ impl UprobeSession {
             instance_scope,
             paired_entry_return,
             drained_total: 0,
+            decode_counters: crate::registers::DecodeCounters::default(),
             lost_total: 0,
         })
     }
@@ -609,6 +611,7 @@ impl UprobeSession {
             return result;
         }
         let instance_scope = self.instance_scope.as_ref();
+        let counters = &mut self.decode_counters;
         for buffer in &mut self.buffers {
             let slots = &mut self.read_slots;
             let report = drain_reads(
@@ -628,11 +631,14 @@ impl UprobeSession {
                         .iter()
                         .take(read.read)
                         .filter_map(|slot| {
+                            let hit = counters.admit(
+                                slot,
+                                instance_scope.map(|s| (s.epoch, s.identities.as_slice())),
+                            )?;
                             if let Some(scope) = instance_scope {
-                                let hit = RegisterContext::decode_instance(slot)?;
                                 scope.accepts(hit.instance.as_ref()?).then_some(hit)
                             } else {
-                                RegisterContext::decode(slot)
+                                Some(hit)
                             }
                         })
                         .collect();

@@ -136,7 +136,7 @@ const _: () = assert!(std::mem::size_of::<AllowValue>() == 24);
 pub(crate) struct ScopeState {
     pub epoch: u32,
     pub keys: Vec<ScopeKey>,
-    identities: Vec<InstanceIdentity>,
+    pub(crate) identities: Vec<InstanceIdentity>,
     pub bindings: Vec<BoundInstance>,
 }
 #[cfg(any(test, target_os = "android", target_os = "linux"))]

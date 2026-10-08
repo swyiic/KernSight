@@ -793,6 +793,7 @@ pub struct InspectRuntime {
     hits: u32,
     /// Raw uprobe records drained from perf buffers, before decode.
     raw_drained: u64,
+    decode_rejections: [u64; 6],
     /// Records the kernel reported lost to ring-buffer overflow.
     perf_lost: u64,
     /// Hits `decode_hit` turned into outputs.
@@ -1401,6 +1402,7 @@ impl InspectRuntime {
             max_hits,
             hits: 0,
             raw_drained: 0,
+            decode_rejections: [0; 6],
             perf_lost: 0,
             decoded_hits: 0,
             ssl_read_entry: 0,
@@ -1659,6 +1661,12 @@ impl InspectRuntime {
     #[must_use]
     pub fn drain_totals(&self) -> (u64, u64, u64) {
         (self.raw_drained, self.decoded_hits, self.perf_lost)
+    }
+
+    /// Fixed counters at the raw-record boundary, before adapter decoding.
+    #[must_use]
+    pub fn record_admission_totals(&self) -> [u64; 6] {
+        self.decode_rejections
     }
 
     /// `TlsSslRead` funnel: (entry, uret`, plaintext_``ok, uret_``fail, want_read_``or_neg`).
@@ -4016,6 +4024,15 @@ fn poll_all(runtime: &mut InspectRuntime) -> Vec<InspectOutput> {
     for probe in &mut runtime.sessions {
         let before_drained = probe.session.drained_total;
         let before_lost = probe.session.lost_total;
+        let before = probe.session.decode_counters;
+        let before = [
+            before.bad_size,
+            before.bad_abi,
+            before.malformed,
+            before.scope_epoch,
+            before.scope_identity,
+            before.accepted,
+        ];
         // A successful one-shot poll detaches and clears the session's live
         // scope. Retain the committed epoch for only this returned batch.
         let polled = probe_renewal::poll_with_epoch(
@@ -4025,6 +4042,22 @@ fn poll_all(runtime: &mut InspectRuntime) -> Vec<InspectOutput> {
         );
         runtime.raw_drained += probe.session.drained_total.saturating_sub(before_drained);
         runtime.perf_lost += probe.session.lost_total.saturating_sub(before_lost);
+        let after = probe.session.decode_counters;
+        let after = [
+            after.bad_size,
+            after.bad_abi,
+            after.malformed,
+            after.scope_epoch,
+            after.scope_identity,
+            after.accepted,
+        ];
+        for (total, (after, before)) in runtime
+            .decode_rejections
+            .iter_mut()
+            .zip(after.into_iter().zip(before))
+        {
+            *total = total.saturating_add(after.saturating_sub(before));
+        }
         let (epoch, hits) = match polled {
             Ok(batch) => batch,
             Err(error) => {
