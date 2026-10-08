@@ -802,9 +802,23 @@ fn dump_package(
     if let Some(l) = lifecycle {
         eprintln!(
             "{}",
-            serde_json::to_string(
-                &l.finish(result.is_ok() && !guard.as_ref().is_some_and(|g| g.receipt().partial))?
-            )?
+            serde_json::to_string(&l.finish_with_dump_coverage(
+                result.is_ok() && !guard.as_ref().is_some_and(|g| g.receipt().partial),
+                if result.is_ok() {
+                    expected_code_sources
+                        .and_then(|body| {
+                            serde_json::from_str::<
+                                    Vec<ksight_agent::qualified_code::SourceIdentity>,
+                                >(body)
+                                .ok()
+                        })
+                        .and_then(|sources| {
+                            ksight_agent::dump_coverage::proof(dest, package, &sources).ok()
+                        })
+                } else {
+                    None
+                },
+            )?)?
         );
     }
     result

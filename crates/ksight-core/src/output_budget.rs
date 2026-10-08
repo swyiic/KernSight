@@ -29,6 +29,7 @@ pub struct Receipt {
     pub reason: Option<String>,
 }
 struct State {
+    non_coverage_failure: bool,
     roots: Vec<PathBuf>,
     deadline: Instant,
     receipt: Receipt,
@@ -140,6 +141,7 @@ impl Guard {
         all.insert(
             id,
             State {
+                non_coverage_failure: false,
                 roots,
                 deadline: Instant::now() + Duration::from_millis(max_ms),
                 receipt: Receipt {
@@ -249,6 +251,7 @@ pub fn charge(path: &Path, n: u64) -> io::Result<()> {
         let reason = reason.map(str::to_owned);
         if let Some(reason) = reason {
             s.receipt.partial = true;
+            s.non_coverage_failure = true;
             s.receipt.reason = Some(reason.clone());
             s.receipt.rejected_writes = s.receipt.rejected_writes.saturating_add(1);
             return Err(io::Error::other(reason));
@@ -301,6 +304,7 @@ pub fn interrupt(path: &Path, reason: &str) {
             .values_mut()
             .filter(|s| s.roots.iter().any(|r| path.starts_with(r)))
         {
+            s.non_coverage_failure = true;
             s.deadline = Instant::now();
             s.receipt.partial = true;
             if s.receipt.reason.is_none() {
@@ -316,6 +320,7 @@ pub fn record_failure(path: &Path, reason: &str) {
             .values_mut()
             .filter(|s| s.roots.iter().any(|r| path.starts_with(r)))
         {
+            s.non_coverage_failure |= reason != "bound_code_copy_partial";
             s.receipt.partial = true;
             if s.receipt.reason.is_none() {
                 s.receipt.reason = Some(reason.into());
@@ -448,6 +453,20 @@ pub fn should_stop(path: &Path) -> bool {
         }
     }
     false
+}
+
+/// True only for a bound-copy coverage gap with no other recorded failure.
+#[must_use]
+pub fn bound_coverage_only(path: &Path) -> bool {
+    states().lock().ok().is_some_and(|all| {
+        all.values().any(|s| {
+            s.roots.iter().any(|r| path.starts_with(r))
+                && !s.non_coverage_failure
+                && Instant::now() < s.deadline
+                && s.receipt.reason.as_deref() == Some("bound_code_copy_partial")
+                && s.receipt.rejected_writes == 0
+        })
+    })
 }
 
 #[cfg(test)]

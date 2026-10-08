@@ -886,7 +886,7 @@ mod physical {
                 saw_range_cap,
                 saw_budget_reserve,
             });
-            let note = serde_json::json!({"schema":"kernsight.bound-code-copy/v1","source":expected,"candidate_manifest":candidate_name,"candidate_result":{"attempted":records.len(),"unattempted_state":unattempted_state,"truncation":truncation,"actual_ranges":"records.read","budget_stop":ksight_core::output_budget::should_stop(out)},"records":records,"partial":partial,"paused":false,"torn":true,"torn_reason":"process_not_paused","unsupported":"unregistered anonymous heap/FD/private scans; main-process enrollment only","object_sha256":format!("{:x}",Sha256::digest(std::fs::read(&self.metadata)?)),"btf_sha256":hex_bytes(&self.btf_hash)});
+            let note = serde_json::json!({"schema":"kernsight.bound-code-copy/v1","source":expected,"candidate_manifest":candidate_name,"candidate_result":{"attempted":records.len(),"unattempted_state":unattempted_state,"truncation":truncation,"stop_scope":if stopped_early && !ksight_core::output_budget::should_stop(out) {"local_copy_window"} else {"none_or_parent_budget"},"actual_ranges":"records.read","budget_stop":ksight_core::output_budget::should_stop(out)},"records":records,"partial":partial,"paused":false,"torn":true,"torn_reason":"process_not_paused","unsupported":"unregistered anonymous heap/FD/private scans; main-process enrollment only","object_sha256":format!("{:x}",Sha256::digest(std::fs::read(&self.metadata)?)),"btf_sha256":hex_bytes(&self.btf_hash)});
             let note_body = serde_json::to_vec_pretty(&note)?;
             let note_path = out.join(format!(
                 "bound-source-{}-{}.json",

@@ -53,6 +53,8 @@ struct PrestartStop {
 }
 #[derive(Debug, Serialize, Deserialize)]
 struct Returned {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dump_coverage: Option<serde_json::Value>,
     token: Uuid,
     result: String,
     stop_reason: Option<String>,
@@ -92,6 +94,9 @@ pub struct Status {
     /// Absence is unknown, never inferred exit.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub qualification_failure: Option<serde_json::Value>,
+    /// Positive Dump coverage proof; absent means unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dump_coverage: Option<serde_json::Value>,
 }
 fn same(a: &CaptureRelation, b: &CaptureRelation) -> bool {
     a.parent_id == b.parent_id
@@ -313,11 +318,14 @@ fn inspect_with(
         collection_returned: returned.is_some(),
         collection_status: returned.as_ref().map(|v| v.result.clone()),
         agent_exited_confirmed: exited,
-        cleanup: returned.map_or("unconfirmed".into(), |v| v.cleanup),
+        cleanup: returned
+            .as_ref()
+            .map_or("unconfirmed".into(), |v| v.cleanup.clone()),
         target_pause: o.target_pause,
         startup,
         qualification,
         qualification_failure,
+        dump_coverage: returned.as_ref().and_then(|v| v.dump_coverage.clone()),
     };
     // Existing controllers bound the entire status RPC at 16 KiB, not each
     // nested receipt. Never make an otherwise valid status unreadable merely
@@ -502,12 +510,22 @@ impl Lease {
     ///
     /// # Errors
     /// Returns the validation or required operation error; no successful result is fabricated.
-    pub fn finish(mut self, successful: bool) -> Result<Status> {
+    pub fn finish(self, successful: bool) -> Result<Status> {
+        self.finish_with_dump_coverage(successful, None)
+    }
+    /// Finish with a producer-validated coverage proof; never upgrades partial.
+    /// # Errors
+    /// Returns lifecycle persistence or owner validation errors.
+    pub fn finish_with_dump_coverage(
+        mut self,
+        successful: bool,
+        dump_coverage: Option<serde_json::Value>,
+    ) -> Result<Status> {
         self.done.store(true, Ordering::SeqCst);
         let mut reason = self
             .watch
             .take()
-            .unwrap()
+            .context("lifecycle watcher missing")?
             .join()
             .map_err(|_| anyhow::anyhow!("lifecycle watcher panicked"))?;
         if reason.is_none() {
@@ -544,6 +562,13 @@ impl Lease {
             &self.root,
             "returned.json",
             &Returned {
+                dump_coverage: dump_coverage.filter(|_| {
+                    self.owner.relation.stage_key == "dump"
+                        && !self.root.join("qualification-failure.json").exists()
+                        && reason.as_deref() == Some("bound_code_copy_partial")
+                        && Instant::now() < self.deadline
+                        && !self.root.join("stop.json").exists()
+                }),
                 token: self.owner.token,
                 result: if successful && reason.is_none() {
                     "completed"
@@ -1015,7 +1040,7 @@ impl LaunchTask {
         let result = self
             .worker
             .take()
-            .unwrap()
+            .context("lifecycle watcher missing")?
             .join()
             .map_err(|_| anyhow::anyhow!("owned launcher worker panicked"))?;
         self.owner.retain_timing()?;
@@ -1128,6 +1153,7 @@ mod qualification_failure_tests {
             &fixture.root,
             "returned.json",
             &Returned {
+                dump_coverage: None,
                 token: fixture.token,
                 result: "partial".into(),
                 stop_reason: None,
