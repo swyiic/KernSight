@@ -1258,6 +1258,14 @@ impl InspectRuntime {
             self.tls_pending.drop_all_incomplete();
             self.scoped_tgids = next.iter().map(|t| t.identity.tgid).collect();
             self.bound_instance_targets = Some(next);
+            for live in &self.sessions {
+                if let Some(epoch) = live.session.instance_epoch() {
+                    eprintln!(
+                        "qualified probe refresh: adapter={} epoch={epoch}",
+                        live.plan.adapter.as_str()
+                    );
+                }
+            }
             Ok(())
         })();
         if let Err(error) = result {
