@@ -74,15 +74,33 @@ impl<T, E> Default for PerfDrainReport<T, E> {
 /// Unread data stays in the kernel ring for the next poll. The caller owns reusable
 /// read slots. No successful read or loss counter is discarded on error.
 pub fn drain_reads<T, E>(
+    read: impl FnMut() -> Result<PerfRead<T>, (E, Option<u64>)>,
+    timestamp: impl Fn(&T) -> u64,
+) -> PerfDrainReport<T, E> {
+    drain_reads_bounded(read, timestamp, 8)
+}
+
+/// Once producers are confirmed stopped, larger bounded read batches reduce
+/// repeated per-buffer overhead without enlarging kernel rings or time slices.
+pub fn drain_stopped_reads<T, E>(
+    read: impl FnMut() -> Result<PerfRead<T>, (E, Option<u64>)>,
+    timestamp: impl Fn(&T) -> u64,
+) -> PerfDrainReport<T, E> {
+    drain_reads_bounded(read, timestamp, 32)
+}
+fn drain_reads_bounded<T, E>(
     mut read: impl FnMut() -> Result<PerfRead<T>, (E, Option<u64>)>,
     timestamp: impl Fn(&T) -> u64,
+    max_calls: u64,
 ) -> PerfDrainReport<T, E> {
     let start = std::time::Instant::now();
     let mut report = PerfDrainReport::default();
     loop {
         // A continuously replenished (including lost-only) ring need never empty.
         // Return to the capture loop so its original observation/lease can be checked.
-        if report.read_calls >= 8 || (report.read_calls > 0 && start.elapsed().as_millis() >= 2) {
+        if report.read_calls >= max_calls
+            || (report.read_calls > 0 && start.elapsed().as_millis() >= 2)
+        {
             report.budget_yielded = true;
             break;
         }
@@ -253,5 +271,43 @@ mod fairness_tests {
         assert_eq!(seen, vec![vec![0, 1, 2, 3, 4, 5]; 3]);
         assert_eq!(super::fair_indices(0, 0).count(), 0);
         assert_eq!(super::fair_indices(3, 2).collect::<Vec<_>>(), [2, 0, 1]);
+    }
+}
+
+#[cfg(test)]
+mod stopped_batch_tests {
+    use super::*;
+    #[test]
+    fn stopped_batch_is_finite_retains_loss_and_can_observe_empty() {
+        let mut count = 0;
+        let report = drain_stopped_reads(
+            || {
+                count += 1;
+                Ok::<_, ((), Option<u64>)>(PerfRead {
+                    samples: if count <= 20 { 1 } else { 0 },
+                    records: if count <= 20 { vec![count] } else { vec![] },
+                    lost_samples: if count == 2 { 7 } else { 0 },
+                    notification_monotonic_ns: None,
+                })
+            },
+            |x| *x,
+        );
+        assert!(!report.budget_yielded);
+        assert_eq!(report.raw_samples, 20);
+        assert_eq!(report.lost_samples, 7);
+        assert_eq!(report.read_calls, 21);
+        let forever = drain_stopped_reads(
+            || {
+                Ok::<_, ((), Option<u64>)>(PerfRead {
+                    samples: 1,
+                    records: vec![1],
+                    lost_samples: 0,
+                    notification_monotonic_ns: None,
+                })
+            },
+            |x| *x,
+        );
+        assert!(forever.budget_yielded);
+        assert!(forever.read_calls <= 32);
     }
 }

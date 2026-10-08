@@ -85,7 +85,7 @@ impl InstanceMaps for BpfInstanceMaps<'_> {
     }
 }
 use super::tgid_filter::{self, FilterMaps};
-use crate::perf_drain::{drain_reads, PerfDrainReport, PerfRead};
+use crate::perf_drain::{drain_reads, drain_stopped_reads, PerfDrainReport, PerfRead};
 
 struct BpfFilterMaps<'a>(&'a mut Ebpf);
 
@@ -635,6 +635,7 @@ impl UprobeSession {
             result.error = Some(format!("instance handle invalidated: {error:#}"));
             return result;
         }
+        let stopped = self.producer_stopped();
         let instance_scope = self.instance_scope.as_ref();
         let counters = &mut self.decode_counters;
         let first = self.next_buffer;
@@ -646,7 +647,12 @@ impl UprobeSession {
         for index in crate::perf_drain::fair_indices(self.buffers.len(), first) {
             let buffer = &mut self.buffers[index];
             let slots = &mut self.read_slots;
-            let mut report = drain_reads(
+            let reader = if stopped {
+                drain_stopped_reads
+            } else {
+                drain_reads
+            };
+            let mut report = reader(
                 || {
                     crate::perf_drain::phase(crate::perf_drain::PollPhase::Read);
                     let read = match buffer.read_events(slots) {
