@@ -311,3 +311,117 @@ mod stopped_batch_tests {
         assert!(forever.read_calls <= 32);
     }
 }
+
+/// Close a one-shot producer without discarding unread queue decoding authority.
+/// A closure failure retains already-read records and remains a reader error.
+pub fn stop_after_one_shot<T, E>(
+    hit_once: bool,
+    report: &mut PerfDrainReport<T, E>,
+    stop: impl FnOnce() -> Result<(), E>,
+) {
+    if hit_once && !report.records.is_empty() && report.error.is_none() {
+        if let Err(error) = stop() {
+            report.error = Some(error);
+        }
+    }
+}
+#[cfg(test)]
+mod one_shot_shutdown_tests {
+    use super::*;
+    #[test]
+    fn stops_once_without_discarding_records_or_loss_and_preserves_errors() {
+        let mut report: PerfDrainReport<u64, &str> = PerfDrainReport {
+            records: vec![1],
+            raw_samples: 1,
+            lost_samples: 7,
+            budget_yielded: true,
+            ..Default::default()
+        };
+        let mut closed = false;
+        stop_after_one_shot(true, &mut report, || {
+            closed = true;
+            Ok(())
+        });
+        assert!(closed);
+        assert_eq!(report.records, vec![1]);
+        assert_eq!(report.lost_samples, 7);
+        assert!(report.budget_yielded);
+        stop_after_one_shot(true, &mut report, || Err("detach denied"));
+        assert_eq!(report.error, Some("detach denied"));
+        assert_eq!(report.records, vec![1]);
+        let mut empty: PerfDrainReport<u64, &str> = Default::default();
+        stop_after_one_shot(true, &mut empty, || {
+            panic!("empty queue cannot trigger a hit")
+        });
+    }
+}
+
+#[cfg(test)]
+mod one_shot_tail_integration {
+    use super::*;
+    use std::collections::VecDeque;
+    #[test]
+    fn hit_closes_producer_tail_still_decodes_and_real_empty_is_observed() {
+        let mut queue = VecDeque::from([11_u64, 12, 13]);
+        let epoch = 7;
+        let mut first: PerfDrainReport<u64, &str> = PerfDrainReport {
+            records: vec![10],
+            raw_samples: 1,
+            budget_yielded: true,
+            ..Default::default()
+        };
+        let mut producer_live = true;
+        stop_after_one_shot(true, &mut first, || {
+            producer_live = false;
+            Ok(())
+        });
+        assert!(!producer_live);
+        let mut valid_scope = true;
+        let tail = drain_stopped_reads(
+            || {
+                assert!(valid_scope);
+                assert_eq!(epoch, 7);
+                Ok::<_, (&str, Option<u64>)>(match queue.pop_front() {
+                    Some(v) => PerfRead {
+                        samples: 1,
+                        records: vec![v],
+                        lost_samples: 0,
+                        notification_monotonic_ns: None,
+                    },
+                    None => PerfRead {
+                        samples: 0,
+                        records: vec![],
+                        lost_samples: 0,
+                        notification_monotonic_ns: None,
+                    },
+                })
+            },
+            |v| *v,
+        );
+        assert_eq!(tail.records, vec![11, 12, 13]);
+        assert!(!tail.budget_yielded);
+        assert_eq!(tail.read_calls, 4);
+        valid_scope = false;
+        assert!(!valid_scope); // Final authority revocation follows queue observation.
+    }
+    #[test]
+    fn canceled_shutdown_stops_production_but_identity_error_never_claims_empty() {
+        let mut first: PerfDrainReport<u64, &str> = PerfDrainReport {
+            records: vec![10],
+            ..Default::default()
+        };
+        let mut live = true;
+        stop_after_one_shot(true, &mut first, || {
+            live = false;
+            Ok(())
+        });
+        assert!(!live);
+        let invalid = drain_stopped_reads(
+            || Err::<PerfRead<u64>, _>(("original identity invalidated", Some(9))),
+            |v| *v,
+        );
+        assert_eq!(invalid.error, Some("original identity invalidated"));
+        assert!(invalid.records.is_empty());
+        assert_eq!(first.records, vec![10]);
+    }
+}

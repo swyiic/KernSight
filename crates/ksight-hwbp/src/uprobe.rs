@@ -726,9 +726,14 @@ impl UprobeSession {
             ));
             self.detach();
         }
-        if self.hit_once && !result.records.is_empty() {
-            self.detach();
-        }
+        // One-shot closes producers, but queued records retain their original
+        // decoding authority until drained or explicitly invalidated. Full
+        // detach here made every later poll permanently Yielded.
+        let hit_once = self.hit_once;
+        crate::perf_drain::stop_after_one_shot(hit_once, &mut result, || {
+            self.stop_production()
+                .map_err(|error| format!("one-shot producer stop unconfirmed: {error:#}"))
+        });
         self.last_poll_drain = if result.budget_yielded {
             crate::perf_drain::PollDrainState::Yielded
         } else {

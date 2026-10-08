@@ -1260,7 +1260,7 @@ impl InspectRuntime {
             probe_renewal::renew_active(
                 &mut self.sessions,
                 |live| {
-                    live.session.finished()
+                    (live.session.finished() || live.session.producer_stopped())
                         && live.plan.adapter.hit_once()
                         && !live.plan.policy.whole_device
                 },
@@ -4131,8 +4131,8 @@ fn poll_all(runtime: &mut InspectRuntime) -> Vec<InspectOutput> {
             before.scope_identity,
             before.accepted,
         ];
-        // A successful one-shot poll detaches and clears the session's live
-        // scope. Retain the committed epoch for only this returned batch.
+        // A one-shot poll closes its producers and preserves original queue
+        // authority. Retain the committed epoch for this returned batch.
         let (epoch, report) = probe_renewal::poll_with_epoch(
             &mut probe.session,
             ksight_hwbp::UprobeSession::instance_epoch,
