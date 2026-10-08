@@ -6140,8 +6140,10 @@ fn resolve_binder_method(
     let Some(interface) = interface else {
         return (None, None);
     };
-    match cache.lookup(pid, interface, code) {
-        Some(name) => (Some(name.to_owned()), Some("process_dex".to_owned())),
+    let method = cache.lookup(pid, interface, code).map(str::to_owned);
+    match method {
+        Some(name) => (Some(name), Some("process_dex".to_owned())),
+        None if cache.lookup_deferred() => (None, Some("process_dex_deferred_budget".to_owned())),
         None => (None, None),
     }
 }

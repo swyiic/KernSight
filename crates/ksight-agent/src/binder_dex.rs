@@ -21,23 +21,131 @@ const MAX_CLASS_DEFS: u32 = 20_000;
 /// `interface token -> (code -> method name)` extracted from one process.
 pub type ProcessAidlTables = HashMap<String, BTreeMap<u32, String>>;
 
+// Enrichment runs on the capture thread: the entire lookup shares one allowance.
+// Exhaustion is deferred annotation, never evidence that a method does not exist.
+thread_local! {
+    static SCAN_BUDGET: std::cell::RefCell<Option<ScanBudget>> = const { std::cell::RefCell::new(None) };
+}
+struct ScanBudget {
+    deadline: std::time::Instant,
+    remaining: usize,
+    exhausted: bool,
+}
+struct ScanGuard;
+impl ScanGuard {
+    fn start(duration: std::time::Duration, bytes: usize) -> Self {
+        SCAN_BUDGET.with(|b| {
+            *b.borrow_mut() = Some(ScanBudget {
+                deadline: std::time::Instant::now() + duration,
+                remaining: bytes,
+                exhausted: false,
+            });
+        });
+        Self
+    }
+    #[allow(
+        clippy::unused_self,
+        reason = "Guard owns the scoped thread-local allowance."
+    )]
+    fn exhausted(&self) -> bool {
+        SCAN_BUDGET.with(|b| b.borrow().as_ref().is_some_and(|b| b.exhausted))
+    }
+}
+impl Drop for ScanGuard {
+    fn drop(&mut self) {
+        SCAN_BUDGET.with(|b| *b.borrow_mut() = None);
+    }
+}
+fn scan_allow(bytes: usize) -> bool {
+    SCAN_BUDGET.with(|b| {
+        let mut b = b.borrow_mut();
+        let Some(b) = b.as_mut() else {
+            return true;
+        };
+        if b.exhausted || std::time::Instant::now() >= b.deadline || bytes > b.remaining {
+            b.exhausted = true;
+            return false;
+        }
+        b.remaining -= bytes;
+        true
+    })
+}
+struct BudgetedReader<T>(T);
+impl<T: std::io::Read> std::io::Read for BudgetedReader<T> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        let take = bytes.len().min(16 * 1024);
+        if !scan_allow(take) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Binder DEX enrichment deferred by capture-thread budget",
+            ));
+        }
+        let result = self.0.read(&mut bytes[..take]);
+        // A single OS call is not preempted; expiration is still recorded on return.
+        let _ = scan_allow(0);
+        result
+    }
+}
+impl<T: std::io::Seek> std::io::Seek for BudgetedReader<T> {
+    fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
+        if !scan_allow(0) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Binder DEX seek deferred by capture-thread budget",
+            ));
+        }
+        let result = self.0.seek(from);
+        let _ = scan_allow(0);
+        result
+    }
+}
+fn read_budgeted(reader: &mut impl std::io::Read) -> Option<Vec<u8>> {
+    let mut reader = BudgetedReader(reader);
+    let mut bytes = Vec::new();
+    loop {
+        if !scan_allow(0) {
+            return None;
+        }
+        let mut chunk = [0u8; 16 * 1024];
+        let n = reader.read(&mut chunk).ok()?;
+        if n == 0 {
+            return Some(bytes);
+        }
+        bytes.extend_from_slice(&chunk[..n]);
+        if bytes.len() > MAX_IMAGE_BYTES {
+            return None;
+        }
+    }
+}
+
 /// Cache of per-PID DEX AIDL tables so each process is scanned once.
 #[derive(Debug, Default)]
 pub struct ProcessDexAidlCache {
     tables: HashMap<u32, ProcessAidlTables>,
     scans: HashMap<u32, u8>,
     token_miss: HashSet<(u32, String)>,
+    next_scan: HashMap<u32, std::time::Instant>,
+    deferred: bool,
 }
 
 impl ProcessDexAidlCache {
     /// Look up a method for `interface`/`code` in this PID's loaded DEX.
     pub fn lookup(&mut self, pid: u32, interface: &str, code: u32) -> Option<&str> {
+        self.deferred = false;
         if pid == 0 || interface.is_empty() {
             return None;
         }
         if self.cached(pid, interface, code).is_some() {
             return self.cached(pid, interface, code);
         }
+        let now = std::time::Instant::now();
+        if self.next_scan.get(&pid).is_some_and(|next| now < *next) {
+            self.deferred = true;
+            return None;
+        }
+        self.next_scan
+            .insert(pid, now + std::time::Duration::from_secs(1));
+        let guard = ScanGuard::start(std::time::Duration::from_millis(2), 4 * 1024 * 1024);
         let scans = self.scans.entry(pid).or_insert(0);
         if *scans < MAX_SCANS {
             *scans = scans.saturating_add(1);
@@ -49,11 +157,20 @@ impl ProcessDexAidlCache {
         {
             let extra = scan_token(pid, interface);
             merge_tables(self.tables.entry(pid).or_default(), extra);
-            if self.cached(pid, interface, code).is_none() {
+            if self.cached(pid, interface, code).is_none() && scan_allow(0) && !guard.exhausted() {
                 self.token_miss.insert((pid, interface.to_owned()));
             }
         }
+        self.deferred = !scan_allow(0) || guard.exhausted();
+        if self.deferred {
+            self.token_miss.remove(&(pid, interface.to_owned()));
+        }
         self.cached(pid, interface, code)
+    }
+
+    /// Whether the last missing method was deferred rather than proved absent.
+    pub fn lookup_deferred(&self) -> bool {
+        self.deferred
     }
 
     fn cached(&self, pid: u32, interface: &str, code: u32) -> Option<&str> {
@@ -150,6 +267,9 @@ struct DexIds {
 fn collect_class_rows(bytes: &[u8], ids: &DexIds) -> Vec<ClassAidl> {
     let mut rows = Vec::<ClassAidl>::new();
     for index in 0..ids.class_defs {
+        if !scan_allow(0) {
+            break;
+        }
         let Some(entry) = usize::try_from(ids.class_defs_off).ok().and_then(|base| {
             usize::try_from(index)
                 .ok()?
@@ -239,6 +359,7 @@ fn parse_class_row(bytes: &[u8], ids: &DexIds, entry: usize) -> Option<ClassAidl
 fn assemble_aidl_tables(rows: Vec<ClassAidl>) -> ProcessAidlTables {
     let interface_methods: HashMap<String, Vec<String>> = rows
         .iter()
+        .take_while(|_| scan_allow(0))
         .map(|row| {
             (
                 row.name.clone(),
@@ -252,6 +373,9 @@ fn assemble_aidl_tables(rows: Vec<ClassAidl>) -> ProcessAidlTables {
         .collect();
     let mut out = ProcessAidlTables::new();
     for row in rows {
+        if !scan_allow(0) {
+            break;
+        }
         let mut txns = row.named_txns.clone();
         let token = row
             .descriptor
@@ -398,6 +522,9 @@ fn class_aidl_body(
     let count = uleb(bytes, &mut value_cursor)?;
     let mut values = Vec::with_capacity(count.min(512) as usize);
     for _ in 0..count {
+        if !scan_allow(0) {
+            return None;
+        }
         values.push(encoded_value(bytes, &mut value_cursor).unwrap_or(Encoded::Other));
     }
     Some((fields, values, virtual_methods))
@@ -460,6 +587,9 @@ fn u32_le(bytes: &[u8], offset: usize) -> Option<u32> {
 }
 
 fn uleb(bytes: &[u8], cursor: &mut usize) -> Option<u32> {
+    if !scan_allow(0) {
+        return None;
+    }
     let mut result = 0_u32;
     let mut shift = 0_u32;
     for _ in 0..5 {
@@ -566,7 +696,11 @@ struct MapSpan {
 
 fn scan_process_dex(pid: u32) -> ProcessAidlTables {
     let _phase = crate::capture_timing::enter(crate::capture_timing::Phase::BinderDexMemory);
-    let Ok(text) = std::fs::read_to_string(format!("/proc/{pid}/maps")) else {
+    let Some(text) = File::open(format!("/proc/{pid}/maps"))
+        .ok()
+        .and_then(|mut file| read_budgeted(&mut file))
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+    else {
         return ProcessAidlTables::new();
     };
     let maps = parse_maps(&text);
@@ -580,6 +714,7 @@ fn scan_process_dex(pid: u32) -> ProcessAidlTables {
 
 fn parse_maps(text: &str) -> Vec<MapSpan> {
     text.lines()
+        .take_while(|_| scan_allow(0))
         .filter_map(|line| {
             let (start, end, perms, path) = parse_map_line(line)?;
             Some(MapSpan {
@@ -597,6 +732,9 @@ fn parse_maps(text: &str) -> Vec<MapSpan> {
 fn stitch_adjacent(maps: &[MapSpan]) -> Vec<MapSpan> {
     let mut out: Vec<MapSpan> = Vec::new();
     for map in maps {
+        if !scan_allow(0) {
+            break;
+        }
         if !map.perms.contains('r') {
             continue;
         }
@@ -615,6 +753,9 @@ fn ingest_file_backed_dex(maps: &[MapSpan], tables: &mut ProcessAidlTables, imag
     let _phase = crate::capture_timing::enter(crate::capture_timing::Phase::BinderDexFiles);
     let mut seen = BTreeSet::<String>::new();
     for map in maps {
+        if !scan_allow(0) {
+            break;
+        }
         if *images >= MAX_DEX_IMAGES {
             return;
         }
@@ -623,7 +764,10 @@ fn ingest_file_backed_dex(maps: &[MapSpan], tables: &mut ProcessAidlTables, imag
         }
         if has_ext(&map.path, "dex") && Path::new(&map.path).is_file() {
             seen.insert(map.path.clone());
-            if let Ok(bytes) = std::fs::read(&map.path) {
+            if let Some(bytes) = File::open(&map.path)
+                .ok()
+                .and_then(|mut f| read_budgeted(&mut f))
+            {
                 merge_tables(tables, parse_binder_tables(&bytes));
                 *images = images.saturating_add(1);
             }
@@ -646,6 +790,9 @@ fn ingest_stitched_dex_data(
     images: &mut usize,
 ) {
     for span in stitch_adjacent(maps) {
+        if !scan_allow(0) {
+            break;
+        }
         if *images >= MAX_DEX_IMAGES {
             return;
         }
@@ -667,13 +814,20 @@ fn scan_token(pid: u32, token: &str) -> ProcessAidlTables {
     if token.is_empty() || token.len() > 192 {
         return ProcessAidlTables::new();
     }
-    let Ok(text) = std::fs::read_to_string(format!("/proc/{pid}/maps")) else {
+    let Some(text) = File::open(format!("/proc/{pid}/maps"))
+        .ok()
+        .and_then(|mut file| read_budgeted(&mut file))
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+    else {
         return ProcessAidlTables::new();
     };
     let needle = token.as_bytes();
     let mut tables = ProcessAidlTables::new();
     let mut images = 0_usize;
     for span in stitch_adjacent(&parse_maps(&text)) {
+        if !scan_allow(0) {
+            break;
+        }
         if images >= MAX_DEX_IMAGES {
             break;
         }
@@ -693,9 +847,15 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
+    for (index, window) in haystack.windows(needle.len()).enumerate() {
+        if index % 256 == 0 && !scan_allow(0) {
+            return None;
+        }
+        if window == needle {
+            return Some(index);
+        }
+    }
+    None
 }
 
 fn ingest_payload_heaps(
@@ -706,6 +866,9 @@ fn ingest_payload_heaps(
 ) {
     let mut kept = 0_usize;
     for span in stitch_adjacent(maps) {
+        if !scan_allow(0) {
+            break;
+        }
         if *images >= MAX_DEX_IMAGES || kept >= 16 {
             return;
         }
@@ -750,6 +913,9 @@ fn walk_span_images(
     };
     let mut off = 0_u64;
     while off.saturating_add(MIN_DEX) <= size && *images < MAX_DEX_IMAGES {
+        if !scan_allow(0) {
+            return;
+        }
         let Some(at) = find_magic_offset(&mut mem, start, off, size) else {
             return;
         };
@@ -768,14 +934,23 @@ fn find_magic_offset(mem: &mut File, base: u64, from: u64, size: u64) -> Option<
     let _phase = crate::capture_timing::enter(crate::capture_timing::Phase::BinderDexMagic);
     let dense_end = from.saturating_add(GAP_SEARCH).min(size);
     let mut off = from;
+    // Preserve the original four-byte candidate grid, but use one read per page
+    // with a seven-byte overlap instead of seek/read for each candidate.
     while off.saturating_add(8) <= dense_end {
-        if peek_is_dex(mem, base.saturating_add(off)) {
-            return Some(off);
+        let take = dense_end.saturating_sub(off).min(4096 + 7);
+        let bytes = read_exact(mem, base.saturating_add(off), take)?;
+        for index in (0..bytes.len().saturating_sub(7)).step_by(4) {
+            if bytes[index..].starts_with(b"dex\n") {
+                return Some(off + index as u64);
+            }
         }
-        off = off.saturating_add(4);
+        off = off.saturating_add(4096);
     }
     off = dense_end;
     while off.saturating_add(8) <= size {
+        if !scan_allow(0) {
+            return None;
+        }
         if peek_is_dex(mem, base.saturating_add(off)) {
             return Some(off);
         }
@@ -789,6 +964,9 @@ fn peek_is_dex(mem: &mut File, at: u64) -> bool {
 }
 
 fn peek_magic(mem: &mut File, at: u64) -> Option<[u8; 8]> {
+    if !scan_allow(8) {
+        return None;
+    }
     mem.seek(SeekFrom::Start(at)).ok()?;
     let mut magic = [0_u8; 8];
     mem.read_exact(&mut magic).ok()?;
@@ -797,6 +975,9 @@ fn peek_magic(mem: &mut File, at: u64) -> Option<[u8; 8]> {
 
 fn read_dex_image(mem: &mut File, at: u64, remaining: u64) -> Option<Vec<u8>> {
     if !peek_is_dex(mem, at) {
+        return None;
+    }
+    if !scan_allow(4) {
         return None;
     }
     mem.seek(SeekFrom::Start(at.saturating_add(32))).ok()?;
@@ -809,10 +990,16 @@ fn read_dex_image(mem: &mut File, at: u64, remaining: u64) -> Option<Vec<u8>> {
     if u64::try_from(declared).ok()? > remaining {
         return None;
     }
+    if !scan_allow(4) {
+        return None;
+    }
     mem.seek(SeekFrom::Start(at.saturating_add(40))).ok()?;
     let mut endian = [0_u8; 4];
     mem.read_exact(&mut endian).ok()?;
     if u32::from_le_bytes(endian) != 0x1234_5678 {
+        return None;
+    }
+    if !scan_allow(declared) {
         return None;
     }
     mem.seek(SeekFrom::Start(at)).ok()?;
@@ -829,6 +1016,9 @@ fn span_has_token(pid: u32, start: u64, size: u64, needle: &[u8]) -> bool {
     let mut off = 0_u64;
     let overlap = u64::try_from(needle.len().saturating_sub(1)).unwrap_or(0);
     while off < size {
+        if !scan_allow(0) {
+            return false;
+        }
         let take = size
             .saturating_sub(off)
             .min(u64::try_from(TOKEN_WINDOW).unwrap_or(size));
@@ -846,6 +1036,9 @@ fn span_has_token(pid: u32, start: u64, size: u64, needle: &[u8]) -> bool {
 }
 
 fn read_exact(mem: &mut File, at: u64, size: u64) -> Option<Vec<u8>> {
+    if !scan_allow(usize::try_from(size).ok()?) {
+        return None;
+    }
     let len = usize::try_from(size).ok()?;
     if len == 0 {
         return None;
@@ -946,12 +1139,15 @@ fn parse_apk_dex(path: &Path) -> ProcessAidlTables {
     let Ok(file) = File::open(path) else {
         return ProcessAidlTables::new();
     };
-    let Ok(mut archive) = zip::ZipArchive::new(file) else {
+    let Ok(mut archive) = zip::ZipArchive::new(BudgetedReader(file)) else {
         return ProcessAidlTables::new();
     };
     let mut tables = ProcessAidlTables::new();
     let mut kept = 0_usize;
     for index in 0..archive.len() {
+        if !scan_allow(0) {
+            break;
+        }
         if kept >= 8 {
             break;
         }
@@ -969,9 +1165,10 @@ fn parse_apk_dex(path: &Path) -> ProcessAidlTables {
             continue;
         }
         let mut bytes = Vec::new();
-        if entry.read_to_end(&mut bytes).is_err() {
+        let Some(read) = read_budgeted(&mut entry) else {
             continue;
-        }
+        };
+        bytes.extend(read);
         drop(entry);
         if bytes.starts_with(b"dex\n") {
             merge_tables(&mut tables, parse_binder_tables(&bytes));
@@ -984,5 +1181,108 @@ fn parse_apk_dex(path: &Path) -> ProcessAidlTables {
 fn merge_tables(into: &mut ProcessAidlTables, extra: ProcessAidlTables) {
     for (iface, methods) in extra {
         into.entry(iface).or_default().extend(methods);
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    fn image(bytes: &[u8]) -> (std::path::PathBuf, File) {
+        let path =
+            std::env::temp_dir().join(format!("ksight-binder-fixture-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&path, bytes).unwrap();
+        let file = File::open(&path).unwrap();
+        (path, file)
+    }
+    #[test]
+    fn dense_and_sparse_candidates_match_original_grid_across_block_boundaries() {
+        for offset in [0usize, 4, 4092, 4096, 65528, 65536, 69632] {
+            let mut bytes = vec![0u8; 73728];
+            bytes[offset..offset + 4].copy_from_slice(b"dex\n");
+            let (path, mut file) = image(&bytes);
+            assert_eq!(
+                find_magic_offset(&mut file, 0, 0, bytes.len() as u64),
+                Some(offset as u64)
+            );
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+    #[test]
+    fn shared_time_or_bytes_exhaustion_returns_without_claiming_no_method() {
+        let (path, mut file) = image(&vec![0u8; 65536]);
+        for (duration, bytes) in [
+            (std::time::Duration::ZERO, usize::MAX),
+            (std::time::Duration::from_secs(1), 1),
+        ] {
+            let guard = ScanGuard::start(duration, bytes);
+            assert_eq!(find_magic_offset(&mut file, 0, 0, 65536), None);
+            assert!(guard.exhausted());
+            assert!(!scan_allow(0));
+        }
+        assert!(scan_allow(0));
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn throttled_enrichment_is_deferred_and_does_not_poison_missing_cache() {
+        let mut cache = ProcessDexAidlCache::default();
+        cache.next_scan.insert(
+            42,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        );
+        assert_eq!(cache.lookup(42, "sample.Interface", 7), None);
+        assert!(cache.lookup_deferred());
+        assert!(cache.token_miss.is_empty());
+        cache.tables.insert(
+            42,
+            HashMap::from([(
+                "sample.Interface".to_owned(),
+                BTreeMap::from([(7, "existingMethod".to_owned())]),
+            )]),
+        );
+        assert_eq!(
+            cache.lookup(42, "sample.Interface", 7),
+            Some("existingMethod")
+        );
+        assert!(!cache.lookup_deferred());
+    }
+    #[test]
+    fn zip_metadata_and_maps_style_reads_share_the_same_allowance() {
+        use std::io::Write as _;
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        zip.start_file("classes.dex", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(&[0u8; 128]).unwrap();
+        let bytes = zip.finish().unwrap().into_inner();
+        let guard = ScanGuard::start(std::time::Duration::from_secs(1), 1);
+        assert!(zip::ZipArchive::new(BudgetedReader(std::io::Cursor::new(bytes))).is_err());
+        assert!(guard.exhausted());
+        drop(guard);
+        let guard = ScanGuard::start(std::time::Duration::from_secs(1), 1);
+        assert!(read_budgeted(&mut std::io::Cursor::new(
+            b"1000-2000 r--p 0 0 0 example".to_vec()
+        ))
+        .is_none());
+        assert!(guard.exhausted());
+    }
+    #[test]
+    fn expired_cpu_lookup_stops_without_false_negative_caching() {
+        let guard = ScanGuard::start(std::time::Duration::ZERO, usize::MAX);
+        assert_eq!(find_bytes(&vec![0u8; 1024 * 1024], b"absent"), None);
+        assert!(guard.exhausted());
+        assert!(parse_maps("1000-2000 r--p 0 0 0 example").is_empty());
+    }
+
+    #[test]
+    fn continuous_reader_cannot_escape_shared_byte_allowance() {
+        struct Continuous;
+        impl std::io::Read for Continuous {
+            fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+                b.fill(0);
+                Ok(b.len())
+            }
+        }
+        let guard = ScanGuard::start(std::time::Duration::from_secs(1), 32768);
+        assert!(read_budgeted(&mut Continuous).is_none());
+        assert!(guard.exhausted());
     }
 }
