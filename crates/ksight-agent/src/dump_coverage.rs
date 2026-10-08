@@ -73,12 +73,16 @@ fn check_note(
             && row["excluded_local_window"] == true
             && row["post_copy_source_verified"] == true
             && row["mapping_revalidated"] == true
-            && read["admission"] == "rejected_identity_or_deadline"
             && read["read_error"] == "local_copy_window_exhausted"
-            && matches!(
-                read["read_status"].as_str(),
-                Some("interrupted" | "complete")
-            )
+            && ((read["admission"] == "rejected_identity_or_deadline"
+                    && matches!(read["read_status"].as_str(), Some("interrupted" | "complete")))
+                // copy_range's initial current() check uses these generic states
+                // even for a local-window stop before the first read. The exact
+                // reason and positive post-copy checks above still gate exclusion.
+                || (read["admission"] == "rejected_identity"
+                    && read["read_status"] == "not_attempted"
+                    && read["actual_length"].as_u64() == Some(0)
+                    && read.get("sha256").is_some_and(Value::is_null)))
             && read["actual_length"]
                 .as_u64()
                 .is_some_and(|n| n <= selected)
@@ -381,5 +385,69 @@ mod tests {
         let mut bad = n.clone();
         bad["records"] = json!([excluded.clone(), excluded]);
         assert!(check_note(&bad, "test.app", &expected).is_err());
+    }
+}
+
+#[cfg(test)]
+mod zero_window_tests {
+    use super::*;
+    fn fixture() -> Value {
+        let source = json!({"package":"test.app","pid":1,"uid":10001,"birth_ns":1,"exec_id":1,"boot_id":"test-boot"});
+        json!({"schema":"kernsight.bound-code-copy/v1","source":source,"paused":false,"candidate_result":{"budget_stop":false,"attempted":2,"unattempted_state":"not_attempted_parent_deadline","stop_scope":"local_copy_window"},"records":[{"source":source,"admitted":true,"selection_limit_bytes":16,"selection_limit_reason":"per_range_cap","read":{"admission":"qualified_live_copy","read_status":"complete","write_status":"complete","read_error":null,"write_error":null,"actual_length":16,"requested_length":16}},{"source":source,"admitted":false,"excluded_local_window":true,"post_copy_source_verified":true,"mapping_revalidated":true,"raw_evidence":"original.pending","selection_limit_bytes":16,"selection_limit_reason":"per_range_cap","read":{"admission":"rejected_identity","read_status":"not_attempted","write_status":"complete","read_error":"local_copy_window_exhausted","write_error":null,"actual_length":0,"requested_length":16,"sha256":null}}]})
+    }
+    #[test]
+    fn zero_local_window_is_excluded_only_with_all_positive_checks() {
+        let note = fixture();
+        let expected = vec![serde_json::from_value(note["source"].clone()).unwrap()];
+        assert_eq!(check_note(&note, "test.app", &expected).unwrap(), (1, 1, 0));
+        for (field, value) in [
+            ("actual_length", json!(1)),
+            ("read_status", json!("interrupted")),
+            ("admission", json!("rejected_generation_after_read")),
+            ("read_error", json!("parent_deadline_or_output_exhausted")),
+            ("read_error", json!("identity changed")),
+            ("read_error", json!("IO")),
+            ("write_status", json!("write_failed")),
+            ("write_error", json!("sync failed")),
+            ("sha256", json!("claimedhash")),
+        ] {
+            let mut bad = note.clone();
+            bad["records"][1]["read"][field] = value;
+            assert!(check_note(&bad, "test.app", &expected).is_err(), "{field}");
+        }
+        for field in [
+            "excluded_local_window",
+            "post_copy_source_verified",
+            "mapping_revalidated",
+        ] {
+            let mut bad = note.clone();
+            bad["records"][1][field] = json!(false);
+            assert!(check_note(&bad, "test.app", &expected).is_err(), "{field}");
+        }
+        let mut bad = note.clone();
+        bad["candidate_result"]["budget_stop"] = json!(true);
+        assert!(check_note(&bad, "test.app", &expected).is_err());
+        let mut bad = note.clone();
+        bad["candidate_result"]["stop_scope"] = json!("none_or_parent_budget");
+        assert!(check_note(&bad, "test.app", &expected).is_err());
+        let mut bad = note.clone();
+        bad["records"][1]["source"]["exec_id"] = json!(2);
+        assert!(check_note(&bad, "test.app", &expected).is_err());
+        let mut bad = note.clone();
+        bad["records"].as_array_mut().unwrap().swap(0, 1);
+        assert!(check_note(&bad, "test.app", &expected).is_err());
+    }
+    #[test]
+    #[ignore = "explicit retained local note; read-only, no device"]
+    fn retained_zero_tail_uses_production_check_without_mutating_note() {
+        let path = std::env::var_os("KSIGHT_RETAINED_ZERO_NOTE").unwrap();
+        let before = fs::read(&path).unwrap();
+        let note: Value = serde_json::from_slice(&before).unwrap();
+        let expected = vec![serde_json::from_value(note["source"].clone()).unwrap()];
+        assert_eq!(
+            check_note(&note, "com.dlxx.mam.Internal", &expected).unwrap(),
+            (166, 1, 0)
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
     }
 }
