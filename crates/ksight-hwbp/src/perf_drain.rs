@@ -349,7 +349,7 @@ mod one_shot_shutdown_tests {
         stop_after_one_shot(true, &mut report, || Err("detach denied"));
         assert_eq!(report.error, Some("detach denied"));
         assert_eq!(report.records, vec![1]);
-        let mut empty: PerfDrainReport<u64, &str> = Default::default();
+        let mut empty: PerfDrainReport<u64, &str> = PerfDrainReport::default();
         stop_after_one_shot(true, &mut empty, || {
             panic!("empty queue cannot trigger a hit")
         });
