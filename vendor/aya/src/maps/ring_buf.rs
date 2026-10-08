@@ -116,9 +116,18 @@ impl<T: Borrow<MapData>> RingBuf<T> {
 }
 
 impl<T> RingBuf<T> {
+    /// Whether the producer and consumer positions are equal at this instant.
+    /// Unlike `next() == None`, a busy reserved record is not reported as empty.
+    /// Callers must stop producers before treating this as a final drain proof.
+    pub fn is_empty(&self) -> bool {
+        let producer: &AtomicUsize = unsafe { self.producer.mmap.ptr.cast().as_ref() };
+        self.consumer.pos == producer.load(Ordering::Acquire)
+    }
+
+
     /// Try to take a new entry from the ringbuf.
     ///
-    /// Returns `Some(item)` if the ringbuf is not empty. Returns `None` if the ringbuf is empty, in
+    /// Returns `Some(item)` if the ringbuf is not empty. Returns `None` if the ringbuf is empty or its next item is busy, in
     /// which case the caller may register for availability notifications through `epoll` or other
     /// APIs. Only one RingBufItem may be outstanding at a time.
     //

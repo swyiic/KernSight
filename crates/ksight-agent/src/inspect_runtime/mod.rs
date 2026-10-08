@@ -787,6 +787,7 @@ pub struct InspectRuntime {
     plans: Vec<InspectPlan>,
     #[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
     selected_adapters: Vec<InspectAdapterKind>,
+    stopping: bool,
     started: Instant,
     max_duration: Duration,
     max_hits: u32,
@@ -1415,6 +1416,7 @@ impl InspectRuntime {
         Self {
             plans,
             selected_adapters,
+            stopping: false,
             started: Instant::now(),
             max_duration,
             max_hits,
@@ -1601,7 +1603,7 @@ impl InspectRuntime {
     pub fn attach_when_safe(&mut self) -> Vec<InspectObservation> {
         #[cfg(any(target_os = "android", target_os = "linux"))]
         {
-            if self.expired {
+            if self.expired || self.stopping {
                 return Vec::new();
             }
             // Push a newly visible package TGID before the map walk. Sessions
@@ -1646,7 +1648,11 @@ impl InspectRuntime {
                 .as_ref()
                 .and_then(|targets| targets.iter().find_map(|t| t.recheck_task_mark().err()))
             {
-                clear_scope_state(self, None);
+                revoke_scope(
+                    self,
+                    None,
+                    &format!("physical_qualification_invalidated:{error:#}"),
+                );
                 self.scope_revoked_poll = true;
                 self.scope_diagnostics.push(format!(
                     "physical qualification invalidated; no payload admitted: {error:#}"
@@ -1654,7 +1660,9 @@ impl InspectRuntime {
                 return scope_observations(self);
             }
             self.scope_revoked_poll = false;
-            refresh_package_tgids(self);
+            if !self.stopping {
+                refresh_package_tgids(self);
+            }
         }
         poll_all(self)
     }
@@ -1747,17 +1755,35 @@ impl InspectRuntime {
         )
     }
 
+    /// Stop owned producers while preserving committed authority and queued records.
+    /// # Errors
+    /// Returns if any owned producer cannot confirm closure.
+    pub fn stop_production(&mut self) -> anyhow::Result<()> {
+        self.stopping = true;
+        #[cfg(any(target_os = "android", target_os = "linux"))]
+        {
+            let mut errors = Vec::new();
+            for probe in &mut self.sessions {
+                if let Err(error) = probe.session.stop_production() {
+                    errors.push(format!("{error:#}"));
+                }
+            }
+            if !errors.is_empty() {
+                anyhow::bail!("inspect producer closure: {}", errors.join("; "));
+            }
+        }
+        Ok(())
+    }
+
     /// Revoke unused probes after the authorized window or hit budget.
     pub fn expire_if_needed(&mut self) -> Option<InspectObservation> {
         let over_time = self.started.elapsed() >= self.max_duration;
         let over_hits = inspect_budget_exhausted(self);
-        if self.expired || (!over_time && !over_hits) {
+        if self.expired || self.stopping || (!over_time && !over_hits) {
             return None;
         }
-        self.expired = true;
-        self.tls_pending.drop_all_incomplete();
-        if !take_attached_sessions(self) {
-            return None;
+        if let Err(error) = self.stop_production() {
+            eprintln!("inspect stop unconfirmed: {error:#}");
         }
         let mut observation = self.plans.first()?.observation.clone();
         observation.attached = false;
@@ -3815,7 +3841,6 @@ fn attach_all(runtime: &mut InspectRuntime) -> Vec<InspectObservation> {
     }
     for plan in plans {
         if runtime.started.elapsed() >= runtime.max_duration {
-            runtime.expired = true;
             eprintln!("inspect attach stopped; window elapsed");
             break;
         }
@@ -4050,8 +4075,10 @@ fn attach_all(_runtime: &mut InspectRuntime) -> Vec<InspectObservation> {
 )]
 fn poll_all(runtime: &mut InspectRuntime) -> Vec<InspectOutput> {
     let refresh_phase = crate::capture_timing::enter(crate::capture_timing::Phase::PollScope);
-    let _ = refresh_process_epochs(runtime);
-    refresh_tgid_filter(runtime);
+    if !runtime.stopping {
+        let _ = refresh_process_epochs(runtime);
+        refresh_tgid_filter(runtime);
+    }
     drop(refresh_phase);
     if runtime.scope_revoked_poll {
         return finish_scope_poll(runtime, Vec::new());
@@ -4128,6 +4155,21 @@ fn poll_all(runtime: &mut InspectRuntime) -> Vec<InspectOutput> {
             .zip(after.into_iter().zip(before))
         {
             *total = total.saturating_add(after.saturating_sub(before));
+        }
+        for notice in &report.notifications {
+            let mut observation = probe.plan.observation.clone();
+            observation.detail = serde_json::json!({
+                "schema":"kernsight.perf-loss/v1", "cpu_id":notice.cpu_id,
+                "lost_samples":notice.lost_samples,
+                "notification_monotonic_ns":notice.notification_monotonic_ns,
+                "lost_event_time_unknown":true, "after_producer_stop":runtime.stopping
+            })
+            .to_string();
+            out.push(inspect_observation(
+                probe.plan.policy.pid.unwrap_or(0),
+                0,
+                observation,
+            ));
         }
         let hits = report.records;
         crate::capture_timing::set(crate::capture_timing::Phase::PollProcess);
@@ -6394,4 +6436,26 @@ fn symbol_from_detail(detail: &str) -> Option<String> {
 fn parse_open_size(path: &str) -> Option<u64> {
     let rest = path.strip_prefix("memory:")?;
     rest.split_once('+')?.1.parse().ok()
+}
+
+#[cfg(test)]
+mod shutdown_scope_tests {
+    #[test]
+    fn revoked_source_remains_partial_after_empty_shutdown() {
+        let mut runtime = super::InspectRuntime::prepare_all(
+            &super::InspectPolicy::default(),
+            &[],
+            std::path::Path::new("unused"),
+        );
+        super::revoke_scope(
+            &mut runtime,
+            None,
+            "physical_qualification_invalidated:test",
+        );
+        assert!(runtime.stop_production().is_ok());
+        assert_eq!(runtime.scope_failure_count(), 1);
+        assert!(!runtime.poll_budget_status().1);
+        // Empty queues never erase the recorded physical-source failure.
+        assert_ne!(runtime.scope_failure_count(), 0);
+    }
 }

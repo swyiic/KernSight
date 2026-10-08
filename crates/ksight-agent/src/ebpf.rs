@@ -72,6 +72,36 @@ impl Collector for EbpfSensor {
             .transpose()
     }
 
+    fn queue_observed_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
+    fn stop_production(&mut self) -> Result<(), String> {
+        self.probe_session.take();
+        let mut errors = Vec::new();
+        for (name, program) in self.bpf.programs_mut() {
+            if program.fd().is_err() {
+                continue;
+            }
+            let result = match program {
+                aya::programs::Program::TracePoint(p) => p.unload(),
+                aya::programs::Program::KProbe(p) => p.unload(),
+                _ => {
+                    errors.push(format!("unsupported producer {name}"));
+                    continue;
+                }
+            };
+            if let Err(error) = result {
+                errors.push(format!("{name}: {error}"));
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+
     fn dropped_records(&self) -> u64 {
         self.dropped.get(&0, 0).unwrap_or(0)
     }

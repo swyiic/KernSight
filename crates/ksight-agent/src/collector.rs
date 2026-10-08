@@ -46,6 +46,18 @@ pub trait Collector {
     /// Returns an adapter-specific error when the kernel channel cannot be consumed safely.
     fn next_record(&mut self) -> Result<Option<RawRecord>, Self::Error>;
 
+    /// Exact queue-position observation; unavailable proof remains false.
+    fn queue_observed_empty(&self) -> bool {
+        false
+    }
+
+    /// Stop owned producers while retaining the channel for final reads.
+    /// # Errors
+    /// Returns when producer closure cannot be confirmed.
+    fn stop_production(&mut self) -> Result<(), String> {
+        Err("collector cannot confirm producer closure".to_owned())
+    }
+
     /// Total records known to have been lost.
     fn dropped_records(&self) -> u64;
 

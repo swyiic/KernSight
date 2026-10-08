@@ -103,3 +103,4 @@ pub mod dump_coverage;
 
 /// Payload-free monotonic capture phase diagnostics.
 pub mod capture_timing;
+pub mod shutdown_drain;

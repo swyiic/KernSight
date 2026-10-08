@@ -1252,10 +1252,93 @@ fn stream_events(
 
         Ok(())
     })();
+    // Stop producers before final reads; keep the original phase lease and a flush reserve.
+    let desired_end = Instant::now() + Duration::from_secs(10);
+    let drain_end = request
+        .storage
+        .spool_root
+        .as_ref()
+        .map_or(desired_end, |root| {
+            ksight_core::output_budget::deadline(root, desired_end)
+        })
+        .checked_sub(Duration::from_secs(1))
+        .unwrap_or_else(Instant::now);
+    let drain_result = crate::shutdown_drain::stop_and_drain(
+        &mut (&mut inspect, &mut sensors, &mut pipeline),
+        |(inspect, sensors, _)| {
+            let mut stopped = true;
+            if let Err(error) = inspect.stop_production() {
+                eprintln!("inspect stop unconfirmed: {error:#}");
+                stopped = false;
+            }
+            for sensor in sensors.iter_mut() {
+                if let Err(error) = sensor.collector.stop_production() {
+                    eprintln!("{} stop unconfirmed: {error}", sensor.name);
+                    stopped = false;
+                }
+            }
+            stopped
+        },
+        |(inspect, sensors, pipeline)| -> anyhow::Result<bool> {
+            let mut empty = true;
+            for sensor in sensors.iter_mut() {
+                let mut observed_empty = false;
+                for _ in 0..32 {
+                    match sensor.next_record() {
+                        Ok(Some(record)) => pipeline.emit(record)?,
+                        Ok(None) => {
+                            observed_empty = sensor.collector.queue_observed_empty();
+                            break;
+                        }
+                        Err(error) => {
+                            pipeline.stats.invalid_records += 1;
+                            anyhow::bail!("{} final ring read: {error}", sensor.name);
+                        }
+                    }
+                }
+                empty &= observed_empty;
+            }
+            for output in inspect.poll() {
+                if let Some(mirror) = pipeline.burp_mirror.as_mut() {
+                    route_inspect_to_mirror(mirror, &output);
+                }
+                pipeline.emit_inspect_output(output)?;
+            }
+            Ok(empty && !inspect.poll_budget_status().1)
+        },
+        || {
+            Instant::now() < drain_end
+                && !request
+                    .storage
+                    .spool_root
+                    .as_ref()
+                    .is_some_and(|root| ksight_core::output_budget::should_stop(root))
+        },
+    );
+    let drain_complete = drain_result
+        .as_ref()
+        .is_ok_and(crate::shutdown_drain::DrainEnd::complete);
+    eprintln!(
+        "{}",
+        serde_json::json!({"schema":"kernsight.capture-drain/v1",
+        "producers_stopped":drain_result.as_ref().ok().map(|d| d.producers_stopped),
+        "queues_observed_empty":drain_result.as_ref().ok().map(|d| d.empty),
+        "rounds":drain_result.as_ref().ok().map(|d| d.rounds),
+        "unknown_tail":!drain_complete,"lost_samples":inspect.drain_totals().2})
+    );
+    let capture_loop_result = match (capture_loop_result, drain_result) {
+        (Err(error), _) | (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(_)) => Ok(()),
+    };
     let (poll_budget_yields, unread_perf_possible) = inspect.poll_budget_status();
     let scope_failures = inspect.scope_failure_count();
     let perf_read_failures = inspect.perf_read_failure_count();
-    let coverage_gap = unread_perf_possible || scope_failures != 0 || perf_read_failures != 0;
+    let coverage_gap = pipeline.stage_coverage_partial
+        || !drain_complete
+        || unread_perf_possible
+        || scope_failures != 0
+        || perf_read_failures != 0
+        || inspect.drain_totals().2 != 0;
     let pending_perf_tail = capture_loop_result.is_ok() && coverage_gap;
     let capture_loop_result = if pending_perf_tail {
         Err(anyhow::anyhow!("capture coverage partial: perf_poll_backlog_or_scope_gap_at_observation_end; raw coverage incomplete"))
@@ -1754,6 +1837,7 @@ struct EventPipeline {
     collector_pid: u32,
     last_event_monotonic_ns: Option<u64>,
     stats: CaptureStats,
+    stage_coverage_partial: bool,
     burp_mirror: Option<crate::burp_mirror::BurpMirror>,
 }
 
@@ -1818,6 +1902,7 @@ impl EventPipeline {
             collector_pid: std::process::id(),
             last_event_monotonic_ns: None,
             stats: CaptureStats::default(),
+            stage_coverage_partial: false,
             burp_mirror: None,
         }
     }
@@ -2875,7 +2960,60 @@ fn finish_capture_stage(
     inspect: &mut crate::inspect_runtime::InspectRuntime,
     instance: Option<crate::capture_stages::TargetInstance>,
 ) -> Result<()> {
+    use std::time::{Duration, Instant};
+    let desired_end = Instant::now() + Duration::from_secs(10);
+    let drain_end = pipeline
+        .storage
+        .spool_root
+        .as_ref()
+        .map_or(desired_end, |root| {
+            ksight_core::output_budget::deadline(root, desired_end)
+        })
+        .checked_sub(Duration::from_secs(1))
+        .unwrap_or_else(Instant::now);
+    let budget_root = pipeline.storage.spool_root.clone();
+    let result = crate::shutdown_drain::stop_and_drain(
+        &mut (&mut *inspect, &mut *pipeline),
+        |(inspect, _)| inspect.stop_production().is_ok(),
+        |(inspect, pipeline)| -> Result<bool> {
+            for output in inspect.poll() {
+                if let Some(mirror) = pipeline.burp_mirror.as_mut() {
+                    route_inspect_to_mirror(mirror, &output);
+                }
+                pipeline.emit_inspect_output(output)?;
+            }
+            Ok(!inspect.poll_budget_status().1)
+        },
+        || {
+            Instant::now() < drain_end
+                && !budget_root
+                    .as_ref()
+                    .is_some_and(|root| ksight_core::output_budget::should_stop(root))
+        },
+    );
+    let complete = result
+        .as_ref()
+        .is_ok_and(crate::shutdown_drain::DrainEnd::complete);
+    emit_capture_stage(
+        pipeline,
+        index,
+        stage,
+        if complete {
+            status
+        } else {
+            "partial_unknown_tail"
+        },
+        Some(inspect),
+        instance,
+    )?;
+    pipeline.stage_coverage_partial |= !complete
+        || inspect.drain_totals().2 != 0
+        || inspect.scope_failure_count() != 0
+        || inspect.perf_read_failure_count() != 0;
     inspect.revoke_for_stage();
-
-    emit_capture_stage(pipeline, index, stage, status, Some(inspect), instance)
+    result?;
+    if !complete {
+        bail!("stage producer closure or queued tail incomplete");
+    }
+    Ok(())
 }

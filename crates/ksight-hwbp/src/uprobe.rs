@@ -131,6 +131,9 @@ pub struct UprobeSession {
     read_slots: [bytes::BytesMut; 8],
     hit_once: bool,
     finished: bool,
+    next_buffer: usize,
+    cpu_ids: Vec<u32>,
+    producer_stop: Option<bool>,
     tgid_keys: Vec<u32>,
     instance_scope: Option<ScopeState>,
     /// True when this session owns both entry and uretprobe on the same object.
@@ -405,6 +408,10 @@ impl UprobeSession {
         )
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep producer setup and CPU ring ownership together."
+    )]
     fn start_programs_configured(
         object: &Path,
         programs: &[&str],
@@ -489,9 +496,11 @@ impl UprobeSession {
         // Alipay warm attach can burst SSL_read/write across BabaSSL+Cronet+Conscrypt;
         // 128 pages/CPU overflowed (perf_lost≈1.6k / 90s). Lean JNI slots + 1024 pages ≈ 4MiB/CPU @4KiB.
         let mut buffers = Vec::new();
+        let mut cpu_ids = Vec::new();
         for cpu in crate::cpu_list::online_cpu_ids() {
             if let Ok(buffer) = events.open(cpu, Some(PERF_RING_PAGES)) {
                 buffers.push(buffer);
+                cpu_ids.push(cpu);
             }
         }
         if buffers.is_empty() {
@@ -508,6 +517,9 @@ impl UprobeSession {
             read_slots: std::array::from_fn(|_| bytes::BytesMut::with_capacity(8192)),
             hit_once,
             finished: false,
+            next_buffer: 0,
+            cpu_ids,
+            producer_stop: None,
             tgid_keys,
             instance_scope,
             paired_entry_return,
@@ -605,11 +617,16 @@ impl UprobeSession {
 
     /// Preserve earlier records, individual loss-notification times and a later
     /// read error. Inspect must revoke transport proof before routing records.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep bounded reads, scope validation and original loss accounting together."
+    )]
     pub fn poll_hits_report(&mut self) -> PerfDrainReport<RegisterContext, String> {
         let started = std::time::Instant::now();
         let mut result = PerfDrainReport::default();
         self.last_poll_drain = crate::perf_drain::PollDrainState::Empty;
         if self.finished {
+            self.last_poll_drain = crate::perf_drain::PollDrainState::Yielded;
             return result;
         }
         crate::perf_drain::phase(crate::perf_drain::PollPhase::Scope);
@@ -620,9 +637,16 @@ impl UprobeSession {
         }
         let instance_scope = self.instance_scope.as_ref();
         let counters = &mut self.decode_counters;
-        for buffer in &mut self.buffers {
+        let first = self.next_buffer;
+        self.next_buffer = if self.buffers.is_empty() {
+            0
+        } else {
+            (first + 1) % self.buffers.len()
+        };
+        for index in crate::perf_drain::fair_indices(self.buffers.len(), first) {
+            let buffer = &mut self.buffers[index];
             let slots = &mut self.read_slots;
-            let report = drain_reads(
+            let mut report = drain_reads(
                 || {
                     crate::perf_drain::phase(crate::perf_drain::PollPhase::Read);
                     let read = match buffer.read_events(slots) {
@@ -674,6 +698,9 @@ impl UprobeSession {
                 .lost_only_reads
                 .saturating_add(report.lost_only_reads);
             result.records.extend(report.records);
+            for notice in &mut report.notifications {
+                notice.cpu_id = Some(self.cpu_ids[index]);
+            }
             result.notifications.extend(report.notifications);
             if report.error.is_some() {
                 result.error = report.error;
@@ -681,6 +708,7 @@ impl UprobeSession {
                 break;
             }
             if self.hit_once && !result.records.is_empty() {
+                result.budget_yielded = true;
                 break;
             }
         }
@@ -734,24 +762,50 @@ impl UprobeSession {
         self.finished
     }
 
-    /// 解除 uprobe。
-    fn detach(&mut self) {
+    /// Detach only producers; keep buffers and the committed decode scope until drained.
+    /// # Errors
+    /// Returns when any owned link cannot be confirmed detached.
+    pub fn stop_production(&mut self) -> Result<()> {
+        if let Some(stopped) = self.producer_stop {
+            if stopped {
+                return Ok(());
+            }
+            anyhow::bail!("previous producer stop unconfirmed");
+        }
         crate::perf_drain::phase(crate::perf_drain::PollPhase::Detach);
+        let mut errors = Vec::new();
+        for (program, link_id) in std::mem::take(&mut self.links) {
+            let result = self
+                .bpf
+                .program_mut(&program)
+                .with_context(|| format!("missing producer {program}"))
+                .and_then(|p| {
+                    let probe: &mut UProbe = p.try_into()?;
+                    probe.detach(link_id).map_err(Into::into)
+                });
+            if let Err(error) = result {
+                errors.push(format!("{program}: {error:#}"));
+            }
+        }
+        self.producer_stop = Some(errors.is_empty());
+        if self.producer_stop == Some(true) {
+            Ok(())
+        } else {
+            anyhow::bail!("producer stop unconfirmed: {}", errors.join("; "))
+        }
+    }
+    /// Whether producer closure was confirmed separately from ring emptiness.
+    pub fn producer_stopped(&self) -> bool {
+        self.producer_stop == Some(true)
+    }
+    /// Release owned links and finally revoke decoding authority.
+    fn detach(&mut self) {
+        let _ = self.stop_production();
         self.finished = true;
         if self.instance_scope.is_some() {
             let _ = BpfFilterMaps(&mut self.bpf).gate(2);
         }
         self.instance_scope = None;
-        let links = std::mem::take(&mut self.links);
-        for (program, link_id) in links {
-            let Some(prog) = self.bpf.program_mut(&program) else {
-                continue;
-            };
-            let Ok(probe): Result<&mut UProbe, _> = prog.try_into() else {
-                continue;
-            };
-            let _ = probe.detach(link_id);
-        }
     }
 }
 

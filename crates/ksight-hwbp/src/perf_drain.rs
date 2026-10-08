@@ -17,6 +17,8 @@ pub struct PerfRead<T> {
 /// Original read-result loss notification with available returned-record bounds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PerfLossNotification {
+    /// CPU buffer reporting the loss; generic fixtures leave it unspecified.
+    pub cpu_id: Option<u32>,
     /// Number of kernel samples reported lost by this read result.
     pub lost_samples: u64,
     /// Read-result observation time; absent if the monotonic clock failed.
@@ -98,6 +100,7 @@ pub fn drain_reads<T, E>(
         if batch.lost_samples != 0 {
             report.lost_only_reads += u64::from(batch.samples == 0);
             report.notifications.push(PerfLossNotification {
+                cpu_id: None,
                 lost_samples: batch.lost_samples,
                 notification_monotonic_ns: batch.notification_monotonic_ns,
                 first_returned_kernel_ns: batch.records.iter().map(&timestamp).min(),
@@ -230,5 +233,25 @@ mod inner_reader_tests {
         for size in [8, 16, 32, 64] {
             aya::maps::perf::validate_record_size(size, 64, 4096).unwrap();
         }
+    }
+}
+
+/// Visit every CPU once, rotating the starting point without enlarging a ring.
+pub fn fair_indices(count: usize, first: usize) -> impl Iterator<Item = usize> {
+    (0..count).map(move |offset| (first + offset) % count)
+}
+#[cfg(test)]
+mod fairness_tests {
+    #[test]
+    fn continuous_first_cpu_cannot_starve_other_cpus_or_reorder_its_tail() {
+        let mut seen = vec![vec![]; 3];
+        for round in 0..6 {
+            for cpu in super::fair_indices(3, round % 3) {
+                seen[cpu].push(round);
+            }
+        }
+        assert_eq!(seen, vec![vec![0, 1, 2, 3, 4, 5]; 3]);
+        assert_eq!(super::fair_indices(0, 0).count(), 0);
+        assert_eq!(super::fair_indices(3, 2).collect::<Vec<_>>(), [2, 0, 1]);
     }
 }
