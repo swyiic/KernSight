@@ -97,6 +97,7 @@ pub fn stub_descriptor(interface: &str) -> String {
 /// Parse Binder Stub tables from one DEX image.
 #[must_use]
 pub fn parse_binder_tables(bytes: &[u8]) -> ProcessAidlTables {
+    let _phase = crate::capture_timing::enter(crate::capture_timing::Phase::BinderDexParse);
     parse_binder_tables_inner(bytes).unwrap_or_default()
 }
 
@@ -564,6 +565,7 @@ struct MapSpan {
 }
 
 fn scan_process_dex(pid: u32) -> ProcessAidlTables {
+    let _phase = crate::capture_timing::enter(crate::capture_timing::Phase::BinderDexMemory);
     let Ok(text) = std::fs::read_to_string(format!("/proc/{pid}/maps")) else {
         return ProcessAidlTables::new();
     };
@@ -610,6 +612,7 @@ fn stitch_adjacent(maps: &[MapSpan]) -> Vec<MapSpan> {
 }
 
 fn ingest_file_backed_dex(maps: &[MapSpan], tables: &mut ProcessAidlTables, images: &mut usize) {
+    let _phase = crate::capture_timing::enter(crate::capture_timing::Phase::BinderDexFiles);
     let mut seen = BTreeSet::<String>::new();
     for map in maps {
         if *images >= MAX_DEX_IMAGES {
@@ -660,6 +663,7 @@ fn ingest_stitched_dex_data(
 }
 
 fn scan_token(pid: u32, token: &str) -> ProcessAidlTables {
+    let _phase = crate::capture_timing::enter(crate::capture_timing::Phase::BinderDexMemory);
     if token.is_empty() || token.len() > 192 {
         return ProcessAidlTables::new();
     }
@@ -761,6 +765,7 @@ fn walk_span_images(
 }
 
 fn find_magic_offset(mem: &mut File, base: u64, from: u64, size: u64) -> Option<u64> {
+    let _phase = crate::capture_timing::enter(crate::capture_timing::Phase::BinderDexMagic);
     let dense_end = from.saturating_add(GAP_SEARCH).min(size);
     let mut off = from;
     while off.saturating_add(8) <= dense_end {
@@ -817,6 +822,7 @@ fn read_dex_image(mem: &mut File, at: u64, remaining: u64) -> Option<Vec<u8>> {
 }
 
 fn span_has_token(pid: u32, start: u64, size: u64, needle: &[u8]) -> bool {
+    let _phase = crate::capture_timing::enter(crate::capture_timing::Phase::BinderDexToken);
     let Ok(mut mem) = File::open(format!("/proc/{pid}/mem")) else {
         return false;
     };

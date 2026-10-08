@@ -2876,6 +2876,7 @@ fn finish_scope_poll(
     runtime: &mut InspectRuntime,
     mut outputs: Vec<InspectOutput>,
 ) -> Vec<InspectOutput> {
+    let _phase = crate::capture_timing::enter(crate::capture_timing::Phase::ConsumerScope);
     #[cfg(any(target_os = "linux", target_os = "android"))]
     if let Some(error) = runtime.bound_instance_targets.as_ref().and_then(|targets| {
         targets
@@ -4307,10 +4308,14 @@ fn decode_hit(
     } else {
         hit.pid
     };
+    let identity_phase =
+        crate::capture_timing::enter(crate::capture_timing::Phase::ConsumerIdentity);
     let identity = process_identity(pid, hit.tid, Uuid::nil());
     if !hit_matches_policy(&plan.policy, &identity) {
         return None;
     }
+    drop(identity_phase);
+    let _adapter_phase = crate::capture_timing::enter(crate::capture_timing::Phase::AdapterDecode);
     match plan.adapter {
         InspectAdapterKind::TlsSslWrite => {
             let layout = effective_layout(plan);

@@ -35,6 +35,22 @@ pub enum Phase {
     PollProcess,
     /// Writing inspect outputs and mirrors.
     PollOutput,
+    /// Event identity and policy qualification.
+    ConsumerIdentity,
+    /// Adapter payload processing outside DEX enrichment.
+    AdapterDecode,
+    /// Binder DEX file/APK enumeration and loading.
+    BinderDexFiles,
+    /// Binder DEX process memory enumeration and reading.
+    BinderDexMemory,
+    /// Binder DEX table parsing.
+    BinderDexParse,
+    /// Final consumer publication qualification.
+    ConsumerScope,
+    /// Binder DEX magic search in process mappings.
+    BinderDexMagic,
+    /// Binder interface token search in process mappings.
+    BinderDexToken,
 }
 
 /// One monotonic-domain diagnostic snapshot, containing no payload or paths.
@@ -44,7 +60,7 @@ pub struct Snapshot {
     active_phase: Phase,
     entered_ms: u64,
     elapsed_ms: u64,
-    exclusive_ms: [u64; 14],
+    exclusive_ms: [u64; 22],
 }
 impl Snapshot {
     fn new() -> Self {
@@ -53,7 +69,7 @@ impl Snapshot {
             active_phase: Phase::Prepare,
             entered_ms: 0,
             elapsed_ms: 0,
-            exclusive_ms: [0; 14],
+            exclusive_ms: [0; 22],
         }
     }
     fn transition(&mut self, phase: Phase, now: u64) -> Phase {
