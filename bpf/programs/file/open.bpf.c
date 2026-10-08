@@ -303,7 +303,9 @@ int ksight_file_open_enter(struct ksight_raw_sys_enter *context)
     path = (const char *)context->arguments[1];
     if (context->id == KSIGHT_A64_OPENAT || context->id == KSIGHT_A32_OPENAT) {
         pending.open_flags = (ksight_u32)context->arguments[2];
-        pending.mode = (ksight_u32)context->arguments[3];
+        /* Do not merge this ctx load with the openat2 stack-field load.
+         * Tracepoint verifiers reject ctx += 40 followed by load [ctx + 0]. */
+        pending.mode = (ksight_u32)*(volatile ksight_u64 *)&context->arguments[3];
     } else if (ksight_bpf_probe_read_user(&how, sizeof(how),
                                           (const void *)context->arguments[2]) == 0) {
         pending.open_flags = (ksight_u32)how.flags;
