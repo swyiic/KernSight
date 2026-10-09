@@ -1271,7 +1271,8 @@ fn stream_events(
         Ok(())
     })();
     let observation_elapsed = started.elapsed();
-    let observation_shortened = deadline.is_some_and(|duration| observation_elapsed < duration);
+    let observation_shortened = observation_end.is_some_and(|end| Instant::now() >= end)
+        && deadline.is_some_and(|duration| observation_elapsed < duration);
     eprintln!(
         "{}",
         serde_json::json!({"schema":"kernsight.observation-window/v1",

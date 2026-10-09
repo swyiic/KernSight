@@ -68,7 +68,7 @@ mod tests {
             before_reserve(now + Duration::from_secs(2), Duration::from_secs(15), now),
             now
         );
-        let expired = now - Duration::from_secs(1);
+        let expired = now.checked_sub(Duration::from_secs(1)).unwrap();
         assert_eq!(
             before_reserve(expired, Duration::from_secs(15), now),
             expired
