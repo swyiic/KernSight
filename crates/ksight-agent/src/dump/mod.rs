@@ -5571,7 +5571,7 @@ mod expanded_copy_window_tests {
             assert_eq!(receipt.admission, "qualified_live_copy");
         }
         assert!(!guard.receipt().partial);
-        assert!(report.warnings.is_empty());
+        assert_eq!(report.warnings, Vec::<String>::new());
         assert_eq!(original - deadline, Duration::from_secs(40));
         let child = ksight_core::output_budget::StaticScope::install_after_bound_copy(
             root.clone(),
