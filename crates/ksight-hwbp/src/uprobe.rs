@@ -615,6 +615,15 @@ impl UprobeSession {
         Ok(report.records)
     }
 
+    /// Advisory ready set only. Does not authorize decoding or attest an empty
+    /// generation; the normal poll still validates physical handles and scope.
+    #[must_use]
+    pub fn has_pending_records(&self) -> bool {
+        self.buffers
+            .iter()
+            .any(aya::maps::perf::PerfEventArrayBuffer::readable)
+    }
+
     /// Preserve earlier records, individual loss-notification times and a later
     /// read error. Inspect must revoke transport proof before routing records.
     #[allow(
@@ -650,6 +659,11 @@ impl UprobeSession {
                 break;
             }
             let buffer = &mut self.buffers[index];
+            // head/tail readiness includes lost-only notices. Empty rings need
+            // no read/parse attempt; retain both physical-handle checks around the poll.
+            if !buffer.readable() {
+                continue;
+            }
             let slots = &mut self.read_slots;
             let reader = if stopped {
                 drain_stopped_reads

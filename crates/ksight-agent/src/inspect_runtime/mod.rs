@@ -4,6 +4,7 @@
 mod attach_admission;
 #[cfg(any(test, target_os = "android", target_os = "linux"))]
 mod instance_backend;
+mod poll_schedule;
 #[cfg(any(test, target_os = "android", target_os = "linux"))]
 mod probe_renewal;
 mod quota_stop;
@@ -837,6 +838,8 @@ pub struct InspectRuntime {
     expired: bool,
     #[cfg(any(target_os = "android", target_os = "linux"))]
     sessions: Vec<LiveProbe>,
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    next_poll_probe: usize,
     /// Last attach attempt per concrete adapter/library/program. Permanent ABI
     /// failures are throttled while transient failures can still recover.
     #[cfg(any(target_os = "android", target_os = "linux"))]
@@ -1460,6 +1463,8 @@ impl InspectRuntime {
             expired: false,
             #[cfg(any(target_os = "android", target_os = "linux"))]
             sessions: Vec::new(),
+            #[cfg(any(target_os = "android", target_os = "linux"))]
+            next_poll_probe: 0,
             #[cfg(any(target_os = "android", target_os = "linux"))]
             attach_attempts: HashMap::new(),
             tls_pending: PendingCallStacks::default(),
@@ -4194,12 +4199,22 @@ fn poll_all(runtime: &mut InspectRuntime) -> Vec<InspectOutput> {
     let read_started = Instant::now();
     let mut probes_read = 0usize;
     let mut unread_probes = false;
-    for probe in &mut runtime.sessions {
+    // Readiness is advisory: every selected session still runs the original
+    // physical scope validation. Entry/return share one LiveProbe and remain
+    // one scheduling unit; consumed records retain existing timestamp sorting.
+    let ready = runtime
+        .sessions
+        .iter()
+        .map(|p| p.session.has_pending_records())
+        .collect::<Vec<_>>();
+    for index in poll_schedule::order(&ready, runtime.next_poll_probe) {
         if probes_read != 0 && read_started.elapsed().as_millis() >= 20 {
             unread_probes = true;
             break;
         }
         probes_read += 1;
+        runtime.next_poll_probe = (index + 1) % runtime.sessions.len();
+        let probe = &mut runtime.sessions[index];
         let skip_exhausted =
             !plan_is_connkey(&probe.plan) && exhausted_adapters.contains(&probe.plan.adapter);
         let before_drained = probe.session.drained_total;
