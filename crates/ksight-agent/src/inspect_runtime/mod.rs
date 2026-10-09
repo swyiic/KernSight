@@ -4115,7 +4115,15 @@ fn poll_all(runtime: &mut InspectRuntime) -> Vec<InspectOutput> {
         })
         .map(|probe| probe.plan.adapter)
         .collect();
+    let read_started = Instant::now();
+    let mut probes_read = 0usize;
+    let mut unread_probes = false;
     for probe in &mut runtime.sessions {
+        if probes_read != 0 && read_started.elapsed().as_millis() >= 20 {
+            unread_probes = true;
+            break;
+        }
+        probes_read += 1;
         let skip_exhausted =
             !plan_is_connkey(&probe.plan) && exhausted_adapters.contains(&probe.plan.adapter);
         let before_drained = probe.session.drained_total;
@@ -4325,10 +4333,15 @@ fn poll_all(runtime: &mut InspectRuntime) -> Vec<InspectOutput> {
             }
         }
     }
-    runtime.unread_perf_possible = runtime
-        .sessions
-        .iter()
-        .any(|p| p.session.last_poll_drain == ksight_hwbp::perf_drain::PollDrainState::Yielded);
+    if !runtime.sessions.is_empty() {
+        let rotate = probes_read % runtime.sessions.len();
+        runtime.sessions.rotate_left(rotate);
+    }
+    runtime.unread_perf_possible = unread_probes
+        || runtime
+            .sessions
+            .iter()
+            .any(|p| p.session.last_poll_drain == ksight_hwbp::perf_drain::PollDrainState::Yielded);
     finish_scope_poll(runtime, out)
 }
 

@@ -1,4 +1,17 @@
 //! Ordered, bounded capture shutdown shared by live capture and offline fixtures.
+/// Carve a shutdown reserve from an existing deadline without extending it.
+pub fn before_reserve(
+    deadline: std::time::Instant,
+    reserve: std::time::Duration,
+    now: std::time::Instant,
+) -> std::time::Instant {
+    deadline
+        .checked_sub(reserve)
+        .unwrap_or(now)
+        .max(now)
+        .min(deadline)
+}
+
 /// Evidence of producer closure and the final queue observation.
 #[derive(Debug, PartialEq, Eq)]
 pub struct DrainEnd {
@@ -43,6 +56,24 @@ pub fn stop_and_drain<C, E>(
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    #[test]
+    fn shutdown_reserve_never_renews_or_spends_an_expired_lease() {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        assert_eq!(
+            before_reserve(now + Duration::from_secs(105), Duration::from_secs(15), now),
+            now + Duration::from_secs(90)
+        );
+        assert_eq!(
+            before_reserve(now + Duration::from_secs(2), Duration::from_secs(15), now),
+            now
+        );
+        let expired = now - Duration::from_secs(1);
+        assert_eq!(
+            before_reserve(expired, Duration::from_secs(15), now),
+            expired
+        );
+    }
     struct Queue {
         live: bool,
         queued: VecDeque<u32>,

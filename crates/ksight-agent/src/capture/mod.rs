@@ -683,6 +683,23 @@ fn stream_events(
     let started = Instant::now();
     let deadline =
         (request.duration_seconds != 0).then(|| Duration::from_secs(request.duration_seconds));
+    // Reserve stop/drain/publication time inside the existing invocation lease.
+    // This never renews it; a shortened observation is explicitly partial below.
+    let observation_end = request
+        .storage
+        .spool_root
+        .as_ref()
+        .filter(|_| request.storage.capture_relation.is_some())
+        .map(|root| {
+            crate::shutdown_drain::before_reserve(
+                ksight_core::output_budget::deadline(
+                    root,
+                    started + Duration::from_secs(u64::from(u32::MAX)),
+                ),
+                Duration::from_secs(if request.inspect.enabled { 15 } else { 5 }),
+                started,
+            )
+        });
     let running = Arc::new(AtomicBool::new(true));
     let signal_state = Arc::clone(&running);
     ctrlc::set_handler(move || signal_state.store(false, Ordering::SeqCst))?;
@@ -866,6 +883,7 @@ fn stream_events(
         while running.load(Ordering::SeqCst)
             && (request.count == 0 || pipeline.stats.live_emitted < request.count)
             && deadline.is_none_or(|duration| started.elapsed() < duration)
+            && observation_end.is_none_or(|end| Instant::now() < end)
         {
             if request
                 .storage
@@ -1252,6 +1270,15 @@ fn stream_events(
 
         Ok(())
     })();
+    let observation_elapsed = started.elapsed();
+    let observation_shortened = deadline.is_some_and(|duration| observation_elapsed < duration);
+    eprintln!(
+        "{}",
+        serde_json::json!({"schema":"kernsight.observation-window/v1",
+        "requested_ms":request.duration_seconds.saturating_mul(1000),
+        "elapsed_ms":observation_elapsed.as_millis(), "shortened":observation_shortened,
+        "shutdown_reserve_ms":if request.inspect.enabled {15000} else {5000}})
+    );
     // Stop producers before final reads; keep the original phase lease and a flush reserve.
     let desired_end = Instant::now() + Duration::from_secs(10);
     let drain_end = request
@@ -1261,7 +1288,7 @@ fn stream_events(
         .map_or(desired_end, |root| {
             ksight_core::output_budget::deadline(root, desired_end)
         })
-        .checked_sub(Duration::from_secs(1))
+        .checked_sub(Duration::from_secs(5))
         .unwrap_or_else(Instant::now);
     let drain_result = crate::shutdown_drain::stop_and_drain(
         &mut (&mut inspect, &mut sensors, &mut pipeline),
@@ -1333,7 +1360,8 @@ fn stream_events(
     let (poll_budget_yields, unread_perf_possible) = inspect.poll_budget_status();
     let scope_failures = inspect.scope_failure_count();
     let perf_read_failures = inspect.perf_read_failure_count();
-    let coverage_gap = pipeline.stage_coverage_partial
+    let coverage_gap = observation_shortened
+        || pipeline.stage_coverage_partial
         || !drain_complete
         || unread_perf_possible
         || scope_failures != 0
@@ -1353,6 +1381,13 @@ fn stream_events(
             "perf_read_failures":perf_read_failures, "budget_skipped_raw":inspect.budget_skipped_raw(), "coverage_partial":coverage_gap
         })
     );
+    // Publish interrupted evidence while its original write allowance remains,
+    // before optional qualification/report work. Never emit a successful completion.
+    if capture_loop_result.is_err() {
+        if let Some(spool) = pipeline.spool.as_mut() {
+            report_spool_failure(spool);
+        }
+    }
     let mut stage_evidence_error = None;
     if let Some(cursor) = &stage_cursor {
         if !cursor.finished {

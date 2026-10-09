@@ -645,6 +645,10 @@ impl UprobeSession {
             (first + 1) % self.buffers.len()
         };
         for index in crate::perf_drain::fair_indices(self.buffers.len(), first) {
+            if result.read_calls != 0 && started.elapsed().as_millis() >= 2 {
+                result.budget_yielded = true;
+                break;
+            }
             let buffer = &mut self.buffers[index];
             let slots = &mut self.read_slots;
             let reader = if stopped {
