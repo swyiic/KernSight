@@ -1282,17 +1282,25 @@ fn stream_events(
         "elapsed_ms":observation_elapsed.as_millis(), "shortened":observation_shortened,
         "shutdown_reserve_ms":shutdown_reserve.as_millis()})
     );
-    // Stop producers before final reads; keep the original phase lease and a flush reserve.
-    let desired_end = Instant::now() + Duration::from_secs(10);
+    // Spend the shutdown reserve already carved from this phase. A second
+    // now+10s cut used to reduce L1's 15s reserve to 5s before serial detach,
+    // leaving no round for queued records even while the original lease lived.
+    let stopping_started = Instant::now();
+    let invocation_end = request
+        .storage
+        .spool_root
+        .as_ref()
+        .and_then(|root| ksight_core::output_budget::invocation_deadline(root));
+    let drain_end = crate::shutdown_drain::capture_drain_deadline(invocation_end, stopping_started);
+    // Keep any stricter child scope and fail-closed budget lookup. This clips
+    // the original reserve, without adding another rolling read deadline.
     let drain_end = request
         .storage
         .spool_root
         .as_ref()
-        .map_or(desired_end, |root| {
-            ksight_core::output_budget::deadline(root, desired_end)
-        })
-        .checked_sub(Duration::from_secs(5))
-        .unwrap_or_else(Instant::now);
+        .map_or(drain_end, |root| {
+            ksight_core::output_budget::deadline(root, drain_end)
+        });
     let drain_result = crate::shutdown_drain::stop_and_drain(
         &mut (&mut inspect, &mut sensors, &mut pipeline),
         |(inspect, sensors, _)| {
@@ -1354,6 +1362,9 @@ fn stream_events(
         "producers_stopped":drain_result.as_ref().ok().map(|d| d.producers_stopped),
         "queues_observed_empty":drain_result.as_ref().ok().map(|d| d.empty),
         "rounds":drain_result.as_ref().ok().map(|d| d.rounds),
+        "stop_elapsed_ms":drain_result.as_ref().ok().map(|d| d.stop_elapsed_ms),
+        "drain_elapsed_ms":drain_result.as_ref().ok().map(|d| d.drain_elapsed_ms),
+        "allowance_before_stop_ms":drain_end.saturating_duration_since(stopping_started).as_millis(),
         "unknown_tail":!drain_complete,"lost_samples":inspect.drain_totals().2})
     );
     let capture_loop_result = match (capture_loop_result, drain_result) {
