@@ -499,6 +499,27 @@ pub fn bound_coverage_only(path: &Path) -> bool {
     })
 }
 
+/// Terminal metadata proof only: a local static child cap does not revoke the
+/// original source grant. Payload writes/reads still obey `should_stop` unchanged.
+#[must_use]
+pub fn bound_terminal_coverage(path: &Path) -> Option<Vec<String>> {
+    states().lock().ok()?.values().find_map(|s| {
+        (s.roots.iter().any(|r| path.starts_with(r))
+            && Instant::now() < s.deadline
+            && s.receipt.admitted_write_bytes < s.receipt.limit_bytes
+            && s.receipt.rejected_writes == 0
+            && s.receipt.reason.as_deref() == Some("bound_code_copy_partial")
+            && !s.receipt.failure_reasons.is_empty()
+            && s.receipt.failure_reasons.iter().all(|r| {
+                matches!(
+                    r.as_str(),
+                    "bound_code_copy_partial" | "static_output_budget_exhausted"
+                )
+            }))
+        .then(|| s.receipt.failure_reasons.clone())
+    })
+}
+
 #[cfg(test)]
 mod static_tests {
     use super::*;
@@ -592,5 +613,41 @@ mod static_tests {
         drop(child);
         charge(&root.join("dump-report.json"), 30).unwrap();
         assert_eq!(parent.receipt().admitted_write_bytes, 100);
+    }
+}
+
+#[cfg(test)]
+mod terminal_coverage_tests {
+    use super::*;
+    #[test]
+    fn original_deadline_parent_bytes_and_unknown_failures_never_become_coverage() {
+        for reason in [
+            "output_io_failed",
+            "cancel_requested",
+            "source_identity_invalid",
+            "catalog_incomplete",
+            "additional_failure_reasons_omitted",
+        ] {
+            let root =
+                std::env::temp_dir().join(format!("terminal-proof-{}", uuid::Uuid::new_v4()));
+            let guard = Guard::install(vec![root.clone()], 100, 10000).unwrap();
+            record_failure(&root, "bound_code_copy_partial");
+            record_failure(&root, "static_output_budget_exhausted");
+            assert!(bound_terminal_coverage(&root).is_some());
+            record_failure(&root, reason);
+            assert!(bound_terminal_coverage(&root).is_none());
+            drop(guard);
+        }
+        let root = std::env::temp_dir().join(format!("terminal-deadline-{}", uuid::Uuid::new_v4()));
+        let guard = Guard::install(vec![root.clone()], 100, 10000).unwrap();
+        record_failure(&root, "bound_code_copy_partial");
+        interrupt(&root, "cancel_requested");
+        assert!(bound_terminal_coverage(&root).is_none());
+        drop(guard);
+        let guard = Guard::install(vec![root.clone()], 100, 10000).unwrap();
+        charge(&root, 100).unwrap();
+        record_failure(&root, "bound_code_copy_partial");
+        assert!(bound_terminal_coverage(&root).is_none());
+        drop(guard);
     }
 }

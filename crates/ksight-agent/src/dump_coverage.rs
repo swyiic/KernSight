@@ -55,8 +55,10 @@ fn check_note(
     }
     let gap = &note["candidate_result"]["unattempted_state"];
     if gap != "none"
-        && !(gap == "not_attempted_parent_deadline"
-            && note["candidate_result"]["stop_scope"] == "local_copy_window")
+        && !(matches!(
+            gap.as_str(),
+            Some("not_attempted_parent_deadline" | "not_attempted_local_copy_window")
+        ) && note["candidate_result"]["stop_scope"] == "local_copy_window")
     {
         bail!("parent or unknown stop");
     }
@@ -143,7 +145,7 @@ pub fn proof(
     package: &str,
     expected: &[crate::qualified_code::SourceIdentity],
 ) -> Result<Value> {
-    if !ksight_core::output_budget::bound_coverage_only(root) {
+    if ksight_core::output_budget::bound_terminal_coverage(root).is_none() {
         bail!("not coverage-only");
     }
     if expected.is_empty() {
@@ -223,12 +225,12 @@ pub fn proof(
         notes_hash.update((bytes.len() as u64).to_le_bytes());
         notes_hash.update(&bytes);
     }
-    if ranges == 0 || !ksight_core::output_budget::bound_coverage_only(root) {
+    if ranges == 0 || ksight_core::output_budget::bound_terminal_coverage(root).is_none() {
         bail!("no admitted range, deadline or subsequent failure");
     }
     Ok(
         json!({"schema":"kernsight.dump-coverage/v1","classification":"coverage_only","package":package,
-        "catalog_complete":true,"catalog_bytes":size,"catalog_sha256":format!("{:x}",catalog_hash.finalize()),
+        "catalog_complete":true,"payload_coverage_complete":false,"coverage_causes":ksight_core::output_budget::bound_terminal_coverage(root).ok_or_else(|| anyhow::anyhow!("parent deadline or subsequent failure"))?,"catalog_bytes":size,"catalog_sha256":format!("{:x}",catalog_hash.finalize()),
         "bound_notes":notes.len(),"bound_notes_sha256":format!("{:x}",notes_hash.finalize()),"admitted_ranges":ranges,"excluded_local_window_ranges":excluded,"excluded_local_window_bytes":excluded_bytes,"excluded_scope":"local_copy_window_only; not admitted code coverage"}),
     )
 }
@@ -252,7 +254,7 @@ struct CheckedReader<'a> {
 }
 impl Read for CheckedReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if !ksight_core::output_budget::bound_coverage_only(self.root) {
+        if ksight_core::output_budget::bound_terminal_coverage(self.root).is_none() {
             return Err(std::io::Error::other("parent deadline or unsafe failure"));
         }
         if self.remaining == 0 {
@@ -577,5 +579,83 @@ mod retained_full_proof_test {
             );
         }
         println!("OFFLINE_FULL_PROOF {}",serde_json::to_string(&json!({"scope":"independent offline validator; does not upgrade historical physical result or renew parent","proof":result,"input_hashes_unchanged":true,"written_bytes":0})).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod retained_5333_regressions {
+    use super::*;
+    #[test]
+    fn local_window_static_child_quota_retains_terminal_proof_and_hard_stops_still_revoke() {
+        let n: Value =
+            serde_json::from_str(include_str!("dump/fixtures/retained-5333-93-ranges.json"))
+                .unwrap();
+        let expected = vec![serde_json::from_value(n["source"].clone()).unwrap()];
+        assert_eq!(check_note(&n, "test.app", &expected).unwrap(), (93, 0, 0));
+        let root = std::env::temp_dir().join(format!("proof-5333-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(root.join("runtime")).unwrap();
+        fs::write(
+            root.join("runtime/bound-source-fixture.json"),
+            serde_json::to_vec(&n).unwrap(),
+        )
+        .unwrap();
+        fs::write(root.join("dump-report.json"), serde_json::to_vec(&json!({"schema_version":crate::dump::PACKAGE_DUMP_SCHEMA,"package":"test.app","dump_id":uuid::Uuid::new_v4(),"agent_version":"fixture","artifacts":[{}],"mapped_code":[],"warnings":["static payload incomplete"]})).unwrap()).unwrap();
+        let guard =
+            ksight_core::output_budget::Guard::install(vec![root.clone()], 1_604_052_748, 10000)
+                .unwrap();
+        ksight_core::output_budget::charge(&root, 487_931_229).unwrap();
+        ksight_core::output_budget::record_failure(&root, "bound_code_copy_partial");
+        ksight_core::output_budget::record_failure(&root, "static_output_budget_exhausted");
+        assert!(ksight_core::output_budget::should_stop(
+            &root.join("runtime")
+        ));
+        assert!(!ksight_core::output_budget::bound_coverage_only(&root));
+        let p = proof(&root, "test.app", &expected).unwrap();
+        assert_eq!(p["admitted_ranges"], 93);
+        assert_eq!(
+            p["coverage_causes"],
+            json!(["bound_code_copy_partial", "static_output_budget_exhausted"])
+        );
+        assert_eq!(p["payload_coverage_complete"], false);
+        assert!(guard.receipt().partial);
+        assert_eq!(guard.receipt().admitted_write_bytes, 487_931_229);
+        assert!(proof(&root, "test.app", &[]).is_err());
+        let mut wrong = expected.clone();
+        wrong[0].exec_id += 1;
+        assert!(proof(&root, "test.app", &wrong).is_err());
+        ksight_core::output_budget::record_failure(&root, "output_io_failed");
+        assert!(proof(&root, "test.app", &expected).is_err());
+        drop(guard);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    #[ignore = "explicit preserved 5333 original root; read-only production validator"]
+    fn preserved_5333_catalog_and_source_notes_validate_without_rewriting_evidence() {
+        let root = std::path::PathBuf::from(std::env::var_os("KSIGHT_5333_ROOT").unwrap());
+        let note = fs::read_dir(root.join("runtime"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("bound-source-")
+            })
+            .unwrap();
+        let bytes = fs::read(&note).unwrap();
+        let n: Value = serde_json::from_slice(&bytes).unwrap();
+        let expected = vec![serde_json::from_value(n["source"].clone()).unwrap()];
+        let guard =
+            ksight_core::output_budget::Guard::install(vec![root.clone()], 1_604_052_748, 30000)
+                .unwrap();
+        ksight_core::output_budget::charge(&root, 487_931_229).unwrap();
+        ksight_core::output_budget::record_failure(&root, "bound_code_copy_partial");
+        ksight_core::output_budget::record_failure(&root, "static_output_budget_exhausted");
+        assert_eq!(
+            proof(&root, "cmb.pb", &expected).unwrap()["admitted_ranges"],
+            93
+        );
+        assert_eq!(fs::read(note).unwrap(), bytes);
+        assert!(guard.receipt().partial);
     }
 }
