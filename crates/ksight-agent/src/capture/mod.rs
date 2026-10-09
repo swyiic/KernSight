@@ -685,6 +685,8 @@ fn stream_events(
         (request.duration_seconds != 0).then(|| Duration::from_secs(request.duration_seconds));
     // Reserve stop/drain/publication time inside the existing invocation lease.
     // This never renews it; a shortened observation is explicitly partial below.
+    let shutdown_reserve =
+        crate::shutdown_drain::reserve(request.inspect.enabled, request.duration_seconds);
     let observation_end = request
         .storage
         .spool_root
@@ -696,7 +698,7 @@ fn stream_events(
                     root,
                     started + Duration::from_secs(u64::from(u32::MAX)),
                 ),
-                Duration::from_secs(if request.inspect.enabled { 15 } else { 5 }),
+                shutdown_reserve,
                 started,
             )
         });
@@ -1278,7 +1280,7 @@ fn stream_events(
         serde_json::json!({"schema":"kernsight.observation-window/v1",
         "requested_ms":request.duration_seconds.saturating_mul(1000),
         "elapsed_ms":observation_elapsed.as_millis(), "shortened":observation_shortened,
-        "shutdown_reserve_ms":if request.inspect.enabled {15000} else {5000}})
+        "shutdown_reserve_ms":shutdown_reserve.as_millis()})
     );
     // Stop producers before final reads; keep the original phase lease and a flush reserve.
     let desired_end = Instant::now() + Duration::from_secs(10);

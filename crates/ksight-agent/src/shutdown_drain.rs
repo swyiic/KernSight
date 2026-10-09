@@ -12,6 +12,18 @@ pub fn before_reserve(
         .min(deadline)
 }
 
+/// Keep short inspect windows within their existing phase lease; long inspect
+/// captures need the larger drain reserve. An unbounded capture is long-lived.
+pub fn reserve(inspect: bool, duration_seconds: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(
+        if inspect && (duration_seconds == 0 || duration_seconds > 30) {
+            15
+        } else {
+            5
+        },
+    )
+}
+
 /// Evidence of producer closure and the final queue observation.
 #[derive(Debug, PartialEq, Eq)]
 pub struct DrainEnd {
@@ -73,6 +85,19 @@ mod tests {
             before_reserve(expired, Duration::from_secs(15), now),
             expired
         );
+    }
+    #[test]
+    fn linker_window_fits_original_lease_and_expired_lease_stays_expired() {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        // The real Linker phase allowed 25s; 734ms was spent before observation.
+        let lease = now + Duration::from_millis(24266);
+        let observation_end = before_reserve(lease, reserve(true, 15), now);
+        assert!(observation_end >= now + Duration::from_secs(15));
+        assert!(observation_end < lease);
+        assert_eq!(reserve(true, 90), Duration::from_secs(15));
+        let expired = now.checked_sub(Duration::from_secs(1)).unwrap();
+        assert_eq!(before_reserve(expired, reserve(true, 15), now), expired);
     }
     struct Queue {
         live: bool,
