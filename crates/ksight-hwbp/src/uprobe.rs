@@ -85,7 +85,9 @@ impl InstanceMaps for BpfInstanceMaps<'_> {
     }
 }
 use super::tgid_filter::{self, FilterMaps};
-use crate::perf_drain::{drain_reads, drain_stopped_reads, PerfDrainReport, PerfRead};
+use crate::perf_drain::{
+    drain_record_reads, drain_stopped_record_reads, BoundedPerfRead, PerfDrainReport, PerfRead,
+};
 
 struct BpfFilterMaps<'a>(&'a mut Ebpf);
 
@@ -666,14 +668,14 @@ impl UprobeSession {
             }
             let slots = &mut self.read_slots;
             let reader = if stopped {
-                drain_stopped_reads
+                drain_stopped_record_reads
             } else {
-                drain_reads
+                drain_record_reads
             };
             let mut report = reader(
                 || {
                     crate::perf_drain::phase(crate::perf_drain::PollPhase::Read);
-                    let read = match buffer.read_events(slots) {
+                    let read = match buffer.read_events_bounded(slots) {
                         Ok(read) => read,
                         Err(error) => {
                             return Err((
@@ -687,7 +689,7 @@ impl UprobeSession {
                     crate::perf_drain::phase(crate::perf_drain::PollPhase::Decode);
                     let records = slots
                         .iter()
-                        .take(read.read)
+                        .take(read.events.read)
                         .filter_map(|slot| {
                             let hit = counters.admit_perf_sample(
                                 slot,
@@ -700,11 +702,20 @@ impl UprobeSession {
                             }
                         })
                         .collect();
-                    Ok(PerfRead {
-                        samples: read.read as u64,
-                        records,
-                        lost_samples: read.lost as u64,
-                        notification_monotonic_ns: observed,
+                    Ok(BoundedPerfRead {
+                        read: PerfRead {
+                            samples: read.events.read as u64,
+                            records,
+                            lost_samples: read.events.lost as u64,
+                            notification_monotonic_ns: observed,
+                        },
+                        lost_notices: read.lost_notices,
+                        consumed_records: read.consumed_records as u64,
+                        consumed_bytes: read.consumed_bytes as u64,
+                        remaining: read.remaining,
+                        error: read
+                            .error
+                            .map(|error| (format!("perf_buffer_read_error: {error}"), observed)),
                     })
                 },
                 |hit: &RegisterContext| hit.time_ns,
@@ -713,6 +724,10 @@ impl UprobeSession {
             self.lost_total = self.lost_total.saturating_add(report.lost_samples);
             result.raw_samples = result.raw_samples.saturating_add(report.raw_samples);
             result.lost_samples = result.lost_samples.saturating_add(report.lost_samples);
+            result.consumed_records = result
+                .consumed_records
+                .saturating_add(report.consumed_records);
+            result.consumed_bytes = result.consumed_bytes.saturating_add(report.consumed_bytes);
             result.read_calls = result.read_calls.saturating_add(report.read_calls);
             result.budget_yielded |= report.budget_yielded;
             self.budget_yields_total = self

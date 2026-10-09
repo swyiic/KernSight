@@ -13,7 +13,7 @@ use bytes::BytesMut;
 
 use crate::{
     maps::{
-        perf::{Events, PerfBuffer, PerfBufferError},
+        perf::{BoundedEvents, Events, PerfBuffer, PerfBufferError},
         MapData, MapError, PinError,
     },
     sys::bpf_map_update_elem,
@@ -53,6 +53,19 @@ impl<T: BorrowMut<MapData>> PerfEventArrayBuffer<T> {
     /// [`PerfBufferError::NoBuffers`] is returned when `out_bufs` is empty.
     pub fn read_events(&mut self, out_bufs: &mut [BytesMut]) -> Result<Events, PerfBufferError> {
         self.buf.read_events(out_bufs)
+    }
+
+    /// Consume at most 64 ring records or 64 KiB, including LOST and unknown
+    /// types. Unconsumed records remain at the original tail. Malformed-record
+    /// errors are returned in the report alongside all earlier progress.
+    ///
+    /// # Errors
+    /// Returns `NoBuffers` without consuming data when output slots are empty.
+    pub fn read_events_bounded(
+        &mut self,
+        out_bufs: &mut [BytesMut],
+    ) -> Result<BoundedEvents, PerfBufferError> {
+        self.buf.read_events_bounded(out_bufs)
     }
 }
 

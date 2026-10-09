@@ -842,7 +842,7 @@ pub fn dump_package_with(
     }
     #[allow(unused_mut)]
     let mut budget_closed = false;
-    let deadline = first_copy_deadline(dest, options.parent_owned, Instant::now());
+    let deadline = first_copy_deadline(dest, options, Instant::now());
     if options.parent_owned {
         report.warnings.push("runtime_mapping_scope=initial_bound_maps_snapshot_per_source; later mappings and later contents are not observed by another full copy pass".into());
     }
@@ -3779,15 +3779,23 @@ fn hex_key(key: [u8; 16]) -> String {
     out
 }
 
-// The original phase owns this time. Leave ten seconds for catalog/return and
-// one third of the remainder for installed/static evidence. A completed source
-// is not reread under a fresh local window on the qualified parent path.
-fn first_copy_deadline(dest: &Path, parent_owned: bool, now: Instant) -> Instant {
-    if parent_owned {
+// All sources share one window within the original phase. Reserve concrete
+// downstream work instead of discarding one third of every remaining window:
+// full static retention gets thirty seconds, reference metadata gets five,
+// and every mode keeps ten seconds for the final catalog and return.
+fn first_copy_deadline(dest: &Path, options: &DumpOptions, now: Instant) -> Instant {
+    if options.parent_owned {
         if let Some(parent_deadline) = ksight_core::output_budget::invocation_deadline(dest) {
+            let static_seconds = if options.runtime_only {
+                0
+            } else if options.code_only {
+                5
+            } else {
+                30
+            };
             let remaining = parent_deadline.saturating_duration_since(now);
-            let live_share = remaining.saturating_sub(Duration::from_secs(10)) / 3 * 2;
-            return (now + live_share).min(parent_deadline);
+            let live_window = remaining.saturating_sub(Duration::from_secs(10 + static_seconds));
+            return (now + live_window).min(parent_deadline);
         }
     }
     ksight_core::output_budget::deadline(dest, now + Duration::from_secs(30))
@@ -5451,6 +5459,13 @@ mod preceding_source_refresh_tests {
 mod expanded_copy_window_tests {
     use super::*;
 
+    fn parent_options() -> DumpOptions {
+        DumpOptions {
+            parent_owned: true,
+            ..DumpOptions::default()
+        }
+    }
+
     #[test]
     fn registered_copy_uses_original_remaining_time_and_manual_fallback_stays_bounded() {
         let root = std::env::temp_dir().join(format!("copy-window-{}", uuid::Uuid::new_v4()));
@@ -5459,20 +5474,22 @@ mod expanded_copy_window_tests {
         let original = ksight_core::output_budget::invocation_deadline(&root).unwrap();
         let now = original.checked_sub(Duration::from_secs(245)).unwrap();
         assert_eq!(
-            first_copy_deadline(&root, true, now) - now,
-            Duration::from_secs(235) / 3 * 2
+            first_copy_deadline(&root, &parent_options(), now) - now,
+            Duration::from_secs(205)
         );
-        assert!(first_copy_deadline(&root, true, now + Duration::from_secs(60)) < original);
+        assert!(
+            first_copy_deadline(&root, &parent_options(), now + Duration::from_secs(60)) < original
+        );
         assert_eq!(
             ksight_core::output_budget::invocation_deadline(&root),
             Some(original)
         );
         assert_eq!(
-            first_copy_deadline(&root, true, original + Duration::from_secs(1)),
+            first_copy_deadline(&root, &parent_options(), original + Duration::from_secs(1)),
             original
         );
         assert_eq!(
-            first_copy_deadline(&root, false, now),
+            first_copy_deadline(&root, &DumpOptions::default(), now),
             now + Duration::from_secs(30)
         );
     }
@@ -5484,7 +5501,7 @@ mod expanded_copy_window_tests {
             ksight_core::output_budget::Guard::install(vec![root.clone()], 100, 60000).unwrap();
         let original = ksight_core::output_budget::invocation_deadline(&root).unwrap();
         let now = original.checked_sub(Duration::from_secs(9)).unwrap();
-        let live_deadline = first_copy_deadline(&root, true, now);
+        let live_deadline = first_copy_deadline(&root, &parent_options(), now);
         assert_eq!(live_deadline, now);
         let mut report = PackageDumpReport::default();
         let mut copy_calls = 0;
@@ -5507,6 +5524,103 @@ mod expanded_copy_window_tests {
             ksight_core::output_budget::invocation_deadline(&root),
             Some(original)
         );
+    }
+
+    #[test]
+    fn sources_past_old_fraction_keep_bytes_and_leave_static_closeout() {
+        use std::io::Cursor;
+        let root = std::env::temp_dir().join(format!("copy-late-source-{}", uuid::Uuid::new_v4()));
+        let guard =
+            ksight_core::output_budget::Guard::install(vec![root.clone()], 1024, 245_000).unwrap();
+        let original = ksight_core::output_budget::invocation_deadline(&root).unwrap();
+        let started = original.checked_sub(Duration::from_secs(245)).unwrap();
+        let options = parent_options();
+        let deadline = first_copy_deadline(&root, &options, started);
+        let old_cutoff = started + Duration::from_secs(235) / 3 * 2;
+        let mut report = PackageDumpReport::default();
+        for (index, contents) in [b"first source".as_slice(), b"second source".as_slice()]
+            .into_iter()
+            .enumerate()
+        {
+            let now = started + Duration::from_secs(170 + index as u64 * 10);
+            assert!(now > old_cutoff);
+            let mut input = Cursor::new(contents);
+            let mut retained = Vec::new();
+            let receipt = crate::qualified_code::copy_range(
+                &mut input,
+                &mut retained,
+                0,
+                contents.len() as u64,
+                || {
+                    if !live_copy_window_available(
+                        &mut report,
+                        &root,
+                        true,
+                        deadline,
+                        now,
+                        2 - index,
+                    ) {
+                        bail!("local_copy_window_exhausted");
+                    }
+                    Ok(())
+                },
+            );
+            assert_eq!(retained, contents);
+            assert_eq!(receipt.read_status, "complete");
+            assert_eq!(receipt.write_status, "complete");
+            assert_eq!(receipt.admission, "qualified_live_copy");
+        }
+        assert!(!guard.receipt().partial);
+        assert!(report.warnings.is_empty());
+        assert_eq!(original - deadline, Duration::from_secs(40));
+        let child = ksight_core::output_budget::StaticScope::install_after_bound_copy(
+            root.clone(),
+            1024,
+            64,
+        )
+        .unwrap();
+        child
+            .limit_deadline(original.checked_sub(Duration::from_secs(10)).unwrap())
+            .unwrap();
+        ksight_core::output_budget::charge(&root.join("apk/base.apk"), 512).unwrap();
+        drop(child);
+        ksight_core::output_budget::charge(&root.join("dump-report.json"), 64).unwrap();
+        assert_eq!(guard.receipt().admitted_write_bytes, 576);
+        assert_eq!(
+            ksight_core::output_budget::invocation_deadline(&root),
+            Some(original)
+        );
+    }
+
+    #[test]
+    fn closeout_reservation_matches_selected_static_work() {
+        let root = std::env::temp_dir().join(format!("copy-modes-{}", uuid::Uuid::new_v4()));
+        let _guard =
+            ksight_core::output_budget::Guard::install(vec![root.clone()], 100, 245_000).unwrap();
+        let original = ksight_core::output_budget::invocation_deadline(&root).unwrap();
+        let started = original.checked_sub(Duration::from_secs(245)).unwrap();
+        for (runtime_only, code_only, reserve) in
+            [(true, false, 10), (false, true, 15), (false, false, 40)]
+        {
+            let options = DumpOptions {
+                parent_owned: true,
+                runtime_only,
+                code_only,
+                ..DumpOptions::default()
+            };
+            assert_eq!(
+                original - first_copy_deadline(&root, &options, started),
+                Duration::from_secs(reserve)
+            );
+            let short = original
+                .checked_sub(Duration::from_secs(reserve - 1))
+                .unwrap();
+            assert_eq!(first_copy_deadline(&root, &options, short), short);
+            assert_eq!(
+                first_copy_deadline(&root, &options, original + Duration::from_secs(1)),
+                original
+            );
+        }
     }
 }
 

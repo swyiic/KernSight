@@ -14,6 +14,23 @@ pub struct PerfRead<T> {
     pub notification_monotonic_ns: Option<u64>,
 }
 
+/// Ring progress for the bounded production reader. Legacy `PerfRead` stays
+/// unchanged; records/bytes here count actual consumed ring data, not samples.
+pub struct BoundedPerfRead<T, E> {
+    /// Decoded records and legacy aggregate counts for this read.
+    pub read: PerfRead<T>,
+    /// Each consumed kernel loss record, including zero, in original order.
+    pub lost_notices: Vec<u64>,
+    /// Actual consumed ring records, including unknown types.
+    pub consumed_records: u64,
+    /// Actual published record bytes consumed.
+    pub consumed_bytes: u64,
+    /// Captured head still contains unconsumed data.
+    pub remaining: bool,
+    /// Parse error after any earlier successful consumption in this read.
+    pub error: Option<(E, Option<u64>)>,
+}
+
 /// Original read-result loss notification with available returned-record bounds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PerfLossNotification {
@@ -35,6 +52,10 @@ pub struct PerfDrainReport<T, E> {
     pub records: Vec<T>,
     /// Raw kernel samples consumed, independent of decoder success.
     pub raw_samples: u64,
+    /// Actual consumed ring records; legacy readers do not supply this count.
+    pub consumed_records: u64,
+    /// Actual consumed ring bytes; legacy readers do not supply this count.
+    pub consumed_bytes: u64,
     /// Kernel-reported lost samples, including lost-only reads.
     pub lost_samples: u64,
     /// Every original loss notice, without timestamp reconstruction.
@@ -58,6 +79,8 @@ impl<T, E> Default for PerfDrainReport<T, E> {
         Self {
             records: Vec::new(),
             raw_samples: 0,
+            consumed_records: 0,
+            consumed_bytes: 0,
             lost_samples: 0,
             notifications: Vec::new(),
             error: None,
@@ -93,11 +116,54 @@ fn drain_reads_bounded<T, E>(
     timestamp: impl Fn(&T) -> u64,
     max_calls: u64,
 ) -> PerfDrainReport<T, E> {
+    drain_record_reads_bounded(
+        || {
+            read().map(|read| {
+                let remaining = read.samples != 0 || read.lost_samples != 0;
+                let lost_notices = if read.lost_samples == 0 {
+                    Vec::new()
+                } else {
+                    vec![read.lost_samples]
+                };
+                BoundedPerfRead {
+                    read,
+                    lost_notices,
+                    consumed_records: 0,
+                    consumed_bytes: 0,
+                    remaining,
+                    error: None,
+                }
+            })
+        },
+        timestamp,
+        max_calls,
+    )
+}
+
+/// Live production drain; every kernel record is bounded by the reader.
+pub fn drain_record_reads<T, E>(
+    read: impl FnMut() -> Result<BoundedPerfRead<T, E>, (E, Option<u64>)>,
+    timestamp: impl Fn(&T) -> u64,
+) -> PerfDrainReport<T, E> {
+    drain_record_reads_bounded(read, timestamp, 8)
+}
+
+/// Stopped production drain, preserving the existing call/time allowance.
+pub fn drain_stopped_record_reads<T, E>(
+    read: impl FnMut() -> Result<BoundedPerfRead<T, E>, (E, Option<u64>)>,
+    timestamp: impl Fn(&T) -> u64,
+) -> PerfDrainReport<T, E> {
+    drain_record_reads_bounded(read, timestamp, 32)
+}
+
+fn drain_record_reads_bounded<T, E>(
+    mut read: impl FnMut() -> Result<BoundedPerfRead<T, E>, (E, Option<u64>)>,
+    timestamp: impl Fn(&T) -> u64,
+    max_calls: u64,
+) -> PerfDrainReport<T, E> {
     let start = std::time::Instant::now();
     let mut report = PerfDrainReport::default();
     loop {
-        // A continuously replenished (including lost-only) ring need never empty.
-        // Return to the capture loop so its original observation/lease can be checked.
         if report.read_calls >= max_calls
             || (report.read_calls > 0 && start.elapsed().as_millis() >= 2)
         {
@@ -113,22 +179,37 @@ fn drain_reads_bounded<T, E>(
                 break;
             }
         };
-        report.raw_samples = report.raw_samples.saturating_add(batch.samples);
-        report.lost_samples = report.lost_samples.saturating_add(batch.lost_samples);
-        if batch.lost_samples != 0 {
-            report.lost_only_reads += u64::from(batch.samples == 0);
+        report.raw_samples = report.raw_samples.saturating_add(batch.read.samples);
+        report.lost_samples = report.lost_samples.saturating_add(batch.read.lost_samples);
+        report.consumed_records = report
+            .consumed_records
+            .saturating_add(batch.consumed_records);
+        report.consumed_bytes = report.consumed_bytes.saturating_add(batch.consumed_bytes);
+        if batch.read.lost_samples != 0 {
+            report.lost_only_reads += u64::from(batch.read.samples == 0);
+        }
+        let first = batch.read.records.iter().map(&timestamp).min();
+        let last = batch.read.records.iter().map(&timestamp).max();
+        for lost_samples in batch.lost_notices {
             report.notifications.push(PerfLossNotification {
                 cpu_id: None,
-                lost_samples: batch.lost_samples,
-                notification_monotonic_ns: batch.notification_monotonic_ns,
-                first_returned_kernel_ns: batch.records.iter().map(&timestamp).min(),
-                last_returned_kernel_ns: batch.records.iter().map(&timestamp).max(),
+                lost_samples,
+                notification_monotonic_ns: batch.read.notification_monotonic_ns,
+                first_returned_kernel_ns: first,
+                last_returned_kernel_ns: last,
             });
         }
-        report.records.extend(batch.records);
-        // A lost-only read advanced the ring tail; keep reading rather than
-        // silently losing its notification or fabricating a sample.
-        if batch.samples == 0 && batch.lost_samples == 0 {
+        report.records.extend(batch.read.records);
+        // Account every consumed record before surfacing an error. The bad
+        // record itself stays at tail, so it is never counted as consumed.
+        if let Some((error, when)) = batch.error {
+            report.error = Some(error);
+            report.error_notification_monotonic_ns = when;
+            report.budget_yielded = batch.remaining;
+            break;
+        }
+        // Unknown-only progress with an unread tail is not an empty ring.
+        if !batch.remaining {
             break;
         }
     }
@@ -423,5 +504,167 @@ mod one_shot_tail_integration {
         assert_eq!(invalid.error, Some("original identity invalidated"));
         assert_eq!(invalid.records, [] as [u64; 0]);
         assert_eq!(first.records, vec![10]);
+    }
+}
+
+#[cfg(test)]
+mod bounded_record_regressions {
+    use super::*;
+
+    fn read(remaining: bool) -> BoundedPerfRead<u64, &'static str> {
+        BoundedPerfRead {
+            read: PerfRead {
+                samples: 0,
+                records: vec![],
+                lost_samples: 0,
+                notification_monotonic_ns: Some(19),
+            },
+            lost_notices: vec![],
+            consumed_records: 0,
+            consumed_bytes: 0,
+            remaining,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn unknown_only_continuous_reader_yields_with_actual_consumption() {
+        let report = drain_record_reads(
+            || {
+                let mut batch = read(true);
+                batch.consumed_records = 64;
+                batch.consumed_bytes = 512;
+                Ok(batch)
+            },
+            |v| *v,
+        );
+        assert!(report.budget_yielded && report.error.is_none());
+        assert!((1..=8).contains(&report.read_calls));
+        assert_eq!(report.consumed_records, report.read_calls * 64);
+        assert_eq!(report.consumed_bytes, report.read_calls * 512);
+        assert_eq!(report.raw_samples, 0);
+        assert_eq!(report.lost_samples, 0);
+        assert!(report.records.is_empty() && report.notifications.is_empty());
+    }
+
+    #[test]
+    fn later_empty_read_clears_remaining_instead_of_sticky_yield() {
+        let mut call = 0;
+        let report = drain_record_reads(
+            || {
+                call += 1;
+                let mut batch = read(call == 1);
+                if call == 1 {
+                    batch.consumed_records = 64;
+                    batch.consumed_bytes = 512;
+                }
+                Ok(batch)
+            },
+            |v| *v,
+        );
+        assert_eq!(report.read_calls, 2);
+        assert_eq!((report.consumed_records, report.consumed_bytes), (64, 512));
+        assert!(!report.budget_yielded && report.error.is_none());
+    }
+
+    #[test]
+    fn all_original_loss_notices_including_zero_survive_without_double_counting() {
+        let report = drain_record_reads(
+            || {
+                let mut batch = read(false);
+                batch.read.lost_samples = 12;
+                batch.lost_notices = vec![0, 3, 9];
+                batch.consumed_records = 3;
+                batch.consumed_bytes = 72;
+                Ok(batch)
+            },
+            |v| *v,
+        );
+        assert_eq!(report.lost_samples, 12);
+        assert_eq!(
+            report
+                .notifications
+                .iter()
+                .map(|n| n.lost_samples)
+                .collect::<Vec<_>>(),
+            vec![0, 3, 9]
+        );
+        assert!(report
+            .notifications
+            .iter()
+            .all(|n| n.notification_monotonic_ns == Some(19)));
+        assert_eq!(report.lost_only_reads, 1);
+        assert_eq!((report.consumed_records, report.consumed_bytes), (3, 72));
+    }
+
+    #[test]
+    fn bad_header_preserves_same_read_progress_and_real_error() {
+        let report = drain_record_reads(
+            || {
+                let mut batch = read(true);
+                batch.read.samples = 1;
+                batch.read.records = vec![42];
+                batch.read.lost_samples = 9;
+                batch.lost_notices = vec![0, 9];
+                batch.consumed_records = 4;
+                batch.consumed_bytes = 72;
+                batch.error = Some(("bad header", Some(19)));
+                Ok(batch)
+            },
+            |v| *v,
+        );
+        assert_eq!(report.records, vec![42]);
+        assert_eq!((report.raw_samples, report.lost_samples), (1, 9));
+        assert_eq!((report.consumed_records, report.consumed_bytes), (4, 72));
+        assert_eq!(
+            report
+                .notifications
+                .iter()
+                .map(|n| n.lost_samples)
+                .collect::<Vec<_>>(),
+            vec![0, 9]
+        );
+        assert!(report.notifications.iter().all(
+            |n| n.first_returned_kernel_ns == Some(42) && n.last_returned_kernel_ns == Some(42)
+        ));
+        assert_eq!(report.error, Some("bad header"));
+        assert_eq!(report.error_notification_monotonic_ns, Some(19));
+        assert!(report.budget_yielded);
+        assert_eq!(report.read_calls, 1);
+    }
+
+    #[test]
+    fn unknown_before_bad_header_is_counted_without_fabricating_sample() {
+        let report = drain_record_reads(
+            || {
+                let mut batch = read(true);
+                batch.consumed_records = 1;
+                batch.consumed_bytes = 8;
+                batch.error = Some(("bad header", Some(19)));
+                Ok(batch)
+            },
+            |v| *v,
+        );
+        assert_eq!((report.consumed_records, report.consumed_bytes), (1, 8));
+        assert_eq!((report.raw_samples, report.lost_samples), (0, 0));
+        assert!(report.records.is_empty() && report.notifications.is_empty());
+        assert_eq!(report.error, Some("bad header"));
+        assert!(report.budget_yielded);
+    }
+
+    #[test]
+    fn stopped_reader_keeps_32_call_allowance_without_hiding_tail() {
+        let report = drain_stopped_record_reads(
+            || {
+                let mut batch = read(true);
+                batch.consumed_records = 64;
+                batch.consumed_bytes = 512;
+                Ok(batch)
+            },
+            |v| *v,
+        );
+        assert!((1..=32).contains(&report.read_calls));
+        assert!(report.budget_yielded && report.error.is_none());
+        assert_eq!(report.consumed_records, report.read_calls * 64);
     }
 }

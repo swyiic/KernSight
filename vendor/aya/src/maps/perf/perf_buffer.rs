@@ -83,6 +83,23 @@ pub struct Events {
     pub lost: usize,
 }
 
+/// One bounded read, including progress before a malformed record.
+#[derive(Debug)]
+pub struct BoundedEvents {
+    /// Legacy SAMPLE and aggregate lost-sample counts.
+    pub events: Events,
+    /// Every consumed PERF_RECORD_LOST count, including zero, in ring order.
+    pub lost_notices: Vec<u64>,
+    /// Successfully consumed ring records, including LOST and unknown types.
+    pub consumed_records: usize,
+    /// Published bytes of those records; not decoded payload bytes.
+    pub consumed_bytes: usize,
+    /// The captured producer head still has unconsumed bytes.
+    pub remaining: bool,
+    /// A malformed record retained at tail; earlier progress remains available.
+    pub error: Option<PerfBufferError>,
+}
+
 /// Validate a kernel ring record before parsing or advancing the consumer cursor.
 ///
 /// # Errors
@@ -163,6 +180,29 @@ impl PerfBuffer {
         &mut self,
         buffers: &mut [BytesMut],
     ) -> Result<Events, PerfBufferError> {
+        let read = self.read_events_inner(buffers, false)?;
+        // Keep the legacy projection, including deferred errors after SAMPLE
+        // or nonzero loss progress. Unknown-only progress never hid errors.
+        if read.events.read == 0 && read.events.lost == 0 {
+            if let Some(error) = read.error {
+                return Err(error);
+            }
+        }
+        Ok(read.events)
+    }
+
+    pub(crate) fn read_events_bounded(
+        &mut self,
+        buffers: &mut [BytesMut],
+    ) -> Result<BoundedEvents, PerfBufferError> {
+        self.read_events_inner(buffers, true)
+    }
+
+    fn read_events_inner(
+        &mut self,
+        buffers: &mut [BytesMut],
+        bounded: bool,
+    ) -> Result<BoundedEvents, PerfBufferError> {
         if buffers.is_empty() {
             return Err(PerfBufferError::NoBuffers);
         }
@@ -171,6 +211,9 @@ impl PerfBuffer {
 
         let mut events = Events { read: 0, lost: 0 };
         let mut buf_n = 0;
+        let mut lost_notices = Vec::new();
+        let mut consumed_records = 0usize;
+        let mut consumed_bytes = 0usize;
 
         let fill_buf = |start_off, base, mmap_size, out_buf: &mut [u8]| {
             let len = out_buf.len();
@@ -250,7 +293,7 @@ impl PerfBuffer {
                         self.size,
                         &mut count,
                     );
-                    Ok(Some((0, u64::from_ne_bytes(count) as usize)))
+                    Ok(Some((0, u64::from_ne_bytes(count))))
                 }
                 _ => Ok(None),
             }
@@ -260,69 +303,77 @@ impl PerfBuffer {
         let mut tail = unsafe { (*header).data_tail } as usize;
         // Kernel publishes record bytes before data_head; acquire before consuming them.
         atomic::fence(Ordering::Acquire);
-        let result = loop {
-            if head == tail {
-                break Ok(());
+        let error = loop {
+            if head == tail || buf_n == buffers.len() {
+                break None;
             }
-            if buf_n == buffers.len() {
-                break Ok(());
+            // SAMPLE slots alone do not bound LOST or unknown ring records.
+            if bounded && (consumed_records >= 64 || consumed_bytes >= 64 * 1024) {
+                break None;
             }
-
-            let buf = &mut buffers[buf_n];
 
             let event_start = tail % self.size;
             let available = head.wrapping_sub(tail);
             if available < mem::size_of::<perf_event_header>() || available > self.size {
-                let error =
+                break Some(
                     io::Error::new(io::ErrorKind::InvalidData, "incomplete perf record header")
-                        .into();
-                break if events.read == 0 && events.lost == 0 {
-                    Err(error)
-                } else {
-                    Ok(())
-                };
+                        .into(),
+                );
             }
             let mut header_bytes = [0u8; mem::size_of::<perf_event_header>()];
             fill_buf(event_start, base, self.size, &mut header_bytes);
             let event =
                 unsafe { ptr::read_unaligned(header_bytes.as_ptr().cast::<perf_event_header>()) };
             let event_size = event.size as usize;
-            if let Err(error) = validate_record_size(event_size, head.wrapping_sub(tail), self.size)
-            {
-                // Return earlier reads first; the next call reports this exact bad header.
-                break if events.read == 0 && events.lost == 0 {
-                    Err(error)
-                } else {
-                    Ok(())
-                };
+            if let Err(error) = validate_record_size(event_size, available, self.size) {
+                break Some(error);
+            }
+            // u16 record sizes ensure the first valid record fits. Never skip
+            // a record to fit the allowance, or consume part of a record.
+            if bounded && event_size > (64 * 1024usize).saturating_sub(consumed_bytes) {
+                break None;
             }
 
-            match read_event(event_start, event.type_, event_size, base, buf) {
+            match read_event(
+                event_start,
+                event.type_,
+                event_size,
+                base,
+                &mut buffers[buf_n],
+            ) {
                 Ok(Some((read, lost))) => {
                     if read > 0 {
                         buf_n += 1;
                         events.read += read;
                     }
-                    events.lost += lost;
-                }
-                Ok(None) => { /* skip unknown event type */ }
-                Err(e) => {
-                    // we got an error and we didn't process any events, propagate the error
-                    // and give the caller a chance to increase buffers
-                    break if events.read == 0 && events.lost == 0 {
-                        Err(e)
+                    if bounded {
+                        events.lost = events.lost.saturating_add(lost as usize);
                     } else {
-                        Ok(())
-                    };
+                        events.lost += lost as usize;
+                    }
+                    if bounded && event.type_ == PERF_RECORD_LOST as u32 {
+                        lost_notices.push(lost);
+                    }
                 }
+                Ok(None) => { /* consume unknown event type without fabricating a sample */ }
+                Err(error) => break Some(error),
             }
-            tail += event_size;
+            tail = tail.wrapping_add(event_size);
+            consumed_records += 1;
+            consumed_bytes += event_size;
         };
 
         atomic::fence(Ordering::SeqCst);
         unsafe { (*header).data_tail = tail as u64 };
 
-        result.map(|()| events)
+        Ok(BoundedEvents {
+            events,
+            lost_notices,
+            consumed_records,
+            consumed_bytes,
+            remaining: head != tail,
+            error,
+        })
     }
 }
 
@@ -374,6 +425,343 @@ mod tests {
             call => panic!("unexpected syscall: {:?}", call),
         });
         TEST_MMAP_RET.with(|ret| *ret.borrow_mut() = buf as *const _ as *mut _);
+    }
+
+    #[repr(C)]
+    #[derive(Debug)]
+    struct BoundedLost {
+        header: perf_event_header,
+        id: u64,
+        count: u64,
+    }
+
+    fn write_lost(mapped: &mut MMappedBuf, offset: usize, count: u64) -> usize {
+        write(
+            mapped,
+            offset,
+            BoundedLost {
+                header: perf_event_header {
+                    type_: PERF_RECORD_LOST as u32,
+                    misc: 0,
+                    size: 24,
+                },
+                id: 1,
+                count,
+            },
+        )
+    }
+
+    #[test]
+    fn bounded_lost_only_keeps_each_notice_and_exact_tail() {
+        let mut mapped = MMappedBuf {
+            data: [0; PAGE_SIZE * 2],
+        };
+        fake_mmap(&mapped);
+        let mut offset = 0;
+        for i in 0..128 {
+            offset = write_lost(&mut mapped, offset, if i == 0 { 0 } else { 7 });
+        }
+        let mut buffer = PerfBuffer::open(1, PAGE_SIZE, 1).unwrap();
+        let mut slots = [BytesMut::new()];
+        let first = buffer.read_events_bounded(&mut slots).unwrap();
+        assert_eq!(
+            first.events,
+            Events {
+                read: 0,
+                lost: 63 * 7
+            }
+        );
+        assert_eq!(first.lost_notices.len(), 64);
+        assert_eq!(first.lost_notices[0], 0);
+        assert_eq!(
+            (first.consumed_records, first.consumed_bytes),
+            (64, 64 * 24)
+        );
+        assert!(first.remaining && first.error.is_none());
+        assert_eq!(unsafe { mapped.mmap_page.data_tail }, 64 * 24);
+        let second = buffer.read_events_bounded(&mut slots).unwrap();
+        assert_eq!(
+            second.events,
+            Events {
+                read: 0,
+                lost: 64 * 7
+            }
+        );
+        assert_eq!(second.lost_notices, vec![7; 64]);
+        assert_eq!(
+            (second.consumed_records, second.consumed_bytes),
+            (64, 64 * 24)
+        );
+        assert!(!second.remaining && second.error.is_none());
+        assert_eq!(unsafe { mapped.mmap_page.data_tail }, offset as u64);
+    }
+
+    #[test]
+    fn bounded_unknown_only_is_progress_and_retains_next_record() {
+        let mut mapped = MMappedBuf {
+            data: [0; PAGE_SIZE * 2],
+        };
+        fake_mmap(&mapped);
+        let mut offset = 0;
+        for _ in 0..65 {
+            offset = write(
+                &mut mapped,
+                offset,
+                perf_event_header {
+                    type_: 0xffff,
+                    misc: 0,
+                    size: 8,
+                },
+            );
+        }
+        let mut buffer = PerfBuffer::open(1, PAGE_SIZE, 1).unwrap();
+        let mut slots = [BytesMut::new()];
+        let first = buffer.read_events_bounded(&mut slots).unwrap();
+        assert_eq!(first.events, Events { read: 0, lost: 0 });
+        assert!(first.lost_notices.is_empty());
+        assert_eq!((first.consumed_records, first.consumed_bytes), (64, 512));
+        assert!(first.remaining && first.error.is_none());
+        assert_eq!(unsafe { mapped.mmap_page.data_tail }, 512);
+        let second = buffer.read_events_bounded(&mut slots).unwrap();
+        assert_eq!((second.consumed_records, second.consumed_bytes), (1, 8));
+        assert!(!second.remaining && second.error.is_none());
+        assert_eq!(unsafe { mapped.mmap_page.data_tail }, offset as u64);
+    }
+
+    #[test]
+    fn bounded_unknown_before_bad_header_returns_progress_and_error() {
+        let mut mapped = MMappedBuf {
+            data: [0; PAGE_SIZE * 2],
+        };
+        fake_mmap(&mapped);
+        let offset = write(
+            &mut mapped,
+            0,
+            perf_event_header {
+                type_: 0xffff,
+                misc: 0,
+                size: 8,
+            },
+        );
+        write(
+            &mut mapped,
+            offset,
+            perf_event_header {
+                type_: PERF_RECORD_SAMPLE as u32,
+                misc: 0,
+                size: 0,
+            },
+        );
+        let mut buffer = PerfBuffer::open(1, PAGE_SIZE, 1).unwrap();
+        let mut slots = [BytesMut::new()];
+        let read = buffer.read_events_bounded(&mut slots).unwrap();
+        assert_eq!(read.events, Events { read: 0, lost: 0 });
+        assert_eq!((read.consumed_records, read.consumed_bytes), (1, 8));
+        assert!(read.remaining && read.error.is_some());
+        assert_eq!(unsafe { mapped.mmap_page.data_tail }, 8);
+        let retry = buffer.read_events_bounded(&mut slots).unwrap();
+        assert_eq!((retry.consumed_records, retry.consumed_bytes), (0, 0));
+        assert!(retry.remaining && retry.error.is_some());
+        assert_eq!(unsafe { mapped.mmap_page.data_tail }, 8);
+    }
+
+    #[test]
+    fn bounded_sample_loss_before_bad_body_retains_every_consumed_record() {
+        let mut mapped = MMappedBuf {
+            data: [0; PAGE_SIZE * 2],
+        };
+        fake_mmap(&mapped);
+        let offset = write_sample(&mut mapped, 0, 42_u32);
+        let offset = write_lost(&mut mapped, offset, 0);
+        let offset = write_lost(&mut mapped, offset, 9);
+        let offset = write(
+            &mut mapped,
+            offset,
+            perf_event_header {
+                type_: 0xffff,
+                misc: 0,
+                size: 8,
+            },
+        );
+        write(
+            &mut mapped,
+            offset,
+            perf_event_header {
+                type_: PERF_RECORD_LOST as u32,
+                misc: 0,
+                size: 8,
+            },
+        );
+        let mut buffer = PerfBuffer::open(1, PAGE_SIZE, 1).unwrap();
+        let mut slots = [BytesMut::new(), BytesMut::new()];
+        let read = buffer.read_events_bounded(&mut slots).unwrap();
+        assert_eq!(read.events, Events { read: 1, lost: 9 });
+        assert_eq!(read.lost_notices, vec![0, 9]);
+        assert_eq!((read.consumed_records, read.consumed_bytes), (4, offset));
+        assert_eq!(&slots[0][..], &42_u32.to_ne_bytes());
+        assert!(read.remaining && read.error.is_some());
+        assert_eq!(unsafe { mapped.mmap_page.data_tail }, offset as u64);
+    }
+
+    #[test]
+    fn bounded_byte_allowance_never_partially_consumes_next_record() {
+        for (record_size, next_size) in [(32768_usize, 8_usize), (32760, 24)] {
+            const RING_SIZE: usize = PAGE_SIZE * 32;
+            let mut mapped = vec![0_u64; (PAGE_SIZE + RING_SIZE) / 8];
+            let header = mapped.as_mut_ptr().cast::<perf_event_mmap_page>();
+            override_syscall(|call| match call {
+                Syscall::PerfEventOpen { .. } | Syscall::PerfEventIoctl { .. } => {
+                    Ok(crate::MockableFd::mock_signed_fd().into())
+                }
+                call => panic!("unexpected syscall: {:?}", call),
+            });
+            TEST_MMAP_RET.with(|ret| *ret.borrow_mut() = header.cast());
+            let mut offset = 0;
+            for size in [record_size, record_size, next_size] {
+                unsafe {
+                    ptr::write_unaligned(
+                        (header.cast::<u8>().add(PAGE_SIZE + offset)).cast(),
+                        perf_event_header {
+                            type_: 0xffff,
+                            misc: 0,
+                            size: size as u16,
+                        },
+                    );
+                    offset += size;
+                    (*header).data_head = offset as u64;
+                }
+            }
+            let mut buffer = PerfBuffer::open(1, PAGE_SIZE, 32).unwrap();
+            let mut slots = [BytesMut::new()];
+            let first = buffer.read_events_bounded(&mut slots).unwrap();
+            assert_eq!(
+                (first.consumed_records, first.consumed_bytes),
+                (2, record_size * 2)
+            );
+            assert!(first.remaining && first.error.is_none());
+            assert_eq!(unsafe { (*header).data_tail }, (record_size * 2) as u64);
+            let second = buffer.read_events_bounded(&mut slots).unwrap();
+            assert_eq!(
+                (second.consumed_records, second.consumed_bytes),
+                (1, next_size)
+            );
+            assert!(!second.remaining && second.error.is_none());
+            assert_eq!(unsafe { (*header).data_tail }, offset as u64);
+        }
+    }
+
+    #[test]
+    fn bounded_sample_slot_limit_leaves_loss_notice_for_next_read() {
+        let mut mapped = MMappedBuf {
+            data: [0; PAGE_SIZE * 2],
+        };
+        fake_mmap(&mapped);
+        let offset = write_sample(&mut mapped, 0, 42_u32);
+        let end = write_lost(&mut mapped, offset, 7);
+        let mut buffer = PerfBuffer::open(1, PAGE_SIZE, 1).unwrap();
+        let mut slots = [BytesMut::new()];
+        let first = buffer.read_events_bounded(&mut slots).unwrap();
+        assert_eq!(first.events, Events { read: 1, lost: 0 });
+        assert_eq!((first.consumed_records, first.consumed_bytes), (1, offset));
+        assert!(first.remaining && first.lost_notices.is_empty());
+        let second = buffer.read_events_bounded(&mut slots).unwrap();
+        assert_eq!(second.lost_notices, vec![7]);
+        assert_eq!((second.consumed_records, second.consumed_bytes), (1, 24));
+        assert!(!second.remaining);
+        assert_eq!(unsafe { mapped.mmap_page.data_tail }, end as u64);
+    }
+
+    #[test]
+    fn bounded_wrapping_lost_record_keeps_count_and_monotonic_tail() {
+        let mut mapped = MMappedBuf {
+            data: [0; PAGE_SIZE * 2],
+        };
+        fake_mmap(&mapped);
+        let lost = BoundedLost {
+            header: perf_event_header {
+                type_: PERF_RECORD_LOST as u32,
+                misc: 0,
+                size: 24,
+            },
+            id: 1,
+            count: 17,
+        };
+        let start = PAGE_SIZE - 8;
+        unsafe {
+            let bytes = slice::from_raw_parts((&lost as *const BoundedLost).cast::<u8>(), 24);
+            for (i, byte) in bytes.iter().enumerate() {
+                mapped.data[PAGE_SIZE + (start + i) % PAGE_SIZE] = *byte;
+            }
+            mapped.mmap_page.data_tail = start as u64;
+            mapped.mmap_page.data_head = (start + 24) as u64;
+        }
+        let mut buffer = PerfBuffer::open(1, PAGE_SIZE, 1).unwrap();
+        let read = buffer.read_events_bounded(&mut [BytesMut::new()]).unwrap();
+        assert_eq!(read.lost_notices, vec![17]);
+        assert_eq!((read.consumed_records, read.consumed_bytes), (1, 24));
+        assert!(!read.remaining && read.error.is_none());
+        assert_eq!(unsafe { mapped.mmap_page.data_tail }, (start + 24) as u64);
+    }
+
+    #[test]
+    fn legacy_unknown_and_zero_loss_bad_header_error_projection_is_unchanged() {
+        for zero_loss in [false, true] {
+            let mut mapped = MMappedBuf {
+                data: [0; PAGE_SIZE * 2],
+            };
+            fake_mmap(&mapped);
+            let offset = if zero_loss {
+                write_lost(&mut mapped, 0, 0)
+            } else {
+                write(
+                    &mut mapped,
+                    0,
+                    perf_event_header {
+                        type_: 0xffff,
+                        misc: 0,
+                        size: 8,
+                    },
+                )
+            };
+            write(
+                &mut mapped,
+                offset,
+                perf_event_header {
+                    type_: 0xffff,
+                    misc: 0,
+                    size: 0,
+                },
+            );
+            let mut buffer = PerfBuffer::open(1, PAGE_SIZE, 1).unwrap();
+            assert!(buffer.read_events(&mut [BytesMut::new()]).is_err());
+            assert_eq!(unsafe { mapped.mmap_page.data_tail }, offset as u64);
+        }
+    }
+
+    #[test]
+    fn legacy_reader_has_no_new_record_limit_and_bounded_empty_slots_do_not_consume() {
+        let mut mapped = MMappedBuf {
+            data: [0; PAGE_SIZE * 2],
+        };
+        fake_mmap(&mapped);
+        let mut offset = 0;
+        for _ in 0..128 {
+            offset = write_lost(&mut mapped, offset, 7);
+        }
+        let mut buffer = PerfBuffer::open(1, PAGE_SIZE, 1).unwrap();
+        assert_matches!(
+            buffer.read_events_bounded(&mut []),
+            Err(PerfBufferError::NoBuffers)
+        );
+        assert_eq!(unsafe { mapped.mmap_page.data_tail }, 0);
+        assert_eq!(
+            buffer.read_events(&mut [BytesMut::new()]).unwrap(),
+            Events {
+                read: 0,
+                lost: 128 * 7
+            }
+        );
+        assert_eq!(unsafe { mapped.mmap_page.data_tail }, offset as u64);
     }
 
     #[test]
