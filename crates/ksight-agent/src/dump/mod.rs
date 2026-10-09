@@ -493,7 +493,7 @@ pub fn dump_package(
     )
 }
 
-fn static_hash(path: &Path) -> Result<String> {
+fn static_hash(path: &Path, output: &Path) -> Result<String> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
     let mut f = std::fs::File::open(path)?;
@@ -503,6 +503,10 @@ fn static_hash(path: &Path) -> Result<String> {
     let mut hash = Sha256::new();
     let mut block = vec![0_u8; 65_536];
     loop {
+        if ksight_core::output_budget::should_stop(output) {
+            bail!("static hash original parent stopped");
+        }
+        ksight_core::output_budget::charge(output, 0)?;
         let n = f.read(&mut block)?;
         if n == 0 {
             break;
@@ -516,14 +520,14 @@ fn reuse_static_apk(source: &Path, destination: &Path, size: u64, hash: &str) ->
         .ancestors()
         .any(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()))
         || std::fs::metadata(source)?.len() != size
-        || static_hash(source)? != hash
+        || static_hash(source, destination)? != hash
     {
         bail!("static cache complete bytes mismatch");
     }
     ksight_core::output_budget::charge(destination, 0)?;
     std::fs::create_dir_all(destination.parent().context("static destination parent")?)?;
     std::fs::hard_link(source, destination)?;
-    if static_hash(destination)? != hash {
+    if static_hash(destination, destination)? != hash {
         bail!("static cache changed during reuse");
     }
     Ok(())
@@ -562,12 +566,17 @@ fn reference_static_apks(package: &str, apks: &[PathBuf], dest: &Path) -> Result
     let mut refs = Vec::new();
     let mut retained = 0;
     for apk in apks {
+        if ksight_core::output_budget::should_stop(dest) {
+            bail!("static references original parent stopped");
+        }
+        ksight_core::output_budget::charge(&dest.join("static-references.json"), 0)?;
         let bytes = std::fs::metadata(apk)?.len();
         if bytes > 512 * 1024 * 1024 {
             let mut members = Vec::new();
             let mut eligible = 0usize;
             if let Ok(mut archive) = zip::ZipArchive::new(std::fs::File::open(apk)?) {
                 for index in 0..archive.len() {
+                    ksight_core::output_budget::charge(&dest.join("static-references.json"), 0)?;
                     let Ok(entry) = archive.by_index(index) else {
                         continue;
                     };
@@ -584,7 +593,7 @@ fn reference_static_apks(package: &str, apks: &[PathBuf], dest: &Path) -> Result
             refs.push(serde_json::json!({"source":apk,"bytes":bytes,"sha256":null,"retained_raw":null,"status":"installed_reference_hash_not_computed_over_512mib","memory_read":false,"members":members,"omitted_members":eligible.saturating_sub(256),"not_extracted_reason":"static hash size bound; runtime copy continues"}));
             continue;
         }
-        let hash = static_hash(apk)?;
+        let hash = static_hash(apk, dest)?;
         let matched = cache["apks"]
             .as_array()
             .unwrap()
@@ -615,6 +624,7 @@ fn reference_static_apks(package: &str, apks: &[PathBuf], dest: &Path) -> Result
         let mut members = Vec::new();
         let mut eligible = 0usize;
         for i in 0..z.len() {
+            ksight_core::output_budget::charge(&dest.join("static-references.json"), 0)?;
             let e = z.by_index(i)?;
             if e.name().ends_with(".dex")
                 || (e.name().starts_with("lib/") && e.name().ends_with(".so"))
@@ -1053,7 +1063,7 @@ pub fn dump_package_with(
     let collect_static = static_batch_allowed(&mut report, dest, runtime_only, budget_closed);
     let static_referenced = options.parent_owned && options.code_only && collect_static;
     if collect_static {
-        let static_scope = ksight_core::output_budget::StaticScope::install(
+        let static_scope = ksight_core::output_budget::StaticScope::install_after_bound_copy(
             dest.to_owned(),
             256 * 1024 * 1024,
             8 * 1024 * 1024,
@@ -3748,6 +3758,11 @@ fn static_batch_allowed(
     if runtime_only {
         return false;
     }
+    let coverage_only = ksight_core::output_budget::bound_coverage_only(dest);
+    if coverage_only {
+        report.warnings.push("runtime_retention=partial: local copy window or per-range bound; independent static references/extraction continue within original phase budget; missing runtime bytes remain missing".into());
+        return true;
+    }
     if budget_closed || ksight_core::output_budget::should_stop(dest) {
         report.warnings.push("static_omissions: parent live copy stopped; APK raw/DEX/assets/native and install lib/oat/data-cache not attempted; retained runtime evidence remains partial".into());
         return false;
@@ -4130,6 +4145,10 @@ fn copy_tree_inner(
     }
     std::fs::create_dir_all(dest)?;
     for entry in std::fs::read_dir(src)?.flatten() {
+        if ksight_core::output_budget::should_stop(dest) {
+            bail!("static directory original parent stopped");
+        }
+        ksight_core::output_budget::charge(dest, 0)?;
         let path = entry.path();
         let name = entry.file_name();
         let target = dest.join(&name);
@@ -5262,7 +5281,7 @@ mod preceding_source_refresh_tests {
         assert_eq!(sources[0], source()); // Enumeration never edits the physical grant.
     }
     #[test]
-    fn successful_partial_copy_keeps_stats_and_catalog_without_another_read() {
+    fn sample_1393_candidates_local_30s_partial_allows_independent_static_without_another_read() {
         let root =
             std::env::temp_dir().join(format!("ksight-partial-refresh-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(root.join("runtime")).unwrap();
@@ -5293,11 +5312,39 @@ mod preceding_source_refresh_tests {
         ));
         assert_eq!(report.memory_images, 1);
         assert_eq!(report.runtime_libs, 2);
-        assert!(!static_batch_allowed(&mut report, &root, false, true));
+        // c0eed780: 1393 candidates, 75 attempts/74 admitted; local 30s gap
+        // is coverage-only with original invocation time/write allowance remaining.
+        let sample: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/local-window-1393.json")).unwrap();
+        assert_eq!(sample["eligible_count"], 1393);
+        assert_eq!(sample["first_stop"], "local_copy_window_exhausted");
+        assert!(static_batch_allowed(&mut report, &root, false, true));
+        let static_scope = ksight_core::output_budget::StaticScope::install_after_bound_copy(
+            root.clone(),
+            1024 * 1024,
+            1024,
+        )
+        .unwrap();
+        let fixture_apk = root.join("fixture.apk");
+        let mut zip = zip::ZipWriter::new(File::create(&fixture_apk).unwrap());
+        zip.start_file("classes.dex", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut zip, b"dex\n035\0fixture complete installed member")
+            .unwrap();
+        zip.finish().unwrap();
+        // Production APK member path must check the original parent, yet not
+        // reject the earlier coverage-only window gap.
+        let extracted = ksight_core::extract_apk_dex(&fixture_apk, &root.join("apk-dex")).unwrap();
+        assert_eq!(extracted.len(), 1);
+        assert!(guard.receipt().partial);
+        assert!(ksight_core::output_budget::should_stop(
+            &root.join("runtime")
+        ));
+        drop(static_scope);
         assert!(report
             .warnings
             .iter()
-            .any(|w| w.starts_with("static_omissions:")));
+            .any(|w| w.starts_with("runtime_retention=partial:")));
         finalize_with_reserved_report(&mut report, &root).unwrap();
         let value: serde_json::Value =
             serde_json::from_slice(&std::fs::read(root.join("dump-report.json")).unwrap()).unwrap();

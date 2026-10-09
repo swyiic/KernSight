@@ -27,6 +27,8 @@ pub struct Receipt {
     pub partial: bool,
     /// Reason retained by this evidence operation.
     pub reason: Option<String>,
+    /// Bounded distinct causes; coverage gaps and later hard stops are retained separately.
+    pub failure_reasons: Vec<String>,
 }
 struct State {
     non_coverage_failure: bool,
@@ -34,6 +36,22 @@ struct State {
     deadline: Instant,
     receipt: Receipt,
 }
+fn note_failure(state: &mut State, reason: &str) {
+    state.non_coverage_failure |= reason != "bound_code_copy_partial";
+    state.receipt.partial = true;
+    if state.receipt.reason.is_none() {
+        state.receipt.reason = Some(reason.into());
+    }
+    let reason: String = reason.chars().take(256).collect();
+    if !state.receipt.failure_reasons.contains(&reason) {
+        if state.receipt.failure_reasons.len() < 16 {
+            state.receipt.failure_reasons.push(reason);
+        } else {
+            state.receipt.failure_reasons[15] = "additional_failure_reasons_omitted".into();
+        }
+    }
+}
+
 static STATES: OnceLock<Mutex<BTreeMap<u64, State>>> = OnceLock::new();
 static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 fn states() -> &'static Mutex<BTreeMap<u64, State>> {
@@ -44,6 +62,7 @@ struct StaticState {
     limit: u64,
     spent: u64,
     reserved_report: Option<PathBuf>,
+    allow_bound_coverage: bool,
 }
 static STATIC_SCOPES: OnceLock<Mutex<BTreeMap<u64, StaticState>>> = OnceLock::new();
 fn static_scopes() -> &'static Mutex<BTreeMap<u64, StaticState>> {
@@ -67,6 +86,21 @@ impl StaticScope {
             .reserved_report = Some(report);
         Ok(scope)
     }
+    /// Permit independent installed-file extraction after a coverage-only live copy gap.
+    /// This never authorizes another runtime memory read, nor resets the parent receipt.
+    /// # Errors
+    /// Returns an invalid scope or lock error.
+    pub fn install_after_bound_copy(root: PathBuf, cap: u64, reserve: u64) -> io::Result<Self> {
+        let scope = Self::install(root, cap, reserve)?;
+        static_scopes()
+            .lock()
+            .map_err(|_| io::Error::other("static scope lock"))?
+            .get_mut(&scope.0)
+            .ok_or_else(|| io::Error::other("missing static scope"))?
+            .allow_bound_coverage = true;
+        Ok(scope)
+    }
+
     /// Reserve report space from the parent's remaining allowance and bound static output.
     /// # Errors
     /// Returns an invalid or overlapping scope error.
@@ -92,6 +126,7 @@ impl StaticScope {
                 limit: cap.min(available),
                 spent: 0,
                 reserved_report: None,
+                allow_bound_coverage: false,
             },
         );
         Ok(Self(id))
@@ -153,6 +188,7 @@ impl Guard {
                     rejected_writes: 0,
                     partial: false,
                     reason: None,
+                    failure_reasons: Vec::new(),
                 },
             },
         );
@@ -233,12 +269,7 @@ pub fn charge(path: &Path, n: u64) -> io::Result<()> {
         let reason = if unsafe_path {
             Some("output_path_escape")
         } else if Instant::now() >= s.deadline {
-            Some(
-                s.receipt
-                    .reason
-                    .as_deref()
-                    .unwrap_or("time_budget_exhausted"),
-            )
+            Some("time_budget_exhausted")
         } else if n > s
             .receipt
             .limit_bytes
@@ -250,9 +281,7 @@ pub fn charge(path: &Path, n: u64) -> io::Result<()> {
         };
         let reason = reason.map(str::to_owned);
         if let Some(reason) = reason {
-            s.receipt.partial = true;
-            s.non_coverage_failure = true;
-            s.receipt.reason = Some(reason.clone());
+            note_failure(s, &reason);
             s.receipt.rejected_writes = s.receipt.rejected_writes.saturating_add(1);
             return Err(io::Error::other(reason));
         }
@@ -304,12 +333,8 @@ pub fn interrupt(path: &Path, reason: &str) {
             .values_mut()
             .filter(|s| s.roots.iter().any(|r| path.starts_with(r)))
         {
-            s.non_coverage_failure = true;
             s.deadline = Instant::now();
-            s.receipt.partial = true;
-            if s.receipt.reason.is_none() {
-                s.receipt.reason = Some(reason.to_owned());
-            }
+            note_failure(s, reason);
         }
     }
 }
@@ -320,11 +345,7 @@ pub fn record_failure(path: &Path, reason: &str) {
             .values_mut()
             .filter(|s| s.roots.iter().any(|r| path.starts_with(r)))
         {
-            s.non_coverage_failure |= reason != "bound_code_copy_partial";
-            s.receipt.partial = true;
-            if s.receipt.reason.is_none() {
-                s.receipt.reason = Some(reason.into());
-            }
+            note_failure(s, reason);
         }
     }
 }
@@ -428,26 +449,34 @@ pub fn deadline(path: &Path, desired: Instant) -> Instant {
 /// Stop admission and the capture loop on exhaustion or a failed output.
 #[must_use]
 pub fn should_stop(path: &Path) -> bool {
+    // Explicit static scope only; runtime roots retain the stop-on-partial rule.
+    let static_only = static_scopes().lock().is_ok_and(|scopes| {
+        scopes.values().any(|s| {
+            s.allow_bound_coverage
+                && path.starts_with(&s.root)
+                && !path.starts_with(s.root.join("runtime"))
+        })
+    });
     if let Ok(mut all) = states().lock() {
         for s in all
             .values_mut()
             .filter(|s| s.roots.iter().any(|r| path.starts_with(r)))
         {
-            if (Instant::now() >= s.deadline
-                || s.receipt.admitted_write_bytes >= s.receipt.limit_bytes)
-                && !s.receipt.partial
-            {
-                s.receipt.partial = true;
-                s.receipt.reason = Some(
+            let exhausted = Instant::now() >= s.deadline
+                || s.receipt.admitted_write_bytes >= s.receipt.limit_bytes;
+            if exhausted {
+                note_failure(
+                    s,
                     if Instant::now() >= s.deadline {
                         "time_budget_exhausted"
                     } else {
                         "output_budget_exhausted"
-                    }
-                    .into(),
+                    },
                 );
             }
-            if s.receipt.partial {
+            let coverage_only = !s.non_coverage_failure
+                && s.receipt.reason.as_deref() == Some("bound_code_copy_partial");
+            if s.receipt.partial && !(static_only && coverage_only && !exhausted) {
                 return true;
             }
         }
@@ -463,6 +492,7 @@ pub fn bound_coverage_only(path: &Path) -> bool {
             s.roots.iter().any(|r| path.starts_with(r))
                 && !s.non_coverage_failure
                 && Instant::now() < s.deadline
+                && s.receipt.admitted_write_bytes < s.receipt.limit_bytes
                 && s.receipt.reason.as_deref() == Some("bound_code_copy_partial")
                 && s.receipt.rejected_writes == 0
         })
@@ -472,6 +502,83 @@ pub fn bound_coverage_only(path: &Path) -> bool {
 #[cfg(test)]
 mod static_tests {
     use super::*;
+    #[test]
+    fn independent_static_scope_keeps_coverage_partial_and_original_hard_limits() {
+        let root = std::env::temp_dir().join(format!("ksight-static-gap-{}", uuid::Uuid::new_v4()));
+        let parent = Guard::install(vec![root.clone()], 100, 30000).unwrap();
+        charge(&root.join("runtime"), 20).unwrap();
+        record_failure(&root, "bound_code_copy_partial");
+        assert!(should_stop(&root));
+        let child = StaticScope::install_after_bound_copy(root.clone(), 60, 30).unwrap();
+        assert!(!should_stop(&root));
+        assert!(should_stop(&root.join("runtime"))); // No renewed memory reads.
+        charge(&root.join("apk-reference.json"), 50).unwrap();
+        assert!(charge(&root.join("apk-reference.json"), 1).is_err());
+        assert!(!should_stop(&root)); // Child allowance is independent of parent exhaustion.
+        assert!(parent.receipt().partial);
+        assert_eq!(
+            parent.receipt().reason.as_deref(),
+            Some("bound_code_copy_partial")
+        );
+        assert_eq!(parent.receipt().admitted_write_bytes, 70);
+        interrupt(&root, "cancelled");
+        assert!(should_stop(&root));
+        assert!(parent
+            .receipt()
+            .failure_reasons
+            .contains(&"cancelled".into()));
+        assert!(parent
+            .receipt()
+            .failure_reasons
+            .contains(&"bound_code_copy_partial".into()));
+        assert!(charge(&root.join("apk-reference.json"), 0).is_err());
+        drop(child);
+    }
+    #[test]
+    fn static_exception_stops_when_the_original_write_allowance_is_spent() {
+        let root =
+            std::env::temp_dir().join(format!("ksight-static-full-{}", uuid::Uuid::new_v4()));
+        let parent = Guard::install(vec![root.clone()], 100, 30000).unwrap();
+        charge(&root.join("runtime"), 20).unwrap();
+        record_failure(&root, "bound_code_copy_partial");
+        let child = StaticScope::install_after_bound_copy(root.clone(), 100, 0).unwrap();
+        charge(&root.join("static"), 80).unwrap();
+        assert!(should_stop(&root));
+        assert!(!bound_coverage_only(&root));
+        assert!(charge(&root.join("static"), 1).is_err());
+        assert!(parent
+            .receipt()
+            .failure_reasons
+            .contains(&"output_budget_exhausted".into()));
+        assert!(parent
+            .receipt()
+            .failure_reasons
+            .contains(&"bound_code_copy_partial".into()));
+        drop(child);
+    }
+    #[test]
+    fn static_scope_cannot_bypass_unsafe_source_or_expired_parent() {
+        for unsafe_stop in [false, true] {
+            let root =
+                std::env::temp_dir().join(format!("ksight-static-unsafe-{}", uuid::Uuid::new_v4()));
+            let parent = Guard::install(vec![root.clone()], 100, 30000).unwrap();
+            record_failure(&root, "bound_code_copy_partial");
+            let child = StaticScope::install_after_bound_copy(root.clone(), 60, 30).unwrap();
+            if unsafe_stop {
+                record_failure(&root, "source_identity_invalidated");
+            } else {
+                states()
+                    .lock()
+                    .unwrap()
+                    .get_mut(&parent.0)
+                    .unwrap()
+                    .deadline = Instant::now();
+            }
+            assert!(should_stop(&root));
+            assert!(!bound_coverage_only(&root));
+            drop(child);
+        }
+    }
     #[test]
     fn static_rejection_preserves_parent_report_allowance() {
         let root = std::env::temp_dir().join(format!("ksight-static-{}", uuid::Uuid::new_v4()));

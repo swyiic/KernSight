@@ -6,6 +6,7 @@ mod attach_admission;
 mod instance_backend;
 #[cfg(any(test, target_os = "android", target_os = "linux"))]
 mod probe_renewal;
+mod quota_stop;
 
 #[cfg(any(test, target_os = "android", target_os = "linux"))]
 mod scope_state;
@@ -795,6 +796,7 @@ pub struct InspectRuntime {
     /// Raw uprobe records drained from perf buffers, before decode.
     raw_drained: u64,
     budget_skipped_raw: u64,
+    quota_stops: Vec<quota_stop::Receipt>,
     poll_budget_yields: u64,
     perf_read_failures: u64,
     unread_perf_possible: bool,
@@ -1261,7 +1263,13 @@ impl InspectRuntime {
                 &mut self.sessions,
                 |live| {
                     (live.session.finished() || live.session.producer_stopped())
-                        && live.plan.adapter.hit_once()
+                        && (live.plan.adapter.hit_once()
+                            || quota_stop::eligible(
+                                live.plan.adapter.as_str(),
+                                plan_is_connkey(&live.plan),
+                                u32::MAX,
+                                live.plan.adapter.default_max_hits(),
+                            ))
                         && !live.plan.policy.whole_device
                 },
                 |live| live.session.apply_bound_instances(&next),
@@ -1424,6 +1432,7 @@ impl InspectRuntime {
             hits: 0,
             raw_drained: 0,
             budget_skipped_raw: 0,
+            quota_stops: Vec::new(),
             poll_budget_yields: 0,
             perf_read_failures: 0,
             unread_perf_possible: false,
@@ -1698,6 +1707,17 @@ impl InspectRuntime {
     /// Already-drained records omitted only after the existing adapter budget was exhausted.
     pub fn budget_skipped_raw(&self) -> u64 {
         self.budget_skipped_raw
+    }
+
+    /// Explicit quota coverage gaps; unknown future event count is never zero.
+    #[must_use]
+    pub fn quota_stop_receipts(&self) -> serde_json::Value {
+        serde_json::to_value(&self.quota_stops).unwrap_or(serde_json::Value::Null)
+    }
+    /// Whether an existing helper quota stopped an owned producer.
+    #[must_use]
+    pub fn quota_coverage_partial(&self) -> bool {
+        !self.quota_stops.is_empty()
     }
 
     /// Physical scope/read failure count, retained independently of raw loss counters.
@@ -3847,6 +3867,14 @@ fn attach_all(runtime: &mut InspectRuntime) -> Vec<InspectObservation> {
         return out; // Explicit empty deny: no hooks or numeric fallback.
     }
     for plan in plans {
+        if quota_stop::eligible(
+            plan.adapter.as_str(),
+            plan_is_connkey(&plan),
+            adapter_hits(runtime, plan.adapter),
+            adapter_hit_cap(runtime, plan.adapter),
+        ) {
+            continue;
+        }
         if runtime.started.elapsed() >= runtime.max_duration {
             eprintln!("inspect attach stopped; window elapsed");
             break;
@@ -4115,6 +4143,54 @@ fn poll_all(runtime: &mut InspectRuntime) -> Vec<InspectOutput> {
         })
         .map(|probe| probe.plan.adapter)
         .collect();
+    // Existing capped outputs were already omitted. Stop only their owned helper
+    // producers, preserving buffers/epoch and draining all queued loss notices.
+    let quota_candidates: Vec<_> = exhausted_adapters
+        .iter()
+        .copied()
+        .map(|adapter| {
+            (
+                adapter,
+                adapter_hits(runtime, adapter),
+                adapter_hit_cap(runtime, adapter),
+            )
+        })
+        .collect();
+    for probe in &mut runtime.sessions {
+        if probe.session.producer_stopped() {
+            continue;
+        }
+        let Some((_, hits, cap)) = quota_candidates.iter().find(|(adapter, hits, cap)| {
+            *adapter == probe.plan.adapter
+                && quota_stop::eligible(adapter.as_str(), plan_is_connkey(&probe.plan), *hits, *cap)
+        }) else {
+            continue;
+        };
+        let receipt = quota_stop::close(probe.plan.adapter.as_str(), *hits, *cap, || {
+            probe
+                .session
+                .stop_production()
+                .map_err(|error| format!("{error:#}"))
+        });
+        let mut observation = probe.plan.observation.clone();
+        observation.attached = false;
+        observation.hit = false;
+        observation.detail = serde_json::to_string(&receipt).expect("quota receipt serializes");
+        eprintln!("{}", observation.detail);
+        out.push(inspect_observation(
+            probe.plan.policy.pid.unwrap_or(0),
+            0,
+            observation,
+        ));
+        if let Some(error) = &receipt.stop_error {
+            bound_failure = Some(format!("quota_stop_unconfirmed:{error}"));
+        }
+        runtime.quota_stops.push(receipt);
+    }
+    if let Some(error) = bound_failure.take() {
+        revoke_scope(runtime, None, &error);
+        return finish_scope_poll(runtime, out);
+    }
     let read_started = Instant::now();
     let mut probes_read = 0usize;
     let mut unread_probes = false;
@@ -4192,7 +4268,7 @@ fn poll_all(runtime: &mut InspectRuntime) -> Vec<InspectOutput> {
                 "schema":"kernsight.perf-loss/v1", "cpu_id":notice.cpu_id,
                 "lost_samples":notice.lost_samples,
                 "notification_monotonic_ns":notice.notification_monotonic_ns,
-                "lost_event_time_unknown":true, "after_producer_stop":runtime.stopping
+                "lost_event_time_unknown":true, "after_producer_stop":runtime.stopping || probe.session.producer_stopped()
             })
             .to_string();
             out.push(inspect_observation(

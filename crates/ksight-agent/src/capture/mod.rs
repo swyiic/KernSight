@@ -1369,7 +1369,8 @@ fn stream_events(
         || unread_perf_possible
         || scope_failures != 0
         || perf_read_failures != 0
-        || inspect.drain_totals().2 != 0;
+        || inspect.drain_totals().2 != 0
+        || inspect.quota_coverage_partial();
     let pending_perf_tail = capture_loop_result.is_ok() && coverage_gap;
     let capture_loop_result = if pending_perf_tail {
         Err(anyhow::anyhow!("capture coverage partial: perf_poll_backlog_or_scope_gap_at_observation_end; raw coverage incomplete"))
@@ -1381,7 +1382,7 @@ fn stream_events(
         serde_json::json!({
             "schema":"kernsight.perf-poll-budget/v1", "bounded_slice_yields":poll_budget_yields,
             "unread_tail_possible":unread_perf_possible, "unread_tail_count":null, "scope_failures":scope_failures,
-            "perf_read_failures":perf_read_failures, "budget_skipped_raw":inspect.budget_skipped_raw(), "coverage_partial":coverage_gap
+            "perf_read_failures":perf_read_failures, "budget_skipped_raw":inspect.budget_skipped_raw(), "quota_stops":inspect.quota_stop_receipts(), "quota_omitted_future_events":null, "coverage_reasons":{"probe_quota":inspect.quota_coverage_partial(),"shortened_window":observation_shortened,"unread_tail":!drain_complete || unread_perf_possible,"scope_failure":scope_failures != 0,"read_failure":perf_read_failures != 0,"perf_loss":inspect.drain_totals().2 != 0}, "coverage_partial":coverage_gap
         })
     );
     // Publish interrupted evidence while its original write allowance remains,

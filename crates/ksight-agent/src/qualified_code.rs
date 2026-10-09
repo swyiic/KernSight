@@ -168,8 +168,10 @@ struct BoundCopyStops {
 fn bound_copy_gap_state(stops: BoundCopyStops) -> (&'static str, &'static str) {
     let unattempted = if stops.stopped_early && stops.budget_stop {
         "not_attempted_parent_deadline_or_output_exhausted"
+    } else if stops.stopped_early && stops.saw_budget_reserve {
+        "not_attempted_runtime_metadata_reserve"
     } else if stops.stopped_early {
-        "not_attempted_parent_deadline"
+        "not_attempted_local_copy_window"
     } else {
         "none"
     };
