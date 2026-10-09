@@ -842,13 +842,23 @@ pub fn dump_package_with(
     }
     #[allow(unused_mut)]
     let mut budget_closed = false;
-    let deadline = Instant::now() + Duration::from_secs(30);
-    for pid in pids.iter().copied().take(8) {
+    let deadline = first_copy_deadline(dest, options.parent_owned, Instant::now());
+    if options.parent_owned {
+        report.warnings.push("runtime_mapping_scope=initial_bound_maps_snapshot_per_source; later mappings and later contents are not observed by another full copy pass".into());
+    }
+    for (source_index, pid) in pids.iter().copied().take(8).enumerate() {
         if ksight_core::output_budget::should_stop(&runtime) {
             budget_closed = true;
             break;
         }
-        if Instant::now() >= deadline {
+        if !live_copy_window_available(
+            &mut report,
+            dest,
+            options.parent_owned,
+            deadline,
+            Instant::now(),
+            pids.len().min(8).saturating_sub(source_index),
+        ) {
             break;
         }
         let live = {
@@ -895,7 +905,7 @@ pub fn dump_package_with(
             break;
         }
     }
-    if !budget_closed && !pids.is_empty() {
+    if !options.parent_owned && !budget_closed && !pids.is_empty() {
         std::thread::sleep(Duration::from_millis(500));
         pids = merge_live_package_pids(package, pids);
         // Package membership does not extend the preceding physical source grant.
@@ -1065,9 +1075,18 @@ pub fn dump_package_with(
     if collect_static {
         let static_scope = ksight_core::output_budget::StaticScope::install_after_bound_copy(
             dest.to_owned(),
-            256 * 1024 * 1024,
+            ksight_core::output_budget::remaining(dest).unwrap_or(256 * 1024 * 1024),
             8 * 1024 * 1024,
         )?;
+        if options.parent_owned {
+            if let Some(original) = ksight_core::output_budget::invocation_deadline(dest) {
+                static_scope.limit_deadline(
+                    original
+                        .checked_sub(Duration::from_secs(10))
+                        .unwrap_or(original),
+                )?;
+            }
+        }
         let static_result = (|| -> Result<()> {
             if static_referenced {
                 report.apk_files = reference_static_apks(package, &apk_paths, dest)?;
@@ -1128,10 +1147,21 @@ pub fn dump_package_with(
 
             Ok(())
         })();
+        let static_time_stop = static_scope.local_deadline_elapsed();
         drop(static_scope);
+        let static_result = static_closeout_result(static_result, static_time_stop);
         if let Err(error) = static_result {
             if error.to_string().contains("static_output_budget_exhausted") {
-                report.warnings.push("static_retention=partial: bounded static allowance exhausted after runtime acquisition; omitted payloads are not retained".into());
+                let kind = if error.to_string().contains("kind=local_time_reserve") {
+                    "local_time_reserve"
+                } else {
+                    "bytes"
+                };
+                eprintln!(
+                    "static-budget-stop {}",
+                    serde_json::json!({"schema":"kernsight.static-budget-stop/v1","limit_kind":kind,"retention":"partial","original_deadline_renewed":false})
+                );
+                report.warnings.push(format!("static_retention=partial: static allowance exhausted; limit_kind={kind}; omitted payloads are not retained; original deadline unchanged"));
                 report.warnings.push(format!(
                     "static_omissions: static batch interrupted; coverage unknown for APK raw/DEX/assets/native and install lib/oat/data-cache; source APKs={:?}; listed_sources_bounded={}",
                     apk_paths.iter().take(32).map(|p| p.to_string_lossy()).collect::<Vec<_>>(),
@@ -3749,6 +3779,62 @@ fn hex_key(key: [u8; 16]) -> String {
     out
 }
 
+// The original phase owns this time. Leave ten seconds for catalog/return and
+// one third of the remainder for installed/static evidence. A completed source
+// is not reread under a fresh local window on the qualified parent path.
+fn first_copy_deadline(dest: &Path, parent_owned: bool, now: Instant) -> Instant {
+    if parent_owned {
+        if let Some(parent_deadline) = ksight_core::output_budget::invocation_deadline(dest) {
+            let remaining = parent_deadline.saturating_duration_since(now);
+            let live_share = remaining.saturating_sub(Duration::from_secs(10)) / 3 * 2;
+            return (now + live_share).min(parent_deadline);
+        }
+    }
+    ksight_core::output_budget::deadline(dest, now + Duration::from_secs(30))
+}
+
+fn static_closeout_result(result: Result<()>, local_time_stop: bool) -> Result<()> {
+    match result {
+        Ok(()) if local_time_stop => {
+            bail!("static_output_budget_exhausted: kind=local_time_reserve")
+        }
+        Err(error)
+            if local_time_stop
+                && matches!(
+                    error.to_string().as_str(),
+                    "APK fingerprint deadline or parent budget interrupted"
+                        | "static hash original parent stopped"
+                        | "static references original parent stopped"
+                        | "static directory original parent stopped"
+                        | "static comparison budget interrupted"
+                        | "static source budget interrupted"
+                        | "static published digest budget interrupted"
+                ) =>
+        {
+            bail!("static_output_budget_exhausted: kind=local_time_reserve")
+        }
+        result => result,
+    }
+}
+
+fn live_copy_window_available(
+    report: &mut PackageDumpReport,
+    dest: &Path,
+    parent_owned: bool,
+    deadline: Instant,
+    now: Instant,
+    remaining_sources: usize,
+) -> bool {
+    if now < deadline {
+        return true;
+    }
+    if parent_owned && remaining_sources != 0 {
+        ksight_core::output_budget::record_failure(dest, "bound_code_copy_partial");
+        report.warnings.push(format!("runtime_retention=partial: local_copy_window_exhausted; unattempted_source_count={remaining_sources}; original deadline unchanged"));
+    }
+    false
+}
+
 fn static_batch_allowed(
     report: &mut PackageDumpReport,
     dest: &Path,
@@ -5357,6 +5443,160 @@ mod preceding_source_refresh_tests {
         );
         assert!(root.join("dump-report.json").is_file());
         drop(guard);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod expanded_copy_window_tests {
+    use super::*;
+
+    #[test]
+    fn registered_copy_uses_original_remaining_time_and_manual_fallback_stays_bounded() {
+        let root = std::env::temp_dir().join(format!("copy-window-{}", uuid::Uuid::new_v4()));
+        let _guard =
+            ksight_core::output_budget::Guard::install(vec![root.clone()], 100, 245_000).unwrap();
+        let original = ksight_core::output_budget::invocation_deadline(&root).unwrap();
+        let now = original.checked_sub(Duration::from_secs(245)).unwrap();
+        assert_eq!(
+            first_copy_deadline(&root, true, now) - now,
+            Duration::from_secs(235) / 3 * 2
+        );
+        assert!(first_copy_deadline(&root, true, now + Duration::from_secs(60)) < original);
+        assert_eq!(
+            ksight_core::output_budget::invocation_deadline(&root),
+            Some(original)
+        );
+        assert_eq!(
+            first_copy_deadline(&root, true, original + Duration::from_secs(1)),
+            original
+        );
+        assert_eq!(
+            first_copy_deadline(&root, false, now),
+            now + Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn short_remaining_window_never_reports_unread_runtime_as_completed() {
+        let root = std::env::temp_dir().join(format!("copy-short-{}", uuid::Uuid::new_v4()));
+        let guard =
+            ksight_core::output_budget::Guard::install(vec![root.clone()], 100, 60000).unwrap();
+        let original = ksight_core::output_budget::invocation_deadline(&root).unwrap();
+        let now = original.checked_sub(Duration::from_secs(9)).unwrap();
+        let live_deadline = first_copy_deadline(&root, true, now);
+        assert_eq!(live_deadline, now);
+        let mut report = PackageDumpReport::default();
+        let mut copy_calls = 0;
+        if live_copy_window_available(&mut report, &root, true, live_deadline, now, 2) {
+            copy_calls += 1;
+        }
+        assert_eq!(copy_calls, 0);
+        assert!(guard.receipt().partial);
+        assert_eq!(
+            guard.receipt().reason.as_deref(),
+            Some("bound_code_copy_partial")
+        );
+        assert!(report
+            .warnings
+            .iter()
+            .any(|s| s.contains("unattempted_source_count=2")));
+        assert!(ksight_core::output_budget::bound_coverage_only(&root));
+        assert!(static_batch_allowed(&mut report, &root, false, false));
+        assert_eq!(
+            ksight_core::output_budget::invocation_deadline(&root),
+            Some(original)
+        );
+    }
+}
+
+#[cfg(test)]
+mod static_closeout_clock_tests {
+    use super::*;
+    #[test]
+    fn every_explicit_static_clock_stop_keeps_io_and_closed_parent_errors_distinct() {
+        for clock in [
+            "APK fingerprint deadline or parent budget interrupted",
+            "static hash original parent stopped",
+            "static references original parent stopped",
+            "static directory original parent stopped",
+            "static comparison budget interrupted",
+            "static source budget interrupted",
+            "static published digest budget interrupted",
+        ] {
+            assert_eq!(
+                static_closeout_result(Err(anyhow::anyhow!(clock)), true)
+                    .unwrap_err()
+                    .to_string(),
+                "static_output_budget_exhausted: kind=local_time_reserve"
+            );
+            assert_eq!(
+                static_closeout_result(Err(anyhow::anyhow!(clock)), false)
+                    .unwrap_err()
+                    .to_string(),
+                clock
+            );
+        }
+        for error in [
+            "injected read failure",
+            "APK changed while fingerprinting",
+            "source identity invalid",
+        ] {
+            assert_eq!(
+                static_closeout_result(Err(anyhow::anyhow!(error)), true)
+                    .unwrap_err()
+                    .to_string(),
+                error
+            );
+        }
+    }
+
+    #[test]
+    fn actual_code_only_reference_clock_stop_still_leaves_catalog_on_original_deadline() {
+        let root =
+            std::env::temp_dir().join(format!("static-reference-clock-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let parent =
+            ksight_core::output_budget::Guard::install(vec![root.clone()], 16 * 1024 * 1024, 60000)
+                .unwrap();
+        let original = ksight_core::output_budget::invocation_deadline(&root).unwrap();
+        let child = ksight_core::output_budget::StaticScope::install_after_bound_copy(
+            root.clone(),
+            16 * 1024 * 1024,
+            8 * 1024 * 1024,
+        )
+        .unwrap();
+        child.limit_deadline(Instant::now()).unwrap();
+        let result =
+            reference_static_apks("test.app", &[root.join("unread.apk")], &root).map(|_| ());
+        assert_eq!(
+            result.as_ref().unwrap_err().to_string(),
+            "static references original parent stopped"
+        );
+        assert!(
+            static_closeout_result(result, child.local_deadline_elapsed())
+                .unwrap_err()
+                .to_string()
+                .contains("kind=local_time_reserve")
+        );
+        drop(child);
+        ksight_core::output_budget::record_failure(&root, "static_output_budget_exhausted");
+        let mut report = PackageDumpReport {
+            package: "test.app".into(),
+            dump_id: uuid::Uuid::new_v4().to_string(),
+            ..PackageDumpReport::default()
+        };
+        report
+            .warnings
+            .push("static_retention=partial: limit_kind=local_time_reserve".into());
+        finalize_with_reserved_report(&mut report, &root).unwrap();
+        assert!(root.join("dump-report.json").exists());
+        assert!(parent.receipt().partial);
+        assert_eq!(
+            ksight_core::output_budget::invocation_deadline(&root),
+            Some(original)
+        );
+        drop(parent);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

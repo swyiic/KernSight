@@ -63,6 +63,7 @@ struct StaticState {
     spent: u64,
     reserved_report: Option<PathBuf>,
     allow_bound_coverage: bool,
+    deadline: Option<Instant>,
 }
 static STATIC_SCOPES: OnceLock<Mutex<BTreeMap<u64, StaticState>>> = OnceLock::new();
 fn static_scopes() -> &'static Mutex<BTreeMap<u64, StaticState>> {
@@ -101,6 +102,41 @@ impl StaticScope {
         Ok(scope)
     }
 
+    /// Shorten the static child window without changing the invocation's deadline.
+    /// # Errors
+    /// Returns a lock or missing child scope error.
+    pub fn limit_deadline(&self, desired: Instant) -> io::Result<()> {
+        let root = static_scopes()
+            .lock()
+            .map_err(|_| io::Error::other("static scope lock"))?
+            .get(&self.0)
+            .ok_or_else(|| io::Error::other("missing static scope"))?
+            .root
+            .clone();
+        let clipped = invocation_deadline(&root).map_or(desired, |parent| desired.min(parent));
+        let mut scopes = static_scopes()
+            .lock()
+            .map_err(|_| io::Error::other("static scope lock"))?;
+        let scope = scopes
+            .get_mut(&self.0)
+            .ok_or_else(|| io::Error::other("missing static scope"))?;
+        scope.deadline = Some(scope.deadline.map_or(clipped, |old| old.min(clipped)));
+        Ok(())
+    }
+
+    /// A local child stop only; original expiry, cancellation and unsafe failures take priority.
+    #[must_use]
+    pub fn local_deadline_elapsed(&self) -> bool {
+        let Some((root, child)) = static_scopes()
+            .lock()
+            .ok()
+            .and_then(|scopes| scopes.get(&self.0).map(|s| (s.root.clone(), s.deadline)))
+        else {
+            return false;
+        };
+        child.is_some_and(|d| Instant::now() >= d) && parent_still_safe(&root)
+    }
+
     /// Reserve report space from the parent's remaining allowance and bound static output.
     /// # Errors
     /// Returns an invalid or overlapping scope error.
@@ -127,6 +163,7 @@ impl StaticScope {
                 spent: 0,
                 reserved_report: None,
                 allow_bound_coverage: false,
+                deadline: None,
             },
         );
         Ok(Self(id))
@@ -246,17 +283,45 @@ pub fn charge(path: &Path, n: u64) -> io::Result<()> {
     let mut scopes = static_scopes()
         .lock()
         .map_err(|_| io::Error::other("static scope lock"))?;
+    // A closed parent is never relabeled as a local static allowance stop.
+    let mut all = states()
+        .lock()
+        .map_err(|_| io::Error::other("budget lock"))?;
+    for state in all
+        .values_mut()
+        .filter(|s| s.roots.iter().any(|r| path.starts_with(r)))
+    {
+        let unsafe_path = path.components().any(|c| matches!(c, Component::ParentDir))
+            || path
+                .ancestors()
+                .filter(|p| state.roots.iter().any(|r| p.starts_with(r)))
+                .any(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()));
+        if unsafe_path || Instant::now() >= state.deadline {
+            let reason = if unsafe_path {
+                "output_path_escape"
+            } else {
+                "time_budget_exhausted"
+            };
+            note_failure(state, reason);
+            state.receipt.rejected_writes = state.receipt.rejected_writes.saturating_add(1);
+            return Err(io::Error::other(reason));
+        }
+    }
     for scope in scopes
         .values()
         .filter(|s| path.starts_with(&s.root) && s.reserved_report.as_deref() != Some(path))
     {
+        if scope.deadline.is_some_and(|d| Instant::now() >= d) {
+            // The existing static-allowance code remains wire compatible. The
+            // detail distinguishes time from bytes in the retained report.
+            return Err(io::Error::other(
+                "static_output_budget_exhausted: kind=local_time_reserve",
+            ));
+        }
         if n > scope.limit.saturating_sub(scope.spent) {
             return Err(io::Error::other("static_output_budget_exhausted"));
         }
     }
-    let mut all = states()
-        .lock()
-        .map_err(|_| io::Error::other("budget lock"))?;
     for s in all
         .values_mut()
         .filter(|s| s.roots.iter().any(|r| path.starts_with(r)))
@@ -340,12 +405,31 @@ pub fn interrupt(path: &Path, reason: &str) {
 }
 /// Record failure retained by this evidence operation.
 pub fn record_failure(path: &Path, reason: &str) {
+    // apk_hash explicitly reports this reason only when its cooperative clock
+    // or should_stop gate fired, never on a read/identity error. Preserve the
+    // existing static-allowance wire code with the detailed kind in the report.
+    let local_fingerprint_stop = reason == "apk_fingerprint_interrupted"
+        && static_scopes().lock().is_ok_and(|scopes| {
+            scopes.values().any(|s| {
+                path.starts_with(&s.root)
+                    && !path.starts_with(s.root.join("runtime"))
+                    && s.deadline.is_some_and(|d| Instant::now() >= d)
+            })
+        })
+        && parent_still_safe(path);
     if let Ok(mut all) = states().lock() {
         for s in all
             .values_mut()
             .filter(|s| s.roots.iter().any(|r| path.starts_with(r)))
         {
-            note_failure(s, reason);
+            note_failure(
+                s,
+                if local_fingerprint_stop {
+                    "static_output_budget_exhausted"
+                } else {
+                    reason
+                },
+            );
         }
     }
 }
@@ -434,16 +518,55 @@ impl std::io::Seek for BudgetFile {
     }
 }
 
+/// Original deadline of the invocation owning this output path; reading it never renews a lease.
+#[must_use]
+pub fn invocation_deadline(path: &Path) -> Option<Instant> {
+    states()
+        .lock()
+        .ok()?
+        .values()
+        .filter(|s| s.roots.iter().any(|r| path.starts_with(r)))
+        .map(|s| s.deadline)
+        .min()
+}
+
 /// Clip all scanner rounds to the same invocation deadline.
 #[must_use]
 pub fn deadline(path: &Path, desired: Instant) -> Instant {
-    if let Ok(all) = states().lock() {
+    let Some(parent) = states().lock().ok().map(|all| {
         all.values()
             .filter(|s| s.roots.iter().any(|r| path.starts_with(r)))
             .fold(desired, |d, s| d.min(s.deadline))
-    } else {
-        Instant::now()
-    }
+    }) else {
+        return Instant::now();
+    };
+    static_scopes().lock().map_or_else(
+        |_| Instant::now(),
+        |scopes| {
+            scopes
+                .values()
+                .filter(|s| path.starts_with(&s.root))
+                .filter_map(|s| s.deadline)
+                .fold(parent, Instant::min)
+        },
+    )
+}
+
+fn parent_still_safe(path: &Path) -> bool {
+    states().lock().is_ok_and(|all| {
+        all.values()
+            .filter(|s| s.roots.iter().any(|r| path.starts_with(r)))
+            .all(|s| {
+                Instant::now() < s.deadline
+                    && s.receipt.admitted_write_bytes < s.receipt.limit_bytes
+                    && s.receipt.failure_reasons.iter().all(|reason| {
+                        matches!(
+                            reason.as_str(),
+                            "bound_code_copy_partial" | "static_output_budget_exhausted"
+                        )
+                    })
+            })
+    })
 }
 
 /// Stop admission and the capture loop on exhaustion or a failed output.
@@ -481,7 +604,11 @@ pub fn should_stop(path: &Path) -> bool {
             }
         }
     }
-    false
+    static_scopes().lock().map_or(true, |scopes| {
+        scopes
+            .values()
+            .any(|s| path.starts_with(&s.root) && s.deadline.is_some_and(|d| Instant::now() >= d))
+    })
 }
 
 /// True only for a bound-copy coverage gap with no other recorded failure.
@@ -649,5 +776,135 @@ mod terminal_coverage_tests {
         record_failure(&root, "bound_code_copy_partial");
         assert!(bound_terminal_coverage(&root).is_none());
         drop(guard);
+    }
+}
+
+#[cfg(test)]
+mod expanded_static_budget_tests {
+    use super::*;
+
+    #[test]
+    fn static_can_exceed_old_cap_but_keeps_original_bytes_and_report_reserve() {
+        const MIB: u64 = 1024 * 1024;
+        let root = std::env::temp_dir().join(format!("expanded-static-{}", uuid::Uuid::new_v4()));
+        let guard = Guard::install(vec![root.clone()], 600 * MIB, 60000).unwrap();
+        let original = invocation_deadline(&root).unwrap();
+        charge(&root.join("runtime"), 100 * MIB).unwrap();
+        let scope =
+            StaticScope::install_after_bound_copy(root.clone(), remaining(&root).unwrap(), 8 * MIB)
+                .unwrap();
+        charge(&root.join("static"), 300 * MIB).unwrap();
+        charge(&root.join("static"), 192 * MIB).unwrap();
+        assert_eq!(remaining(&root), Some(8 * MIB));
+        assert!(charge(&root.join("static"), 1).is_err());
+        assert_eq!(guard.receipt().rejected_writes, 0);
+        assert!(!guard.receipt().partial);
+        assert_eq!(invocation_deadline(&root), Some(original));
+        drop(scope);
+        charge(&root.join("dump-report.json"), 8 * MIB).unwrap();
+        assert_eq!(guard.receipt().admitted_write_bytes, 600 * MIB);
+    }
+
+    #[test]
+    fn static_local_time_stop_leaves_parent_deadline_and_report_open() {
+        let root = std::env::temp_dir().join(format!("static-time-{}", uuid::Uuid::new_v4()));
+        let guard = Guard::install(vec![root.clone()], 100, 60000).unwrap();
+        let original = invocation_deadline(&root).unwrap();
+        let scope = StaticScope::install_after_bound_copy(root.clone(), 100, 30).unwrap();
+        scope.limit_deadline(Instant::now()).unwrap();
+        // Reapplying a later deadline must never renew the child window.
+        scope.limit_deadline(original).unwrap();
+        let error = charge(&root.join("static"), 1).unwrap_err();
+        assert!(error.to_string().contains("kind=local_time_reserve"));
+        assert_eq!(invocation_deadline(&root), Some(original));
+        assert_eq!(guard.receipt().admitted_write_bytes, 0);
+        assert!(!guard.receipt().partial);
+        drop(scope);
+        charge(&root.join("dump-report.json"), 30).unwrap();
+    }
+
+    #[test]
+    fn original_expiry_still_rejects_static_and_report_without_renewal() {
+        let root =
+            std::env::temp_dir().join(format!("static-parent-expiry-{}", uuid::Uuid::new_v4()));
+        let guard = Guard::install(vec![root.clone()], 100, 60000).unwrap();
+        interrupt(&root, "cancel_requested");
+        let expired = invocation_deadline(&root).unwrap();
+        let scope = StaticScope::install_after_bound_copy(root.clone(), 100, 30).unwrap();
+        scope
+            .limit_deadline(Instant::now() + Duration::from_secs(60))
+            .unwrap();
+        let error = charge(&root.join("static"), 1).unwrap_err();
+        assert_eq!(error.to_string(), "time_budget_exhausted");
+        assert!(!error.to_string().contains("local_time_reserve"));
+        drop(scope);
+        assert!(charge(&root.join("dump-report.json"), 1).is_err());
+        assert_eq!(invocation_deadline(&root), Some(expired));
+        assert!(guard.receipt().partial);
+    }
+}
+
+#[cfg(test)]
+mod static_read_clock_tests {
+    use super::*;
+    #[test]
+    fn fingerprint_cooperative_clock_uses_child_without_poisoning_parent_or_io_errors() {
+        let root = std::env::temp_dir().join(format!("static-read-clock-{}", uuid::Uuid::new_v4()));
+        let guard = Guard::install(vec![root.clone()], 100, 60000).unwrap();
+        let original = invocation_deadline(&root).unwrap();
+        let child = StaticScope::install_after_bound_copy(root.clone(), 100, 30).unwrap();
+        let cutoff = Instant::now();
+        child.limit_deadline(cutoff).unwrap();
+        assert_eq!(deadline(&root, original), cutoff);
+        assert!(should_stop(&root));
+        record_failure(&root, "apk_fingerprint_interrupted");
+        assert_eq!(
+            guard.receipt().failure_reasons,
+            ["static_output_budget_exhausted"]
+        );
+        assert!(child.local_deadline_elapsed());
+        // Actual IO must never be reclassified merely because the child expired.
+        record_failure(&root, "output_io_failed");
+        assert!(!child.local_deadline_elapsed());
+        assert!(guard
+            .receipt()
+            .failure_reasons
+            .contains(&"output_io_failed".into()));
+        drop(child);
+        assert_eq!(deadline(&root, original), original);
+        charge(&root.join("dump-report.json"), 30).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod actual_static_fingerprint_tests {
+    use super::*;
+    #[test]
+    fn actual_apk_hasher_obeys_child_clock_and_leaves_report_on_original_parent() {
+        let root =
+            std::env::temp_dir().join(format!("actual-static-hash-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("base.apk");
+        std::fs::write(&source, [1, 2, 3]).unwrap();
+        let parent = Guard::install(vec![root.clone()], 100, 60000).unwrap();
+        let original = invocation_deadline(&root).unwrap();
+        let child = StaticScope::install_after_bound_copy(root.clone(), 100, 30).unwrap();
+        child.limit_deadline(Instant::now()).unwrap();
+        let error = crate::code_evidence::apk_hash(&source, &root).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "APK fingerprint deadline or parent budget interrupted"
+        );
+        assert_eq!(
+            parent.receipt().failure_reasons,
+            ["static_output_budget_exhausted"]
+        );
+        assert!(child.local_deadline_elapsed());
+        assert_eq!(invocation_deadline(&root), Some(original));
+        drop(child);
+        write(root.join("dump-report.json"), b"retained").unwrap();
+        assert_eq!(parent.receipt().admitted_write_bytes, 8);
+        drop(parent);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

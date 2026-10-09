@@ -4197,8 +4197,6 @@ fn poll_all(runtime: &mut InspectRuntime) -> Vec<InspectOutput> {
         return finish_scope_poll(runtime, out);
     }
     let read_started = Instant::now();
-    let mut probes_read = 0usize;
-    let mut unread_probes = false;
     // Readiness is advisory: every selected session still runs the original
     // physical scope validation. Entry/return share one LiveProbe and remain
     // one scheduling unit; consumed records retain existing timestamp sorting.
@@ -4207,13 +4205,11 @@ fn poll_all(runtime: &mut InspectRuntime) -> Vec<InspectOutput> {
         .iter()
         .map(|p| p.session.has_pending_records())
         .collect::<Vec<_>>();
-    for index in poll_schedule::order(&ready, runtime.next_poll_probe) {
-        if probes_read != 0 && read_started.elapsed().as_millis() >= 20 {
-            unread_probes = true;
-            break;
-        }
-        probes_read += 1;
-        runtime.next_poll_probe = (index + 1) % runtime.sessions.len();
+    let mut round = poll_schedule::Round::new(&ready, runtime.next_poll_probe);
+    while let Some(index) = round.next(
+        read_started.elapsed().as_millis(),
+        &mut runtime.next_poll_probe,
+    ) {
         let probe = &mut runtime.sessions[index];
         let skip_exhausted =
             !plan_is_connkey(&probe.plan) && exhausted_adapters.contains(&probe.plan.adapter);
@@ -4424,15 +4420,11 @@ fn poll_all(runtime: &mut InspectRuntime) -> Vec<InspectOutput> {
             }
         }
     }
-    if !runtime.sessions.is_empty() {
-        let rotate = probes_read % runtime.sessions.len();
-        runtime.sessions.rotate_left(rotate);
-    }
-    runtime.unread_perf_possible = unread_probes
-        || runtime
-            .sessions
-            .iter()
-            .any(|p| p.session.last_poll_drain == ksight_hwbp::perf_drain::PollDrainState::Yielded);
+    runtime.unread_perf_possible =
+        round.finish(&mut runtime.sessions, &mut runtime.next_poll_probe)
+            || runtime.sessions.iter().any(|p| {
+                p.session.last_poll_drain == ksight_hwbp::perf_drain::PollDrainState::Yielded
+            });
     finish_scope_poll(runtime, out)
 }
 

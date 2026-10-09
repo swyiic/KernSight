@@ -19,6 +19,98 @@ const MAX_RECORD: u64 = 16384;
 const MAX_FAILURE_RECORD: u64 = 4096;
 // capture-control prints one trailing newline; legacy RPC caps count it.
 const MAX_STATUS_JSON: u64 = MAX_RECORD - 1;
+#[cfg(any(test, target_os = "android", target_os = "linux"))]
+const MAX_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
+#[cfg(any(target_os = "android", target_os = "linux"))]
+const MAX_EXECUTABLE_HASH_TIME: Duration = Duration::from_millis(250);
+
+/// Build and running-image identity observed once by the collection process.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentBuild {
+    /// Semantic version and compile-time Git suffix, including unknown/dirty states.
+    pub version: String,
+    /// Full compile-time Git commit; absent means unknown.
+    pub git_commit: Option<String>,
+    /// Compile-time source modification state; absent means unknown.
+    pub git_dirty: Option<bool>,
+    /// Compile-time provenance origin: git, override, or unknown.
+    pub source: String,
+    /// Observed running executable path; never reopened to obtain the hash.
+    pub executable_path: Option<PathBuf>,
+    /// SHA-256 of the opened running image; absent means unobserved, not a match.
+    pub executable_sha256: Option<String>,
+    /// Hash observation source; absent when the hash could not be established.
+    pub executable_identity_source: Option<String>,
+}
+impl AgentBuild {
+    fn observe(deadline: Instant) -> Self {
+        let mut build = Self {
+            version: ksight_core::build_info::VERSION.into(),
+            git_commit: ksight_core::build_info::git_commit().map(str::to_owned),
+            git_dirty: ksight_core::build_info::git_dirty(),
+            source: ksight_core::build_info::SOURCE.into(),
+            executable_path: None,
+            executable_sha256: None,
+            executable_identity_source: None,
+        };
+        #[cfg(any(target_os = "android", target_os = "linux"))]
+        {
+            // procfs resolves the executing inode, including an unlinked/replaced
+            // image. Reopening current_exe's pathname could hash its replacement.
+            build.executable_path = fs::read_link("/proc/self/exe")
+                .ok()
+                .filter(|path| path.as_os_str().len() <= 4096 && path.to_str().is_some());
+            let hash_deadline = deadline.min(Instant::now() + MAX_EXECUTABLE_HASH_TIME);
+            build.executable_sha256 = fs::File::open("/proc/self/exe").ok().and_then(|file| {
+                let metadata = file.metadata().ok()?;
+                metadata.is_file().then_some(())?;
+                hash_running_image(file, metadata.len(), hash_deadline)
+            });
+            if build.executable_sha256.is_some() {
+                build.executable_identity_source = Some("procfs_running_executable".into());
+            }
+        }
+        #[cfg(not(any(target_os = "android", target_os = "linux")))]
+        {
+            let _ = deadline;
+            // Other hosts lack this running-inode proof; a pathname hash would
+            // pretend to know more than was observed.
+            build.executable_path = std::env::current_exe()
+                .ok()
+                .filter(|path| path.as_os_str().len() <= 4096 && path.to_str().is_some());
+        }
+        build
+    }
+}
+
+#[cfg(any(test, target_os = "android", target_os = "linux"))]
+fn hash_running_image(
+    mut image: impl Read,
+    expected_bytes: u64,
+    deadline: Instant,
+) -> Option<String> {
+    use sha2::{Digest as _, Sha256};
+    if expected_bytes == 0 || expected_bytes > MAX_EXECUTABLE_BYTES {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+    let mut total = 0_u64;
+    loop {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        let count = image.read(&mut buffer).ok()?;
+        if count == 0 {
+            return (total == expected_bytes).then(|| format!("{:x}", hasher.finalize()));
+        }
+        total = total.checked_add(u64::try_from(count).ok()?)?;
+        if total > expected_bytes {
+            return None;
+        }
+        hasher.update(&buffer[..count]);
+    }
+}
 
 /// Immutable identity and no-pause contract of one collection attempt.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -40,6 +132,9 @@ pub struct Owner {
     pub max_ms: u64,
     /// This contract forbids target pause; forensic CLI is separate.
     pub target_pause: String,
+    /// Identity saved by this owner at begin; legacy records stay unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_build: Option<AgentBuild>,
 }
 #[derive(Debug, Serialize, Deserialize)]
 struct Stop {
@@ -97,6 +192,11 @@ pub struct Status {
     /// Positive Dump coverage proof; absent means unknown.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dump_coverage: Option<serde_json::Value>,
+    /// Saved collection-process identity, never the current controller build.
+    /// Absent is unknown for legacy records or a full legacy status RPC; the
+    /// immutable owner.json retains any identity omitted from that response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_build: Option<AgentBuild>,
 }
 fn same(a: &CaptureRelation, b: &CaptureRelation) -> bool {
     a.parent_id == b.parent_id
@@ -326,10 +426,16 @@ fn inspect_with(
         qualification,
         qualification_failure,
         dump_coverage: returned.as_ref().and_then(|v| v.dump_coverage.clone()),
+        agent_build: o.agent_build,
     };
     // Existing controllers bound the entire status RPC at 16 KiB, not each
     // nested receipt. Never make an otherwise valid status unreadable merely
     // by adding a diagnostic. The immutable on-disk receipt is unchanged.
+    // The new extension must not consume space needed by any legacy failure
+    // fact. Drop it first, then apply the existing receipt-size policy.
+    if status.agent_build.is_some() && serde_json::to_vec(&status)?.len() as u64 > MAX_STATUS_JSON {
+        status.agent_build = None;
+    }
     while status.qualification_failure.is_some()
         && serde_json::to_vec(&status)?.len() as u64 > MAX_STATUS_JSON
     {
@@ -421,6 +527,11 @@ impl Lease {
         if !no_pause || !(1..=3_600_000).contains(&max_ms) {
             bail!("cooperative lifecycle requires no-pause and a bounded deadline");
         }
+        // Provenance I/O consumes this original contract; it cannot renew it.
+        let deadline = scopes.iter().fold(
+            Instant::now() + Duration::from_millis(max_ms),
+            |d, scope| ksight_core::output_budget::deadline(scope, d),
+        );
         ensure_control_root(root)?;
         // One attempt is immutable. A retry needs a new attempt ID/root.
         if root.join("owner.json").exists() {
@@ -435,14 +546,11 @@ impl Lease {
             boot_id: crate::retention::boot_id(),
             max_ms,
             target_pause: "forbidden".into(),
+            agent_build: Some(AgentBuild::observe(deadline)),
         };
         reject_prestart(root, relation)?;
         retain(root, "owner.json", &o)?;
         reject_prestart(root, relation)?;
-        let deadline = scopes.iter().fold(
-            Instant::now() + Duration::from_millis(max_ms),
-            |d, scope| ksight_core::output_budget::deadline(scope, d),
-        );
         let done = Arc::new(AtomicBool::new(false));
         let signal = done.clone();
         let path = root.to_owned();
@@ -1110,6 +1218,7 @@ mod qualification_failure_tests {
                     boot_id: Some("test-boot".into()),
                     max_ms: 90_000,
                     target_pause: "forbidden".into(),
+                    agent_build: None,
                 },
             )
             .expect("owner");
@@ -1333,6 +1442,252 @@ mod qualification_failure_tests {
         assert_eq!(
             after.qualification_failure.expect("shortened receipt")["cause_truncated"],
             true
+        );
+    }
+}
+
+#[cfg(test)]
+mod build_identity_tests {
+    use super::*;
+
+    struct Fixture {
+        root: PathBuf,
+        relation: CaptureRelation,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!("ksight-build-{}", Uuid::new_v4()));
+            fs::create_dir(&root).expect("test root");
+            let relation = CaptureRelation::parse(
+                Some(Uuid::new_v4()),
+                Some(Uuid::new_v4()),
+                Some(Uuid::new_v4()),
+                Some(1),
+                Some("l1".into()),
+            )
+            .expect("relation")
+            .expect("present");
+            Self { root, relation }
+        }
+        fn retain_owner(&self, agent_build: Option<AgentBuild>) {
+            retain(
+                &self.root,
+                "owner.json",
+                &Owner {
+                    schema: SCHEMA.into(),
+                    relation: self.relation.clone(),
+                    token: Uuid::new_v4(),
+                    pid: std::process::id(),
+                    process_start_ticks: None,
+                    boot_id: None,
+                    max_ms: 90_000,
+                    target_pause: "forbidden".into(),
+                    agent_build,
+                },
+            )
+            .expect("owner");
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn prior_build() -> AgentBuild {
+        AgentBuild {
+            version: "0.2.12+prior-owner".into(),
+            git_commit: Some("1".repeat(40)),
+            git_dirty: Some(true),
+            source: "git".into(),
+            executable_path: Some("/data/local/tmp/ksight/ksightd (deleted)".into()),
+            executable_sha256: Some("2".repeat(64)),
+            executable_identity_source: Some("procfs_running_executable".into()),
+        }
+    }
+
+    #[test]
+    fn legacy_owner_never_inherits_the_controller_build() {
+        let fixture = Fixture::new();
+        fixture.retain_owner(None);
+        let saved = fs::read(fixture.root.join("owner.json")).expect("saved owner");
+        let json: serde_json::Value = serde_json::from_slice(&saved).expect("JSON");
+        assert!(json.get("agent_build").is_none());
+        let status = inspect_with(&fixture.root, &fixture.relation, |_| None).expect("status");
+        assert!(status.agent_build.is_none());
+        assert!(serde_json::to_value(status)
+            .expect("JSON")
+            .get("agent_build")
+            .is_none());
+        assert_eq!(
+            saved,
+            fs::read(fixture.root.join("owner.json")).expect("unchanged")
+        );
+    }
+
+    #[test]
+    fn replaced_controller_reports_the_saved_owner_identity() {
+        let fixture = Fixture::new();
+        let expected = prior_build();
+        assert_ne!(expected.version, ksight_core::build_info::VERSION);
+        fixture.retain_owner(Some(expected.clone()));
+        let status = inspect_with(&fixture.root, &fixture.relation, |_| Some(false))
+            .expect("status of exited prior owner");
+        assert_eq!(status.agent_build, Some(expected));
+        assert_eq!(status.agent_exited_confirmed, Some(true));
+    }
+
+    #[test]
+    fn begin_persists_its_compiled_identity_and_status_reuses_it() {
+        let fixture = Fixture::new();
+        let lease = Lease::begin(&fixture.root, &fixture.relation, vec![], 2000, true)
+            .expect("lease without starting a producer");
+        let saved = owner(&fixture.root, &fixture.relation)
+            .expect("owner")
+            .agent_build
+            .expect("capturing process identity");
+        assert_eq!(saved.version, ksight_core::build_info::VERSION);
+        assert_eq!(
+            saved.git_commit.as_deref(),
+            ksight_core::build_info::git_commit()
+        );
+        assert_eq!(saved.git_dirty, ksight_core::build_info::git_dirty());
+        assert_eq!(saved.source, ksight_core::build_info::SOURCE);
+        let status = lease.finish(true).expect("return without collecting");
+        assert_eq!(status.agent_build, Some(saved));
+    }
+
+    #[test]
+    fn hash_is_complete_bounded_and_rejects_short_or_growing_images() {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let hash = hash_running_image(&b"abc"[..], 3, deadline).expect("complete image");
+        assert_eq!(
+            hash,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert!(hash_running_image(&b"ab"[..], 3, deadline).is_none());
+        assert!(hash_running_image(&b"abcd"[..], 3, deadline).is_none());
+        assert!(hash_running_image(&b""[..], 0, deadline).is_none());
+        assert!(hash_running_image(&b"abc"[..], MAX_EXECUTABLE_BYTES + 1, deadline).is_none());
+    }
+
+    #[test]
+    fn hash_obeys_original_deadline_and_read_errors_stay_unknown() {
+        struct NoRead;
+        impl Read for NoRead {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                panic!("an expired contract must not read provenance bytes");
+            }
+        }
+        struct FailedRead;
+        impl Read for FailedRead {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            }
+        }
+        assert!(hash_running_image(NoRead, 3, Instant::now()).is_none());
+        assert!(
+            hash_running_image(FailedRead, 3, Instant::now() + Duration::from_secs(1)).is_none()
+        );
+    }
+
+    #[test]
+    fn full_legacy_rpc_preserves_every_failure_field_before_omitting_build() {
+        let fixture = Fixture::new();
+        fixture.retain_owner(None);
+        let mut recorded_owner = owner(&fixture.root, &fixture.relation).expect("owner");
+        let failure = serde_json::json!({
+            "schema": "kernsight.qualified-source-failure/v1",
+            "relation": fixture.relation, "token": recorded_owner.token,
+            "failure": {"kind": "requalification_failed", "cause": "original refusal ".repeat(64)},
+            "cause_truncated": false,
+        });
+        retain(&fixture.root, "qualification-failure.json", &failure).expect("failure");
+        let mut startup = serde_json::json!({
+            "schema": "kernsight.startup/v1", "relation": fixture.relation,
+            "token": recorded_owner.token, "padding": "",
+        });
+        let startup_path = fixture.root.join("startup.json");
+        fs::write(&startup_path, serde_json::to_vec(&startup).expect("JSON")).expect("startup");
+        let overhead = serde_json::to_vec(
+            &inspect_with(&fixture.root, &fixture.relation, |_| None).expect("small legacy status"),
+        )
+        .expect("JSON")
+        .len();
+        startup["padding"] = serde_json::json!(
+            "x".repeat(usize::try_from(MAX_STATUS_JSON).expect("bound") - overhead)
+        );
+        fs::write(&startup_path, serde_json::to_vec(&startup).expect("JSON"))
+            .expect("full startup");
+        let legacy =
+            inspect_with(&fixture.root, &fixture.relation, |_| None).expect("full legacy status");
+        assert_eq!(
+            serde_json::to_vec(&legacy).expect("JSON").len() as u64,
+            MAX_STATUS_JSON
+        );
+        assert_eq!(legacy.qualification_failure.as_ref(), Some(&failure));
+        let legacy_json = serde_json::to_value(legacy).expect("legacy JSON");
+
+        // Add the optional owner identity while keeping every legacy fact and
+        // ancestry byte identical; only this test fixture changes an owner.
+        recorded_owner.agent_build = Some(prior_build());
+        let owner_bytes = serde_json::to_vec(&recorded_owner).expect("owner JSON");
+        fs::write(fixture.root.join("owner.json"), &owner_bytes).expect("fixture build extension");
+        let with_build = inspect_with(&fixture.root, &fixture.relation, |_| None)
+            .expect("bounded extended status");
+        assert!(with_build.agent_build.is_none());
+        assert_eq!(
+            serde_json::to_value(with_build).expect("status JSON"),
+            legacy_json
+        );
+        assert_eq!(
+            fs::read(fixture.root.join("owner.json")).expect("saved owner"),
+            owner_bytes
+        );
+        assert_eq!(
+            read::<serde_json::Value>(&fixture.root, "qualification-failure.json")
+                .expect("unchanged receipt"),
+            failure
+        );
+    }
+
+    #[test]
+    fn full_legacy_rpc_keeps_owner_identity_even_when_status_omits_extension() {
+        let fixture = Fixture::new();
+        let expected = prior_build();
+        fixture.retain_owner(Some(expected.clone()));
+        let saved = fs::read(fixture.root.join("owner.json")).expect("saved identity");
+        let retained_owner = owner(&fixture.root, &fixture.relation).expect("owner");
+        let mut startup = serde_json::json!({
+            "schema": "kernsight.startup/v1", "relation": fixture.relation,
+            "token": retained_owner.token, "padding": "",
+        });
+        let path = fixture.root.join("startup.json");
+        fs::write(&path, serde_json::to_vec(&startup).expect("JSON")).expect("startup");
+        let mut without_build =
+            inspect_with(&fixture.root, &fixture.relation, |_| None).expect("small status");
+        without_build.agent_build = None;
+        let overhead = serde_json::to_vec(&without_build).expect("JSON").len();
+        startup["padding"] = serde_json::json!(
+            "x".repeat(usize::try_from(MAX_STATUS_JSON).expect("bound") - overhead)
+        );
+        fs::write(&path, serde_json::to_vec(&startup).expect("JSON")).expect("full startup");
+        let status =
+            inspect_with(&fixture.root, &fixture.relation, |_| None).expect("bounded status");
+        assert!(status.agent_build.is_none());
+        assert_eq!(
+            serde_json::to_vec(&status).expect("JSON").len() as u64,
+            MAX_STATUS_JSON
+        );
+        assert_eq!(
+            saved,
+            fs::read(fixture.root.join("owner.json")).expect("unchanged")
+        );
+        assert_eq!(
+            owner(&fixture.root, &fixture.relation)
+                .expect("owner")
+                .agent_build,
+            Some(expected)
         );
     }
 }

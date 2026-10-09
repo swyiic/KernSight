@@ -1,9 +1,11 @@
 #![cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
 //! Backend capability, physical task qualification and anchored live code copies.
 //! No qualification is minted from a numeric PID, proc ticks or a missing record.
-use anyhow::{bail, Result};
+use anyhow::{bail, Context as _, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::io;
 use std::{
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -92,19 +94,17 @@ fn eligible_mapping(r: &crate::dexdump::MapRow) -> bool {
                 .any(|s| r.path.contains(s)))
 }
 
-fn code_range_cap(path: &str) -> u64 {
-    let path = path.trim_end().strip_suffix(" (deleted)").unwrap_or(path);
-    // DEX images and named ELF libraries share the 128MiB image limit.
-    // JIT memfd and APK mappings stay at 16MiB so they cannot consume the runtime payload.
-    if android_suffix(path, ".vdex")
-        || android_suffix(path, ".dex")
-        || android_suffix(path, ".cdex")
-        || android_suffix(path, ".so")
-    {
-        128 * 1024 * 1024
-    } else {
-        16 * 1024 * 1024
-    }
+const UNGUARDED_RANGE_LIMIT: u64 = 128 * 1024 * 1024;
+// A wider copy can create a multi-MiB bound note plus a catalog. Reserve this
+// before selecting payload, rather than relying on the 256KiB note fallback.
+const RANGE_METADATA_RESERVE: u64 = 16 * 1024 * 1024;
+
+fn selected_range_bytes(requested: u64, parent_remaining: Option<u64>) -> u64 {
+    // Registered invocations already have finite byte and time contracts.
+    // Mapping type cannot silently truncate an APK/JIT/ELF payload.
+    parent_remaining.map_or(requested.min(UNGUARDED_RANGE_LIMIT), |remaining| {
+        requested.min(remaining.saturating_sub(RANGE_METADATA_RESERVE))
+    })
 }
 
 enum BoundRangeStep {
@@ -189,7 +189,11 @@ fn budget_io(error: &std::io::Error) -> bool {
     let text = error.to_string();
     text.contains("output_budget_exhausted") || text.contains("time_budget_exhausted")
 }
-fn candidate_object(rank: usize, row: &crate::dexdump::MapRow) -> serde_json::Value {
+fn candidate_object(
+    rank: usize,
+    row: &crate::dexdump::MapRow,
+    parent_remaining: Option<u64>,
+) -> serde_json::Value {
     let category = if row.path.contains("jit") {
         "jit_named"
     } else if [".dex", ".vdex", ".apk", ".oat", ".art"]
@@ -212,23 +216,27 @@ fn candidate_object(rank: usize, row: &crate::dexdump::MapRow) -> serde_json::Va
         "category": category,
         "ownership": "unknown",
         "requested_mapping_bytes": row.end.saturating_sub(row.start),
-        "selection_limit_bytes": row.end.saturating_sub(row.start).min(code_range_cap(&row.path)),
+        "selection_limit_bytes": selected_range_bytes(row.end.saturating_sub(row.start), parent_remaining),
         "selection_reason": "eligible_install_priority_until_parent_budget",
         "state": "planned_not_read",
         "actual_bytes": null
     })
 }
 
-fn candidate_ledger(rows: &[crate::dexdump::MapRow]) -> serde_json::Value {
+fn candidate_ledger(
+    rows: &[crate::dexdump::MapRow],
+    parent_remaining: Option<u64>,
+) -> serde_json::Value {
     let candidates: Vec<_> = rows
         .iter()
         .filter(|row| eligible_mapping(row))
         .enumerate()
-        .map(|(rank, row)| candidate_object(rank, row))
+        .map(|(rank, row)| candidate_object(rank, row, parent_remaining))
         .collect();
     serde_json::json!({
         "schema": "kernsight.code-candidates/v1",
         "order": "original_maps_order_unchanged",
+        "mapping_observation_scope": "initial_bound_maps_snapshot; later mappings not observed",
         "eligible_count": candidates.len(),
         "listed_count": candidates.len(),
         "omitted_count": 0,
@@ -300,6 +308,208 @@ fn write_candidate_ledger(dir: &Path, stem: &str, mut note: serde_json::Value) -
         if shard > 64 {
             bail!("candidate shard bound");
         }
+    }
+    Ok(())
+}
+
+const NOTE_LIMIT: usize = 2 * 1024 * 1024;
+const NOTES_TOTAL_LIMIT: usize = 8 * 1024 * 1024;
+const NOTE_COUNT_LIMIT: usize = 16;
+const HEADER_GROWTH_RESERVE: usize = 1024;
+
+struct LimitedJson {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+impl Write for LimitedJson {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let next = self
+            .bytes
+            .len()
+            .checked_add(bytes.len())
+            .filter(|next| *next <= self.limit)
+            .ok_or_else(|| io::Error::other("bound note exceeds size limit"))?;
+        if next > self.bytes.capacity() {
+            let capacity = self
+                .limit
+                .min(self.bytes.capacity().saturating_mul(2).max(65536).max(next));
+            self.bytes.reserve_exact(capacity - self.bytes.len());
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+fn encode_note(note: &Value) -> Result<Vec<u8>> {
+    let mut sink = LimitedJson {
+        bytes: Vec::new(),
+        limit: NOTE_LIMIT,
+    };
+    serde_json::to_writer(&mut sink, note).context("bounded compact bound note")?;
+    Ok(sink.bytes)
+}
+struct JsonCount {
+    count: usize,
+    limit: usize,
+}
+impl Write for JsonCount {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.count = self
+            .count
+            .checked_add(bytes.len())
+            .filter(|next| *next <= self.limit)
+            .ok_or_else(|| io::Error::other("bound record exceeds size limit"))?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+fn compact_record_bytes(record: &Value) -> Result<usize> {
+    let mut count = JsonCount {
+        count: 0,
+        limit: NOTE_LIMIT,
+    };
+    serde_json::to_writer(&mut count, record).context("bounded compact record size")?;
+    Ok(count.count)
+}
+fn admit_note_size(total: &mut usize, size: usize) -> Result<()> {
+    if size > NOTE_LIMIT {
+        bail!("bound note exceeds single-note limit");
+    }
+    let next = total
+        .checked_add(size)
+        .filter(|next| *next <= NOTES_TOTAL_LIMIT)
+        .context("bound notes exceed aggregate limit")?;
+    *total = next;
+    Ok(())
+}
+
+// Each compact shard remains readable by the existing v1 coverage verifier.
+// Encoding is bounded; publication still obeys the original output guard.
+fn compact_bound_notes(mut template: Value) -> Result<Vec<Vec<u8>>> {
+    let Value::Array(records) = template["records"].take() else {
+        bail!("missing bound records");
+    };
+    let attempted = records.len();
+    if attempted > 65536 {
+        bail!("bound record count limit");
+    }
+    let excluded = records
+        .iter()
+        .enumerate()
+        .filter(|(_, record)| record["excluded_local_window"] == true)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if excluded.len() > 1
+        || excluded
+            .first()
+            .is_some_and(|index| *index + 1 != attempted)
+    {
+        bail!("excluded local window must be the last global record only");
+    }
+    template["records"] = json!([]);
+    template["candidate_result"]["attempted"] = json!(0);
+    template["candidate_result"]["total_attempted"] = json!(attempted);
+    template["shard_index"] = json!(0);
+    template["shard_count"] = json!(NOTE_COUNT_LIMIT);
+    let overhead = encode_note(&template)?
+        .len()
+        .checked_add(HEADER_GROWTH_RESERVE)
+        .filter(|size| *size < NOTE_LIMIT)
+        .context("bound header exceeds note limit")?;
+    let capacity = NOTE_LIMIT - overhead;
+    let mut groups = Vec::<Vec<Value>>::new();
+    let mut current = Vec::new();
+    let mut used = 0usize;
+    for record in records {
+        let size = compact_record_bytes(&record)?;
+        if size > capacity {
+            bail!("single bound record cannot fit within note limit");
+        }
+        let need = size + usize::from(!current.is_empty());
+        if need > capacity.saturating_sub(used) {
+            groups.push(std::mem::take(&mut current));
+            used = 0;
+        }
+        if groups.len() >= NOTE_COUNT_LIMIT {
+            bail!("bound note shard count limit");
+        }
+        used += size + usize::from(!current.is_empty());
+        current.push(record);
+    }
+    if !current.is_empty() || groups.is_empty() {
+        groups.push(current);
+    }
+    if groups.len() > NOTE_COUNT_LIMIT {
+        bail!("bound note shard count limit");
+    }
+    let count = groups.len();
+    let mut bodies = Vec::with_capacity(count);
+    let mut total = 0usize;
+    for (index, records) in groups.into_iter().enumerate() {
+        let mut note = template.clone();
+        note["shard_index"] = json!(index);
+        note["shard_count"] = json!(count);
+        note["candidate_result"]["attempted"] = json!(records.len());
+        if index + 1 != count {
+            // This note's rows are complete; global remainder is described only
+            // by the final note. Explicit shard metadata keeps the scope clear.
+            note["candidate_result"]["unattempted_state"] = json!("none");
+            note["candidate_result"]["stop_scope"] = json!("none_or_parent_budget");
+        }
+        note["records"] = Value::Array(records);
+        let body = encode_note(&note)?;
+        admit_note_size(&mut total, body.len())?;
+        bodies.push(body);
+    }
+    Ok(bodies)
+}
+
+fn track_record_metadata(out: &Path, record: &Value, used: &mut usize) -> Result<()> {
+    let next = compact_record_bytes(record)
+        .and_then(|size| {
+            used.checked_add(size + 1)
+                .filter(|next| *next <= NOTES_TOTAL_LIMIT - 65536)
+                .context("bound record metadata size limit")
+        })
+        .inspect_err(|_| {
+            ksight_core::output_budget::record_failure(out, "bound_note_metadata_exhausted");
+        })?;
+    *used = next;
+    Ok(())
+}
+
+fn write_bound_notes(out: &Path, pid: u32, note: Value) -> Result<()> {
+    let bodies = compact_bound_notes(note)?;
+    let mut count = bodies.len();
+    let mut total = bodies.iter().map(Vec::len).sum::<usize>();
+    for entry in std::fs::read_dir(out)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("bound-source-") && name.ends_with(".json") {
+            let bytes = usize::try_from(entry.metadata()?.len())?;
+            if bytes > NOTE_LIMIT {
+                bail!("existing bound note size limit");
+            }
+            count += 1;
+            total = total
+                .checked_add(bytes)
+                .context("bound note inventory overflow")?;
+        }
+    }
+    if count > NOTE_COUNT_LIMIT || total > NOTES_TOTAL_LIMIT {
+        bail!("bound note inventory limit");
+    }
+    let id = uuid::Uuid::new_v4();
+    for (index, body) in bodies.iter().enumerate() {
+        ksight_core::output_budget::write(
+            out.join(format!("bound-source-{pid}-{id}-{index:02}.json")),
+            body,
+        )?;
     }
     Ok(())
 }
@@ -470,8 +680,8 @@ pub(crate) fn copy_range(
 mod physical {
     use super::{
         android_suffix, app_code_mapped_bytes, bail, bound_copy_gap_state, budget_io,
-        candidate_ledger, code_range_cap, copy_range, eligible_mapping, hex_bytes,
-        prioritize_install_rows, publish_bound_pending, stat_start_ticks, write_candidate_ledger,
+        candidate_ledger, copy_range, eligible_mapping, hex_bytes, prioritize_install_rows,
+        publish_bound_pending, selected_range_bytes, stat_start_ticks, write_candidate_ledger,
         BoundCopyStops, BoundRangeStep, Digest, Path, Read, Result, Sha256, SourceIdentity,
     };
     use anyhow::Context as _;
@@ -683,7 +893,7 @@ mod physical {
             }
             let mut rows = crate::dexdump::parse_maps(&text);
             prioritize_install_rows(&mut rows, &crate::dump::apk_paths(&expected.package));
-            let mut note = candidate_ledger(&rows);
+            let mut note = candidate_ledger(&rows, ksight_core::output_budget::remaining(out));
             note["order"] =
                 serde_json::json!("app_install_dex_then_elf_then_other_original_maps_order");
             note["source"] = serde_json::to_value(expected)?;
@@ -718,13 +928,10 @@ mod physical {
                 .context("source generation changed before next range")?;
             let binding = current.qualified.into_bound()?;
             let requested = row.end.saturating_sub(row.start);
-            let range_cap = code_range_cap(&row.path);
-            let want = requested.min(range_cap).min(
-                ksight_core::output_budget::remaining(out)
-                    .map_or(u64::MAX, |n| n.saturating_sub(256 * 1024)),
-            );
-            let saw_budget_reserve = want < requested.min(range_cap);
-            let saw_range_cap = !saw_budget_reserve && want < requested;
+            let remaining = ksight_core::output_budget::remaining(out);
+            let want = selected_range_bytes(requested, remaining);
+            let saw_budget_reserve = remaining.is_some() && want < requested;
+            let saw_range_cap = remaining.is_none() && want < requested;
             if want == 0 {
                 return Ok(BoundRangeStep::Stop { saw_budget_reserve });
             }
@@ -847,13 +1054,15 @@ mod physical {
             let mut stats = crate::dexdump::LiveDump::default();
             let mut rows = crate::dexdump::parse_maps(&text);
             prioritize_install_rows(&mut rows, &crate::dump::apk_paths(&expected.package));
-            let mut candidates = candidate_ledger(&rows);
+            let mut candidates =
+                candidate_ledger(&rows, ksight_core::output_budget::remaining(out));
             candidates["order"] =
                 serde_json::json!("app_install_dex_then_elf_then_other_original_maps_order");
             let candidate_name =
                 format!("bound-candidates-{}-{}", expected.pid, uuid::Uuid::new_v4());
             write_candidate_ledger(out, &candidate_name, candidates)?;
             let mut records = Vec::new();
+            let mut record_bytes = 0usize;
             let mut partial = false;
             let mut stopped_early = false;
             let mut saw_range_cap = false;
@@ -869,6 +1078,7 @@ mod physical {
                         saw_budget_reserve: reserve,
                     } => {
                         partial = true;
+                        stopped_early = true;
                         saw_budget_reserve |= reserve;
                         break;
                     }
@@ -891,6 +1101,7 @@ mod physical {
                         } else if native {
                             stats.native_libs = stats.native_libs.saturating_add(1);
                         }
+                        super::track_record_metadata(out, &record, &mut record_bytes)?;
                         records.push(record);
                     }
                 }
@@ -901,19 +1112,10 @@ mod physical {
                 saw_range_cap,
                 saw_budget_reserve,
             });
-            let note = serde_json::json!({"schema":"kernsight.bound-code-copy/v1","source":expected,"candidate_manifest":candidate_name,"candidate_result":{"attempted":records.len(),"unattempted_state":unattempted_state,"truncation":truncation,"stop_scope":if stopped_early && !ksight_core::output_budget::should_stop(out) {"local_copy_window"} else {"none_or_parent_budget"},"actual_ranges":"records.read","budget_stop":ksight_core::output_budget::should_stop(out)},"records":records,"partial":partial,"paused":false,"torn":true,"torn_reason":"process_not_paused","unsupported":"unregistered anonymous heap/FD/private scans; main-process enrollment only","object_sha256":format!("{:x}",Sha256::digest(std::fs::read(&self.metadata)?)),"btf_sha256":hex_bytes(&self.btf_hash)});
-            let note_body = serde_json::to_vec_pretty(&note)?;
-            let note_path = out.join(format!(
-                "bound-source-{}-{}.json",
-                expected.pid,
-                uuid::Uuid::new_v4()
-            ));
-            if ksight_core::output_budget::write(&note_path, &note_body).is_err() {
-                partial = true;
-                // Already-read range metadata only. No further process memory is read.
-                if note_body.len() <= 256 * 1024 {
-                    let _ = std::fs::write(&note_path, &note_body);
-                }
+            let note = serde_json::json!({"schema":"kernsight.bound-code-copy/v1","source":expected,"candidate_manifest":candidate_name,"candidate_result":{"attempted":records.len(),"unattempted_state":unattempted_state,"truncation":truncation,"stop_scope":if stopped_early && saw_budget_reserve {"runtime_metadata_reserve"} else if stopped_early && !ksight_core::output_budget::should_stop(out) {"local_copy_window"} else {"none_or_parent_budget"},"actual_ranges":"records.read","budget_stop":ksight_core::output_budget::should_stop(out)},"records":records,"partial":partial,"paused":false,"torn":true,"torn_reason":"process_not_paused","unsupported":"unregistered anonymous heap/FD/private scans; main-process enrollment only","object_sha256":format!("{:x}",Sha256::digest(std::fs::read(&self.metadata)?)),"btf_sha256":hex_bytes(&self.btf_hash)});
+            if let Err(error) = super::write_bound_notes(out, expected.pid, note) {
+                ksight_core::output_budget::record_failure(out, "bound_note_metadata_uncommitted");
+                return Err(error).context("bound notes not committed; raw payload retained");
             }
             if partial {
                 ksight_core::output_budget::record_failure(out, "bound_code_copy_partial");
@@ -1105,5 +1307,416 @@ mod preceding_source_identity_tests {
         });
         assert_eq!(receipt.admission, "qualified_live_copy");
         assert_eq!(sink, b"original task bytes");
+    }
+}
+
+#[cfg(test)]
+mod expanded_mapping_tests {
+    use super::*;
+    use std::io;
+
+    struct VirtualMap {
+        length: u64,
+        at: u64,
+        sparse_tail: bool,
+        max_read: usize,
+    }
+    impl Read for VirtualMap {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            self.max_read = self.max_read.max(bytes.len());
+            let n = usize::try_from((self.length - self.at).min(bytes.len() as u64)).unwrap();
+            bytes[..n].fill(0);
+            if self.sparse_tail && n != 0 && self.at + n as u64 == self.length {
+                bytes[n - 1] = 7;
+            }
+            self.at += n as u64;
+            Ok(n)
+        }
+    }
+    impl Seek for VirtualMap {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            if let SeekFrom::Start(at) = pos {
+                self.at = at;
+                Ok(at)
+            } else {
+                Err(io::Error::other("start seek only"))
+            }
+        }
+    }
+    #[derive(Default)]
+    struct CountingSink {
+        bytes: u64,
+        max_write: usize,
+        nonzero: usize,
+        last: u8,
+    }
+    impl Write for CountingSink {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.bytes += bytes.len() as u64;
+            self.max_write = self.max_write.max(bytes.len());
+            self.nonzero += bytes.iter().filter(|b| **b != 0).count();
+            if let Some(last) = bytes.last() {
+                self.last = *last;
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn registered_mapping_selection_removes_type_caps_but_reserves_finite_metadata() {
+        for requested in [
+            16 * 1024 * 1024 + 1,
+            64 * 1024 * 1024 + 1,
+            128 * 1024 * 1024 + 1,
+            121_491_456,
+        ] {
+            assert_eq!(
+                selected_range_bytes(requested, Some(requested + RANGE_METADATA_RESERVE)),
+                requested
+            );
+        }
+        assert_eq!(selected_range_bytes(100, Some(RANGE_METADATA_RESERVE)), 0);
+        assert_eq!(
+            selected_range_bytes(100, Some(RANGE_METADATA_RESERVE - 1)),
+            0
+        );
+        assert_eq!(
+            selected_range_bytes(100, Some(RANGE_METADATA_RESERVE + 1)),
+            1
+        );
+        assert_eq!(selected_range_bytes(u64::MAX, None), UNGUARDED_RANGE_LIMIT);
+        let text = "1000-2000 r-xp 00000000 00:00 0 /data/app/base.apk\n3000-5000 r-xp 00000000 00:00 0 /memfd:jit-cache";
+        let rows = crate::dexdump::parse_maps(text);
+        let ledger = candidate_ledger(&rows, Some(RANGE_METADATA_RESERVE));
+        assert_eq!(ledger["eligible_count"], 2);
+        for candidate in ledger["candidates"].as_array().unwrap() {
+            assert_eq!(candidate["selection_limit_bytes"], 0);
+            assert_eq!(candidate["state"], "planned_not_read");
+            assert!(candidate["actual_bytes"].is_null());
+        }
+        let (gap, truncation) = bound_copy_gap_state(BoundCopyStops {
+            stopped_early: true,
+            budget_stop: false,
+            saw_range_cap: false,
+            saw_budget_reserve: true,
+        });
+        assert_eq!(gap, "not_attempted_runtime_metadata_reserve");
+        assert_eq!(truncation, "runtime_payload_budget_metadata_reserve");
+    }
+
+    #[test]
+    fn large_sparse_tails_and_all_zero_bytes_are_retained_with_fixed_chunks() {
+        for (length, sparse_tail) in [
+            (16 * 1024 * 1024 + 1, true),
+            (64 * 1024 * 1024 + 1, true),
+            (128 * 1024 * 1024 + 1, true),
+            (65539, false),
+        ] {
+            let mut source = VirtualMap {
+                length,
+                at: 0,
+                sparse_tail,
+                max_read: 0,
+            };
+            let mut sink = CountingSink::default();
+            let receipt = copy_range(&mut source, &mut sink, 0, length, || Ok(()));
+            assert_eq!(receipt.requested_length, length);
+            assert_eq!(receipt.actual_length, length);
+            assert_eq!(receipt.read_status, "complete");
+            assert_eq!(receipt.write_status, "complete");
+            assert_eq!(receipt.admission, "qualified_live_copy");
+            assert_eq!(sink.bytes, length);
+            assert_eq!(sink.nonzero, usize::from(sparse_tail));
+            assert_eq!(sink.last, if sparse_tail { 7 } else { 0 });
+            assert!(source.max_read <= 65536 && sink.max_write <= 65536);
+        }
+    }
+
+    #[test]
+    fn original_parent_stop_between_chunks_retains_prefix_and_stops_further_reads() {
+        let root = std::env::temp_dir().join(format!("copy-parent-stop-{}", uuid::Uuid::new_v4()));
+        let _guard =
+            ksight_core::output_budget::Guard::install(vec![root.clone()], 1024 * 1024, 60000)
+                .unwrap();
+        let mut source = VirtualMap {
+            length: 200_000,
+            at: 0,
+            sparse_tail: true,
+            max_read: 0,
+        };
+        let mut sink = CountingSink::default();
+        let mut checks = 0;
+        let receipt = copy_range(&mut source, &mut sink, 0, 200_000, || {
+            checks += 1;
+            if checks == 3 {
+                ksight_core::output_budget::interrupt(&root, "cancel_requested");
+            }
+            if ksight_core::output_budget::should_stop(&root) {
+                bail!("parent_deadline_or_output_exhausted");
+            }
+            Ok(())
+        });
+        assert_eq!(source.at, 65536);
+        assert_eq!(sink.bytes, 65536);
+        assert_eq!(receipt.read_status, "interrupted");
+        assert_eq!(receipt.admission, "rejected_identity_or_deadline");
+        assert_eq!(checks, 3);
+    }
+}
+#[cfg(test)]
+mod bounded_note_tests {
+    use super::*;
+    fn check_note(
+        note: &Value,
+        package: &str,
+        expected: &[crate::qualified_code::SourceIdentity],
+    ) -> Result<(usize, usize, u64)> {
+        let rows = note["records"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("missing ranges"))?;
+        let source: crate::qualified_code::SourceIdentity =
+            serde_json::from_value(note["source"].clone())?;
+        source.validate()?;
+        if !expected.contains(&source)
+            || source.package != package
+            || note["schema"] != "kernsight.bound-code-copy/v1"
+            || note["paused"] != false
+            || note["candidate_result"]["budget_stop"] != false
+            || rows.is_empty()
+            || rows.len() > 65536
+            || note["candidate_result"]["attempted"].as_u64() != Some(rows.len() as u64)
+        {
+            bail!("unknown bound coverage");
+        }
+        let gap = &note["candidate_result"]["unattempted_state"];
+        if gap != "none"
+            && !(matches!(
+                gap.as_str(),
+                Some("not_attempted_parent_deadline" | "not_attempted_local_copy_window")
+            ) && note["candidate_result"]["stop_scope"] == "local_copy_window")
+        {
+            bail!("parent or unknown stop");
+        }
+        let mut admitted = 0;
+        let mut excluded = 0;
+        let mut excluded_bytes = 0;
+        for (index, row) in rows.iter().enumerate() {
+            let read = &row["read"];
+            let selected = row["selection_limit_bytes"].as_u64().unwrap_or(0);
+            if row["source"] != note["source"]
+                || selected == 0
+                || read["requested_length"].as_u64() != Some(selected)
+                || read["write_status"] != "complete"
+                || !read["write_error"].is_null()
+                || !matches!(
+                    row["selection_limit_reason"].as_str(),
+                    Some(
+                        "full_mapping_selected"
+                            | "per_range_cap"
+                            | "runtime_payload_budget_metadata_reserve"
+                    )
+                )
+            {
+                bail!("unverified source/range or write failure");
+            }
+            if row["admitted"] == true
+                && read["admission"] == "qualified_live_copy"
+                && read["read_status"] == "complete"
+                && read["read_error"].is_null()
+                && read["actual_length"].as_u64() == Some(selected)
+            {
+                admitted += 1;
+            } else if index + 1 == rows.len()
+                && excluded == 0
+                && row["admitted"] == false
+                && row["excluded_local_window"] == true
+                && row["post_copy_source_verified"] == true
+                && row["mapping_revalidated"] == true
+                && read["read_error"] == "local_copy_window_exhausted"
+                && ((read["admission"] == "rejected_identity_or_deadline"
+                    && matches!(read["read_status"].as_str(), Some("interrupted" | "complete")))
+                // copy_range's initial current() check uses these generic states
+                // even for a local-window stop before the first read. The exact
+                // reason and positive post-copy checks above still gate exclusion.
+                || (read["admission"] == "rejected_identity"
+                    && read["read_status"] == "not_attempted"
+                    && read["actual_length"].as_u64() == Some(0)
+                    && read.get("sha256").is_some_and(Value::is_null)))
+                && read["actual_length"]
+                    .as_u64()
+                    .is_some_and(|n| n <= selected)
+                && row["raw_evidence"]
+                    .as_str()
+                    .is_some_and(|name| name.ends_with(".pending") && !name.contains('/'))
+                && note["candidate_result"]["stop_scope"] == "local_copy_window"
+            {
+                excluded = 1;
+                excluded_bytes = read["actual_length"].as_u64().unwrap_or(0);
+            } else {
+                bail!("unverified range or IO/identity failure");
+            }
+        }
+        Ok((admitted, excluded, excluded_bytes))
+    }
+
+    fn source() -> Value {
+        json!({"package":"test.app","pid":1,"uid":10001,"birth_ns":1,"exec_id":1,"boot_id":"test-boot"})
+    }
+    fn complete(padding: usize) -> Value {
+        json!({"source":source(),"admitted":true,"selection_limit_bytes":1,
+            "selection_limit_reason":"full_mapping_selected","padding":"x".repeat(padding),
+            "read":{"admission":"qualified_live_copy","read_status":"complete",
+            "write_status":"complete","read_error":null,"write_error":null,"actual_length":1,"requested_length":1}})
+    }
+    fn note(records: Vec<Value>) -> Value {
+        json!({"schema":"kernsight.bound-code-copy/v1","source":source(),"paused":false,
+            "candidate_manifest":"bound-candidates-review","candidate_result":{"budget_stop":false,
+            "attempted":records.len(),"unattempted_state":"none","stop_scope":"none_or_parent_budget"},"records":Value::Array(records)})
+    }
+    fn validated_counts(bodies: &[Vec<u8>]) -> (usize, usize) {
+        let expected = vec![serde_json::from_value(source()).unwrap()];
+        let mut admitted = 0;
+        let mut excluded = 0;
+        for body in bodies {
+            assert!(body.len() <= NOTE_LIMIT);
+            let parsed: Value = serde_json::from_slice(body).unwrap();
+            let counts = check_note(&parsed, "test.app", &expected).unwrap();
+            admitted += counts.0;
+            excluded += counts.1;
+        }
+        assert!(bodies.len() <= NOTE_COUNT_LIMIT);
+        assert!(bodies.iter().map(Vec::len).sum::<usize>() <= NOTES_TOTAL_LIMIT);
+        (admitted, excluded)
+    }
+    #[test]
+    fn compact_1390_rows_remain_inside_the_current_validator_limits() {
+        let bodies = compact_bound_notes(note(vec![complete(700); 1390])).unwrap();
+        assert_eq!(validated_counts(&bodies), (1390, 0));
+        assert_eq!(bodies.len(), 1);
+    }
+    #[test]
+    fn bounded_shards_keep_all_actual_ranges_and_match_attempted() {
+        let bodies = compact_bound_notes(note(vec![complete(800_000); 3])).unwrap();
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(validated_counts(&bodies), (3, 0));
+    }
+    #[test]
+    fn only_the_last_global_local_window_is_excluded() {
+        let mut last = complete(800_000);
+        last["admitted"] = json!(false);
+        last["excluded_local_window"] = json!(true);
+        last["post_copy_source_verified"] = json!(true);
+        last["mapping_revalidated"] = json!(true);
+        last["raw_evidence"] = json!("bound-review.pending");
+        last["read"] = json!({"admission":"rejected_identity","read_status":"not_attempted",
+            "write_status":"complete","read_error":"local_copy_window_exhausted",
+            "write_error":null,"actual_length":0,"requested_length":1,"sha256":null});
+        let mut n = note(vec![complete(800_000), complete(800_000), last.clone()]);
+        n["candidate_result"]["unattempted_state"] = json!("not_attempted_local_copy_window");
+        n["candidate_result"]["stop_scope"] = json!("local_copy_window");
+        let bodies = compact_bound_notes(n).unwrap();
+        assert_eq!(validated_counts(&bodies), (2, 1));
+        assert!(compact_bound_notes(note(vec![last, complete(0)])).is_err());
+    }
+    #[test]
+    fn exact_note_and_total_size_boundaries_fail_closed_at_plus_one() {
+        let mut count = JsonCount {
+            count: 0,
+            limit: NOTE_LIMIT,
+        };
+        let chunk = vec![0u8; 65536];
+        for _ in 0..NOTE_LIMIT / 65536 {
+            count.write_all(&chunk).unwrap();
+        }
+        assert_eq!(count.count, NOTE_LIMIT);
+        assert!(count.write_all(&[0]).is_err());
+        let mut total = NOTES_TOTAL_LIMIT - NOTE_LIMIT;
+        admit_note_size(&mut total, NOTE_LIMIT).unwrap();
+        assert_eq!(total, NOTES_TOTAL_LIMIT);
+        assert!(admit_note_size(&mut total, 1).is_err());
+        assert!(admit_note_size(&mut 0, NOTE_LIMIT + 1).is_err());
+    }
+    #[test]
+    fn excessive_single_record_and_aggregate_are_never_silently_omitted() {
+        assert!(compact_bound_notes(note(vec![complete(NOTE_LIMIT)])).is_err());
+        assert!(compact_bound_notes(note(vec![complete(800_000); 12])).is_err());
+    }
+    #[test]
+    fn runtime_metadata_reserve_gap_is_not_disguised_as_local_time() {
+        let mut n = note(vec![complete(0)]);
+        n["candidate_result"]["unattempted_state"] =
+            json!("not_attempted_runtime_metadata_reserve");
+        n["candidate_result"]["stop_scope"] = json!("runtime_metadata_reserve");
+        let bodies = compact_bound_notes(n).unwrap();
+        let parsed: Value = serde_json::from_slice(&bodies[0]).unwrap();
+        let expected = vec![serde_json::from_value(source()).unwrap()];
+        assert!(check_note(&parsed, "test.app", &expected).is_err());
+        assert_eq!(
+            parsed["candidate_result"]["unattempted_state"],
+            "not_attempted_runtime_metadata_reserve"
+        );
+    }
+}
+
+#[cfg(test)]
+mod bound_note_production_proof_tests {
+    use super::*;
+    #[test]
+    fn production_shards_keep_real_1390_receipts_compatible_with_existing_proof() {
+        let root = std::env::temp_dir().join(format!("bound-note-proof-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("runtime")).unwrap();
+        let guard =
+            ksight_core::output_budget::Guard::install(vec![root.clone()], 16 * 1024 * 1024, 60000)
+                .unwrap();
+        let source = SourceIdentity {
+            package: "test.app".into(),
+            pid: 1,
+            uid: 10001,
+            birth_ns: 1,
+            exec_id: 1,
+            boot_id: "test-boot".into(),
+        };
+        let records = (0..1390).map(|_| json!({"source":source,"admitted":true,"selection_limit_bytes":1,"selection_limit_reason":"full_mapping_selected","padding":"x".repeat(1300),"read":{"admission":"qualified_live_copy","read_status":"complete","write_status":"complete","read_error":null,"write_error":null,"actual_length":1,"requested_length":1}})).collect::<Vec<_>>();
+        let note = json!({"schema":"kernsight.bound-code-copy/v1","source":source,"paused":false,"candidate_result":{"budget_stop":false,"attempted":1390,"unattempted_state":"none","stop_scope":"none_or_parent_budget"},"records":records});
+        write_bound_notes(&root.join("runtime"), source.pid, note).unwrap();
+        ksight_core::output_budget::write(root.join("dump-report.json"), serde_json::to_vec(&json!({"schema_version":crate::dump::PACKAGE_DUMP_SCHEMA,"package":"test.app","dump_id":uuid::Uuid::new_v4(),"agent_version":"test","artifacts":[{}],"mapped_code":[],"warnings":[]})).unwrap()).unwrap();
+        ksight_core::output_budget::record_failure(&root, "bound_code_copy_partial");
+        let proof =
+            crate::dump_coverage::proof(&root, "test.app", std::slice::from_ref(&source)).unwrap();
+        assert_eq!(proof["admitted_ranges"], 1390);
+        assert_eq!(proof["bound_notes"], 2);
+        assert_eq!(proof["payload_coverage_complete"], false);
+        drop(guard);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod metadata_omission_authority_tests {
+    use super::*;
+    #[test]
+    fn oversized_record_is_explicit_noncoverage_failure_not_a_trusted_prior_note() {
+        let root = std::env::temp_dir().join(format!("metadata-stop-{}", uuid::Uuid::new_v4()));
+        let guard =
+            ksight_core::output_budget::Guard::install(vec![root.clone()], 16 * 1024 * 1024, 60000)
+                .unwrap();
+        ksight_core::output_budget::record_failure(&root, "bound_code_copy_partial");
+        assert!(ksight_core::output_budget::bound_terminal_coverage(&root).is_some());
+        let mut used = 0;
+        assert!(track_record_metadata(
+            &root,
+            &json!({"padding":"x".repeat(NOTE_LIMIT)}),
+            &mut used
+        )
+        .is_err());
+        assert_eq!(used, 0);
+        assert!(guard
+            .receipt()
+            .failure_reasons
+            .contains(&"bound_note_metadata_exhausted".into()));
+        assert!(ksight_core::output_budget::bound_terminal_coverage(&root).is_none());
     }
 }
