@@ -43,6 +43,17 @@ fn valid_commit(value: &str) -> bool {
     matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn fresh_suffix() -> String {
+    let mut bytes = [0_u8; 4];
+    let generated = std::fs::File::open("/dev/urandom")
+        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut bytes))
+        .is_ok();
+    if !generated {
+        bytes = std::process::id().to_le_bytes();
+    }
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 fn watch(path: &Path) {
     // A nonexistent rerun-if-changed path would make Cargo rebuild on every call.
     if path.exists() {
@@ -120,13 +131,13 @@ fn main() {
         _ => panic!("set both KERNSIGHT_BUILD_GIT_COMMIT and KERNSIGHT_BUILD_GIT_DIRTY for an archive/release override"),
     };
     let base = env::var("CARGO_PKG_VERSION").expect("Cargo supplies the package version");
-    let suffix = commit.as_ref().map_or("unknown", |commit| &commit[..7]);
-    let state = match (commit.as_ref(), dirty) {
-        (_, Some(true)) => ".dirty",
-        (Some(_), None) => ".dirty-unknown",
-        _ => "",
-    };
-    println!("cargo:rustc-env=KERNSIGHT_BUILD_VERSION={base}+{suffix}{state}");
+    // One suffix, and it changes on every compile. The Git commit stays in
+    // KERNSIGHT_GIT_COMMIT and is not repeated here.
+    println!("cargo:rerun-if-changed=target/kernsight-build-nonce");
+    println!(
+        "cargo:rustc-env=KERNSIGHT_BUILD_VERSION={base}_{}",
+        fresh_suffix()
+    );
     println!(
         "cargo:rustc-env=KERNSIGHT_GIT_COMMIT={}",
         commit.as_deref().unwrap_or("")

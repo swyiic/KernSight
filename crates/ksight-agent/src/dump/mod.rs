@@ -868,7 +868,15 @@ pub fn dump_package_with(
                     Some(s) => s.iter().find(|s| s.pid == pid).cloned().ok_or_else(|| {
                         anyhow::anyhow!("dump PID absent from preceding qualified source")
                     })?,
-                    None => backend.qualify(package, pid, false)?.identity,
+                    None => match backend.qualify(package, pid, false) {
+                        Ok(qualified) => qualified.identity,
+                        Err(error) => {
+                            report.warnings.push(format!(
+                                "pid {pid} metadata qualification skipped: {error:#}"
+                            ));
+                            continue;
+                        }
+                    },
                 };
                 if let Some(copied) =
                     copy_qualified_or_stop(backend, &expected, &runtime, deadline)?
@@ -929,7 +937,15 @@ pub fn dump_package_with(
                         Some(s) => s.iter().find(|s| s.pid == pid).cloned().ok_or_else(|| {
                             anyhow::anyhow!("dump PID absent from preceding qualified source")
                         })?,
-                        None => backend.qualify(package, pid, false)?.identity,
+                        None => match backend.qualify(package, pid, false) {
+                            Ok(qualified) => qualified.identity,
+                            Err(error) => {
+                                report.warnings.push(format!(
+                                    "pid {pid} metadata qualification skipped: {error:#}"
+                                ));
+                                continue;
+                            }
+                        },
                     };
                     if let Some(copied) = copy_qualified_or_stop(backend, &expected, &runtime, mid)?
                     {
@@ -989,7 +1005,15 @@ pub fn dump_package_with(
                                     )
                                 })?
                             }
-                            None => backend.qualify(package, pid, false)?.identity,
+                            None => match backend.qualify(package, pid, false) {
+                                Ok(qualified) => qualified.identity,
+                                Err(error) => {
+                                    report.warnings.push(format!(
+                                        "pid {pid} metadata qualification skipped: {error:#}"
+                                    ));
+                                    continue;
+                                }
+                            },
                         };
                         if let Some(copied) =
                             copy_qualified_or_stop(backend, &expected, &runtime, second)?

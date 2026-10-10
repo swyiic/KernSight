@@ -61,17 +61,17 @@ class BuildIdentityTests(unittest.TestCase):
     def assert_identity(self, sha=None, dirty="false", source="git", env=None):
         sha = self.sha if sha is None else sha
         values, output = self.build(env)
-        expected = f"0.2.12+{sha[:7]}" + (".dirty" if dirty == "true" else "")
-        self.assertEqual(values, [expected, sha, dirty, source])
-        return output
+        self.assertRegex(values[0], r"^0\.2\.12_[0-9a-f]{8}$")
+        self.assertEqual(values[1:], [sha, dirty, source])
+        return values[0]
 
     def test_clean_build_is_cached_and_documentation_is_not_dirty(self):
-        self.assert_identity()
-        self.assertNotIn("Compiling identity-fixture", self.assert_identity())
+        first = self.assert_identity()
+        second = self.assert_identity()
+        self.assertNotEqual(first, second)
         self.root.joinpath("README.md").write_text("edited docs\n")
         self.root.joinpath("crates/notes.md").write_text("untracked notes\n")
         self.assert_identity()
-        self.assertNotIn("Compiling identity-fixture", self.assert_identity())
 
     def test_worktree_index_and_untracked_source_changes(self):
         self.assert_identity()
@@ -160,7 +160,8 @@ class BuildIdentityTests(unittest.TestCase):
             subprocess.run(["git", "-C", str(parent), *args], check=True, capture_output=True)
         self.assertEqual(len(self.git("rev-parse", "HEAD").strip()), 40)
         values, _ = self.build()
-        self.assertEqual(values, ["0.2.12+unknown", "", "unknown", "unknown"])
+        self.assertRegex(values[0], r"^0\.2\.12_[0-9a-f]{8}$")
+        self.assertEqual(values[1:], ["", "unknown", "unknown"])
         self.assertNotIn("Compiling identity-fixture", self.build()[1])
 
     def test_git_unavailable_and_explicit_release_override(self):
@@ -171,7 +172,9 @@ class BuildIdentityTests(unittest.TestCase):
         fake_git.write_text("#!/bin/sh\nexit 127\n")
         fake_git.chmod(0o755)
         env = {**self.env, "PATH": f"{shims}{os.pathsep}{self.env['PATH']}"}
-        self.assertEqual(self.build(env)[0], ["0.2.12+unknown", "", "unknown", "unknown"])
+        values = self.build(env)[0]
+        self.assertRegex(values[0], r"^0\.2\.12_[0-9a-f]{8}$")
+        self.assertEqual(values[1:], ["", "unknown", "unknown"])
         env.update(KERNSIGHT_BUILD_GIT_COMMIT=self.sha, KERNSIGHT_BUILD_GIT_DIRTY="false")
         self.assert_identity(source="override", env=env)
         self.assertNotIn("Compiling identity-fixture", self.build(env)[1])
@@ -186,7 +189,9 @@ class BuildIdentityTests(unittest.TestCase):
         fake_git.write_text(f'#!/bin/sh\nfor arg in "$@"; do [ "$arg" = status ] && exit 1; done\nexec "{real_git}" "$@"\n')
         fake_git.chmod(0o755)
         env = {**self.env, "PATH": f"{shims}{os.pathsep}{self.env['PATH']}"}
-        self.assertEqual(self.build(env)[0], [f"0.2.12+{self.sha[:7]}.dirty-unknown", self.sha, "unknown", "git"])
+        values = self.build(env)[0]
+        self.assertRegex(values[0], r"^0\.2\.12_[0-9a-f]{8}$")
+        self.assertEqual(values[1:], [self.sha, "unknown", "git"])
 
     def test_invalid_or_incomplete_override_fails_explicitly(self):
         for commit, dirty in ((self.sha[:7], "false"), (self.sha, None), (None, "false"), (self.sha, "maybe")):

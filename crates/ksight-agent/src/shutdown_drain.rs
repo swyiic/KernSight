@@ -1,4 +1,7 @@
 //! Ordered, bounded capture shutdown shared by live capture and offline fixtures.
+mod frozen;
+pub use frozen::{FrozenQueues, ReadFailure, ReadProgress, ReadStep, SourceDrain};
+
 /// Carve a shutdown reserve from an existing deadline without extending it.
 pub fn before_reserve(
     deadline: std::time::Instant,

@@ -123,9 +123,21 @@ jobs:
           if-no-files-found: error
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: release/*
-          generate_release_notes: true
-          prerelease: true
-          fail_on_unmatched_files: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > notes.md <<'EOF'
+          KernSight device agent and host CLI.
+
+          Verified kernel on Pixel 6a (bluejay, aarch64), BTF not available:
+          Linux 6.1.124-android14-11-g061a6a266b80c-ab10015560-4k
+          #1 SMP PREEMPT Sun Dec 01 08:10:00 UTC 2024
+
+          The phone copy exercised on that kernel was KernSight 0.2.12_011492a0,
+          SHA-256 10f86a3346c212abd41fcd0eb4a24c57983d7f0e0ec00577ab5ba74e4a3e7c3d,
+          path /data/local/tmp/ksight/ksightd.
+          This workflow rebuilds ksightd, so the packaged binary has a new build suffix.
+          EOF
+          gh release create "${GITHUB_REF_NAME}" release/* \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file notes.md

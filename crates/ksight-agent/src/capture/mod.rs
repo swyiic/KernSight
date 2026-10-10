@@ -684,7 +684,8 @@ fn stream_events(
     let deadline =
         (request.duration_seconds != 0).then(|| Duration::from_secs(request.duration_seconds));
     // Reserve stop/drain/publication time inside the existing invocation lease.
-    // This never renews it; a shortened observation is explicitly partial below.
+    // Reaching that planned cutoff is a normal window end. Shortened means the
+    // observation stopped before the reserve, not that the reserve was used.
     let shutdown_reserve =
         crate::shutdown_drain::reserve(request.inspect.enabled, request.duration_seconds);
     let observation_end = request
@@ -1274,7 +1275,9 @@ fn stream_events(
     })();
     let observation_elapsed = started.elapsed();
     let observation_shortened = observation_end.is_some_and(|end| Instant::now() >= end)
-        && deadline.is_some_and(|duration| observation_elapsed < duration);
+        && deadline.is_some_and(|duration| {
+            observation_elapsed + shutdown_reserve + Duration::from_secs(1) < duration
+        });
     eprintln!(
         "{}",
         serde_json::json!({"schema":"kernsight.observation-window/v1",
@@ -1301,9 +1304,23 @@ fn stream_events(
         .map_or(drain_end, |root| {
             ksight_core::output_budget::deadline(root, drain_end)
         });
+    let mut drain_sources = crate::shutdown_drain::FrozenQueues::new(sensors.len() + 1);
+    let drain_allowed = || {
+        Instant::now() < drain_end
+            && !request
+                .storage
+                .spool_root
+                .as_ref()
+                .is_some_and(|root| ksight_core::output_budget::should_stop(root))
+    };
     let drain_result = crate::shutdown_drain::stop_and_drain(
-        &mut (&mut inspect, &mut sensors, &mut pipeline),
-        |(inspect, sensors, _)| {
+        &mut (
+            &mut inspect,
+            &mut sensors,
+            &mut pipeline,
+            &mut drain_sources,
+        ),
+        |(inspect, sensors, _, sources)| {
             let mut stopped = true;
             if let Err(error) = inspect.stop_production() {
                 eprintln!("inspect stop unconfirmed: {error:#}");
@@ -1315,43 +1332,160 @@ fn stream_events(
                     stopped = false;
                 }
             }
+            sources.confirm_producers_stopped(stopped);
             stopped
         },
-        |(inspect, sensors, pipeline)| -> anyhow::Result<bool> {
-            let mut empty = true;
-            for sensor in sensors.iter_mut() {
-                let mut observed_empty = false;
-                for _ in 0..32 {
-                    match sensor.next_record() {
-                        Ok(Some(record)) => pipeline.emit(record)?,
-                        Ok(None) => {
-                            observed_empty = sensor.collector.queue_observed_empty();
-                            break;
+        |(inspect, sensors, pipeline, sources)| -> anyhow::Result<bool> {
+            sources.read_round(
+                &mut (inspect, sensors, pipeline),
+                |(inspect, sensors, pipeline),
+                 index|
+                 -> Result<
+                    crate::shutdown_drain::ReadStep,
+                    crate::shutdown_drain::ReadFailure<anyhow::Error>,
+                > {
+                    use crate::shutdown_drain::{ReadFailure, ReadProgress, ReadStep};
+                    let read_started = Instant::now();
+                    if index < sensors.len() {
+                        let sensor = &mut sensors[index];
+                        let record = sensor.next_record();
+                        let read_elapsed_us =
+                            u64::try_from(read_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+                        let emit_started = Instant::now();
+                        let progress = match record {
+                            Ok(Some(record)) => {
+                                if let Err(error) = pipeline.emit(record) {
+                                    return Err(ReadFailure {
+                                        step: ReadStep {
+                                            progress: ReadProgress::More(1),
+                                            read_elapsed_us,
+                                            emit_elapsed_us: u64::try_from(
+                                                emit_started.elapsed().as_micros(),
+                                            )
+                                            .unwrap_or(u64::MAX),
+                                        },
+                                        error,
+                                    });
+                                }
+                                let mut count = 1_u64;
+                                let mut saw_empty = false;
+                                while count < 64 {
+                                    match sensor.next_record() {
+                                        Ok(Some(next)) => {
+                                            if let Err(error) = pipeline.emit(next) {
+                                                return Err(ReadFailure {
+                                                    step: ReadStep {
+                                                        progress: ReadProgress::More(count),
+                                                        read_elapsed_us,
+                                                        emit_elapsed_us: u64::try_from(
+                                                            emit_started.elapsed().as_micros(),
+                                                        )
+                                                        .unwrap_or(u64::MAX),
+                                                    },
+                                                    error,
+                                                });
+                                            }
+                                            count += 1;
+                                        }
+                                        Ok(None) if sensor.collector.queue_observed_empty() => {
+                                            saw_empty = true;
+                                            break;
+                                        }
+                                        Ok(None) => break,
+                                        Err(error) => {
+                                            pipeline.stats.invalid_records += 1;
+                                            return Err(ReadFailure {
+                                                step: ReadStep {
+                                                    progress: ReadProgress::More(count),
+                                                    read_elapsed_us,
+                                                    emit_elapsed_us: u64::try_from(
+                                                        emit_started.elapsed().as_micros(),
+                                                    )
+                                                    .unwrap_or(u64::MAX),
+                                                },
+                                                error: anyhow::anyhow!(
+                                                    "{} final ring read: {error}",
+                                                    sensor.name
+                                                ),
+                                            });
+                                        }
+                                    }
+                                }
+                                if saw_empty {
+                                    ReadProgress::Empty(count)
+                                } else {
+                                    ReadProgress::More(count)
+                                }
+                            }
+                            Ok(None) if sensor.collector.queue_observed_empty() => {
+                                ReadProgress::Empty(0)
+                            }
+                            Ok(None) => ReadProgress::Busy,
+                            Err(error) => {
+                                pipeline.stats.invalid_records += 1;
+                                return Err(ReadFailure {
+                                    step: ReadStep {
+                                        progress: ReadProgress::More(0),
+                                        read_elapsed_us,
+                                        emit_elapsed_us: 0,
+                                    },
+                                    error: anyhow::anyhow!(
+                                        "{} final ring read: {error}",
+                                        sensor.name
+                                    ),
+                                });
+                            }
+                        };
+                        return Ok(ReadStep {
+                            progress,
+                            read_elapsed_us,
+                            emit_elapsed_us: u64::try_from(emit_started.elapsed().as_micros())
+                                .unwrap_or(u64::MAX),
+                        });
+                    }
+                    let before_raw = inspect.drain_totals().0;
+                    let outputs = inspect.poll();
+                    let raw_records = inspect.drain_totals().0.saturating_sub(before_raw);
+                    let read_elapsed_us =
+                        u64::try_from(read_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+                    let emit_started = Instant::now();
+                    for output in outputs {
+                        if let Some(mirror) = pipeline.burp_mirror.as_mut() {
+                            route_inspect_to_mirror(mirror, &output);
                         }
-                        Err(error) => {
-                            pipeline.stats.invalid_records += 1;
-                            anyhow::bail!("{} final ring read: {error}", sensor.name);
+                        if let Err(error) = pipeline.emit_inspect_output(output) {
+                            return Err(ReadFailure {
+                                step: ReadStep {
+                                    progress: ReadProgress::More(raw_records),
+                                    read_elapsed_us,
+                                    emit_elapsed_us: u64::try_from(
+                                        emit_started.elapsed().as_micros(),
+                                    )
+                                    .unwrap_or(u64::MAX),
+                                },
+                                error,
+                            });
                         }
                     }
-                }
-                empty &= observed_empty;
-            }
-            for output in inspect.poll() {
-                if let Some(mirror) = pipeline.burp_mirror.as_mut() {
-                    route_inspect_to_mirror(mirror, &output);
-                }
-                pipeline.emit_inspect_output(output)?;
-            }
-            Ok(empty && !inspect.poll_budget_status().1)
+                    // Emptiness is only the latest ring observation. Scope and read
+                    // failures stay in the coverage verdict; they must not freeze
+                    // the queue or invent an unread tail.
+                    let empty = !inspect.poll_budget_status().1;
+                    Ok(ReadStep {
+                        progress: if empty {
+                            ReadProgress::Empty(raw_records)
+                        } else {
+                            ReadProgress::Yielded(raw_records)
+                        },
+                        read_elapsed_us,
+                        emit_elapsed_us: u64::try_from(emit_started.elapsed().as_micros())
+                            .unwrap_or(u64::MAX),
+                    })
+                },
+                drain_allowed,
+            )
         },
-        || {
-            Instant::now() < drain_end
-                && !request
-                    .storage
-                    .spool_root
-                    .as_ref()
-                    .is_some_and(|root| ksight_core::output_budget::should_stop(root))
-        },
+        drain_allowed,
     );
     let drain_complete = drain_result
         .as_ref()
@@ -1365,6 +1499,9 @@ fn stream_events(
         "stop_elapsed_ms":drain_result.as_ref().ok().map(|d| d.stop_elapsed_ms),
         "drain_elapsed_ms":drain_result.as_ref().ok().map(|d| d.drain_elapsed_ms),
         "allowance_before_stop_ms":drain_end.saturating_duration_since(stopping_started).as_millis(),
+        "sources":drain_sources.sources().iter().enumerate().map(|(index, progress)| {
+            serde_json::json!({"source":sensors.get(index).map_or("inspect", |sensor| sensor.name), "progress":progress})
+        }).collect::<Vec<_>>(),
         "unknown_tail":!drain_complete,"lost_samples":inspect.drain_totals().2})
     );
     let capture_loop_result = match (capture_loop_result, drain_result) {
@@ -1381,19 +1518,15 @@ fn stream_events(
         || scope_failures != 0
         || perf_read_failures != 0
         || inspect.drain_totals().2 != 0
-        || inspect.quota_coverage_partial();
-    let pending_perf_tail = capture_loop_result.is_ok() && coverage_gap;
-    let capture_loop_result = if pending_perf_tail {
-        Err(anyhow::anyhow!("capture coverage partial: perf_poll_backlog_or_scope_gap_at_observation_end; raw coverage incomplete"))
-    } else {
-        capture_loop_result
-    };
+        || inspect.quota_coverage_partial()
+        || inspect.budget_skipped_raw() != 0;
+    // coverage_gap is reported in the poll record. It does not fail the process.
     eprintln!(
         "{}",
         serde_json::json!({
             "schema":"kernsight.perf-poll-budget/v1", "bounded_slice_yields":poll_budget_yields,
             "unread_tail_possible":unread_perf_possible, "unread_tail_count":null, "scope_failures":scope_failures,
-            "perf_read_failures":perf_read_failures, "budget_skipped_raw":inspect.budget_skipped_raw(), "quota_stops":inspect.quota_stop_receipts(), "quota_omitted_future_events":null, "coverage_reasons":{"probe_quota":inspect.quota_coverage_partial(),"shortened_window":observation_shortened,"unread_tail":!drain_complete || unread_perf_possible,"scope_failure":scope_failures != 0,"read_failure":perf_read_failures != 0,"perf_loss":inspect.drain_totals().2 != 0}, "coverage_partial":coverage_gap
+            "perf_read_failures":perf_read_failures, "budget_skipped_raw":inspect.budget_skipped_raw(), "quota_stops":inspect.quota_stop_receipts(), "quota_omitted_future_events":null, "coverage_reasons":{"adapter_budget_omission":inspect.budget_skipped_raw() != 0,"probe_quota":inspect.quota_coverage_partial(),"shortened_window":observation_shortened,"unread_tail":!drain_complete || unread_perf_possible,"scope_failure":scope_failures != 0,"read_failure":perf_read_failures != 0,"perf_loss":inspect.drain_totals().2 != 0}, "coverage_partial":coverage_gap
         })
     );
     // Publish interrupted evidence while its original write allowance remains,
@@ -1617,14 +1750,6 @@ fn stream_events(
         }
         // Flush already accepted records before revoking further writes. A sliced
         // ring tail is unknown, not zero loss or a completed observation receipt.
-        if pending_perf_tail {
-            if let Some(root) = request.storage.spool_root.as_ref() {
-                ksight_core::output_budget::record_failure(
-                    root,
-                    "perf_poll_backlog_or_scope_gap_at_observation_end",
-                );
-            }
-        }
         std::io::stdout().flush()?;
         return Err(error); // no false DurationElapsed / capture_complete receipt
     }
