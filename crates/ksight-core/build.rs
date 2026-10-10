@@ -51,7 +51,7 @@ fn fresh_suffix() -> String {
     if !generated {
         bytes = std::process::id().to_le_bytes();
     }
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    format!("{:08x}", u32::from_be_bytes(bytes))
 }
 
 fn watch(path: &Path) {

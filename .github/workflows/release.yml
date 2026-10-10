@@ -3,6 +3,8 @@ name: release
 on:
   workflow_dispatch:
   push:
+    branches:
+      - "release/actions-20261010"
     tags:
       - "v*"
 
@@ -15,15 +17,20 @@ env:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: stable
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.91.1
+          toolchain: stable
           components: clippy,rustfmt
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets
+      - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - run: cargo test --manifest-path vendor/aya/Cargo.toml --lib maps::perf::perf_buffer::tests
       - run: python3 scripts/test_build_identity.py
       - run: cargo run -p xtask -- architecture
 
@@ -45,6 +52,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.91.1
@@ -78,6 +87,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.91.1
@@ -107,6 +118,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -123,27 +136,75 @@ jobs:
           path: release/*
           if-no-files-found: error
       - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/release/actions-20261010'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          release_tag="${GITHUB_REF_NAME}"
+          prerelease_args=()
+          if [[ "${GITHUB_REF}" == "refs/heads/release/actions-20261010" ]]; then
+            base_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+            test -n "$base_version"
+            release_tag="v${base_version}-build.${GITHUB_SHA:0:8}"
+            prerelease_args=(--prerelease)
+          fi
           cat > notes.md <<'EOF'
           KernSight device agent and host CLI.
 
-          Verified kernel on Pixel 6a (bluejay, aarch64), BTF not available:
+          Assets:
+          - ksightd-android-arm64: ARM64 Android device agent, statically linked
+            for aarch64-unknown-linux-musl. Includes seven ordinary eBPF sensor
+            objects and two qualified-code eBPF objects.
+          - kernsight-cli-linux-x86_64.tar.gz: x86_64-unknown-linux-gnu host CLI.
+          - kernsight-cli-linux-aarch64.tar.gz: aarch64-unknown-linux-musl host CLI.
+          - kernsight-cli-macos-arm64.tar.gz: aarch64-apple-darwin host CLI.
+          - SHA256SUMS: SHA-256 checksums for the four downloadable assets.
+
+          Device compatibility:
+          - ARM64 Android with root authorization and a security policy allowing
+            the required BPF, perf-event and tracefs operations.
+          - Baseline collection requires BPF ring-buffer maps/helpers, the
+            probe-read helpers, and the BPF v3/atomic instructions emitted by
+            this build. Required tracepoints and their record layouts must match.
+          - Readable kernel BTF is not a universal requirement for ordinary
+            tracepoint sensors. Qualified task-bound code collection additionally
+            requires matching kernel BTF/CO-RE, task iterators, task-storage maps,
+            pidfds and supported task helpers. It must refuse unsupported kernels.
+          - Binder and userspace inspection require their particular tracepoints,
+            kprobe/uprobe/perf support and matching target layouts. No universal
+            Android release or kernel-version support guarantee is made.
+          - Run ksightd probe --json and ksightd code-capabilities, then validate
+            loading, attachment and real event output for the selected sensors.
+            Read-only probing alone does not establish runtime compatibility.
+
+          Historical device-test record from the existing v0.2.12 release notes:
+          https://github.com/swyiic/KernSight/releases/tag/v0.2.12
+          This workflow did not independently repeat that device test.
+          Pixel 6a (bluejay, aarch64), BTF not available:
           Linux 6.1.124-android14-11-g061a6a266b80c-ab10015560-4k
           #1 SMP PREEMPT Sun Dec 01 08:10:00 UTC 2024
+          Exercised phone copy: KernSight 0.2.12_011492a0
+          SHA-256: 10f86a3346c212abd41fcd0eb4a24c57983d7f0e0ec00577ab5ba74e4a3e7c3d
+          Path: /data/local/tmp/ksight/ksightd
 
-          The phone copy exercised on that kernel was KernSight 0.2.12_011492a0,
-          SHA-256 10f86a3346c212abd41fcd0eb4a24c57983d7f0e0ec00577ab5ba74e4a3e7c3d,
-          path /data/local/tmp/ksight/ksightd.
-          This workflow rebuilds ksightd, so the packaged binary has a new build suffix.
+          These assets were rebuilt by GitHub Actions and have new build suffixes.
+          CI validates formatting, strict Clippy, workspace tests, vendored Aya
+          perf-buffer tests, build identity and architecture checks. It does not
+          run the released agent on an Android device. The recorded no-BTF test
+          does not validate the BTF-dependent backend. Other devices and kernels,
+          including other 6.1 builds, require their own runtime validation.
           EOF
-          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            gh release upload "${GITHUB_REF_NAME}" release/* --clobber
-            gh release edit "${GITHUB_REF_NAME}" --notes-file notes.md
-          else
-            gh release create "${GITHUB_REF_NAME}" release/* \
-              --title "${GITHUB_REF_NAME}" \
-              --notes-file notes.md
+          printf '\nSource commit: %s\nWorkflow: https://github.com/%s/actions/runs/%s\n' \
+            "$GITHUB_SHA" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" >> notes.md
+          # Never replace an existing release or retarget an existing tag.
+          if gh release view "$release_tag" >/dev/null 2>&1; then
+            echo "Release $release_tag already exists; refusing to overwrite assets."
+            exit 1
           fi
+          gh release create "$release_tag" release/* \
+            --target "$GITHUB_SHA" \
+            --title "$release_tag" \
+            "${prerelease_args[@]}" \
+            --notes-file notes.md
+
