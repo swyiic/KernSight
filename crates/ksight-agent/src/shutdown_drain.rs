@@ -248,7 +248,7 @@ mod tests {
         assert!(end.producers_stopped);
         assert!(!end.complete());
         assert_eq!(end.rounds, 0);
-        assert!(q.retained.is_empty());
+        assert_eq!(q.retained, [] as [u32; 0]);
         assert_eq!(q.queued, [1]);
         assert_eq!(q.loss, 7);
     }
