@@ -12,7 +12,12 @@ fn human_version_includes_source_identity() {
         String::from_utf8(output.stdout).unwrap().trim(),
         format!("ksightd {}", ksight_core::build_info::VERSION)
     );
-    assert!(ksight_core::build_info::VERSION.starts_with(concat!(env!("CARGO_PKG_VERSION"), "+")));
+    let version = ksight_core::build_info::VERSION;
+    let prefix = concat!(env!("CARGO_PKG_VERSION"), "_");
+    assert!(version.starts_with(prefix), "{version}");
+    let suffix = &version[prefix.len()..];
+    assert_eq!(suffix.len(), 8, "{version}");
+    assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()), "{version}");
 }
 
 #[test]
