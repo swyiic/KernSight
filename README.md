@@ -1,357 +1,77 @@
-KernSight
+# KernSight
 
-KernSight 是 Android 内核分析工具。
-基于 eBPF 采集进程、文件、内存映射、网络、Binder 和调度事实，由设备端 `ksightd` 归一化并持久化，
-再通过 `ksightctl` 完成控制、回放、聚合。G
+**从内核观察行为，从运行时提取证据。**
 
-开发基线是 Pixel 6a、Android 16 (SDK 36) 、arm64-v8a。
+KernSight 希望减少分析工作对传统脱壳流程的依赖：通过 eBPF 观察内核行为，结合按需启用的用户态探针和内存快照，提取有分析价值的代码、通信与运行证据。
 
-## 覆盖范围
-- 覆盖常见 Android 应用栈；
-- 远超常规动态砸壳，抓取内存中各种Key，CE/DE，以及其他明文信息，可适用大部分金融类，政务类，购物类，短视频类app；
+设备端 `ksightd` 负责采集与持久化，电脑端 `ksightctl` 负责控制、回放和报告。可独立使用，也可接入 MobileE。
 
-## 编译环境
+## 能做什么
 
-### PC 端
+- **观察运行行为**：进程与线程、文件访问、网络连接、内存映射、Binder 和调度唤醒
+- **整理代码证据**：APK/DEX、已加载 SO 与部分运行时内存映像，保留哈希、进程和映射来源
+- **按需检查语义边界**：在适配与权限满足时，采集 TLS、JNI、Linker 等边界上的有限证据
+- **回放与关联**：保存会话、生成报告和关联图，区分直接证据、关联与推断
 
-推荐使用 macOS（Apple Silicon）或 Linux x86_64/ARM64：
+eBPF 提供内核观察；进程内存、DEX 和用户态明文由相应探针或 Dump 路径补充。实际覆盖以设备能力与本次证据报告为准。
 
-- Git、Make
-- Rust stable，最低支持版本 `1.85`
-- `rustfmt`、`clippy`
-- LLVM/Clang，且 Clang 必须支持 `-target bpfel`
-- Android Platform Tools（`adb`）
+## 下载与开始
 
-macOS 使用 Homebrew 时可以安装：
+1. 从 [Releases](https://github.com/swyiic/KernSight/releases) 下载对应文件：
 
-```bash
-brew install rustup-init llvm android-platform-tools make
-rustup-init
-rustup component add rustfmt clippy
-```
+| 用途 | 文件 |
+| --- | --- |
+| ARM64 Android 设备端 | `ksightd-android-arm64` |
+| Linux x86_64 / ARM64 电脑端 | `kernsight-cli-linux-x86_64.tar.gz` / `kernsight-cli-linux-aarch64.tar.gz` |
+| Apple Silicon 电脑端 | `kernsight-cli-macos-arm64.tar.gz` |
+| 完整性校验 | `SHA256SUMS` |
 
-Makefile 会优先使用 `/opt/homebrew/opt/llvm/bin/clang`。也可以显式指定：
+2. 按[安装与能力检查](docs/usage.md#安装与能力检查)部署。需要 ARM64 Android、root 授权，以及允许 BPF/perf/tracefs 操作的内核与安全策略
+3. 打开已获授权的目标应用，替换包名，开始一个短会话：
 
 ```bash
-make bpf BPF_CLANG=/absolute/path/to/clang
-```
-
-### Android 设备端
-
-当前设备构建目标为 `aarch64-unknown-linux-musl`，要求：
-
-- ARM64 Android 设备
-- 已开启 USB 调试并被当前 PC 授权
-- 具备管理员控制权；当前部署流程需要 `su`
-- 内核支持 eBPF、BTF、tracefs、ring buffer 及所用 tracepoint
-- 测试环境：6.1.124-android14，其他 Android/内核版本必须重新执行能力探测
-
-KernSight 目前部署到 `/data/local/tmp/ksight`。AOSP init、独立 SELinux 域、AVB 签名及锁定自定义信任根仍属于后续系统集成工作。
-
-## 获取源码
-
-```bash
-git clone https://github.com/swyiic/KernSight.git
-cd KernSight
-```
-
-## 检查与测试
-
-```bash
-cargo check --workspace --all-targets
-cargo test --workspace
-python3 scripts/test_build_identity.py
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo run -p xtask -- architecture
-```
-
-也可以使用 `make check`、`make test`、`make fmt`、`make lint` 和 `make architecture`。
-
-## 编译
-
-### 构建身份
-
-`ksightd --version` 和 `ksightctl --version` 在基础版本后追加编译时的 Git 短提交号，例如
-`0.2.12+03e97b4`；相关源码有未提交修改时显示 `0.2.12+03e97b4.dirty`。
-版本标记保存在二进制中，查询版本不需要 Git，也不会触发编译。短提交号用于人工辨认，
-精确核对部署仍应使用完整提交号和实际二进制 SHA-256。
-
-`ksightd code-capabilities` 保留 `kernsight.code-capabilities/v1` 和纯基础版本
-`agent_version`，并增加 `agent_build_version`、`agent_git_commit`（完整 SHA 或 null）、
-`agent_git_dirty`（true / false / null）、`agent_build_identity_source`（git / override / unknown）。
-现有 `agent_sha256` 仍是当前运行二进制的 SHA-256；协议握手和兼容性版本不变。
-旧代理没有新增字段时，客户端应显示构建身份未知，不应拿本机仓库版本代替设备版本。
-
-Dirty 检查包含 Cargo 清单/锁文件、Makefile、工具链配置，以及 `.cargo`、`crates`、`bpf`、
-`native`、`android`、`rules`、`xtask`、`scripts` 下的已跟踪修改、暂存修改和未忽略的新文件。
-Markdown/reStructuredText 文档、其他本地笔记、Git 忽略的构建产物不计入 dirty。
-Cargo 会监视源码目录和 Git 元数据（包含 HEAD、refs、index、packed refs 和 worktree）；
-更改后下次构建会更新标记，未更改时复用缓存。完整 checkout 保留 `.cargo/.gitkeep`，
-确保新 Cargo 配置也能触发更新；根 `.gitignore` 的变更同样会重新检查。
-若 Git checkout 缺失声明的输入路径，会保守地每次重新检查，恢复路径后继续复用缓存。
-标记不含时间戳或主机信息。
-
-源码压缩包或无法读取 Git 时默认显示 `0.2.12+unknown`，不猜测提交号；若仅 dirty 状态
-无法读取，则显示 `0.2.12+<短提交号>.dirty-unknown`。可复现发布流水线若已验证源码，
-可同时显式设置 `KERNSIGHT_BUILD_GIT_COMMIT=<完整提交 SHA>` 和
-`KERNSIGHT_BUILD_GIT_DIRTY=false`（有修改则 true）；覆盖来源会标记为 override。
-缺失其中一个变量、无效 SHA 或非 true/false 的 dirty 值会使构建失败。覆盖值是发布者声明，
-不是脚本对源码的独立验证；常规 Git checkout 发布无需设置它们。
-
-
-### PC 端 CLI
-
-```bash
-cargo build --release -p ksight-cli
-```
-
-产物为 `target/release/ksightctl`。开发时可以直接运行：
-
-```bash
-cargo run -q -p ksight-cli -- capabilities
-```
-
-### eBPF 对象
-
-```bash
-make bpf
-```
-
-对象生成在 `build/bpf/`，包括进程、文件、网络、内存、Binder、调度和 uprobe 传感器。
-这些是生成物，不应提交到 Git。
-
-### Android 设备端代理
-
-```bash
-make device-target
-make device
-```
-
-设备端二进制为 `target/aarch64-unknown-linux-musl/release/ksightd`。
-它是单文件设备发行版：7 个 eBPF 对象、默认服务配置、hide-debug 辅助脚本以及原生框架
-规则均编译在 `ksightd` 内。第一次执行采集、Dump 或服务命令时，程序会自动在
-`/data/local/tmp/ksight` 安装并校验内部运行资源；用户不需要逐个复制这些文件。
-
-### 只使用一个设备端二进制
-
-从 GitHub Release 下载 `ksightd-android-arm64`，或使用上面的 `make device` 自行编译。
-电脑到手机只需执行一次 push：
-
-```bash
-adb push ksightd-android-arm64 /data/local/tmp/ksightd
-adb shell su -c 'chmod 0755 /data/local/tmp/ksightd'
-```
-
-随后可以直接探测和采集，不依赖 PC 端 `ksightctl`：
-
-```bash
-adb shell su -c '/data/local/tmp/ksightd probe --json'
-adb shell su -c '/data/local/tmp/ksightd capture --all \
-  --duration-seconds 30 \
-  --spool-dir /data/local/tmp/ksight/spool \
-  --json'
-```
-
-按包采集：
-
-```bash
-adb shell su -c '/data/local/tmp/ksightd capture \
+adb shell su -c '/data/local/tmp/ksight/ksightd capture \
   --package com.example.app \
   --files --network --memory --binder \
-  --duration-seconds 45 \
-  --spool-dir /data/local/tmp/ksight/spool \
-  --json'
-```
-
-这里的“单文件”是指安装和分发只需要 `ksightd`。eBPF 加载器仍需要把内嵌对象释放到
-设备私有运行目录，这是程序自动且带内容校验完成的，不需要用户手工管理。
-
-### 一步编译并部署
-
-先确认设备：
-
-```bash
-adb devices -l
-```
-
-只有一台设备时：
-
-```bash
-make deploy
-```
-
-有多台设备时限定序列号：
-
-```bash
-make deploy ADB="adb -s <serial>"
-```
-
-部署后执行只读能力探测：
-
-```bash
-make probe ADB="adb -s <serial>"
-```
-
-部署会更新 `/data/local/tmp/ksight`，需要设备端 `su` 授权。
-
-## 基本用法
-
-已编译 release 版本，选择android版本即可。
-
-推送文件：
-```bash
-adb push ~/../ksightd-android-arm64 /data/local/tmp/ksightd
-adb shell su -c 'chmod 0755 /data/local/tmp/ksightd'
-```
-能力检测：
-```bash
-adb shell su -c '/data/local/tmp/ksightd probe --json'
-```
-全设备采集：
-```bash
-adb shell su -c '/data/local/tmp/ksightd capture \
-  --all \
   --duration-seconds 30 \
-  --spool-dir /data/local/tmp/ksight/spool \
-  --json'
-```
-指定应用采集：
-```bash
-adb shell su -c '/data/local/tmp/ksightd capture \
-  --package com.example.app \
-  --files --network --memory --binder \
-  --duration-seconds 60 \
-  --spool-dir /data/local/tmp/ksight/spool \
-  --json'
-```
-查看 Session：
-```bash
-adb shell su -c '/data/local/tmp/ksightd spool replay <SESSION_UUID>'
-```
-回放指定 Session：
-```bash
-adb shell su -c '/data/local/tmp/ksightd spool replay <SESSION_UUID>'
-```
-采集某个包的 L2 证据：
-```bash
-adb shell su -c '/data/local/tmp/ksightd dump-package \
-  --package com.example.app \
-  --dest /data/local/tmp/ksight/packages/com.example.app \
-  --launch \
-  --json'
+  --spool-dir /data/local/tmp/ksight/spool --json'
 ```
 
-### 查看能力
+仅用设备端也能采集；电脑端 CLI 可进一步查看会话：
 
 ```bash
-cargo run -q -p ksight-cli -- capabilities
-cargo run -q -p ksight-cli -- keypoints
-cargo run -q -p ksight-cli -- device --serial "$SERIAL" probe
+ksightctl device sessions
+ksightctl device report <SESSION_UUID> --json
 ```
 
-`keypoints` 只列出经过审查的 ART、JNI、linker、Binder、TLS 和 QUIC 适配点，不会自动
-启用探针。
+| 常用参数 | 用途 |
+| --- | --- |
+| `--package NAME` | 限定目标包 |
+| `--duration-seconds N` | 限定采集时长 |
+| `--files --network --memory --binder` | 选择所需传感器 |
+| `--spool-dir PATH` | 设备端持久化目录；CLI 对应 `--spool` |
+| `--json` | 结构化输出 |
 
-### 全设备短时采集
+更多参数、Dump、Inspect、回放及清理见[使用指南](docs/usage.md)。编译、部署和构建身份见[开发指南](docs/development.md)。
 
-```bash
-cargo run -q -p ksight-cli -- device --serial "$SERIAL" capture \
-  --all --duration-seconds 30 --spool
-```
+## 历史验证记录
 
-全设备模式适合建立 L0 内核事实基线。调度和高频网络 I/O 会产生较大事件量，建议先用
-短时会话并观察丢失统计。
+以下来自公开仓库中的基线记录，均有范围限制；本次 Actions 构建没有重新进行真机验证。
 
-### 按包名采集
+| 场景 | 已记录结果 | 边界 |
+| --- | --- | --- |
+| Pixel 6a 设备运行 | [v0.2.12 发布说明](https://github.com/swyiic/KernSight/releases/tag/v0.2.12)记录了实际使用的代理与内核 | 历史二进制，不能替代本次发布文件的验收 |
+| FD 生命周期与 Binder FD 传递 | [能力记录](crates/ksight-core/src/capability.rs)记载 clone/close_range，以及 system_server → Settings 的带来源 FD 传递 | 该能力仍为 partial，io_uring 等路径不完整 |
+| Binder 接口名称关联 | 同一[能力记录](crates/ksight-core/src/capability.rs)记载 Pixel 6a 的一次 8 秒窗口中约 97% 获得名称 | 单次历史窗口，不能推广为整体覆盖率 |
 
-```bash
-cargo run -q -p ksight-cli -- device --serial "$SERIAL" capture \
-  --package com.example.app \
-  --files --network --binder --memory \
-  --duration-seconds 45 --spool
-```
+## 内核兼容性
 
-显式检查 TLS 边界属于可见性更高的 Inspect 操作，只应在授权测试中短时启用：
+历史记录的完整内核为 `6.1.124-android14-11-g061a6a266b80c-ab10015560-4k`，设备为 Pixel 6a；当时 BTF 不可用。
 
-```bash
-cargo run -q -p ksight-cli -- device --serial "$SERIAL" capture \
-  --package com.example.app --inspect-tls \
-  --duration-seconds 30 --spool
-```
+普通 tracepoint 采集和依赖 BTF 的 qualified code 后端有不同要求。其他 6.1 构建及 5.10、5.15、6.6 等版本均需逐设备验证，不能只按版本号判断支持。详见[内核要求与验证范围](docs/usage.md#内核要求与验证范围)。
 
-## 以下针对开发环境
-### 查看和解析会话
+## 使用边界
 
-```bash
-cargo run -q -p ksight-cli -- device --serial "$SERIAL" sessions
-cargo run -q -p ksight-cli -- device --serial "$SERIAL" report <session-uuid>
-cargo run -q -p ksight-cli -- device --serial "$SERIAL" report <session-uuid> --json
-cargo run -q -p ksight-cli -- device --serial "$SERIAL" replay <session-uuid> --after 0
-```
+仅分析自有或明确获授权的设备与应用。Inspect 和 Dump 可能影响目标执行；明文、内存和私有数据应限定范围并妥善保管。当前不承诺隐形运行、通用 root 隐藏或反检测。报告中的 partial、丢样和未知覆盖必须保留。
 
-- `report`：面向人的确定性聚合报告。
-- `report --json`：供 MobileE 或其他工具解析。
-- `replay`：按批次查看原始事件证据。
-- 读取报告不会自动确认或删除设备端批次。
-
-### 拉取应用产物
-
-```bash
-cargo run -q -p ksight-cli -- device --serial "$SERIAL" pull-package \
-  --package com.example.app
-# apps that check USB debugging:
-cargo run -q -p ksight-cli -- device --serial "$SERIAL" pull-package \
-  --package com.example.app --launch --hide-debug
-# apps that check root, Magisk present:
-cargo run -q -p ksight-cli -- device --serial "$SERIAL" pull-package \
-  --package com.example.app --launch --denylist
-```
-
-该流程编目 APK DEX、内存 DEX、Native SO、明文片段和 key candidate，并生成
-`mobilee.kernsight-package-dump/v2` 报告。同内容 DEX 按 SHA-256 聚合为逻辑 DEX Set，
-但原始文件和 PID、VMA、路径来源会被保留。
-
-重新编目或显式清理某个包：
-
-```bash
-cargo run -q -p ksight-cli -- device --serial "$SERIAL" recatalog-package \
-  --package com.example.app
-cargo run -q -p ksight-cli -- device --serial "$SERIAL" cleanup-package \
-  --package com.example.app
-```
-
-清理操作会删除对应包的设备端证据，执行前应确认已经完成所需备份。
-
-## MobileE 联动
-
-MobileE 通过共享的 `ksight-protocol` 和 `ksight-core` 与设备通信，可完成：
-
-- 选择设备、目标包并点击控制采集
-- 展示进程、线程、文件、Socket、Binder 和内存映射统计
-- 展开 DEX Set 的 SHA-256、PID、VMA 和来源文件
-- 展示壳/加固及密码框架候选规则命中
-- 查看原始事件、明文片段和关联图
-- 将有界、结构化会话摘要交给 AI 辅助分析
-
-MobileE 是 KernSight 的客户端；KernSight 不依赖 MobileE，也可以完全通过 CLI 使用。
-
-## 证据边界
-
-- `confirmed`：由稳定内核标识或经过验证的探针直接证明。
-- `correlated`：具有明确关联依据，但不能证明运行时因果。
-- `inferred`：规则或分析推断，必须显示置信度和依据。
-
-SO 文件名或路径命中只能说明壳、加固或密码框架候选，不能单独证明具体版本和行为。
-DEX 与 VMA 地址重叠也不能自动证明某次 mmap 导致了对应 DEX 的执行。
-
-## 安全与适用范围
-
-本项目仅用于学习目的。目前不做隐形运行，也不提供通用的 root 隐藏、应用完整性绕过或反检测保证。
-应用仍可能观察到 bootloader、root、调试设置、内核差异、探针状态或时序变化。
-
-默认全局 Observe 和选定进程 Inspect 应保持分离。明文、密钥候选、内存快照等敏感证据需要限制目标、时间和大小，并由操作者负责保存、访问控制和清理。
-
-## License
-
-Apache-2.0
+[Apache-2.0](LICENSE)
