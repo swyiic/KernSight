@@ -22,7 +22,6 @@ eBPF 提供内核观察；进程内存、DEX 和用户态明文由相应探针�
 | 用途 | 文件 |
 | --- | --- |
 | ARM64 Android 设备端 | `ksightd-android-arm64` |
-| Linux x86_64 / ARM64 电脑端 | `kernsight-cli-linux-x86_64.tar.gz` / `kernsight-cli-linux-aarch64.tar.gz` |
 | Apple Silicon 电脑端 | `kernsight-cli-macos-arm64.tar.gz` |
 | 完整性校验 | `SHA256SUMS` |
 
@@ -60,8 +59,8 @@ ksightctl device report <SESSION_UUID> --json
 
 | 场景 | 已记录结果 | 边界 |
 | --- | --- | --- |
-| Pixel 6a 设备运行 | [v0.2.12 发布说明](https://github.com/swyiic/KernSight/releases/tag/v0.2.12)记录了实际使用的代理与内核 | 历史二进制，不能替代本次发布文件的验收 |
-| FD 生命周期与 Binder FD 传递 | [能力记录](crates/ksight-core/src/capability.rs)记载 clone/close_range，以及 system_server → Settings 的带来源 FD 传递 | 该能力仍为 partial，io_uring 等路径不完整 |
+| Pixel 6a 设备运行 | [v0.2.12 发布说明](https://github.com/swyiic/KernSight/releases/tag/v0.2.12)记录了实际使用的代理与内核 | 历史二进制，仍在开发中 |
+| FD 生命周期与 Binder FD 传递 | [能力记录](crates/ksight-core/src/capability.rs)记载 clone/close_range，以及 system_server → Settings 的带来源 FD 传递 | 该能力仍为 partial，io_uring 等路径不完整，加载某些App瞬时内存超过写入速度会造成内存丢样等，持续优化中 |
 | Binder 接口名称关联 | 同一[能力记录](crates/ksight-core/src/capability.rs)记载 Pixel 6a 的一次 8 秒窗口中约 97% 获得名称 | 单次历史窗口，不能推广为整体覆盖率 |
 
 ## 内核兼容性
@@ -72,6 +71,6 @@ ksightctl device report <SESSION_UUID> --json
 
 ## 使用边界
 
-仅分析自有或明确获授权的设备与应用。Inspect 和 Dump 可能影响目标执行；明文、内存和私有数据应限定范围并妥善保管。当前不承诺隐形运行、通用 root 隐藏或反检测。报告中的 partial、丢样和未知覆盖必须保留。
+Inspect 和 Dump 可能影响目标执行；明文、内存和私有数据应限定范围并妥善保管。当前阶段不做隐形运行、通用 root 隐藏或反检测。报告中的 partial、丢样和未知覆盖会保留进行分析完善。
 
 [Apache-2.0](LICENSE)
