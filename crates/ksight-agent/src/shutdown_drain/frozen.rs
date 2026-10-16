@@ -251,7 +251,7 @@ mod tests {
             }
         }
         assert_eq!(retained, (0..150).collect::<Vec<_>>());
-        assert!(tail.is_empty());
+        assert_eq!(tail, std::collections::VecDeque::new());
         assert_eq!(empty_polls, 1);
         assert_eq!(rounds, 5);
         assert!(now.get() < deadline);
@@ -423,7 +423,7 @@ mod tests {
             || true,
         );
         assert_eq!(result, Err("publication failure"));
-        assert!(raw.is_empty()); // The payload read already happened, even though publication failed.
+        assert_eq!(raw, std::collections::VecDeque::new()); // The payload read already happened, even though publication failed.
         assert_eq!(committed_prefix, [0, 1]); // Previously published prefix stays owned by the consumer.
         let s = &ledger.sources()[0];
         assert_eq!(s.raw_records, 3);

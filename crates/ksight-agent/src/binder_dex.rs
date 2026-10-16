@@ -1231,7 +1231,7 @@ mod budget_tests {
         );
         assert_eq!(cache.lookup(42, "sample.Interface", 7), None);
         assert!(cache.lookup_deferred());
-        assert!(cache.token_miss.is_empty());
+        assert_eq!(cache.token_miss, std::collections::HashSet::<(u32, String)>::new());
         cache.tables.insert(
             42,
             HashMap::from([(
