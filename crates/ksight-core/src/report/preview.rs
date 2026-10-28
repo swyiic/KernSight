@@ -130,20 +130,31 @@ pub(super) fn stitch_preview(existing: &str, next: &str) -> String {
             .saturating_add(1)
             .min(PREVIEW_STITCH_CAP),
     );
-    out.push_str(existing);
+    append_preview_bounded(&mut out, existing);
+    if existing.len() >= PREVIEW_STITCH_CAP {
+        return out;
+    }
     let next_trim = next.trim_start();
     if !existing.ends_with('\n')
         && (next_trim.starts_with("http://")
             || next_trim.starts_with("https://")
             || next_trim.starts_with("HTTP/"))
     {
-        out.push('\n');
+        append_preview_bounded(&mut out, "\n");
     }
-    out.push_str(next);
-    if out.len() > PREVIEW_STITCH_CAP {
-        out.truncate(PREVIEW_STITCH_CAP);
-    }
+    append_preview_bounded(&mut out, next);
     out
+}
+
+// Bound before appending: never allocate the full incoming preview or split UTF-8.
+fn append_preview_bounded(out: &mut String, value: &str) {
+    let mut end = value
+        .len()
+        .min(PREVIEW_STITCH_CAP.saturating_sub(out.len()));
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    out.push_str(&value[..end]);
 }
 
 pub(super) fn preview_is_hex(preview: &str) -> bool {
@@ -188,5 +199,38 @@ pub(super) fn inferred_content_class(class: &str, preview: Option<&str>) -> Stri
         "tls_record".to_owned()
     } else {
         String::new()
+    }
+}
+
+#[cfg(test)]
+mod preview_utf8_regressions {
+    use super::{stitch_preview, PREVIEW_STITCH_CAP};
+
+    #[test]
+    fn unicode_at_every_byte_boundary_is_bounded_and_preserved() {
+        for ch in ["a", "é", "中", "😀"] {
+            for remaining in 0..=4 {
+                let prefix = "x".repeat(PREVIEW_STITCH_CAP - remaining);
+                let result = stitch_preview(&prefix, &ch.repeat(8));
+                assert!(result.len() <= PREVIEW_STITCH_CAP);
+                assert!(result.starts_with(&prefix));
+                assert!(format!("{prefix}{}", ch.repeat(8)).starts_with(&result));
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_existing_and_url_separator_stay_within_cap() {
+        let result = stitch_preview(&"中".repeat(PREVIEW_STITCH_CAP), "https://example.test");
+        assert!(result.len() <= PREVIEW_STITCH_CAP);
+        assert_eq!(
+            stitch_preview("first", "https://example.test"),
+            "first\nhttps://example.test"
+        );
+        let prefix = "x".repeat(PREVIEW_STITCH_CAP - 1);
+        assert_eq!(
+            stitch_preview(&prefix, "https://example.test"),
+            format!("{prefix}\n")
+        );
     }
 }

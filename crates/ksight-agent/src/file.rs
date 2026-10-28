@@ -4,6 +4,7 @@ use std::{
     fs::File,
     io::{Read as _, Write as _},
     path::{Component, Path, PathBuf},
+    time::Instant,
 };
 
 use ksight_model::FileOpen;
@@ -14,6 +15,11 @@ const MAX_HASH_BYTES: u64 = 1024 * 1024;
 
 /// Resolve a submitted `openat` path without opening the target file.
 pub fn resolve_open_path(process_id: u32, open: &mut FileOpen) {
+    resolve_open_path_until(process_id, open, None);
+}
+
+/// Bound optional content hashing by the caller's observation deadline.
+pub fn resolve_open_path_until(process_id: u32, open: &mut FileOpen, deadline: Option<Instant>) {
     if open.path.is_empty() {
         return;
     }
@@ -24,7 +30,7 @@ pub fn resolve_open_path(process_id: u32, open: &mut FileOpen) {
                 .to_string_lossy()
                 .into_owned(),
         );
-        hash_code_candidate(process_id, open);
+        hash_code_candidate(process_id, open, deadline);
         return;
     }
 
@@ -41,10 +47,13 @@ pub fn resolve_open_path(process_id: u32, open: &mut FileOpen) {
             .to_string_lossy()
             .into_owned(),
     );
-    hash_code_candidate(process_id, open);
+    hash_code_candidate(process_id, open, deadline);
 }
 
-fn hash_code_candidate(process_id: u32, open: &mut FileOpen) {
+fn hash_code_candidate(process_id: u32, open: &mut FileOpen, deadline: Option<Instant>) {
+    if check_deadline(deadline).is_err() {
+        return;
+    }
     let Some(fd) = open.file_descriptor.filter(|_| open.result >= 0) else {
         return;
     };
@@ -56,7 +65,8 @@ fn hash_code_candidate(process_id: u32, open: &mut FileOpen) {
         return;
     }
     let proc_fd = format!("/proc/{process_id}/fd/{fd}");
-    let Ok(mut file) = File::open(&proc_fd).or_else(|_| File::open(path)) else {
+    let Ok(mut file) = open_regular(Path::new(&proc_fd)).or_else(|_| open_regular(Path::new(path)))
+    else {
         return;
     };
     let Ok(metadata) = file.metadata() else {
@@ -69,6 +79,9 @@ fn hash_code_candidate(process_id: u32, open: &mut FileOpen) {
     let mut buffer = [0_u8; 8192];
     let mut total_bytes = 0_u64;
     loop {
+        if check_deadline(deadline).is_err() {
+            return;
+        }
         let Ok(read) = file.read(&mut buffer) else {
             return;
         };
@@ -202,47 +215,68 @@ fn is_forensic_snapshot(path: &str) -> bool {
 /// Copies through `/proc/<pid>/fd/<n>` first so an unlink still yields the
 /// live inode. Does not require a prior SHA-256 (payload DEX is often > 1 MiB).
 pub fn snapshot_forensic(process_id: u32, open: &mut FileOpen, dest_dir: &Path) {
+    let _ = snapshot_forensic_until(process_id, open, dest_dir, None);
+}
+
+/// Preserve raw files within a live window; derived DEX repair is offline work.
+/// A timeout never publishes a partial file hash as a complete snapshot.
+/// # Errors
+/// Returns the optional enrichment failure, including an expired window.
+pub fn snapshot_forensic_until(
+    process_id: u32,
+    open: &mut FileOpen,
+    dest_dir: &Path,
+    deadline: Option<Instant>,
+) -> std::io::Result<()> {
     let Some(fd) = open.file_descriptor.filter(|_| open.result >= 0) else {
-        return;
+        return Ok(());
     };
     let Some(path) = open.resolved_path.as_deref().or(Some(open.path.as_str())) else {
-        return;
+        return Ok(());
     };
     if !is_forensic_snapshot(path) {
-        return;
+        return Ok(());
     }
     let name = Path::new(path)
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("blob");
-    if std::fs::create_dir_all(dest_dir).is_err() {
-        return;
-    }
+    check_deadline(deadline)?;
+    std::fs::create_dir_all(dest_dir)?;
     let staging = dest_dir.join(format!(".partial-{process_id}-{fd}-{name}"));
     let proc_fd = format!("/proc/{process_id}/fd/{fd}");
     let cap = snapshot_cap(path);
-    let copied = copy_capped(Path::new(&proc_fd), &staging, cap)
-        .or_else(|_| copy_capped(Path::new(path), &staging, cap));
-    let Ok((copied, digest, prefix)) = copied else {
-        let _ = std::fs::remove_file(&staging);
-        return;
+    let copied = copy_capped(Path::new(&proc_fd), &staging, cap, deadline).or_else(|error| {
+        if error.kind() == std::io::ErrorKind::TimedOut {
+            return Err(error);
+        }
+        copy_capped(Path::new(path), &staging, cap, deadline)
+    });
+    let (copied, digest, prefix) = match copied {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = std::fs::remove_file(&staging);
+            return Err(error);
+        }
     };
     if copied == 0 || !prefix_matches_name(name, &prefix) {
         let _ = std::fs::remove_file(&staging);
-        return;
+        return Ok(());
     }
     open.content_bytes = Some(copied);
     open.content_sha256 = Some(digest.clone());
     let dest = dest_dir.join(format!("{digest}_{name}"));
     if dest.exists() {
         let _ = std::fs::remove_file(&staging);
-        return;
+        return Ok(());
     }
-    if std::fs::rename(&staging, &dest).is_err() {
-        let _ = std::fs::copy(&staging, &dest);
+    if let Err(error) = std::fs::rename(&staging, &dest) {
         let _ = std::fs::remove_file(&staging);
+        open.content_bytes = None;
+        open.content_sha256 = None;
+        return Err(error);
     }
-    if ksight_core::is_dex_magic(&prefix) {
+    if deadline.is_none() && ksight_core::is_dex_magic(&prefix) {
         if let Ok(bytes) = std::fs::read(&dest) {
             if let Some(repaired) = ksight_core::repair_dex(&bytes) {
                 let repaired_dir = dest_dir.join("repaired");
@@ -254,6 +288,7 @@ pub fn snapshot_forensic(process_id: u32, open: &mut FileOpen, dest_dir: &Path) 
             }
         }
     }
+    Ok(())
 }
 
 fn snapshot_cap(path: &str) -> u64 {
@@ -286,8 +321,14 @@ fn prefix_matches_name(name: &str, prefix: &[u8]) -> bool {
     }
 }
 
-fn copy_capped(src: &Path, dest: &Path, max_bytes: u64) -> std::io::Result<(u64, String, Vec<u8>)> {
-    let mut input = File::open(src)?;
+fn copy_capped(
+    src: &Path,
+    dest: &Path,
+    max_bytes: u64,
+    deadline: Option<Instant>,
+) -> std::io::Result<(u64, String, Vec<u8>)> {
+    check_deadline(deadline)?;
+    let mut input = open_regular(src)?;
     if let Ok(meta) = input.metadata() {
         if meta.len() > max_bytes.saturating_mul(2) && max_bytes <= 12 * 1024 * 1024 {
             return Err(std::io::Error::other("source larger than forensic cap"));
@@ -299,6 +340,7 @@ fn copy_capped(src: &Path, dest: &Path, max_bytes: u64) -> std::io::Result<(u64,
     let mut total = 0_u64;
     let mut prefix = Vec::new();
     loop {
+        check_deadline(deadline)?;
         let read = input.read(&mut buffer)?;
         if read == 0 {
             break;
@@ -323,6 +365,33 @@ fn copy_capped(src: &Path, dest: &Path, max_bytes: u64) -> std::io::Result<(u64,
     Ok((total, format!("{:x}", hasher.finalize()), prefix))
 }
 
+fn check_deadline(deadline: Option<Instant>) -> std::io::Result<()> {
+    if deadline.is_some_and(|end| Instant::now() >= end) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "file enrichment window expired",
+        ));
+    }
+    Ok(())
+}
+
+// File extensions are untrusted. Opening a FIFO named *.dex in blocking mode
+// can stall the entire collector indefinitely, even before metadata is checked.
+pub(crate) fn open_regular(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_NOCTTY)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular evidence file",
+        ));
+    }
+    Ok(file)
+}
+
 fn normalize_lexically(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
@@ -335,4 +404,63 @@ fn normalize_lexically(path: &Path) -> PathBuf {
         }
     }
     normalized
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+
+    #[test]
+    fn expired_copy_does_not_create_output() {
+        let root = std::env::temp_dir().join(format!("ks-file-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("source"), b"bytes").unwrap();
+        let result = copy_capped(
+            &root.join("source"),
+            &root.join("output"),
+            100,
+            Some(Instant::now()),
+        );
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert!(!root.join("output").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fifo_named_dex_cannot_block_capture() {
+        let root = std::env::temp_dir().join(format!("ks-fifo-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let fifo = root.join("payload.dex");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        let start = Instant::now();
+        assert_eq!(
+            open_regular(&fifo).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn regular_copy_still_has_exact_bytes_and_digest() {
+        let root = std::env::temp_dir().join(format!("ks-copy-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let input = vec![b'x'; 16384];
+        std::fs::write(root.join("source"), &input).unwrap();
+        let (bytes, hash, _) = copy_capped(
+            &root.join("source"),
+            &root.join("output"),
+            32768,
+            Some(Instant::now() + std::time::Duration::from_secs(1)),
+        )
+        .unwrap();
+        assert_eq!(bytes, input.len() as u64);
+        assert_eq!(hash, format!("{:x}", Sha256::digest(&input)));
+        assert_eq!(std::fs::read(root.join("output")).unwrap(), input);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

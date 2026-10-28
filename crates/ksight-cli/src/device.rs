@@ -127,6 +127,7 @@ pub(crate) fn pull_package(
     dest: &Path,
     launch: bool,
     runtime_only: bool,
+    runtime_copy_ms: Option<u64>,
     hide_debug: bool,
     denylist: bool,
     hide_debug_secs: Option<u64>,
@@ -148,7 +149,7 @@ pub(crate) fn pull_package(
     if denylist {
         flags.push_str(" --denylist");
     }
-    let dump = format!("{DEVICE_AGENT} dump-package --package {package} --dest {remote}{flags}");
+    let dump = package_dump_command(package, &remote, &flags, runtime_copy_ms)?;
     if hide_debug {
         let secs = hide_debug_secs.unwrap_or(if launch { 120 } else { 60 });
         eprintln!(
@@ -218,6 +219,25 @@ pub(crate) fn pull_package(
         Err(error) => eprintln!("DEX extract/repair skipped: {error}"),
     }
     Ok(())
+}
+
+/// Preserve the device's ready-based clock. No host timer clips this window.
+fn package_dump_command(
+    package: &str,
+    remote: &str,
+    flags: &str,
+    milliseconds: Option<u64>,
+) -> Result<String> {
+    let runtime_copy_flag = match milliseconds {
+        None => String::new(),
+        Some(value) if (1..=3_600_000).contains(&value) => {
+            format!(" --runtime-copy-ms {value}")
+        }
+        Some(_) => bail!("runtime-copy-ms must be between 1 and 3600000"),
+    };
+    Ok(format!(
+        "{DEVICE_AGENT} dump-package --package {package} --dest {remote}{flags}{runtime_copy_flag}"
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1245,4 +1265,45 @@ fn find_tshark() -> Option<std::path::PathBuf> {
         return Some(bundled.to_path_buf());
     }
     None
+}
+
+#[cfg(test)]
+mod package_copy_clock_tests {
+    use super::*;
+
+    #[test]
+    fn production_dump_command_preserves_legacy_and_forwards_copy_clock_once() {
+        let package = "org.example.fixture";
+        let remote = format!("{DEVICE_PACKAGES_ROOT}/{package}");
+        let flags = " --launch --runtime-only";
+        let legacy =
+            format!("{DEVICE_AGENT} dump-package --package {package} --dest {remote}{flags}");
+        assert_eq!(
+            package_dump_command(package, &remote, flags, None).unwrap(),
+            legacy
+        );
+        for milliseconds in [1, 180_001, 3_600_000] {
+            let command =
+                package_dump_command(package, &remote, flags, Some(milliseconds)).unwrap();
+            assert_eq!(
+                command,
+                format!("{legacy} --runtime-copy-ms {milliseconds}")
+            );
+            assert_eq!(command.matches("--runtime-copy-ms").count(), 1);
+            assert!(!command.contains("timeout"));
+        }
+    }
+
+    #[test]
+    fn invalid_copy_clock_cannot_build_a_device_command() {
+        for milliseconds in [0, 3_600_001, u64::MAX] {
+            assert!(package_dump_command(
+                "org.example.fixture",
+                "/fixture",
+                "",
+                Some(milliseconds)
+            )
+            .is_err());
+        }
+    }
 }

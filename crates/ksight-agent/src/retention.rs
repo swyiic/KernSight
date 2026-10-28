@@ -105,7 +105,8 @@ pub struct SpoolRetention {
     pub root: PathBuf,
     /// Maximum complete-batch bytes across all sessions; zero disables the global bound.
     pub max_total_bytes: u64,
-    /// Complete sessions to keep after pruning, newest first.
+    /// Complete sessions to keep during explicit pruning, newest first.
+    /// Automatic capture never prunes evidence; this is a legacy manual policy.
     pub keep_completed: u32,
 }
 
@@ -160,6 +161,26 @@ impl SpoolRetention {
                     .checked_add(summary.used_bytes)
                     .ok_or(RetentionError::Overflow)
             })
+    }
+
+    /// Admit a new session without deleting any historical evidence.
+    ///
+    /// The root collector lease must be held by the caller. Reserve the entire
+    /// next session budget so rotation cannot silently evict unexported batches.
+    ///
+    /// # Errors
+    /// Returns an inventory error or a storage-limit error requiring explicit cleanup.
+    pub fn prepare_session(&self, session_budget: u64) -> Result<(), RetentionError> {
+        self.repair_interrupted()?;
+        let used = self.used_bytes()?;
+        if self.max_total_bytes != 0 && used.saturating_add(session_budget) > self.max_total_bytes {
+            return Err(RetentionError::StorageFull {
+                used,
+                required: session_budget,
+                limit: self.max_total_bytes,
+            });
+        }
+        Ok(())
     }
 
     /// Delete oldest sealed sessions until the global bound and keep-count are satisfied.
@@ -295,6 +316,16 @@ pub enum RetentionError {
     /// JSON encoding failed.
     #[error(transparent)]
     Encode(#[from] serde_json::Error),
+    /// Historical evidence is preserved; the operator must export and explicitly delete it.
+    #[error("spool storage limit: used={used} required={required} limit={limit}; existing sessions preserved; export and explicitly delete old sessions before retrying")]
+    StorageFull {
+        /// Retained complete batch bytes.
+        used: u64,
+        /// New session reservation.
+        required: u64,
+        /// Configured root bound.
+        limit: u64,
+    },
     /// Byte accounting overflowed.
     #[error("spool byte accounting overflow")]
     Overflow,

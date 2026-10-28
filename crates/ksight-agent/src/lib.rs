@@ -96,6 +96,7 @@ pub mod capture_stages;
 pub mod evidence_inventory;
 mod memory_windows;
 pub mod qualified_code;
+mod runtime_copy_clock;
 pub mod runtime_paths;
 
 /// Positive proof for independent cold Linker after a coverage-only Dump.
@@ -104,3 +105,5 @@ pub mod dump_coverage;
 /// Payload-free monotonic capture phase diagnostics.
 pub mod capture_timing;
 pub mod shutdown_drain;
+
+mod work_window;

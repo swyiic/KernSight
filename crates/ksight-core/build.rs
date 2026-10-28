@@ -1,6 +1,6 @@
 //! Compile-time provenance shared by the agent and host CLI. No runtime Git calls.
 
-use std::{env, path::Path, process::Command};
+use std::{env, fmt::Write as _, path::Path, process::Command};
 
 // Only inputs that can affect shipped code/assets count as source modifications.
 // Ignore documentation, generated build outputs and unrelated untracked files.
@@ -51,7 +51,11 @@ fn fresh_suffix() -> String {
     if !generated {
         bytes = std::process::id().to_le_bytes();
     }
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    let mut suffix = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut suffix, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    suffix
 }
 
 fn watch(path: &Path) {

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the actual dependency-free build.rs, including Cargo cache invalidation."""
+"""Exercise the actual dependency-free build.rs, including fresh per-build suffixes and source provenance."""
 import os
 from pathlib import Path
 import shutil
@@ -65,7 +65,7 @@ class BuildIdentityTests(unittest.TestCase):
         self.assertEqual(values[1:], [sha, dirty, source])
         return values[0]
 
-    def test_clean_build_is_cached_and_documentation_is_not_dirty(self):
+    def test_clean_rebuild_refreshes_suffix_and_documentation_is_not_dirty(self):
         first = self.assert_identity()
         second = self.assert_identity()
         self.assertNotEqual(first, second)
@@ -127,7 +127,7 @@ class BuildIdentityTests(unittest.TestCase):
         folder.mkdir()
         folder.joinpath(".gitkeep").write_text(original)
         self.assert_identity()
-        self.assertNotIn("Compiling identity-fixture", self.assert_identity())
+        self.assert_identity()
 
     def test_head_ref_packed_refs_and_detached_head(self):
         self.assert_identity()
@@ -148,7 +148,7 @@ class BuildIdentityTests(unittest.TestCase):
         self.assert_identity()
         self.git("commit", "--allow-empty", "-m", "linked identity")
         self.assert_identity(sha=self.git("rev-parse", "HEAD").strip())
-        self.assertNotIn("Compiling identity-fixture", self.build()[1])
+        self.assertIn("Compiling identity-fixture", self.build()[1])
 
     def test_archive_does_not_borrow_ancestor_repository_identity(self):
         shutil.rmtree(self.root / ".git")
@@ -162,7 +162,7 @@ class BuildIdentityTests(unittest.TestCase):
         values, _ = self.build()
         self.assertRegex(values[0], r"^0\.2\.12_[0-9a-f]{8}$")
         self.assertEqual(values[1:], ["", "unknown", "unknown"])
-        self.assertNotIn("Compiling identity-fixture", self.build()[1])
+        self.assertIn("Compiling identity-fixture", self.build()[1])
 
     def test_git_unavailable_and_explicit_release_override(self):
         # A small PATH shim makes only Git unavailable while Cargo/rustc keep working.
@@ -177,7 +177,7 @@ class BuildIdentityTests(unittest.TestCase):
         self.assertEqual(values[1:], ["", "unknown", "unknown"])
         env.update(KERNSIGHT_BUILD_GIT_COMMIT=self.sha, KERNSIGHT_BUILD_GIT_DIRTY="false")
         self.assert_identity(source="override", env=env)
-        self.assertNotIn("Compiling identity-fixture", self.build(env)[1])
+        self.assertIn("Compiling identity-fixture", self.build(env)[1])
         env["KERNSIGHT_BUILD_GIT_DIRTY"] = "true"
         self.assert_identity(dirty="true", source="override", env=env)
 

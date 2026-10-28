@@ -247,59 +247,86 @@ fn candidate_ledger(
 }
 
 fn write_candidate_ledger(dir: &Path, stem: &str, mut note: serde_json::Value) -> Result<()> {
-    let candidates = note["candidates"].as_array().cloned().unwrap_or_default();
+    #[derive(Serialize)]
+    struct CandidatePage<'a> {
+        #[serde(flatten)]
+        header: &'a serde_json::Map<String, Value>,
+        candidates: &'a [Value],
+        shard_index: u32,
+        listed_count: usize,
+        omitted_count: usize,
+        omitted_reason: Option<&'static str>,
+    }
+    // Keep one owned candidate array and borrow its slices. Repeatedly cloning
+    // and encoding every growing prefix made preparation quadratic in mappings.
+    let candidates = match note["candidates"].take() {
+        Value::Array(candidates) => candidates,
+        _ => Vec::new(),
+    };
     let eligible = candidates.len();
     note["eligible_count"] = serde_json::json!(eligible);
+    let header = note.as_object_mut().context("candidate ledger header")?;
+    for key in [
+        "candidates",
+        "shard_index",
+        "listed_count",
+        "omitted_count",
+        "omitted_reason",
+    ] {
+        header.remove(key);
+    }
+    let part = |start: usize, end: usize, shard_index: u32| CandidatePage {
+        header: &*header,
+        candidates: &candidates[start..end],
+        shard_index,
+        listed_count: end - start,
+        omitted_count: eligible - end,
+        omitted_reason: (end < eligible).then_some("continued_in_next_candidate_shard"),
+    };
+    let fits = |shard: &CandidatePage<'_>| {
+        serde_json::to_writer(
+            &mut JsonCount {
+                count: 0,
+                limit: 200 * 1024,
+            },
+            shard,
+        )
+        .is_ok()
+    };
     let mut start = 0_usize;
     let mut shard = 0_u32;
     while start < eligible || (eligible == 0 && shard == 0) {
-        let mut end = (start + 1).min(eligible.max(1));
-        if eligible == 0 {
-            end = 0;
-        }
-        let mut chosen = end;
-        while end <= eligible {
-            let mut part = note.clone();
-            part["candidates"] = serde_json::json!(candidates[start..end]);
-            part["shard_index"] = serde_json::json!(shard);
-            part["shard_count_known_after_write"] = serde_json::json!(true);
-            part["listed_count"] = serde_json::json!(end.saturating_sub(start));
-            part["omitted_count"] = serde_json::json!(eligible.saturating_sub(end));
-            part["omitted_reason"] = if end < eligible {
-                serde_json::json!("continued_in_next_candidate_shard")
-            } else {
-                serde_json::Value::Null
-            };
-            let size = serde_json::to_vec(&part)?.len();
-            if size > 200 * 1024 && end > start + 1 {
-                break;
-            }
-            chosen = end;
-            if size > 200 * 1024 || end == eligible {
-                break;
-            }
-            end += 1;
-        }
-        let mut part = note.clone();
-        let listed = if eligible == 0 {
-            &candidates[..]
+        // Test the final suffix separately: its omitted_reason becomes null,
+        // so its encoded size need not be monotonic with the preceding shard.
+        let chosen = if eligible == 0 || fits(&part(start, eligible, shard)) {
+            eligible
         } else {
-            &candidates[start..chosen]
+            // One entry may exceed the soft bound, but must still pass the
+            // hard 256 KiB publication bound below; never silently omit it.
+            let mut chosen = start + 1;
+            let mut low = start + 1;
+            let mut high = eligible;
+            while low < high {
+                let middle = low + (high - low) / 2;
+                if fits(&part(start, middle, shard)) {
+                    chosen = middle;
+                    low = middle + 1;
+                } else {
+                    high = middle;
+                }
+            }
+            chosen
         };
-        part["candidates"] = serde_json::json!(listed);
-        part["shard_index"] = serde_json::json!(shard);
-        part["listed_count"] = serde_json::json!(listed.len());
-        part["omitted_count"] = serde_json::json!(eligible.saturating_sub(chosen));
-        part["omitted_reason"] = if chosen < eligible {
-            serde_json::json!("continued_in_next_candidate_shard")
-        } else {
-            serde_json::Value::Null
+        let mut sink = LimitedJson {
+            bytes: Vec::new(),
+            limit: 256 * 1024,
         };
-        let bytes = serde_json::to_vec(&part)?;
-        if bytes.len() > 256 * 1024 {
-            bail!("candidate metadata size bound");
-        }
-        ksight_core::output_budget::write(dir.join(format!("{stem}-{shard:02}.json")), &bytes)?;
+        serde_json::to_writer(&mut sink, &part(start, chosen, shard))
+            .context("candidate metadata size bound")?;
+        ksight_core::output_budget::write(
+            dir.join(format!("{stem}-{shard:02}.json")),
+            &sink.bytes,
+        )?;
         if eligible == 0 || chosen >= eligible {
             break;
         }
@@ -551,6 +578,22 @@ fn require_same_source(actual: &SourceIdentity, expected: &SourceIdentity) -> Re
     Ok(())
 }
 
+fn require_package_witness(cmdline: &[u8], status: &str, package: &str, uid: u32) -> Result<()> {
+    if cmdline.split(|b| *b == 0).next() != Some(package.as_bytes()) {
+        bail!("only explicitly enrolled main process is qualified");
+    }
+    let observed = status
+        .lines()
+        .find(|line| line.starts_with("Uid:"))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse::<u32>().ok())
+        .context("anchored UID missing")?;
+    if observed != uid {
+        bail!("anchored package witness mismatch");
+    }
+    Ok(())
+}
+
 /// Capability checks only the available physical backend, not a not-yet-started App.
 ///
 /// # Errors
@@ -681,11 +724,13 @@ mod physical {
     use super::{
         android_suffix, app_code_mapped_bytes, bail, bound_copy_gap_state, budget_io,
         candidate_ledger, copy_range, eligible_mapping, hex_bytes, prioritize_install_rows,
-        publish_bound_pending, selected_range_bytes, stat_start_ticks, write_candidate_ledger,
-        BoundCopyStops, BoundRangeStep, Digest, Path, Read, Result, Sha256, SourceIdentity,
+        publish_bound_pending, require_package_witness, selected_range_bytes, stat_start_ticks,
+        write_candidate_ledger, BoundCopyStops, BoundRangeStep, Digest, Path, Read, Result, Sha256,
+        SourceIdentity,
     };
     use anyhow::Context as _;
     use ksight_hwbp::{
+        instance_scope::BoundInstance,
         metadata_scope::{PolicyWitness, QualificationPolicy, QualifiedInstance},
         MetadataObserver,
     };
@@ -787,22 +832,12 @@ mod physical {
                     |_, identity| {
                         let name = read_at(&dir, "cmdline", 65536)
                             .context("read anchored qualification cmdline")?;
-                        if name.split(|b| *b == 0).next() != Some(package.as_bytes()) {
-                            bail!(
-                                "not-supported: only explicitly enrolled main process is qualified"
-                            );
-                        }
                         let status = String::from_utf8(
                             read_at(&dir, "status", 65536)
                                 .context("read anchored qualification status")?,
                         )?;
-                        let observed = status
-                            .lines()
-                            .find(|l| l.starts_with("Uid:"))
-                            .and_then(|l| l.split_whitespace().nth(1))
-                            .and_then(|s| s.parse::<u32>().ok())
-                            .context("anchored UID missing")?;
-                        if observed != uid || identity.uid != uid || identity.tgid != pid {
+                        require_package_witness(&name, &status, package, uid)?;
+                        if identity.uid != uid || identity.tgid != pid {
                             bail!("anchored package witness mismatch");
                         }
                         if with_memory {
@@ -918,15 +953,15 @@ mod physical {
         fn copy_one_bound_range(
             &self,
             target: &mut Target,
+            binding: &BoundInstance,
             expected: &SourceIdentity,
             out: &Path,
             deadline: Instant,
             row: &crate::dexdump::MapRow,
         ) -> Result<BoundRangeStep> {
-            let current = self.qualify(&expected.package, expected.pid, false)?;
-            super::require_same_source(&current.identity, expected)
+            self.recheck_copy_source(target, binding, expected)
                 .context("source generation changed before next range")?;
-            let binding = current.qualified.into_bound()?;
+            let mapping_before = same_bound_mapping(target, row);
             let requested = row.end.saturating_sub(row.start);
             let remaining = ksight_core::output_budget::remaining(out);
             let want = selected_range_bytes(requested, remaining);
@@ -960,32 +995,29 @@ mod physical {
                     if Instant::now() >= deadline {
                         bail!("local_copy_window_exhausted");
                     }
-                    binding.check_current()
+                    if !mapping_before {
+                        bail!("mapping_changed_before_read");
+                    }
+                    binding.recheck_task_mark()
                 },
             );
-            if receipt.admission == "qualified_live_copy" {
-                match self.qualify(&expected.package, expected.pid, false) {
-                    Ok(current) if current.identity == *expected => {}
-                    _ => {
-                        receipt.admission = "rejected_generation_after_read".into();
-                    }
-                }
+            let source_after = self.recheck_copy_source(target, binding, expected).is_ok();
+            if receipt.admission == "qualified_live_copy" && !source_after {
+                receipt.admission = "rejected_generation_after_read".into();
             }
             // The partial file stays unadmitted. A separate positive end check
             // only establishes that this gap was local time, never code coverage.
             let local_window = receipt.read_error.as_deref() == Some("local_copy_window_exhausted");
             let post_copy_source_verified = local_window
                 && !ksight_core::output_budget::should_stop(out)
-                && binding.check_current().is_ok()
-                && self
-                    .qualify(&expected.package, expected.pid, false)
-                    .is_ok_and(|current| current.identity == *expected)
+                && source_after
+                && binding.recheck_task_mark().is_ok()
                 && !ksight_core::output_budget::should_stop(out);
-            let stable_mapping = same_bound_mapping(target, row);
+            let stable_mapping = mapping_before && same_bound_mapping(target, row);
             let post_copy_source_verified = post_copy_source_verified
                 && stable_mapping
                 && !ksight_core::output_budget::should_stop(out)
-                && binding.check_current().is_ok()
+                && binding.recheck_task_mark().is_ok()
                 && !ksight_core::output_budget::should_stop(out);
             if !stable_mapping {
                 receipt.admission = "rejected_mapping_changed_or_unknown".into();
@@ -1024,21 +1056,49 @@ mod physical {
             })
         }
 
+        // The original pidfd, immutable verified BPF program/task token and
+        // anchored proc/mem handles remain owned by this pass. Re-observe the
+        // live task and package witness without issuing a replacement grant or
+        // reopening memory through a numeric PID for every mapping.
+        #[allow(clippy::unused_self)]
+        fn recheck_copy_source(
+            &self,
+            target: &Target,
+            binding: &BoundInstance,
+            expected: &SourceIdentity,
+        ) -> Result<()> {
+            super::require_same_source(&target.identity, expected)?;
+            if crate::retention::boot_id().as_deref() != Some(expected.boot_id.as_str()) {
+                bail!("boot identity changed during live copy");
+            }
+            binding.recheck_task_mark()?;
+            let name = read_at(&target.dir, "cmdline", 65536)?;
+            let status = String::from_utf8(read_at(&target.dir, "status", 65536)?)?;
+            require_package_witness(&name, &status, &expected.package, expected.uid)?;
+            binding.recheck_task_mark()
+        }
+
         /// Copy qualified code ranges from the anchored task.
         ///
         /// # Errors
         ///
         /// Returns when qualification, the maps handle, or the copy note cannot be written.
-        pub fn copy_code(
+        pub(crate) fn copy_code(
             &self,
             expected: &SourceIdentity,
             out: &Path,
-            deadline: Instant,
+            clock: &mut crate::runtime_copy_clock::RuntimeCopyClock,
         ) -> Result<crate::dexdump::LiveDump> {
+            let setup_started = Instant::now();
             expected.validate()?;
             let mut target = self.qualify(&expected.package, expected.pid, true)?;
             super::require_same_source(&target.identity, expected)
                 .context("source generation changed before live-copy; no numeric retry")?;
+            // Admission is bounded to five seconds. Bind before candidate
+            // preparation, then use the lease's existing LIVE checks, which
+            // still re-read token/UID/birth/exec and pidfd on every chunk.
+            // No deadline or sampler admission is renewed here.
+            let binding = target.qualified.try_clone()?.into_bound()?;
 
             let mut text = String::new();
             target
@@ -1062,6 +1122,11 @@ mod physical {
                 format!("bound-candidates-{}-{}", expected.pid, uuid::Uuid::new_v4());
             write_candidate_ledger(out, &candidate_name, candidates)?;
             let mut records = Vec::new();
+            let setup_elapsed_ms = setup_started.elapsed().as_millis();
+            let ready = Instant::now();
+            let deadline = clock.ready(ready)?;
+            let granted_window_ms = deadline.saturating_duration_since(ready).as_millis();
+            let eligible_count = rows.iter().filter(|row| eligible_mapping(row)).count();
             let mut record_bytes = 0usize;
             let mut partial = false;
             let mut stopped_early = false;
@@ -1073,7 +1138,14 @@ mod physical {
                     stopped_early = true;
                     break;
                 }
-                match self.copy_one_bound_range(&mut target, expected, out, deadline, &row)? {
+                match self.copy_one_bound_range(
+                    &mut target,
+                    &binding,
+                    expected,
+                    out,
+                    deadline,
+                    &row,
+                )? {
                     BoundRangeStep::Stop {
                         saw_budget_reserve: reserve,
                     } => {
@@ -1112,7 +1184,7 @@ mod physical {
                 saw_range_cap,
                 saw_budget_reserve,
             });
-            let note = serde_json::json!({"schema":"kernsight.bound-code-copy/v1","source":expected,"candidate_manifest":candidate_name,"candidate_result":{"attempted":records.len(),"unattempted_state":unattempted_state,"truncation":truncation,"stop_scope":if stopped_early && saw_budget_reserve {"runtime_metadata_reserve"} else if stopped_early && !ksight_core::output_budget::should_stop(out) {"local_copy_window"} else {"none_or_parent_budget"},"actual_ranges":"records.read","budget_stop":ksight_core::output_budget::should_stop(out)},"records":records,"partial":partial,"paused":false,"torn":true,"torn_reason":"process_not_paused","unsupported":"unregistered anonymous heap/FD/private scans; main-process enrollment only","object_sha256":format!("{:x}",Sha256::digest(std::fs::read(&self.metadata)?)),"btf_sha256":hex_bytes(&self.btf_hash)});
+            let note = serde_json::json!({"schema":"kernsight.bound-code-copy/v1","source":expected,"candidate_manifest":candidate_name,"candidate_result":{"attempted":records.len(),"eligible_ranges":eligible_count,"unattempted_ranges":eligible_count.saturating_sub(records.len()),"requested_window_ms":clock.requested_ms(),"clock":"device_monotonic_after_candidate_ready","granted_window_ms":granted_window_ms,"setup_elapsed_ms":setup_elapsed_ms,"copy_elapsed_ms":ready.elapsed().as_millis(),"identity_validation":"retained_original_pidfd_and_verified_program; live_task_token_uid_birth_exec_per_chunk; anchored_package_and_mapping_before_after_each_range","unattempted_state":unattempted_state,"truncation":truncation,"stop_scope":if stopped_early && saw_budget_reserve {"runtime_metadata_reserve"} else if stopped_early && !ksight_core::output_budget::should_stop(out) {"local_copy_window"} else {"none_or_parent_budget"},"actual_ranges":"records.read","budget_stop":ksight_core::output_budget::should_stop(out)},"records":records,"partial":partial,"paused":false,"torn":true,"torn_reason":"process_not_paused","unsupported":"unregistered anonymous heap/FD/private scans; main-process enrollment only","object_sha256":hex_bytes(&self.object_hash),"btf_sha256":hex_bytes(&self.btf_hash)});
             if let Err(error) = super::write_bound_notes(out, expected.pid, note) {
                 ksight_core::output_budget::record_failure(out, "bound_note_metadata_uncommitted");
                 return Err(error).context("bound notes not committed; raw payload retained");
@@ -1272,6 +1344,51 @@ mod range_receipt_regressions {
 mod preceding_source_identity_tests {
     use super::*;
     use std::io::Cursor;
+    #[test]
+    fn retained_source_witness_still_rejects_child_rename_missing_or_changed_uid() {
+        let status = "Name:\tfixture\nUid:\t10001\t10001\t10001\t10001\n";
+        require_package_witness(
+            b"com.example.fixture\0arg",
+            status,
+            "com.example.fixture",
+            10001,
+        )
+        .unwrap();
+        for (name, witness) in [
+            (b"com.example.fixture:push\0".as_slice(), status),
+            (b"com.other.fixture\0".as_slice(), status),
+            (b"com.example.fixture\0".as_slice(), "Uid:\t10002\t10002\n"),
+            (b"com.example.fixture\0".as_slice(), "Name:\tfixture\n"),
+        ] {
+            assert!(require_package_witness(name, witness, "com.example.fixture", 10001).is_err());
+        }
+    }
+
+    #[test]
+    fn retained_witness_change_between_chunks_stops_without_admitting_prefix() {
+        let mut source = Cursor::new(vec![7; 65537]);
+        let mut sink = Vec::new();
+        let mut checks = 0;
+        let receipt = copy_range(&mut source, &mut sink, 0, 65537, || {
+            checks += 1;
+            require_package_witness(
+                b"com.example.fixture\0",
+                if checks < 3 {
+                    "Uid:\t10001\n"
+                } else {
+                    "Uid:\t10002\n"
+                },
+                "com.example.fixture",
+                10001,
+            )
+        });
+        assert_eq!(receipt.actual_length, 65536);
+        assert_eq!(sink.len(), 65536);
+        assert_eq!(source.position(), 65536);
+        assert_eq!(receipt.read_status, "interrupted");
+        assert_eq!(receipt.admission, "rejected_identity_or_deadline");
+    }
+
     #[test]
     fn next_copy_rejects_pid_reuse_exec_change_or_exit_before_reading() {
         let expected = SourceIdentity {
@@ -1718,5 +1835,214 @@ mod metadata_omission_authority_tests {
             .failure_reasons
             .contains(&"bound_note_metadata_exhausted".into()));
         assert!(ksight_core::output_budget::bound_terminal_coverage(&root).is_none());
+    }
+}
+
+#[cfg(test)]
+mod candidate_ledger_shard_tests {
+    use super::*;
+
+    struct TestRoot(PathBuf);
+    impl TestRoot {
+        fn new() -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("candidate-ledger-shards-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+        fn shards(&self) -> Vec<(Vec<u8>, Value)> {
+            let mut paths: Vec<_> = std::fs::read_dir(&self.0)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            paths.sort();
+            paths
+                .into_iter()
+                .map(|path| {
+                    let bytes = std::fs::read(path).unwrap();
+                    let note = serde_json::from_slice(&bytes).unwrap();
+                    (bytes, note)
+                })
+                .collect()
+        }
+    }
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn ledger(count: usize) -> Value {
+        let rows = (0..count)
+            .map(|rank| crate::dexdump::MapRow {
+                start: 0x1000 + rank as u64 * 0x2000,
+                end: 0x2000 + rank as u64 * 0x2000,
+                perms: "r-xp".into(),
+                path: format!("/data/app/test.app/lib/arm64/libsample-{rank}-雪\".so"),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let mut note = candidate_ledger(&rows, Some(512 * 1024 * 1024));
+        note["source"] = json!({"package":"test.app","pid":42,"birth_ns":1234});
+        note["phase"] = json!("initial");
+        note
+    }
+
+    #[test]
+    fn production_1444_mapping_ledger_keeps_order_headers_and_maximal_bounded_shards() {
+        let root = TestRoot::new();
+        let _guard = ksight_core::output_budget::Guard::install(
+            vec![root.0.clone()],
+            16 * 1024 * 1024,
+            60_000,
+        )
+        .unwrap();
+        let original = ledger(1444);
+        let expected = original["candidates"].as_array().unwrap().clone();
+        write_candidate_ledger(&root.0, "candidates", original.clone()).unwrap();
+        let shards = root.shards();
+        assert!(shards.len() > 1);
+        let mut actual = Vec::new();
+        for (index, (bytes, note)) in shards.iter().enumerate() {
+            assert!(bytes.len() <= 200 * 1024);
+            assert_eq!(note["shard_index"], index);
+            assert_eq!(note["eligible_count"], expected.len());
+            for field in [
+                "schema",
+                "order",
+                "mapping_observation_scope",
+                "source",
+                "phase",
+            ] {
+                assert_eq!(note[field], original[field]);
+            }
+            assert!(note.get("shard_count_known_after_write").is_none());
+            let entries = note["candidates"].as_array().unwrap();
+            assert_eq!(note["listed_count"], entries.len());
+            actual.extend(entries.iter().cloned());
+            assert_eq!(note["omitted_count"], expected.len() - actual.len());
+            if actual.len() < expected.len() {
+                assert_eq!(note["omitted_reason"], "continued_in_next_candidate_shard");
+                let mut next = note.clone();
+                next["candidates"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(expected[actual.len()].clone());
+                next["listed_count"] = json!(entries.len() + 1);
+                next["omitted_count"] = json!(expected.len() - actual.len() - 1);
+                if actual.len() + 1 == expected.len() {
+                    next["omitted_reason"] = Value::Null;
+                }
+                assert!(serde_json::to_vec(&next).unwrap().len() > 200 * 1024);
+            } else {
+                assert!(note["omitted_reason"].is_null());
+            }
+        }
+        assert_eq!(actual, expected);
+        for (rank, candidate) in actual.iter().enumerate() {
+            assert_eq!(candidate["rank"], rank);
+        }
+    }
+
+    #[test]
+    fn empty_ledger_publishes_one_explicit_empty_shard() {
+        let root = TestRoot::new();
+        write_candidate_ledger(&root.0, "empty", ledger(0)).unwrap();
+        let shards = root.shards();
+        assert_eq!(shards.len(), 1);
+        let note = &shards[0].1;
+        assert_eq!(note["candidates"], json!([]));
+        assert_eq!(note["eligible_count"], 0);
+        assert_eq!(note["listed_count"], 0);
+        assert_eq!(note["omitted_count"], 0);
+        assert!(note["omitted_reason"].is_null());
+    }
+
+    #[test]
+    fn final_suffix_uses_null_reason_before_searching_nonfinal_prefixes() {
+        let root = TestRoot::new();
+        let mut note = json!({"candidates":[{"padding":""},null]});
+        let overhead = serde_json::to_vec(&json!({
+            "eligible_count": 2,
+            "candidates": [{"padding":""},null],
+            "shard_index": 0,
+            "listed_count": 2,
+            "omitted_count": 0,
+            "omitted_reason": null
+        }))
+        .unwrap()
+        .len();
+        note["candidates"][0]["padding"] = json!("x".repeat(200 * 1024 - overhead));
+        write_candidate_ledger(&root.0, "final-suffix", note).unwrap();
+        let shards = root.shards();
+        assert_eq!(shards.len(), 1);
+        assert_eq!(shards[0].0.len(), 200 * 1024);
+        assert_eq!(shards[0].1["listed_count"], 2);
+        assert!(shards[0].1["omitted_reason"].is_null());
+    }
+
+    #[test]
+    fn single_entry_may_exceed_soft_limit_but_hard_limit_is_exact_and_fail_closed() {
+        let root = TestRoot::new();
+        let mut note = ledger(1);
+        note["candidates"][0]["padding"] = json!("");
+        let mut published = note.clone();
+        published["shard_index"] = json!(0);
+        let overhead = serde_json::to_vec(&published).unwrap().len();
+        note["candidates"][0]["padding"] = json!("x".repeat(256 * 1024 - overhead));
+        write_candidate_ledger(&root.0, "exact", note.clone()).unwrap();
+        let shards = root.shards();
+        assert_eq!(shards.len(), 1);
+        assert_eq!(shards[0].0.len(), 256 * 1024);
+        assert_eq!(shards[0].1["listed_count"], 1);
+        assert_eq!(shards[0].1["omitted_count"], 0);
+
+        let rejected = TestRoot::new();
+        note["candidates"][0]["padding"] = json!("x".repeat(256 * 1024 - overhead + 1));
+        assert!(write_candidate_ledger(&rejected.0, "oversized", note).is_err());
+        assert!(rejected.shards().is_empty());
+    }
+
+    #[test]
+    fn output_budget_failure_preserves_only_the_written_incomplete_prefix() {
+        let reference = TestRoot::new();
+        let note = ledger(1444);
+        write_candidate_ledger(&reference.0, "reference", note.clone()).unwrap();
+        let reference_shards = reference.shards();
+        assert!(reference_shards.len() > 1);
+
+        let limited = TestRoot::new();
+        let guard = ksight_core::output_budget::Guard::install(
+            vec![limited.0.clone()],
+            reference_shards[0].0.len() as u64,
+            60_000,
+        )
+        .unwrap();
+        assert!(write_candidate_ledger(&limited.0, "limited", note).is_err());
+        let actual = limited.shards();
+        assert_eq!(actual.len(), 1);
+        assert_eq!(actual[0].0, reference_shards[0].0);
+        assert!(actual[0].1["omitted_count"].as_u64().unwrap() > 0);
+        assert_eq!(
+            actual[0].1["omitted_reason"],
+            "continued_in_next_candidate_shard"
+        );
+        assert!(guard.receipt().partial);
+    }
+
+    #[test]
+    fn shard_count_bound_keeps_an_explicit_incomplete_prefix() {
+        let root = TestRoot::new();
+        let mut note = ledger(66);
+        for candidate in note["candidates"].as_array_mut().unwrap() {
+            candidate["padding"] = json!("x".repeat(201 * 1024));
+        }
+        assert!(write_candidate_ledger(&root.0, "bounded", note).is_err());
+        let shards = root.shards();
+        assert_eq!(shards.len(), 65);
+        let last = &shards.last().unwrap().1;
+        assert_eq!(last["shard_index"], 64);
+        assert_eq!(last["omitted_count"], 1);
+        assert_eq!(last["omitted_reason"], "continued_in_next_candidate_shard");
     }
 }

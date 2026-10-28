@@ -111,6 +111,10 @@ enum Command {
     },
     /// Copy one installed package's APK, native libraries, and live DEX/SO images.
     DumpPackage {
+        /// Effective initial qualified memory-copy budget, starting when candidates are ready.
+        /// Preparation and static closeout are separate; an insufficient outer budget refuses start.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=3_600_000))]
+        runtime_copy_ms: Option<u64>,
         #[arg(long)]
         expected_code_sources: Option<String>,
         #[arg(long)]
@@ -553,7 +557,7 @@ fn main() -> Result<()> {
             let status = ksight_agent::qualified_code::capability();
             println!(
                 "{}",
-                serde_json::json!({"schema":"kernsight.code-capabilities/v1","supported":status.is_ok(),"reason":status.as_ref().err().map(|e|format!("{e:#}")),"failure":status.as_ref().err().map(capability_failure),"instance_state":"not-yet-qualified","code_scope":"main process; registered named/executable mappings only; unregistered anonymous/FD scans not-supported","agent_version":env!("CARGO_PKG_VERSION"),"agent_build_version":ksight_core::build_info::VERSION,"agent_git_commit":ksight_core::build_info::git_commit(),"agent_git_dirty":ksight_core::build_info::git_dirty(),"agent_build_identity_source":ksight_core::build_info::SOURCE,"lifecycle_schema":"kernsight.capture-lifecycle/v1","code_copy_pause":"forbidden","runtime_paths_schema":"kernsight.runtime-paths/v1","runtime_root":ksight_agent::runtime_paths::root(),"agent_sha256":runtime_agent_hash(),"agent_path":std::env::current_exe().ok(),"parent_lifecycle_supported":cfg!(any(target_os="linux",target_os="android")) && std::fs::read_to_string("/proc/sys/kernel/random/boot_id").is_ok() && std::fs::read_to_string("/proc/self/stat").is_ok()})
+                serde_json::json!({"schema":"kernsight.code-capabilities/v1","supported":status.is_ok(),"reason":status.as_ref().err().map(|e|format!("{e:#}")),"failure":status.as_ref().err().map(capability_failure),"instance_state":"not-yet-qualified","code_scope":"main process; registered named/executable mappings only; unregistered anonymous/FD scans not-supported","agent_version":env!("CARGO_PKG_VERSION"),"agent_build_version":ksight_core::build_info::VERSION,"agent_git_commit":ksight_core::build_info::git_commit(),"agent_git_dirty":ksight_core::build_info::git_dirty(),"agent_build_identity_source":ksight_core::build_info::SOURCE,"lifecycle_schema":"kernsight.capture-lifecycle/v1","code_copy_pause":"forbidden","runtime_copy_clock":"kernsight.runtime-copy-clock/v1","runtime_paths_schema":"kernsight.runtime-paths/v1","runtime_root":ksight_agent::runtime_paths::root(),"agent_sha256":runtime_agent_hash(),"agent_path":std::env::current_exe().ok(),"parent_lifecycle_supported":cfg!(any(target_os="linux",target_os="android")) && std::fs::read_to_string("/proc/sys/kernel/random/boot_id").is_ok() && std::fs::read_to_string("/proc/self/stat").is_ok()})
             );
             Ok(())
         }
@@ -582,6 +586,7 @@ fn main() -> Result<()> {
         Command::Spool { root, command } => manage_spool(&root, &command),
         Command::Serve { spool_root } => serve_stdio(spool_root),
         Command::DumpPackage {
+            runtime_copy_ms,
             expected_code_sources,
             code_only,
             output_budget_bytes,
@@ -631,6 +636,7 @@ fn main() -> Result<()> {
                 output_budget_ms,
                 relation.as_ref(),
                 expected_code_sources.as_deref(),
+                runtime_copy_ms,
             )
         }
         Command::RecatalogPackage { dest, json } => recatalog_package(&dest, json),
@@ -736,6 +742,7 @@ fn dump_package(
     output_budget_ms: Option<u64>,
     relation: Option<&ksight_agent::capture_relation::CaptureRelation>,
     expected_code_sources: Option<&str>,
+    runtime_copy_ms: Option<u64>,
 ) -> Result<()> {
     if relation.is_some() && launch {
         bail!("not-supported: parent dump requires the existing capture instance; launch via parent capture first; standalone --launch is unchanged");
@@ -768,6 +775,7 @@ fn dump_package(
             package,
             dest,
             &ksight_agent::dump::DumpOptions {
+                runtime_copy_ms,
                 launch,
                 runtime_only,
                 hide_debug,
@@ -1504,6 +1512,7 @@ mod auxiliary_route_guards {
                 None,
                 None,
                 Some(&relation),
+                None,
                 None,
             )
             .expect_err("parent auxiliary refused");

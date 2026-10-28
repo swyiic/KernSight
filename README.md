@@ -74,3 +74,11 @@ ksightctl device report <SESSION_UUID> --json
 Inspect 和 Dump 可能影响目标执行；明文、内存和私有数据应限定范围并妥善保管。当前阶段不做隐形运行、通用 root 隐藏或反检测。报告中的 partial、丢样和未知覆盖会保留进行分析完善。
 
 [Apache-2.0](LICENSE)
+
+### Evidence retention (0.2.13)
+
+Automatic capture preserves completed and interrupted spool sessions. It no longer
+evicts older sessions to keep a count of four. The default 512 MiB complete-batch
+budget reserves room for the next session; when full, capture reports a storage
+limit instead of deleting evidence. Export and explicitly delete old sessions in
+ME before retrying. This bound covers spool batches, not package dump storage.

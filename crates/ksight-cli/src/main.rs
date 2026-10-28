@@ -155,6 +155,10 @@ enum DeviceCommand {
         /// Skip install APK/lib/oat. The pulled folder is this package's collected evidence.
         #[arg(long, alias = "evidence-only")]
         runtime_only: bool,
+        /// Device-side live-copy milliseconds, measured after mapping candidates are ready.
+        /// Preparation, static export and host transfer are outside this window.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=3_600_000))]
+        runtime_copy_ms: Option<u64>,
         /// Hide USB debugging and developer options after ART attach, then launch. Apps that check `adb_enabled` need this. Does not hide root.
         #[arg(long)]
         hide_debug: bool,
@@ -366,6 +370,7 @@ fn run_device_command(serial: Option<&str>, command: DeviceCommand) -> Result<()
             dest,
             launch,
             runtime_only,
+            runtime_copy_ms,
             hide_debug,
             denylist,
             hide_debug_secs,
@@ -375,6 +380,7 @@ fn run_device_command(serial: Option<&str>, command: DeviceCommand) -> Result<()
             &dest,
             launch,
             runtime_only,
+            runtime_copy_ms,
             hide_debug,
             denylist,
             hide_debug_secs,
@@ -675,4 +681,61 @@ fn run_capture(serial: Option<&str>, mut options: CaptureOptions) -> Result<()> 
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod pull_package_clock_arguments {
+    use super::*;
+
+    fn parse_clock(value: Option<&str>) -> Result<Args, clap::Error> {
+        let mut args = vec![
+            "ksightctl",
+            "device",
+            "--serial",
+            "fixture-serial",
+            "pull-package",
+            "--package",
+            "org.example.fixture",
+            "--launch",
+            "--runtime-only",
+        ];
+        if let Some(value) = value {
+            args.extend(["--runtime-copy-ms", value]);
+        }
+        Args::try_parse_from(args)
+    }
+
+    #[test]
+    fn optional_runtime_copy_clock_keeps_legacy_and_exact_milliseconds() {
+        for value in [None, Some("1"), Some("180001"), Some("3600000")] {
+            let args = parse_clock(value).unwrap();
+            let Command::Device { serial, command } = args.command else {
+                panic!("expected device command");
+            };
+            assert_eq!(serial.as_deref(), Some("fixture-serial"));
+            let DeviceCommand::PullPackage {
+                package,
+                launch,
+                runtime_only,
+                runtime_copy_ms,
+                ..
+            } = *command
+            else {
+                panic!("expected pull-package");
+            };
+            assert_eq!(package, "org.example.fixture");
+            assert!(launch && runtime_only);
+            assert_eq!(
+                runtime_copy_ms,
+                value.map(|value| value.parse::<u64>().unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_copy_clock_rejects_zero_overflow_and_more_than_one_hour() {
+        for invalid in ["0", "3600001", "-1", "18446744073709551616"] {
+            assert!(parse_clock(Some(invalid)).is_err(), "accepted {invalid}");
+        }
+    }
 }

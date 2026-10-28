@@ -448,6 +448,8 @@ pub struct PackageDumpReport {
 #[derive(Debug, Clone, Default)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct DumpOptions {
+    /// Device-owned effective copy budget, starting after qualification and candidate preparation.
+    pub runtime_copy_ms: Option<u64>,
     /// Code-only scope disables implicit key probes, generic windows, private stores.
     pub code_only: bool,
     /// New parent contract uses live copies without pausing; standalone CLI retains its explicit policy.
@@ -661,12 +663,19 @@ pub fn dump_package_with(
     dest: &Path,
     options: &DumpOptions,
 ) -> Result<PackageDumpReport> {
+    if options
+        .runtime_copy_ms
+        .is_some_and(|ms| !(1..=3_600_000).contains(&ms))
+    {
+        bail!("runtime-copy-ms must be between 1 and 3600000");
+    }
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    let qualified_backend = if options.code_only || options.parent_owned {
-        Some(crate::qualified_code::Backend::open()?)
-    } else {
-        None
-    };
+    let qualified_backend =
+        if options.code_only || options.parent_owned || options.runtime_copy_ms.is_some() {
+            Some(crate::qualified_code::Backend::open()?)
+        } else {
+            None
+        };
     if options.parent_owned
         && options
             .expected_code_sources
@@ -843,6 +852,13 @@ pub fn dump_package_with(
     #[allow(unused_mut)]
     let mut budget_closed = false;
     let deadline = first_copy_deadline(dest, options, Instant::now());
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let mut copy_clock =
+        crate::runtime_copy_clock::RuntimeCopyClock::new(deadline, options.runtime_copy_ms)?;
+    eprintln!(
+        "{}",
+        serde_json::json!({"schema":"kernsight.runtime-copy-window/v1","window_ms":deadline.saturating_duration_since(Instant::now()).as_millis(),"source_count":pids.len().min(8),"parent_owned":options.parent_owned,"runtime_only":options.runtime_only,"code_only":options.code_only})
+    );
     if options.parent_owned {
         report.warnings.push("runtime_mapping_scope=initial_bound_maps_snapshot_per_source; later mappings and later contents are not observed by another full copy pass".into());
     }
@@ -879,7 +895,7 @@ pub fn dump_package_with(
                     },
                 };
                 if let Some(copied) =
-                    copy_qualified_or_stop(backend, &expected, &runtime, deadline)?
+                    copy_qualified_or_stop(backend, &expected, &runtime, &mut copy_clock)?
                 {
                     copied
                 } else {
@@ -913,7 +929,11 @@ pub fn dump_package_with(
             break;
         }
     }
-    if !options.parent_owned && !budget_closed && !pids.is_empty() {
+    if !options.parent_owned
+        && options.runtime_copy_ms.is_none()
+        && !budget_closed
+        && !pids.is_empty()
+    {
         std::thread::sleep(Duration::from_millis(500));
         pids = merge_live_package_pids(package, pids);
         // Package membership does not extend the preceding physical source grant.
@@ -947,8 +967,12 @@ pub fn dump_package_with(
                             }
                         },
                     };
-                    if let Some(copied) = copy_qualified_or_stop(backend, &expected, &runtime, mid)?
-                    {
+                    if let Some(copied) = copy_qualified_or_stop(
+                        backend,
+                        &expected,
+                        &runtime,
+                        &mut crate::runtime_copy_clock::RuntimeCopyClock::new(mid, None)?,
+                    )? {
                         copied
                     } else {
                         budget_closed = true;
@@ -1015,9 +1039,12 @@ pub fn dump_package_with(
                                 }
                             },
                         };
-                        if let Some(copied) =
-                            copy_qualified_or_stop(backend, &expected, &runtime, second)?
-                        {
+                        if let Some(copied) = copy_qualified_or_stop(
+                            backend,
+                            &expected,
+                            &runtime,
+                            &mut crate::runtime_copy_clock::RuntimeCopyClock::new(second, None)?,
+                        )? {
                             copied
                         } else {
                             budget_closed = true;
@@ -2173,9 +2200,9 @@ fn copy_qualified_or_stop(
     backend: &crate::qualified_code::Backend,
     expected: &crate::qualified_code::SourceIdentity,
     runtime: &Path,
-    deadline: Instant,
+    clock: &mut crate::runtime_copy_clock::RuntimeCopyClock,
 ) -> Result<Option<crate::dexdump::LiveDump>> {
-    match backend.copy_code(expected, runtime, deadline) {
+    match backend.copy_code(expected, runtime, clock) {
         Ok(live) => Ok(Some(live)),
         Err(error) if closed_output_budget(&error) => {
             eprintln!(
@@ -3803,11 +3830,24 @@ fn hex_key(key: [u8; 16]) -> String {
     out
 }
 
-// All sources share one window within the original phase. Reserve concrete
-// downstream work instead of discarding one third of every remaining window:
-// full static retention gets thirty seconds, reference metadata gets five,
-// and every mode keeps ten seconds for the final catalog and return.
+// Keep closeout inside the original phase without letting a fixed forty-second
+// reserve consume almost the whole short GUI grant before the first range.
 fn first_copy_deadline(dest: &Path, options: &DumpOptions, now: Instant) -> Instant {
+    if let Some(ms) = options.runtime_copy_ms {
+        // This is the latest permitted end, not the requested clock's start.
+        // ready() grants the whole user duration after preparation or refuses it.
+        let reserve = Duration::from_secs(if options.runtime_only {
+            10
+        } else if options.code_only {
+            15
+        } else {
+            40
+        });
+        return ksight_core::output_budget::invocation_deadline(dest).map_or_else(
+            || now + Duration::from_millis(ms) + Duration::from_secs(20),
+            |end| end.checked_sub(reserve).unwrap_or(now).max(now),
+        );
+    }
     if options.parent_owned {
         if let Some(parent_deadline) = ksight_core::output_budget::invocation_deadline(dest) {
             let static_seconds = if options.runtime_only {
@@ -3818,7 +3858,8 @@ fn first_copy_deadline(dest: &Path, options: &DumpOptions, now: Instant) -> Inst
                 30
             };
             let remaining = parent_deadline.saturating_duration_since(now);
-            let live_window = remaining.saturating_sub(Duration::from_secs(10 + static_seconds));
+            let reserve = Duration::from_secs(10 + static_seconds).min(remaining / 4);
+            let live_window = remaining.saturating_sub(reserve);
             return (now + live_window).min(parent_deadline);
         }
     }
@@ -5526,10 +5567,10 @@ mod expanded_copy_window_tests {
         let original = ksight_core::output_budget::invocation_deadline(&root).unwrap();
         let now = original.checked_sub(Duration::from_secs(9)).unwrap();
         let live_deadline = first_copy_deadline(&root, &parent_options(), now);
-        assert_eq!(live_deadline, now);
+        assert!(live_deadline > now && live_deadline < original);
         let mut report = PackageDumpReport::default();
         let mut copy_calls = 0;
-        if live_copy_window_available(&mut report, &root, true, live_deadline, now, 2) {
+        if live_copy_window_available(&mut report, &root, true, live_deadline, live_deadline, 2) {
             copy_calls += 1;
         }
         assert_eq!(copy_calls, 0);
@@ -5639,7 +5680,11 @@ mod expanded_copy_window_tests {
             let short = original
                 .checked_sub(Duration::from_secs(reserve - 1))
                 .unwrap();
-            assert_eq!(first_copy_deadline(&root, &options, short), short);
+            let available = original.saturating_duration_since(short);
+            assert_eq!(
+                first_copy_deadline(&root, &options, short),
+                original.checked_sub(available / 4).unwrap()
+            );
             assert_eq!(
                 first_copy_deadline(&root, &options, original + Duration::from_secs(1)),
                 original

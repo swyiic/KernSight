@@ -466,11 +466,11 @@ dependencies = [
 
 [[package]]
 name = "ksight-abi"
-version = "0.2.12"
+version = "0.2.13"
 
 [[package]]
 name = "ksight-agent"
-version = "0.2.12"
+version = "0.2.13"
 dependencies = [
  "anyhow",
  "aya",
@@ -494,7 +494,7 @@ dependencies = [
 
 [[package]]
 name = "ksight-cli"
-version = "0.2.12"
+version = "0.2.13"
 dependencies = [
  "anyhow",
  "clap",
@@ -508,7 +508,7 @@ dependencies = [
 
 [[package]]
 name = "ksight-core"
-version = "0.2.12"
+version = "0.2.13"
 dependencies = [
  "brotli-decompressor",
  "flate2",
@@ -524,7 +524,7 @@ dependencies = [
 
 [[package]]
 name = "ksight-hwbp"
-version = "0.2.12"
+version = "0.2.13"
 dependencies = [
  "anyhow",
  "aya",
@@ -537,14 +537,14 @@ dependencies = [
 
 [[package]]
 name = "ksight-inject"
-version = "0.2.12"
+version = "0.2.13"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "ksight-model"
-version = "0.2.12"
+version = "0.2.13"
 dependencies = [
  "serde",
  "uuid",
@@ -552,7 +552,7 @@ dependencies = [
 
 [[package]]
 name = "ksight-protocol"
-version = "0.2.12"
+version = "0.2.13"
 dependencies = [
  "ksight-model",
  "serde",
@@ -933,7 +933,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.2.12"
+version = "0.2.13"
 dependencies = [
  "anyhow",
  "clap",

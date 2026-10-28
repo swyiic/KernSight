@@ -1,8 +1,12 @@
 //! Foreground multi-sensor capture orchestration.
 
 mod auxiliary;
+mod observation_clock;
 #[cfg(any(target_os = "android", target_os = "linux"))]
 pub(crate) mod qualification;
+#[cfg(any(target_os = "android", target_os = "linux"))]
+use std::time::{Duration, Instant};
+
 pub use auxiliary::{AuxiliaryAction, AuxiliaryCapturePlan, AuxiliaryStage};
 
 use std::path::PathBuf;
@@ -83,7 +87,7 @@ pub struct StorageOptions {
     pub max_session_age_secs: u64,
     /// Global complete-batch bound across the spool root; zero disables it.
     pub max_total_spool_bytes: u64,
-    /// Sealed sessions to retain after pruning.
+    /// Legacy explicit-pruning count; automatic capture preserves all sessions.
     pub keep_completed_sessions: u32,
 }
 
@@ -455,8 +459,7 @@ pub fn run(request: CaptureRequest) -> Result<()> {
             max_total_bytes: request.storage.max_total_spool_bytes,
             keep_completed: request.storage.keep_completed_sessions,
         };
-        retention.repair_interrupted()?;
-        retention.prune()?;
+        retention.prepare_session(request.storage.max_spool_bytes)?;
     }
     let spool = request
         .storage
@@ -679,8 +682,7 @@ fn stream_events(
         time::{Duration, Instant},
     };
 
-    let _phase = crate::capture_timing::enter(crate::capture_timing::Phase::Observe);
-    let started = Instant::now();
+    let preparing_started = Instant::now();
     let deadline =
         (request.duration_seconds != 0).then(|| Duration::from_secs(request.duration_seconds));
     // Reserve stop/drain/publication time inside the existing invocation lease.
@@ -688,21 +690,11 @@ fn stream_events(
     // observation stopped before the reserve, not that the reserve was used.
     let shutdown_reserve =
         crate::shutdown_drain::reserve(request.inspect.enabled, request.duration_seconds);
-    let observation_end = request
+    let invocation_deadline = request
         .storage
         .spool_root
         .as_ref()
-        .filter(|_| request.storage.capture_relation.is_some())
-        .map(|root| {
-            crate::shutdown_drain::before_reserve(
-                ksight_core::output_budget::deadline(
-                    root,
-                    started + Duration::from_secs(u64::from(u32::MAX)),
-                ),
-                shutdown_reserve,
-                started,
-            )
-        });
+        .and_then(|root| ksight_core::output_budget::invocation_deadline(root));
     let running = Arc::new(AtomicBool::new(true));
     let signal_state = Arc::clone(&running);
     ctrlc::set_handler(move || signal_state.store(false, Ordering::SeqCst))?;
@@ -843,16 +835,6 @@ fn stream_events(
         }
     }
 
-    if let Some(cursor) = &stage_cursor {
-        emit_capture_stage(
-            &mut pipeline,
-            cursor.index,
-            &request.inspect_stages[cursor.index],
-            "started",
-            Some(&inspect),
-            target_instance,
-        )?;
-    }
     publish_service_health(request, &pipeline, &sensors)?;
     let mut next_heartbeat = Instant::now() + Duration::from_secs(1);
     let mut next_crypto = Instant::now() + Duration::from_secs(3);
@@ -872,6 +854,33 @@ fn stream_events(
         pipeline.emit_event(event)?;
     }
 
+    let setup_elapsed = preparing_started.elapsed();
+    let mut stage_setup_elapsed = Duration::ZERO;
+    let mut stage_boundary_overrun = Duration::ZERO;
+    let mut started = Instant::now();
+    let mut observation_end = observation_clock::end(
+        started,
+        request.duration_seconds,
+        invocation_deadline,
+        shutdown_reserve,
+    )?;
+    pipeline.file_deadline = observation_end;
+    inspect.arm_observation_clock();
+    let _phase = crate::capture_timing::enter(crate::capture_timing::Phase::Observe);
+    if let Some(cursor) = &stage_cursor {
+        emit_capture_stage(
+            &mut pipeline,
+            cursor.index,
+            &request.inspect_stages[cursor.index],
+            "started",
+            Some(&inspect),
+            target_instance,
+        )?;
+    }
+    eprintln!(
+        "{}",
+        serde_json::json!({"schema":"kernsight.observation-ready/v1","clock":"device_monotonic_after_prepare","requested_ms":request.duration_seconds.saturating_mul(1000),"setup_elapsed_ms":setup_elapsed.as_millis()})
+    );
     let launch_task = request
         .startup
         .as_ref()
@@ -881,9 +890,14 @@ fn stream_events(
     let mut next_startup_observation = Instant::now();
     let mut next_stack_inventory = Instant::now();
     let mut unprocessed_inspect_outputs = 0usize;
+    // A read batch may cross the observation boundary. Keep its already-owned
+    // outputs for the existing stopped-producer drain instead of publishing
+    // an entire batch while the producers continue past the requested time.
+    let mut pending_inspect_outputs = std::collections::VecDeque::new();
+    let mut slowest_live_segment = ("none", Duration::ZERO);
     // Loop errors must not skip final counters, raw checkpoints or own child cleanup.
     let capture_loop_result = (|| -> Result<()> {
-        while running.load(Ordering::SeqCst)
+        'observe: while running.load(Ordering::SeqCst)
             && (request.count == 0 || pipeline.stats.live_emitted < request.count)
             && deadline.is_none_or(|duration| started.elapsed() < duration)
             && observation_end.is_none_or(|end| Instant::now() < end)
@@ -976,6 +990,14 @@ fn stream_events(
                     next_instance_check = Instant::now() + Duration::from_secs(1);
                 }
                 if cursor.due(elapsed) {
+                    let transition_started = Instant::now();
+                    let completed_seconds = request.inspect_stages[..=cursor.index]
+                        .iter()
+                        .map(|stage| stage.seconds)
+                        .sum::<u64>();
+                    stage_boundary_overrun += transition_started
+                        .saturating_duration_since(started)
+                        .saturating_sub(Duration::from_secs(completed_seconds));
                     if target_instance.is_none() {
                         bail!("staged target instance was never verified; stopping before the next phase");
                     }
@@ -988,7 +1010,10 @@ fn stream_events(
                         target_instance,
                     )?;
                     stage_open = false;
-                    if !cursor.advance(elapsed).map_err(anyhow::Error::msg)? {
+                    if !cursor
+                        .advance(completed_seconds)
+                        .map_err(anyhow::Error::msg)?
+                    {
                         running.store(false, Ordering::SeqCst);
                         break;
                     }
@@ -1017,6 +1042,17 @@ fn stream_events(
                             &request.uprobe_object,
                         )
                     };
+                    let setup = transition_started.elapsed();
+                    stage_setup_elapsed += setup;
+                    (started, observation_end) = observation_clock::next_stage(
+                        Instant::now(),
+                        completed_seconds,
+                        request.duration_seconds,
+                        invocation_deadline,
+                        shutdown_reserve,
+                    )?;
+                    pipeline.file_deadline = observation_end;
+                    inspect.arm_observation_clock();
                     stage_open = true;
                     emit_capture_stage(
                         &mut pipeline,
@@ -1031,45 +1067,83 @@ fn stream_events(
                     }
                 }
             }
-            if Instant::now() >= next_environment_check {
-                let current = crate::environment::collect(request.collector_mode);
-                if !same_environment_state(&last_environment, &current) {
-                    pipeline.environment.clone_from(&current);
-                    pipeline.emit_session_payload(
-                        ksight_model::EventPayload::SessionEnvironment(current.clone()),
-                    )?;
-                    last_environment = current;
+            // Keep reading while a sensor ring still returns records. Crypto
+            // scans and heartbeats run only after this burst, so they do not
+            // sit between every sample. sample_one_in stays 1.
+            let mut read_anything = false;
+            let mut sensor_pending = false;
+            for _ in 0..64 {
+                if !running.load(Ordering::SeqCst)
+                    || observation_end.is_some_and(|end| Instant::now() >= end)
+                {
+                    break 'observe;
                 }
-                next_environment_check = Instant::now() + environment_check_interval;
-            }
-            let mut consumed_any = false;
-            for sensor in &mut sensors {
                 if request.count != 0 && pipeline.stats.live_emitted >= request.count {
                     break;
                 }
-                match sensor.next_record() {
-                    Ok(Some(record)) => {
-                        consumed_any = true;
-                        pipeline.emit(record)?;
+                let mut pass = false;
+                for sensor in &mut sensors {
+                    if !running.load(Ordering::SeqCst)
+                        || observation_end.is_some_and(|end| Instant::now() >= end)
+                    {
+                        break 'observe;
                     }
-                    Ok(None) => {}
-                    Err(error) => {
-                        pipeline.stats.invalid_records += 1;
-                        eprintln!(
-                            "discard invalid {} ring-buffer record: {error}",
-                            sensor.name
-                        );
+                    if request.count != 0 && pipeline.stats.live_emitted >= request.count {
+                        break;
+                    }
+                    match sensor.next_record() {
+                        Ok(Some(record)) => {
+                            pass = true;
+                            read_anything = true;
+                            let work_started = Instant::now();
+                            pipeline.emit(record)?;
+                            let elapsed = work_started.elapsed();
+                            if elapsed > slowest_live_segment.1 {
+                                slowest_live_segment = ("kernel_output", elapsed);
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            pipeline.stats.invalid_records += 1;
+                            eprintln!(
+                                "discard invalid {} ring-buffer record: {error}",
+                                sensor.name
+                            );
+                        }
                     }
                 }
+                if !pass {
+                    sensor_pending = false;
+                    break;
+                }
+                sensor_pending = true;
+            }
+            if observation_end.is_some_and(|end| Instant::now() >= end) {
+                break;
             }
             if inspect_policy.enabled {
-                for observation in inspect.attach_when_safe() {
+                let work_started = Instant::now();
+                let attached = inspect.attach_when_safe_until(observation_end);
+                let elapsed = work_started.elapsed();
+                if elapsed > slowest_live_segment.1 {
+                    slowest_live_segment = ("inspect_attach", elapsed);
+                }
+                for observation in attached {
                     if observation.attached {
                         if let Some(startup) = &request.startup {
                             startup.record_attach(&observation.adapter);
                         }
                     }
-                    pipeline.emit_inspect(observation)?;
+                    pending_inspect_outputs.push_back(
+                        crate::inspect_runtime::InspectOutput::Observation {
+                            pid: 0,
+                            tid: 0,
+                            observation,
+                        },
+                    );
+                }
+                if observation_end.is_some_and(|end| Instant::now() >= end) {
+                    break;
                 }
                 if let (Some(inject), Some(package)) =
                     (tls_inject.as_mut(), request.package.as_deref())
@@ -1096,71 +1170,107 @@ fn stream_events(
                         }
                     }
                 }
+                let work_started = Instant::now();
                 let outputs = {
                     let _phase = crate::capture_timing::enter(crate::capture_timing::Phase::Poll);
-                    inspect.poll()
+                    inspect.poll_until(observation_end)
                 };
-                let output_count = outputs.len();
+                let elapsed = work_started.elapsed();
+                if elapsed > slowest_live_segment.1 {
+                    slowest_live_segment = ("inspect_poll", elapsed);
+                }
+                pending_inspect_outputs.extend(outputs);
                 let _output_phase =
                     crate::capture_timing::enter(crate::capture_timing::Phase::PollOutput);
-                for (output_index, output) in outputs.into_iter().enumerate() {
+                while !pending_inspect_outputs.is_empty() {
+                    if !running.load(Ordering::SeqCst)
+                        || observation_end.is_some_and(|end| Instant::now() >= end)
+                    {
+                        break 'observe;
+                    }
+                    let output = pending_inspect_outputs.pop_front().unwrap();
+                    let work_started = Instant::now();
                     if let Some(mirror) = pipeline.burp_mirror.as_mut() {
                         route_inspect_to_mirror(mirror, &output);
                     }
                     if let Err(error) = pipeline.emit_inspect_output(output) {
-                        unprocessed_inspect_outputs = output_count - output_index - 1;
+                        unprocessed_inspect_outputs = pending_inspect_outputs.len();
                         return Err(error);
                     }
+                    let elapsed = work_started.elapsed();
+                    if elapsed > slowest_live_segment.1 {
+                        slowest_live_segment = ("inspect_output", elapsed);
+                    }
+                }
+                if observation_end.is_some_and(|end| Instant::now() >= end) {
+                    break;
                 }
                 if let Some(observation) = inspect.expire_if_needed() {
                     pipeline.emit_inspect(observation)?;
                 }
             }
-            if request.mirror_http.is_some() && Instant::now() >= next_stack_inventory {
-                if let (Some(package), Some(mirror)) =
-                    (request.package.as_deref(), pipeline.burp_mirror.as_mut())
-                {
-                    mirror.set_stack_coverage(mapped_stack_coverage(package));
+            let inspect_pending = inspect_policy.enabled && inspect.poll_budget_status().1;
+            let ring_open = sensor_pending || inspect_pending;
+            if !ring_open {
+                if observation_end.is_some_and(|end| Instant::now() >= end) {
+                    break;
                 }
-                next_stack_inventory = Instant::now() + Duration::from_secs(15);
-            }
-            if Instant::now() >= next_inspect_stats {
-                let (raw, decoded, lost) = inspect.drain_totals();
-                let [perf_min_size, perf_max_size, perf_padding_removed] =
-                    inspect.perf_record_framing_totals();
-                eprintln!("inspect perf framing: min_size={perf_min_size} max_size={perf_max_size} padding_removed={perf_padding_removed}");
-                let [bad_size, bad_abi, malformed, scope_epoch, scope_identity, accepted] =
-                    inspect.record_admission_totals();
-                eprintln!("inspect record admission: bad_size={bad_size} bad_abi={bad_abi} malformed={malformed} scope_epoch={scope_epoch} scope_identity={scope_identity} accepted={accepted}");
-                let (read_entry, read_return, read_success, read_failure, read_wanted) =
-                    inspect.ssl_read_funnel();
-                let (
-                    positive_return,
-                    dropped_positive,
-                    want_openssl,
-                    want_conscrypt,
-                    ok_openssl,
-                    ok_conscrypt,
-                    positive_openssl,
-                    positive_conscrypt,
-                ) = inspect.ssl_read_funnel_ex();
-                let (conn_streams, conn_returns, conn_shared) = inspect.connkey_stats();
-                let mirror_diagnostics = pipeline
-                    .burp_mirror
-                    .as_ref()
-                    .map(crate::burp_mirror::BurpMirror::diagnostic_detail);
-                let mirror_metrics = pipeline
-                    .burp_mirror
-                    .as_ref()
-                    .map(crate::burp_mirror::BurpMirror::diagnostic_metrics)
-                    .unwrap_or_default();
-                eprintln!(
+                if Instant::now() >= next_environment_check {
+                    let current = crate::environment::collect(request.collector_mode);
+                    if !same_environment_state(&last_environment, &current) {
+                        pipeline.environment.clone_from(&current);
+                        pipeline.emit_session_payload(
+                            ksight_model::EventPayload::SessionEnvironment(current.clone()),
+                        )?;
+                        last_environment = current;
+                    }
+                    next_environment_check = Instant::now() + environment_check_interval;
+                }
+                if request.mirror_http.is_some() && Instant::now() >= next_stack_inventory {
+                    if let (Some(package), Some(mirror)) =
+                        (request.package.as_deref(), pipeline.burp_mirror.as_mut())
+                    {
+                        mirror.set_stack_coverage(mapped_stack_coverage(package));
+                    }
+                    next_stack_inventory = Instant::now() + Duration::from_secs(15);
+                }
+                if Instant::now() >= next_inspect_stats {
+                    let (raw, decoded, lost) = inspect.drain_totals();
+                    let [perf_min_size, perf_max_size, perf_padding_removed] =
+                        inspect.perf_record_framing_totals();
+                    eprintln!("inspect perf framing: min_size={perf_min_size} max_size={perf_max_size} padding_removed={perf_padding_removed}");
+                    let [bad_size, bad_abi, malformed, scope_epoch, scope_identity, accepted] =
+                        inspect.record_admission_totals();
+                    eprintln!("inspect record admission: bad_size={bad_size} bad_abi={bad_abi} malformed={malformed} scope_epoch={scope_epoch} scope_identity={scope_identity} accepted={accepted}");
+                    let (read_entry, read_return, read_success, read_failure, read_wanted) =
+                        inspect.ssl_read_funnel();
+                    let (
+                        positive_return,
+                        dropped_positive,
+                        want_openssl,
+                        want_conscrypt,
+                        ok_openssl,
+                        ok_conscrypt,
+                        positive_openssl,
+                        positive_conscrypt,
+                    ) = inspect.ssl_read_funnel_ex();
+                    let (conn_streams, conn_returns, conn_shared) = inspect.connkey_stats();
+                    let mirror_diagnostics = pipeline
+                        .burp_mirror
+                        .as_ref()
+                        .map(crate::burp_mirror::BurpMirror::diagnostic_detail);
+                    let mirror_metrics = pipeline
+                        .burp_mirror
+                        .as_ref()
+                        .map(crate::burp_mirror::BurpMirror::diagnostic_metrics)
+                        .unwrap_or_default();
+                    eprintln!(
                 "inspect layers: raw_uprobe={raw} decoded={decoded} perf_lost={lost} ssl_read_entry={read_entry} ssl_read_ret={read_return} ssl_read_ok={read_success} ssl_read_fail={read_failure} ssl_read_want={read_wanted} ssl_read_ret_gt0={positive_return} ssl_read_drop_gt0={dropped_positive} ssl_read_want_openssl={want_openssl} ssl_read_want_conscrypt={want_conscrypt} ssl_read_ok_openssl={ok_openssl} ssl_read_ok_conscrypt={ok_conscrypt} ssl_read_gt0_openssl={positive_openssl} ssl_read_gt0_conscrypt={positive_conscrypt} quic_connkey_streams={conn_streams} quic_connkey_returns={conn_returns} quic_connkey_shared={conn_shared} {}",
                 mirror_diagnostics.as_deref().unwrap_or("mirror=disabled")
             );
-                if pipeline.burp_mirror.is_some() {
-                    let get = |name: &str| mirror_metrics.get(name).copied().unwrap_or(0);
-                    eprintln!(
+                    if pipeline.burp_mirror.is_some() {
+                        let get = |name: &str| mirror_metrics.get(name).copied().unwrap_or(0);
+                        eprintln!(
                     "mirror rates: coverage candidates={} export={} pinned={} empirical={} keylog={} uncovered={} | retention raw={} decoded={} perf_lost={} drop_gt0={} | delivery delivered={} reconstructed={} ok_paired={} no_status={} no_host={} unpaired_req={} unpaired_resp={} orphan_overflow={} incomplete={} http3_dirs={} http3_yielded={}",
                     get("stack_candidates"),
                     get("stack_export_candidates"),
@@ -1184,22 +1294,23 @@ fn stream_events(
                     get("http3_directions"),
                     get("http3_yielded"),
                 );
+                    }
+                    if let Some(detail) = mirror_diagnostics {
+                        pipeline.emit_inspect(ksight_model::InspectObservation {
+                            adapter: "burp_mirror_diagnostics".to_owned(),
+                            attached: true,
+                            hit: true,
+                            detail,
+                            metrics: mirror_metrics,
+                            detectability_notice:
+                                "diagnostic counters only; no additional probe was attached"
+                                    .to_owned(),
+                            ..ksight_model::InspectObservation::default()
+                        })?;
+                    }
+                    next_inspect_stats = Instant::now() + Duration::from_secs(10);
                 }
-                if let Some(detail) = mirror_diagnostics {
-                    pipeline.emit_inspect(ksight_model::InspectObservation {
-                        adapter: "burp_mirror_diagnostics".to_owned(),
-                        attached: true,
-                        hit: true,
-                        detail,
-                        metrics: mirror_metrics,
-                        detectability_notice:
-                            "diagnostic counters only; no additional probe was attached".to_owned(),
-                        ..ksight_model::InspectObservation::default()
-                    })?;
-                }
-                next_inspect_stats = Instant::now() + Duration::from_secs(10);
-            }
-            auxiliary.dispatch(AuxiliaryStage::Poll, true, |action| -> Result<()> {
+                auxiliary.dispatch(AuxiliaryStage::Poll, true, |action| -> Result<()> {
                 debug_assert_eq!(action, AuxiliaryAction::CryptoWatch);
         if Instant::now() >= next_crypto {
             if let Some(package) = request.package.as_deref() {
@@ -1237,12 +1348,11 @@ fn stream_events(
             }
                 Ok(())
             })?;
-            if !consumed_any {
-                std::thread::sleep(Duration::from_millis(10));
             }
-            if let Some(spool) = pipeline.spool.as_mut() {
-                flush_capture_idle(spool)?;
+            if observation_end.is_some_and(|end| Instant::now() >= end) {
+                break;
             }
+            // Health publication must not wait for a continuously busy ring.
             if Instant::now() >= next_heartbeat {
                 publish_service_health(request, &pipeline, &sensors)?;
                 next_heartbeat = Instant::now() + Duration::from_secs(1);
@@ -1259,6 +1369,15 @@ fn stream_events(
                     }
                 }
             }
+            if !read_anything && !inspect_pending {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if observation_end.is_some_and(|end| Instant::now() >= end) {
+                break;
+            }
+            if let Some(spool) = pipeline.spool.as_mut() {
+                flush_capture_idle(spool)?;
+            }
             if pipeline.should_rotate() {
                 if stage_cursor.is_some() {
                     bail!("staged session reached rotation boundary; refusing to silently start another session");
@@ -1274,15 +1393,26 @@ fn stream_events(
         Ok(())
     })();
     let observation_elapsed = started.elapsed();
-    let observation_shortened = observation_end.is_some_and(|end| Instant::now() >= end)
-        && deadline.is_some_and(|duration| {
-            observation_elapsed + shutdown_reserve + Duration::from_secs(1) < duration
-        });
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "schema":"kernsight.file-enrichment/v1", "failed_snapshots":pipeline.file_enrichment_failures,
+            "live_repair":"deferred_to_offline", "raw_file_events":"retained",
+            "cooperative_budget_ms":50, "scope":"optional_file_enrichment_not_memory_copy_coverage"
+        })
+    );
+    let reached_requested_count =
+        request.count != 0 && pipeline.stats.live_emitted >= request.count;
+    let observation_shortened =
+        !reached_requested_count && deadline.is_some_and(|duration| observation_elapsed < duration);
     eprintln!(
         "{}",
         serde_json::json!({"schema":"kernsight.observation-window/v1",
+        "clock":"device_monotonic_after_prepare","setup_elapsed_ms":setup_elapsed.as_millis(),"stage_setup_elapsed_ms":stage_setup_elapsed.as_millis(),"stage_boundary_overrun_ms":stage_boundary_overrun.as_millis(),
         "requested_ms":request.duration_seconds.saturating_mul(1000),
         "elapsed_ms":observation_elapsed.as_millis(), "shortened":observation_shortened,
+        "window_overrun_ms":deadline.map(|requested|observation_elapsed.saturating_sub(requested).as_millis()),
+        "slowest_live_segment":{"name":slowest_live_segment.0,"elapsed_ms":slowest_live_segment.1.as_millis()},
         "shutdown_reserve_ms":shutdown_reserve.as_millis()})
     );
     // Spend the shutdown reserve already carved from this phase. A second
@@ -1304,6 +1434,7 @@ fn stream_events(
         .map_or(drain_end, |root| {
             ksight_core::output_budget::deadline(root, drain_end)
         });
+    pipeline.file_deadline = Some(drain_end);
     let mut drain_sources = crate::shutdown_drain::FrozenQueues::new(sensors.len() + 1);
     let drain_allowed = || {
         Instant::now() < drain_end
@@ -1319,8 +1450,9 @@ fn stream_events(
             &mut sensors,
             &mut pipeline,
             &mut drain_sources,
+            &mut pending_inspect_outputs,
         ),
-        |(inspect, sensors, _, sources)| {
+        |(inspect, sensors, _, sources, _)| {
             let mut stopped = true;
             if let Err(error) = inspect.stop_production() {
                 eprintln!("inspect stop unconfirmed: {error:#}");
@@ -1335,10 +1467,10 @@ fn stream_events(
             sources.confirm_producers_stopped(stopped);
             stopped
         },
-        |(inspect, sensors, pipeline, sources)| -> anyhow::Result<bool> {
+        |(inspect, sensors, pipeline, sources, pending)| -> anyhow::Result<bool> {
             sources.read_round(
-                &mut (inspect, sensors, pipeline),
-                |(inspect, sensors, pipeline),
+                &mut (inspect, sensors, pipeline, pending),
+                |(inspect, sensors, pipeline, pending),
                  index|
                  -> Result<
                     crate::shutdown_drain::ReadStep,
@@ -1444,12 +1576,16 @@ fn stream_events(
                         });
                     }
                     let before_raw = inspect.drain_totals().0;
-                    let outputs = inspect.poll();
+                    let performed_poll = pending.is_empty();
+                    if performed_poll {
+                        pending.extend(inspect.poll_until(Some(drain_end)));
+                    }
                     let raw_records = inspect.drain_totals().0.saturating_sub(before_raw);
                     let read_elapsed_us =
                         u64::try_from(read_started.elapsed().as_micros()).unwrap_or(u64::MAX);
                     let emit_started = Instant::now();
-                    for output in outputs {
+                    while !pending.is_empty() && drain_allowed() {
+                        let output = pending.pop_front().unwrap();
                         if let Some(mirror) = pipeline.burp_mirror.as_mut() {
                             route_inspect_to_mirror(mirror, &output);
                         }
@@ -1470,7 +1606,11 @@ fn stream_events(
                     // Emptiness is only the latest ring observation. Scope and read
                     // failures stay in the coverage verdict; they must not freeze
                     // the queue or invent an unread tail.
-                    let empty = !inspect.poll_budget_status().1;
+                    // Publishing an earlier live batch says nothing about
+                    // records produced between that read and producer stop.
+                    // Require a fresh stopped-queue poll before freezing it.
+                    let empty =
+                        performed_poll && pending.is_empty() && !inspect.poll_budget_status().1;
                     Ok(ReadStep {
                         progress: if empty {
                             ReadProgress::Empty(raw_records)
@@ -1489,7 +1629,9 @@ fn stream_events(
     );
     let drain_complete = drain_result
         .as_ref()
-        .is_ok_and(crate::shutdown_drain::DrainEnd::complete);
+        .is_ok_and(crate::shutdown_drain::DrainEnd::complete)
+        && pending_inspect_outputs.is_empty();
+    unprocessed_inspect_outputs = unprocessed_inspect_outputs.max(pending_inspect_outputs.len());
     eprintln!(
         "{}",
         serde_json::json!({"schema":"kernsight.capture-drain/v1",
@@ -1542,7 +1684,7 @@ fn stream_events(
             let last_elapsed = capture_loop_result.is_ok()
                 && running.load(Ordering::SeqCst)
                 && cursor.index + 1 == request.inspect_stages.len()
-                && cursor.due(started.elapsed().as_secs())
+                && cursor.due(observation_elapsed.as_secs())
                 && target_instance.is_some()
                 && observe_stage_target(request, target_instance) == target_instance;
             if !last_elapsed {
@@ -1712,7 +1854,9 @@ fn stream_events(
                         if pid != source.pid {
                             continue;
                         }
-                        backend.copy_code(source, &dest, dump_deadline)?
+                        let mut clock =
+                            crate::runtime_copy_clock::RuntimeCopyClock::new(dump_deadline, None)?;
+                        backend.copy_code(source, &dest, &mut clock)?
                     } else {
                         crate::dexdump::dump_live_process_with_pause(
                             pid,
@@ -1981,6 +2125,28 @@ struct CaptureStats {
     invalid_records: u64,
 }
 
+// Bounded metadata only: no path, payload, or business text in slow-step logs.
+#[cfg(any(target_os = "android", target_os = "linux"))]
+struct SlowEventStep(&'static str, Instant);
+#[cfg(any(target_os = "android", target_os = "linux"))]
+impl SlowEventStep {
+    fn new(name: &'static str) -> Self {
+        Self(name, Instant::now())
+    }
+}
+#[cfg(any(target_os = "android", target_os = "linux"))]
+impl Drop for SlowEventStep {
+    fn drop(&mut self) {
+        let elapsed = self.1.elapsed();
+        if elapsed >= Duration::from_millis(50) {
+            eprintln!(
+                "{}",
+                serde_json::json!({"schema":"kernsight.slow-event-step/v1", "step":self.0, "elapsed_ms":elapsed.as_millis()})
+            );
+        }
+    }
+}
+
 #[cfg(any(target_os = "android", target_os = "linux"))]
 struct EventPipeline {
     normalizer: crate::normalize::EventNormalizer,
@@ -1994,6 +2160,8 @@ struct EventPipeline {
     storage: StorageOptions,
     environment: ksight_model::SessionEnvironment,
     storage_limit_reached: bool,
+    file_deadline: Option<Instant>,
+    file_enrichment_failures: u64,
     binder_transactions_in_scope: std::collections::HashSet<i32>,
     /// Kernel parcel prefix waiting to join the matching submit `debug_id`.
     pending_parcels: std::collections::HashMap<i32, PendingParcel>,
@@ -2066,6 +2234,8 @@ impl EventPipeline {
             storage,
             environment,
             storage_limit_reached: false,
+            file_deadline: None,
+            file_enrichment_failures: 0,
             binder_transactions_in_scope: std::collections::HashSet::new(),
             pending_parcels: std::collections::HashMap::new(),
             pending_parcels_by_tid_code: std::collections::HashMap::new(),
@@ -2086,6 +2256,7 @@ impl EventPipeline {
         use crate::normalize::Normalizer as _;
 
         self.stats.raw_records += 1;
+        let normalize_work = SlowEventStep::new("normalize");
         let mut event = match self.normalizer.normalize(record) {
             Ok(event) => event,
             Err(error) => {
@@ -2094,6 +2265,7 @@ impl EventPipeline {
                 return Ok(());
             }
         };
+        drop(normalize_work);
         if self.absorb_or_apply_parcel(&mut event) {
             return Ok(());
         }
@@ -2224,12 +2396,16 @@ impl EventPipeline {
     fn finalize_event(&mut self, event: &mut ksight_model::Event) -> Result<()> {
         use ksight_model::{EventPayload, SensorKind};
 
+        let identity_work = SlowEventStep::new("identity");
         self.identity_resolver.enrich(&mut event.header.process);
+        drop(identity_work);
         if event.header.process.tgid == self.collector_pid {
             self.stats.filtered_collector = self.stats.filtered_collector.saturating_add(1);
             return Ok(());
         }
+        let process_work = SlowEventStep::new("process_correlation");
         self.process_instances.correlate(event);
+        drop(process_work);
         self.correlate_binder_request_reply(event);
         event.header.quality.sample_one_in = self.sampling.for_sensor(event.header.sensor);
         let process_matches_scope = self.scope.matches(&event.header.process);
@@ -2243,12 +2419,26 @@ impl EventPipeline {
             return Ok(());
         }
         if let EventPayload::FileOpen(open) = &mut event.payload {
-            crate::file::resolve_open_path(event.header.process.key.pid, open);
+            // Optional file processing shares the original phase boundary and
+            // may consume at most 50ms per event. Never start live DEX repair.
+            let end = Instant::now() + Duration::from_millis(50);
+            let end = self.file_deadline.map_or(end, |phase| phase.min(end));
+            let _file_work = SlowEventStep::new("file_enrichment");
+            crate::file::resolve_open_path_until(event.header.process.key.pid, open, Some(end));
             if let Some(root) = self.storage.spool_root.as_ref() {
                 let dest = root
                     .join("forensics")
                     .join(self.normalizer.session_id().to_string());
-                crate::file::snapshot_forensic(event.header.process.key.pid, open, &dest);
+                if crate::file::snapshot_forensic_until(
+                    event.header.process.key.pid,
+                    open,
+                    &dest,
+                    Some(end),
+                )
+                .is_err()
+                {
+                    self.file_enrichment_failures = self.file_enrichment_failures.saturating_add(1);
+                }
             }
         }
         if let EventPayload::MemoryRegionChange(change) = &mut event.payload {
@@ -2300,9 +2490,11 @@ impl EventPipeline {
     fn publish_event(&mut self, event: &ksight_model::Event) -> Result<()> {
         self.last_event_monotonic_ns = Some(event.header.monotonic_ns);
         if let Some(spool) = self.spool.as_mut() {
+            let _spool_work = SlowEventStep::new("spool_push");
             spool.push(event)?;
         }
         if !self.output.quiet {
+            let _stdout_work = SlowEventStep::new("stdout");
             if self.output.json {
                 println!("{}", serde_json::to_string(event)?);
             } else {
@@ -2438,8 +2630,8 @@ impl EventPipeline {
             max_total_bytes: self.storage.max_total_spool_bytes,
             keep_completed: self.storage.keep_completed_sessions,
         };
-        let _ = retention.prune();
-        if !retention.can_open_session().unwrap_or(false) {
+        if let Err(error) = retention.prepare_session(self.storage.max_spool_bytes) {
+            eprintln!("cannot rotate session: {error}");
             self.storage_limit_reached = true;
             write_last_exit(request, self.normalizer.session_id(), reason, true);
             return Ok(false);

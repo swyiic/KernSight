@@ -4,6 +4,7 @@
 mod attach_admission;
 #[cfg(any(test, target_os = "android", target_os = "linux"))]
 mod instance_backend;
+mod pending_decode;
 mod poll_schedule;
 #[cfg(any(test, target_os = "android", target_os = "linux"))]
 mod probe_renewal;
@@ -16,6 +17,8 @@ use scope_state::update_allowlist;
 #[cfg(any(test, target_os = "android", target_os = "linux"))]
 use scope_state::{observe_process_start, ProcStartRead, ProcessEpoch};
 
+#[cfg(any(target_os = "android", target_os = "linux"))]
+use std::collections::VecDeque;
 use std::{
     collections::{BTreeSet, HashMap},
     fmt::Write as _,
@@ -660,12 +663,30 @@ impl InspectPlan {
         adapter: InspectAdapterKind,
         uprobe_object: PathBuf,
     ) -> Vec<Self> {
+        Self::evaluate_tls_exports_until(policy, adapter, uprobe_object, None)
+    }
+
+    fn evaluate_tls_exports_until(
+        policy: InspectPolicy,
+        adapter: InspectAdapterKind,
+        uprobe_object: PathBuf,
+        deadline: Option<Instant>,
+    ) -> Vec<Self> {
+        if deadline.is_some_and(|end| Instant::now() >= end) {
+            return Vec::new();
+        }
         let libraries = resolve_libraries(&policy, adapter);
+        if deadline.is_some_and(|end| Instant::now() >= end) {
+            return Vec::new();
+        }
         if libraries.is_empty() {
             return Self::evaluate(policy, adapter, uprobe_object);
         }
         let mut plans = Vec::new();
         for library in libraries {
+            if deadline.is_some_and(|end| Instant::now() >= end) {
+                break;
+            }
             if let Some(mut found) =
                 evaluate_tls_symbol_exports(&policy, adapter, &uprobe_object, &library)
             {
@@ -691,7 +712,7 @@ impl InspectPlan {
                 }
             }
         }
-        if plans.is_empty() {
+        if plans.is_empty() && deadline.is_none_or(|end| Instant::now() < end) {
             Self::evaluate(policy, adapter, uprobe_object)
         } else {
             plans
@@ -840,6 +861,10 @@ pub struct InspectRuntime {
     sessions: Vec<LiveProbe>,
     #[cfg(any(target_os = "android", target_os = "linux"))]
     next_poll_probe: usize,
+    // One already-consumed read batch. Decode precedes every subsequent perf
+    // read, so bounded slices never create an unbounded backlog or drop hits.
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    pending_decode: VecDeque<PendingDecode>,
     /// Last attach attempt per concrete adapter/library/program. Permanent ABI
     /// failures are throttled while transient failures can still recover.
     #[cfg(any(target_os = "android", target_os = "linux"))]
@@ -1150,6 +1175,17 @@ struct LiveProbe {
     paired_entry_return: bool,
 }
 
+#[cfg(any(target_os = "android", target_os = "linux"))]
+struct PendingDecode {
+    plan: InspectPlan,
+    retprobe: bool,
+    hit: ksight_hwbp::RegisterContext,
+    // Authority observed when this exact report was removed from its probe.
+    // A later renewal must never relabel queued records with its new epoch.
+    epoch: Option<u32>,
+    skip_exhausted: bool,
+}
+
 impl Drop for InspectRuntime {
     fn drop(&mut self) {
         take_attached_sessions(self);
@@ -1157,6 +1193,11 @@ impl Drop for InspectRuntime {
 }
 
 impl InspectRuntime {
+    /// Start effective observation only after resources are ready. Capture's
+    /// original invocation deadline and quotas stay unchanged.
+    pub(crate) fn arm_observation_clock(&mut self) {
+        self.started = Instant::now();
+    }
     /// Low-level candidate only. No CLI/capture entry selects this until the
     /// exact metadata issuer, package qualification and target verifier pass.
     /// The caller owns group-leader pidfds and trusted SAME-task raw identities;
@@ -1466,6 +1507,8 @@ impl InspectRuntime {
             #[cfg(any(target_os = "android", target_os = "linux"))]
             next_poll_probe: 0,
             #[cfg(any(target_os = "android", target_os = "linux"))]
+            pending_decode: VecDeque::new(),
+            #[cfg(any(target_os = "android", target_os = "linux"))]
             attach_attempts: HashMap::new(),
             tls_pending: PendingCallStacks::default(),
             jni_region_pending: HashMap::new(),
@@ -1509,7 +1552,10 @@ impl InspectRuntime {
     /// SDK initializes), so the once-at-start sweep misses them. Re-evaluate
     /// the TLS plans on a throttle and attach unseen (library, offset) pairs.
     #[cfg(any(target_os = "android", target_os = "linux"))]
-    fn rescan_tls_exports_maybe(&mut self) -> Vec<InspectObservation> {
+    fn rescan_tls_exports_maybe(&mut self, deadline: Option<Instant>) -> Vec<InspectObservation> {
+        if deadline.is_some_and(|end| Instant::now() >= end) {
+            return Vec::new();
+        }
         if !self
             .selected_adapters
             .iter()
@@ -1563,9 +1609,15 @@ impl InspectRuntime {
             }
         }
         for adapter in &rescan_adapters {
-            for plan in
-                InspectPlan::evaluate_tls_exports(policy.clone(), *adapter, uprobe_object.clone())
-            {
+            if deadline.is_some_and(|end| Instant::now() >= end) {
+                break;
+            }
+            for plan in InspectPlan::evaluate_tls_exports_until(
+                policy.clone(),
+                *adapter,
+                uprobe_object.clone(),
+                deadline,
+            ) {
                 let key = (
                     plan.adapter.as_str().to_owned(),
                     plan.elf_path.clone().unwrap_or_default(),
@@ -1600,13 +1652,13 @@ impl InspectRuntime {
             observations.push(observation);
         }
         self.plans.extend(fresh);
-        observations.extend(attach_all(self));
+        observations.extend(attach_all_until(self, deadline));
         observations
     }
 
     #[cfg(not(any(target_os = "android", target_os = "linux")))]
     #[allow(dead_code, unused_variables, clippy::unused_self)]
-    fn rescan_tls_exports_maybe(&mut self) -> Vec<InspectObservation> {
+    fn rescan_tls_exports_maybe(&mut self, _deadline: Option<Instant>) -> Vec<InspectObservation> {
         Vec::new()
     }
 
@@ -1617,18 +1669,34 @@ impl InspectRuntime {
     /// [`PACKER_ATTACH_GRACE`] old, then attach. Already-running apps attach
     /// immediately. Whole-device inspect is unchanged.
     pub fn attach_when_safe(&mut self) -> Vec<InspectObservation> {
+        self.attach_when_safe_until(None)
+    }
+
+    /// Observe the same absolute capture boundary while discovering and attaching.
+    /// No new discovery or attach starts after it; existing producers are owned
+    /// by the caller's normal stop-and-drain path.
+    pub fn attach_when_safe_until(&mut self, deadline: Option<Instant>) -> Vec<InspectObservation> {
+        let _ = deadline;
         #[cfg(any(target_os = "android", target_os = "linux"))]
         {
-            if self.expired || self.stopping {
+            if self.expired || self.stopping || deadline.is_some_and(|end| Instant::now() >= end) {
                 return Vec::new();
             }
+            // Carry the absolute observation boundary into nested reads and
+            // ELF loops. Do not start a fresh full window on each rescan.
+            // No short per-pass cap: large candidates must not starve on retries.
+            let work = crate::work_window::WorkWindow::enter(
+                deadline.or_else(|| self.started.checked_add(self.max_duration)),
+                self.max_duration,
+            );
+            let deadline = Some(work.end);
             // Push a newly visible package TGID before the map walk. Sessions
             // attached while /proc had no cmdline stay deny-all until this runs.
             sync_live_tgid_allowlist(self);
-            let mut observations = self.rescan_tls_exports_maybe();
+            let mut observations = self.rescan_tls_exports_maybe(deadline);
             // Every entry path (initial, rescan, and existing TLS sessions) is
             // gated per plan inside attach_all. TLS never grants early ART admission.
-            observations.extend(attach_all(self));
+            observations.extend(attach_all_until(self, deadline));
             observations
         }
         #[cfg(not(any(target_os = "android", target_os = "linux")))]
@@ -1654,6 +1722,17 @@ impl InspectRuntime {
 
     /// Poll authorized hits.
     pub fn poll(&mut self) -> Vec<InspectOutput> {
+        self.poll_until(None)
+    }
+
+    /// Bound the entire read/admission/decode pass, preserving consumed raw
+    /// records for a later pass or the caller's post-stop drain.
+    pub fn poll_until(&mut self, deadline: Option<Instant>) -> Vec<InspectOutput> {
+        let deadline = pending_decode::slice_end(Instant::now(), deadline);
+        if Instant::now() >= deadline {
+            self.unread_perf_possible = true;
+            return Vec::new();
+        }
         if self.expired {
             return Vec::new();
         }
@@ -1680,7 +1759,7 @@ impl InspectRuntime {
                 refresh_package_tgids(self);
             }
         }
-        poll_all(self)
+        poll_all(self, deadline)
     }
 
     /// Pending frames and explicitly incomplete calls at a stage boundary.
@@ -1738,7 +1817,19 @@ impl InspectRuntime {
 
     /// Bounded slice yields and possible unread tail at the latest poll.
     pub fn poll_budget_status(&self) -> (u64, bool) {
-        (self.poll_budget_yields, self.unread_perf_possible)
+        (
+            self.poll_budget_yields,
+            self.unread_perf_possible || {
+                #[cfg(any(target_os = "android", target_os = "linux"))]
+                {
+                    !self.pending_decode.is_empty()
+                }
+                #[cfg(not(any(target_os = "android", target_os = "linux")))]
+                {
+                    false
+                }
+            },
+        )
     }
 
     /// Fixed counters at the raw-record boundary, before adapter decoding.
@@ -2902,6 +2993,14 @@ fn clear_scope_state(runtime: &mut InspectRuntime, pid: Option<u32>) {
     runtime.scoped_tgids.clear();
     #[cfg(any(target_os = "android", target_os = "linux"))]
     runtime.attach_attempts.clear();
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    if !runtime.pending_decode.is_empty() {
+        runtime.scope_diagnostics.push(format!(
+            "consumed_raw_rejected_after_scope_failure count={}; original authority revoked, no replacement enrollment",
+            runtime.pending_decode.len()
+        ));
+        runtime.pending_decode.clear();
+    }
     runtime.tls_pending.drop_all_incomplete();
     runtime.connkey_pending.clear();
     runtime.connkey = ksight_core::ConnUserDataBook::default();
@@ -3064,6 +3163,9 @@ fn resolve_libraries(policy: &InspectPolicy, adapter: InspectAdapterKind) -> Vec
     if let Some(path) = policy.elf_path.clone() {
         return vec![path];
     }
+    if crate::work_window::expired() {
+        return Vec::new();
+    }
     let needles = adapter.map_needles();
     let mut found = BTreeSet::new();
     for path in adapter.libraries() {
@@ -3197,6 +3299,7 @@ fn rank_inspect_pids(pids: &[u32]) -> Vec<u32> {
     let mut scored: Vec<(u32, u32)> = pids
         .iter()
         .copied()
+        .take_while(|_| !crate::work_window::expired())
         .map(|pid| {
             let mut score = 0_u32;
             let fd = format!("/proc/{pid}/fd");
@@ -3274,10 +3377,16 @@ fn discover_mapped_libraries_by_tls_symbol(
     let pid_cap = 16;
     let skipped_pids = ranked.len().saturating_sub(pid_cap);
     for pid in ranked.iter().copied().take(pid_cap) {
+        if crate::work_window::expired() {
+            break;
+        }
         let Ok(maps) = std::fs::read_to_string(format!("/proc/{pid}/maps")) else {
             continue;
         };
         for line in maps.lines() {
+            if crate::work_window::expired() {
+                break;
+            }
             let Some(path) = line.split_whitespace().last() else {
                 continue;
             };
@@ -3298,6 +3407,9 @@ fn discover_mapped_libraries_by_tls_symbol(
     let mut exporters: Vec<String> = Vec::new();
     let mut scanned = 0_u32;
     for path in early.into_iter().chain(rest) {
+        if crate::work_window::expired() {
+            break;
+        }
         if !crate::elf::plausible_elf_file(&path) {
             continue;
         }
@@ -3819,7 +3931,22 @@ fn uprobe_attach_unsupported(error: &anyhow::Error) -> bool {
     reason = "Keep this admission or delivery transaction together for review."
 )]
 fn attach_all(runtime: &mut InspectRuntime) -> Vec<InspectObservation> {
+    attach_all_until(runtime, None)
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep owned probe admission and the absolute work boundary together."
+)]
+fn attach_all_until(
+    runtime: &mut InspectRuntime,
+    deadline: Option<Instant>,
+) -> Vec<InspectObservation> {
     let mut out = Vec::new();
+    if deadline.is_some_and(|end| Instant::now() >= end) {
+        return out;
+    }
     let selected = runtime.selected_adapters.clone();
     let plans = runtime
         .plans
@@ -3872,6 +3999,9 @@ fn attach_all(runtime: &mut InspectRuntime) -> Vec<InspectObservation> {
         return out; // Explicit empty deny: no hooks or numeric fallback.
     }
     for plan in plans {
+        if deadline.is_some_and(|end| Instant::now() >= end) {
+            break;
+        }
         if quota_stop::eligible(
             plan.adapter.as_str(),
             plan_is_connkey(&plan),
@@ -4023,6 +4153,9 @@ fn attach_all(runtime: &mut InspectRuntime) -> Vec<InspectObservation> {
         }
 
         for program in programs {
+            if deadline.is_some_and(|end| Instant::now() >= end) {
+                break;
+            }
             let retprobe =
                 *program == "ksight_uretprobe_regs" || *program == "ksight_uretprobe_regs_nocopy";
             let already_live = runtime.sessions.iter().any(|live| {
@@ -4113,7 +4246,7 @@ fn attach_all(_runtime: &mut InspectRuntime) -> Vec<InspectObservation> {
     clippy::too_many_lines,
     reason = "Keep this admission or delivery transaction together for review."
 )]
-fn poll_all(runtime: &mut InspectRuntime) -> Vec<InspectOutput> {
+fn poll_all(runtime: &mut InspectRuntime, deadline: Instant) -> Vec<InspectOutput> {
     let refresh_phase = crate::capture_timing::enter(crate::capture_timing::Phase::PollScope);
     if !runtime.stopping {
         let _ = refresh_process_epochs(runtime);
@@ -4123,7 +4256,9 @@ fn poll_all(runtime: &mut InspectRuntime) -> Vec<InspectOutput> {
     if runtime.scope_revoked_poll {
         return finish_scope_poll(runtime, Vec::new());
     }
-    let _ = runtime.tls_pending.drop_stale(PENDING_STALE);
+    if runtime.pending_decode.is_empty() && !runtime.stopping {
+        let _ = runtime.tls_pending.drop_stale(PENDING_STALE);
+    }
     let mut out = Vec::new();
     let max_payload = usize::try_from(
         runtime
@@ -4135,209 +4270,242 @@ fn poll_all(runtime: &mut InspectRuntime) -> Vec<InspectOutput> {
     .min(MAX_PAYLOAD_BYTES);
     let mut batch = Vec::new();
     let mut bound_failure = None;
-    // These records were already unconditionally omitted by the later budget guard.
-    // Keep draining and counting them, but avoid creating one live metadata iterator
-    // and cloning/sorting one plan per record that cannot produce a payload.
-    let exhausted_adapters: Vec<_> = runtime
-        .sessions
-        .iter()
-        .filter(|probe| {
-            !plan_is_connkey(&probe.plan)
-                && adapter_hits(runtime, probe.plan.adapter)
-                    >= adapter_hit_cap(runtime, probe.plan.adapter)
-        })
-        .map(|probe| probe.plan.adapter)
-        .collect();
-    // Existing capped outputs were already omitted. Stop only their owned helper
-    // producers, preserving buffers/epoch and draining all queued loss notices.
-    let quota_candidates: Vec<_> = exhausted_adapters
-        .iter()
-        .copied()
-        .map(|adapter| {
-            (
-                adapter,
-                adapter_hits(runtime, adapter),
-                adapter_hit_cap(runtime, adapter),
-            )
-        })
-        .collect();
-    for probe in &mut runtime.sessions {
-        if probe.session.producer_stopped() {
-            continue;
-        }
-        let Some((_, hits, cap)) = quota_candidates.iter().find(|(adapter, hits, cap)| {
-            *adapter == probe.plan.adapter
-                && quota_stop::eligible(adapter.as_str(), plan_is_connkey(&probe.plan), *hits, *cap)
-        }) else {
-            continue;
-        };
-        let receipt = quota_stop::close(probe.plan.adapter.as_str(), *hits, *cap, || {
-            probe
-                .session
-                .stop_production()
-                .map_err(|error| format!("{error:#}"))
-        });
-        let mut observation = probe.plan.observation.clone();
-        observation.attached = false;
-        observation.hit = false;
-        observation.detail = serde_json::to_string(&receipt).expect("quota receipt serializes");
-        eprintln!("{}", observation.detail);
-        out.push(inspect_observation(
-            probe.plan.policy.pid.unwrap_or(0),
-            0,
-            observation,
-        ));
-        if let Some(error) = &receipt.stop_error {
-            bound_failure = Some(format!("quota_stop_unconfirmed:{error}"));
-        }
-        runtime.quota_stops.push(receipt);
-    }
-    if let Some(error) = bound_failure.take() {
-        revoke_scope(runtime, None, &error);
-        return finish_scope_poll(runtime, out);
-    }
-    let read_started = Instant::now();
-    // Readiness is advisory: every selected session still runs the original
-    // physical scope validation. Entry/return share one LiveProbe and remain
-    // one scheduling unit; consumed records retain existing timestamp sorting.
-    let ready = runtime
-        .sessions
-        .iter()
-        .map(|p| p.session.has_pending_records())
-        .collect::<Vec<_>>();
-    let mut round = poll_schedule::Round::new(&ready, runtime.next_poll_probe);
-    while let Some(index) = round.next(
-        read_started.elapsed().as_millis(),
-        &mut runtime.next_poll_probe,
-    ) {
-        let probe = &mut runtime.sessions[index];
-        let skip_exhausted =
-            !plan_is_connkey(&probe.plan) && exhausted_adapters.contains(&probe.plan.adapter);
-        let before_drained = probe.session.drained_total;
-        let before_yields = probe.session.budget_yields_total;
-        let before_lost = probe.session.lost_total;
-        let before = probe.session.decode_counters;
-        let before_padding = before.perf_padding_removed;
-        let before = [
-            before.bad_size,
-            before.bad_abi,
-            before.malformed,
-            before.scope_epoch,
-            before.scope_identity,
-            before.accepted,
-        ];
-        // A one-shot poll closes its producers and preserves original queue
-        // authority. Retain the committed epoch for this returned batch.
-        let (epoch, report) = probe_renewal::poll_with_epoch(
-            &mut probe.session,
-            ksight_hwbp::UprobeSession::instance_epoch,
-            |session| Ok(session.poll_hits_report()),
-        )
-        .expect("report polling is infallible; errors travel inside the report");
-        if let Some(error) = &report.error {
-            runtime.perf_read_failures = runtime.perf_read_failures.saturating_add(1);
-            if runtime.bound_instance_targets.is_some() {
-                bound_failure = Some(format!("bound_backend_read_error:{error}"));
+    let mut unread_probes = !runtime.pending_decode.is_empty() || Instant::now() >= deadline;
+    // Drain the already-owned batch before reading more. The maximum queue is
+    // one existing perf round, rather than a growing second spool in memory.
+    if runtime.pending_decode.is_empty() && Instant::now() < deadline {
+        // These records were already unconditionally omitted by the later budget guard.
+        // Keep draining and counting them, but avoid creating one live metadata iterator
+        // and cloning/sorting one plan per record that cannot produce a payload.
+        let exhausted_adapters: Vec<_> = runtime
+            .sessions
+            .iter()
+            .filter(|probe| {
+                !plan_is_connkey(&probe.plan)
+                    && adapter_hits(runtime, probe.plan.adapter)
+                        >= adapter_hit_cap(runtime, probe.plan.adapter)
+            })
+            .map(|probe| probe.plan.adapter)
+            .collect();
+        // Existing capped outputs were already omitted. Stop only their owned helper
+        // producers, preserving buffers/epoch and draining all queued loss notices.
+        let quota_candidates: Vec<_> = exhausted_adapters
+            .iter()
+            .copied()
+            .map(|adapter| {
+                (
+                    adapter,
+                    adapter_hits(runtime, adapter),
+                    adapter_hit_cap(runtime, adapter),
+                )
+            })
+            .collect();
+        for probe in &mut runtime.sessions {
+            if Instant::now() >= deadline {
+                unread_probes = true;
+                break;
             }
-        }
-        runtime.raw_drained += probe.session.drained_total.saturating_sub(before_drained);
-        runtime.poll_budget_yields = runtime.poll_budget_yields.saturating_add(
-            probe
-                .session
-                .budget_yields_total
-                .saturating_sub(before_yields),
-        );
-        runtime.perf_lost += probe.session.lost_total.saturating_sub(before_lost);
-        let after = probe.session.decode_counters;
-        if after.perf_min_size != 0
-            && (runtime.perf_record_framing[0] == 0
-                || after.perf_min_size < runtime.perf_record_framing[0])
-        {
-            runtime.perf_record_framing[0] = after.perf_min_size;
-        }
-        runtime.perf_record_framing[1] = runtime.perf_record_framing[1].max(after.perf_max_size);
-        runtime.perf_record_framing[2] = runtime.perf_record_framing[2]
-            .saturating_add(after.perf_padding_removed.saturating_sub(before_padding));
-        let after = [
-            after.bad_size,
-            after.bad_abi,
-            after.malformed,
-            after.scope_epoch,
-            after.scope_identity,
-            after.accepted,
-        ];
-        for (total, (after, before)) in runtime
-            .decode_rejections
-            .iter_mut()
-            .zip(after.into_iter().zip(before))
-        {
-            *total = total.saturating_add(after.saturating_sub(before));
-        }
-        for notice in &report.notifications {
+            if probe.session.producer_stopped() {
+                continue;
+            }
+            let Some((_, hits, cap)) = quota_candidates.iter().find(|(adapter, hits, cap)| {
+                *adapter == probe.plan.adapter
+                    && quota_stop::eligible(
+                        adapter.as_str(),
+                        plan_is_connkey(&probe.plan),
+                        *hits,
+                        *cap,
+                    )
+            }) else {
+                continue;
+            };
+            let receipt = quota_stop::close(probe.plan.adapter.as_str(), *hits, *cap, || {
+                probe
+                    .session
+                    .stop_production()
+                    .map_err(|error| format!("{error:#}"))
+            });
             let mut observation = probe.plan.observation.clone();
-            observation.detail = serde_json::json!({
+            observation.attached = false;
+            observation.hit = false;
+            observation.detail = serde_json::to_string(&receipt).expect("quota receipt serializes");
+            eprintln!("{}", observation.detail);
+            out.push(inspect_observation(
+                probe.plan.policy.pid.unwrap_or(0),
+                0,
+                observation,
+            ));
+            if let Some(error) = &receipt.stop_error {
+                bound_failure = Some(format!("quota_stop_unconfirmed:{error}"));
+            }
+            runtime.quota_stops.push(receipt);
+        }
+        if let Some(error) = bound_failure.take() {
+            revoke_scope(runtime, None, &error);
+            return finish_scope_poll(runtime, out);
+        }
+        let read_started = Instant::now();
+        // Readiness is advisory: every selected session still runs the original
+        // physical scope validation. Entry/return share one LiveProbe and remain
+        // one scheduling unit; consumed records retain existing timestamp sorting.
+        let ready = runtime
+            .sessions
+            .iter()
+            .map(|p| p.session.has_pending_records())
+            .collect::<Vec<_>>();
+        let mut round = poll_schedule::Round::new(&ready, runtime.next_poll_probe);
+        while Instant::now() < deadline {
+            let Some(index) = round.next(
+                read_started.elapsed().as_millis(),
+                &mut runtime.next_poll_probe,
+            ) else {
+                break;
+            };
+            let probe = &mut runtime.sessions[index];
+            let skip_exhausted =
+                !plan_is_connkey(&probe.plan) && exhausted_adapters.contains(&probe.plan.adapter);
+            let before_drained = probe.session.drained_total;
+            let before_yields = probe.session.budget_yields_total;
+            let before_lost = probe.session.lost_total;
+            let before = probe.session.decode_counters;
+            let before_padding = before.perf_padding_removed;
+            let before = [
+                before.bad_size,
+                before.bad_abi,
+                before.malformed,
+                before.scope_epoch,
+                before.scope_identity,
+                before.accepted,
+            ];
+            // A one-shot poll closes its producers and preserves original queue
+            // authority. Retain the committed epoch for this returned batch.
+            let (epoch, report) = probe_renewal::poll_with_epoch(
+                &mut probe.session,
+                ksight_hwbp::UprobeSession::instance_epoch,
+                |session| Ok(session.poll_hits_report()),
+            )
+            .expect("report polling is infallible; errors travel inside the report");
+            if let Some(error) = &report.error {
+                runtime.perf_read_failures = runtime.perf_read_failures.saturating_add(1);
+                if runtime.bound_instance_targets.is_some() {
+                    bound_failure = Some(format!("bound_backend_read_error:{error}"));
+                }
+            }
+            runtime.raw_drained += probe.session.drained_total.saturating_sub(before_drained);
+            runtime.poll_budget_yields = runtime.poll_budget_yields.saturating_add(
+                probe
+                    .session
+                    .budget_yields_total
+                    .saturating_sub(before_yields),
+            );
+            runtime.perf_lost += probe.session.lost_total.saturating_sub(before_lost);
+            let after = probe.session.decode_counters;
+            if after.perf_min_size != 0
+                && (runtime.perf_record_framing[0] == 0
+                    || after.perf_min_size < runtime.perf_record_framing[0])
+            {
+                runtime.perf_record_framing[0] = after.perf_min_size;
+            }
+            runtime.perf_record_framing[1] =
+                runtime.perf_record_framing[1].max(after.perf_max_size);
+            runtime.perf_record_framing[2] = runtime.perf_record_framing[2]
+                .saturating_add(after.perf_padding_removed.saturating_sub(before_padding));
+            let after = [
+                after.bad_size,
+                after.bad_abi,
+                after.malformed,
+                after.scope_epoch,
+                after.scope_identity,
+                after.accepted,
+            ];
+            for (total, (after, before)) in runtime
+                .decode_rejections
+                .iter_mut()
+                .zip(after.into_iter().zip(before))
+            {
+                *total = total.saturating_add(after.saturating_sub(before));
+            }
+            for notice in &report.notifications {
+                let mut observation = probe.plan.observation.clone();
+                observation.detail = serde_json::json!({
                 "schema":"kernsight.perf-loss/v1", "cpu_id":notice.cpu_id,
                 "lost_samples":notice.lost_samples,
                 "notification_monotonic_ns":notice.notification_monotonic_ns,
                 "lost_event_time_unknown":true, "after_producer_stop":runtime.stopping || probe.session.producer_stopped()
             })
             .to_string();
-            out.push(inspect_observation(
-                probe.plan.policy.pid.unwrap_or(0),
-                0,
-                observation,
-            ));
-        }
-        let hits = report.records;
-        crate::capture_timing::set(crate::capture_timing::Phase::PollProcess);
-        for hit in hits {
-            if let Some(targets) = &runtime.bound_instance_targets {
-                if let Err(error) = instance_backend::check_budgeted_hit(
-                    &hit,
-                    targets,
+                out.push(inspect_observation(
+                    probe.plan.policy.pid.unwrap_or(0),
+                    0,
+                    observation,
+                ));
+            }
+            let hits = report.records;
+            crate::capture_timing::set(crate::capture_timing::Phase::PollProcess);
+            for hit in hits {
+                let retprobe = if probe.paired_entry_return {
+                    hit.snapshot_at_return
+                } else {
+                    probe.retprobe
+                };
+                batch.push(PendingDecode {
+                    plan: probe.plan.clone(),
+                    retprobe,
+                    hit,
                     epoch,
                     skip_exhausted,
-                    || {
-                        targets
-                            .iter()
-                            .find_map(|target| target.recheck_task_mark().err())
-                            .map_or(Ok(()), |error| {
-                                Err(format!("bound_live_source_invalid:{error:#}"))
-                            })
-                    },
-                ) {
-                    bound_failure = Some(error);
-                    continue;
-                }
+                });
             }
-            if skip_exhausted {
-                runtime.budget_skipped_raw = runtime.budget_skipped_raw.saturating_add(1);
-                continue;
-            }
-            let retprobe = if probe.paired_entry_return {
-                hit.snapshot_at_return
-            } else {
-                probe.retprobe
-            };
-            batch.push((probe.plan.clone(), retprobe, hit));
         }
-    }
-    if let Some(error) = bound_failure {
-        revoke_scope(runtime, None, &error);
-        return finish_scope_poll(runtime, Vec::new());
+        if let Some(error) = bound_failure {
+            revoke_scope(runtime, None, &error);
+            return finish_scope_poll(runtime, Vec::new());
+        }
+        crate::capture_timing::set(crate::capture_timing::Phase::PollProcess);
+        batch.sort_by_key(|item| item.hit.time_ns);
+        unread_probes |= Instant::now() >= deadline;
+        unread_probes |= round.finish(&mut runtime.sessions, &mut runtime.next_poll_probe);
+        runtime.pending_decode.extend(batch);
     }
     crate::capture_timing::set(crate::capture_timing::Phase::PollProcess);
-    batch.sort_by_key(|(_, _, hit)| hit.time_ns);
-    for (plan, retprobe, hit) in batch {
+    while let Some(PendingDecode {
+        plan,
+        retprobe,
+        hit,
+        epoch,
+        skip_exhausted,
+    }) = pending_decode::take_before(&mut runtime.pending_decode, Instant::now(), deadline)
+    {
+        if let Some(targets) = &runtime.bound_instance_targets {
+            if let Err(error) =
+                instance_backend::check_budgeted_hit(&hit, targets, epoch, skip_exhausted, || {
+                    targets
+                        .iter()
+                        .find_map(|target| target.recheck_task_mark().err())
+                        .map_or(Ok(()), |error| {
+                            Err(format!("bound_live_source_invalid:{error:#}"))
+                        })
+                })
+            {
+                revoke_scope(runtime, None, &error);
+                return finish_scope_poll(runtime, Vec::new());
+            }
+        }
+        if skip_exhausted {
+            runtime.budget_skipped_raw = runtime.budget_skipped_raw.saturating_add(1);
+            continue;
+        }
         if plan_is_connkey(&plan) {
             note_connkey(runtime, retprobe, &hit);
             continue;
         }
         if adapter_hits(runtime, plan.adapter) >= adapter_hit_cap(runtime, plan.adapter) {
+            runtime.budget_skipped_raw = runtime.budget_skipped_raw.saturating_add(1);
             continue;
         }
         if !runtime.per_adapter_budget && runtime.hits >= runtime.max_hits {
-            break;
+            runtime.budget_skipped_raw = runtime.budget_skipped_raw.saturating_add(1);
+            continue;
         }
         let ssl_lib = if plan.adapter == InspectAdapterKind::TlsSslRead {
             ssl_read_lib_kind(plan.elf_path.as_deref())
@@ -4420,16 +4588,20 @@ fn poll_all(runtime: &mut InspectRuntime) -> Vec<InspectOutput> {
             }
         }
     }
-    runtime.unread_perf_possible =
-        round.finish(&mut runtime.sessions, &mut runtime.next_poll_probe)
-            || runtime.sessions.iter().any(|p| {
-                p.session.last_poll_drain == ksight_hwbp::perf_drain::PollDrainState::Yielded
-            });
+    if !runtime.pending_decode.is_empty() {
+        runtime.poll_budget_yields = runtime.poll_budget_yields.saturating_add(1);
+    }
+    runtime.unread_perf_possible = unread_probes
+        || !runtime.pending_decode.is_empty()
+        || runtime
+            .sessions
+            .iter()
+            .any(|p| p.session.last_poll_drain == ksight_hwbp::perf_drain::PollDrainState::Yielded);
     finish_scope_poll(runtime, out)
 }
 
 #[cfg(not(any(target_os = "android", target_os = "linux")))]
-fn poll_all(_runtime: &mut InspectRuntime) -> Vec<InspectOutput> {
+fn poll_all(_runtime: &mut InspectRuntime, _deadline: Instant) -> Vec<InspectOutput> {
     Vec::new()
 }
 
@@ -6584,5 +6756,98 @@ mod shutdown_scope_tests {
         assert!(!runtime.poll_budget_status().1);
         // Empty queues never erase the recorded physical-source failure.
         assert_ne!(runtime.scope_failure_count(), 0);
+    }
+}
+
+#[cfg(all(test, any(target_os = "android", target_os = "linux")))]
+mod consumed_raw_deadline_tests {
+    use super::*;
+
+    fn runtime_with_consumed_hit(skip_exhausted: bool) -> InspectRuntime {
+        let mut runtime =
+            InspectRuntime::prepare_all(&InspectPolicy::default(), &[], Path::new("unused"));
+        let identity = ksight_hwbp::instance_scope::InstanceIdentity {
+            tgid: 42,
+            uid: 10001,
+            birth_ns: 123,
+            exec_id: 4,
+        };
+        runtime.pending_decode.push_back(PendingDecode {
+            plan: runtime.plans[0].clone(),
+            retprobe: true,
+            hit: ksight_hwbp::RegisterContext {
+                pid: identity.tgid,
+                tid: 43,
+                time_ns: 99,
+                instance: Some(ksight_hwbp::instance_scope::InstanceStamp {
+                    identity,
+                    epoch: 11,
+                    thread_birth_ns: 124,
+                }),
+                ..ksight_hwbp::RegisterContext::default()
+            },
+            epoch: Some(11),
+            skip_exhausted,
+        });
+        runtime.raw_drained = 1;
+        runtime
+    }
+
+    #[test]
+    fn expired_live_poll_retains_the_original_report_epoch_and_exact_source() {
+        let mut runtime = runtime_with_consumed_hit(false);
+        assert!(runtime.poll_until(Some(Instant::now())).is_empty());
+        assert_eq!(runtime.pending_decode.len(), 1);
+        assert!(runtime.poll_budget_status().1);
+        assert_eq!(runtime.drain_totals().0, 1);
+        let original = &runtime.pending_decode[0];
+        assert_eq!(original.epoch, Some(11));
+        assert_eq!(original.hit.instance.as_ref().unwrap().epoch, 11);
+        let targets = vec![
+            ksight_hwbp::instance_scope::BoundInstance::trusted_candidate(
+                original.hit.instance.as_ref().unwrap().identity,
+                File::open("/dev/null").unwrap().into(),
+            ),
+        ];
+        assert!(instance_backend::accepts(
+            &original.hit,
+            &targets,
+            original.epoch
+        ));
+        assert!(!instance_backend::accepts(
+            &original.hit,
+            &targets,
+            Some(12)
+        ));
+    }
+
+    #[test]
+    fn stopped_runtime_drains_owned_raw_before_another_pass_can_prove_empty() {
+        let mut runtime = runtime_with_consumed_hit(true);
+        runtime.stop_production().unwrap();
+        // This record had already crossed its original adapter quota, so the
+        // original omission remains explicit; no payload is newly authorized.
+        assert!(runtime
+            .poll_until(Some(Instant::now() + Duration::from_secs(1)))
+            .is_empty());
+        assert!(runtime.pending_decode.is_empty());
+        assert_eq!(runtime.budget_skipped_raw(), 1);
+        assert_eq!(runtime.drain_totals().0, 1);
+        assert!(runtime.poll_budget_status().1);
+        assert!(runtime.poll().is_empty());
+        assert!(!runtime.poll_budget_status().1);
+        assert_eq!(runtime.budget_skipped_raw(), 1);
+    }
+
+    #[test]
+    fn scope_failure_explicitly_rejects_consumed_pending_authority() {
+        let mut runtime = runtime_with_consumed_hit(false);
+        revoke_scope(&mut runtime, None, "fixture_original_source_revoked");
+        assert!(runtime.pending_decode.is_empty());
+        assert_eq!(runtime.scope_failure_count(), 1);
+        assert!(runtime
+            .scope_diagnostics
+            .iter()
+            .any(|line| { line.contains("consumed_raw_rejected_after_scope_failure count=1") }));
     }
 }

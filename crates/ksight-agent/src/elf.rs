@@ -1,6 +1,6 @@
 //! Minimal ELF64 parser for GNU build-id and dynamic symbol file offsets.
 
-use std::{collections::BTreeSet, fs, path::Path};
+use std::{collections::BTreeSet, io::Read as _, path::Path};
 
 /// Parsed ELF identity used by Inspect adapters.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,18 +22,31 @@ pub struct ElfIdentity {
 /// Returns an error when the file cannot be read or is not ELF little-endian.
 pub fn inspect_elf(path: impl AsRef<Path>) -> Result<ElfIdentity, String> {
     let path = path.as_ref();
-    let bytes = fs::read(path).map_err(|error| error.to_string())?;
+    crate::work_window::check().map_err(|error| error.to_string())?;
+    let mut input = crate::file::open_regular(path).map_err(|error| error.to_string())?;
+    let mut bytes = Vec::new();
+    let mut chunk = vec![0_u8; 64 * 1024];
+    loop {
+        crate::work_window::check().map_err(|error| error.to_string())?;
+        let read = input.read(&mut chunk).map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
     if bytes.len() < 52 || &bytes[0..4] != b"\x7fELF" {
         return Err("not an ELF file".to_owned());
     }
     if bytes[5] != 1 {
         return Err("only little-endian ELF is supported".to_owned());
     }
-    match bytes[4] {
+    let result = match bytes[4] {
         1 => inspect_elf32(path, &bytes),
         2 => inspect_elf64(path, &bytes),
         _ => Err("unsupported ELF class".to_owned()),
-    }
+    };
+    crate::work_window::check().map_err(|error| error.to_string())?;
+    result
 }
 
 fn inspect_elf64(path: &Path, bytes: &[u8]) -> Result<ElfIdentity, String> {
@@ -48,6 +61,9 @@ fn inspect_elf64(path: &Path, bytes: &[u8]) -> Result<ElfIdentity, String> {
     let shnum = read_u16(bytes, 60)?;
     let mut loads = Vec::new();
     for index in 0..phnum {
+        if crate::work_window::expired() {
+            break;
+        }
         let offset = usize::try_from(phoff).map_err(|_| "phoff")?
             + usize::from(index) * usize::from(phentsize);
         if offset + 56 > bytes.len() {
@@ -65,6 +81,9 @@ fn inspect_elf64(path: &Path, bytes: &[u8]) -> Result<ElfIdentity, String> {
     let mut build_id = None;
     let mut sections = Vec::new();
     for index in 0..shnum {
+        if crate::work_window::expired() {
+            break;
+        }
         let offset = usize::try_from(shoff).map_err(|_| "shoff")?
             + usize::from(index) * usize::from(shentsize);
         if offset + 64 > bytes.len() {
@@ -103,6 +122,9 @@ fn inspect_elf32(path: &Path, bytes: &[u8]) -> Result<ElfIdentity, String> {
     let shnum = read_u16(bytes, 48)?;
     let mut loads = Vec::new();
     for index in 0..phnum {
+        if crate::work_window::expired() {
+            break;
+        }
         let offset = usize::try_from(phoff).map_err(|_| "phoff")?
             + usize::from(index) * usize::from(phentsize);
         if offset + 32 > bytes.len() {
@@ -120,6 +142,9 @@ fn inspect_elf32(path: &Path, bytes: &[u8]) -> Result<ElfIdentity, String> {
     let mut build_id = None;
     let mut sections = Vec::new();
     for index in 0..shnum {
+        if crate::work_window::expired() {
+            break;
+        }
         let offset = usize::try_from(shoff).map_err(|_| "shoff")?
             + usize::from(index) * usize::from(shentsize);
         if offset + 40 > bytes.len() {
@@ -183,6 +208,9 @@ pub fn matching_symbols_exact<'a, S: AsRef<str>>(
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
     for wanted in names {
+        if crate::work_window::expired() {
+            break;
+        }
         let wanted = wanted.as_ref();
         if let Some((name, offset)) = elf
             .symbols
@@ -204,6 +232,9 @@ pub fn matching_symbols<'a>(elf: &'a ElfIdentity, names: &[&str]) -> Vec<(&'a st
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
     for (name, offset) in &elf.symbols {
+        if crate::work_window::expired() {
+            break;
+        }
         let matched = names
             .iter()
             .any(|wanted| name == wanted || name.starts_with(wanted));
@@ -230,6 +261,9 @@ fn parse_dynsym_via_sections(
     let mut dynsym = None;
     let mut dynstr = None;
     for &(kind, offset, size, link) in sections {
+        if crate::work_window::expired() {
+            break;
+        }
         if kind != 11 {
             continue;
         }
@@ -268,6 +302,9 @@ fn parse_dynsym_via_pt_dynamic(
     let mut dyn_off = None;
     let mut dyn_filesz = 0_u64;
     for index in 0..phnum {
+        if crate::work_window::expired() {
+            break;
+        }
         let offset = phoff.saturating_add(usize::from(index).saturating_mul(entsize));
         let (kind, file_off, filesz) = if elf64 {
             if offset.saturating_add(56) > bytes.len() {
@@ -310,6 +347,9 @@ fn parse_dynsym_via_pt_dynamic(
     let mut syment = if elf64 { 24_u64 } else { 16 };
     let mut hash_va = None;
     for entry in bytes[start..end].chunks(dyn_entsize) {
+        if crate::work_window::expired() {
+            break;
+        }
         if entry.len() < dyn_entsize {
             break;
         }
@@ -384,6 +424,9 @@ fn parse_dynsym_entries(
     let chunk = if elf64 { 24 } else { 16 };
     let mut symbols = Vec::new();
     for entry in bytes[start..sym_end].chunks(chunk) {
+        if crate::work_window::expired() {
+            break;
+        }
         if entry.len() < chunk {
             break;
         }
@@ -440,6 +483,9 @@ fn merge_tls_symtab(
     let extra = parse_sym_section(bytes, loads, sections, 2, elf64);
     let mut seen: BTreeSet<u64> = symbols.iter().map(|(_, offset)| *offset).collect();
     for (name, offset) in extra {
+        if crate::work_window::expired() {
+            break;
+        }
         if !is_tls_copy_symbol(&name) || !seen.insert(offset) {
             continue;
         }
@@ -457,6 +503,9 @@ fn parse_sym_section(
     let mut dynsym = None;
     let mut dynstr = None;
     for &(kind, offset, size, link) in sections {
+        if crate::work_window::expired() {
+            break;
+        }
         if kind != wanted_kind {
             continue;
         }
@@ -530,6 +579,9 @@ fn parse_gnu_build_id(bytes: &[u8], offset: u64, size: u64) -> Option<String> {
     let desc = note.get(desc_off..desc_off.checked_add(descsz)?)?;
     let mut id = String::with_capacity(desc.len().saturating_mul(2));
     for byte in desc {
+        if crate::work_window::expired() {
+            break;
+        }
         let _ = std::fmt::Write::write_fmt(&mut id, format_args!("{byte:02x}"));
     }
     Some(id)
@@ -586,4 +638,18 @@ pub fn plausible_elf_file(path: &str) -> bool {
         std::io::Read::read_exact(&mut file, &mut magic).is_ok()
             && magic == [0x7f, b'E', b'L', b'F']
     })
+}
+
+#[cfg(test)]
+mod work_window_tests {
+    use super::*;
+    #[test]
+    fn expired_scan_returns_deferred_error_before_opening_file() {
+        let _work = crate::work_window::WorkWindow::enter(
+            Some(std::time::Instant::now()),
+            std::time::Duration::from_secs(1),
+        );
+        let error = inspect_elf("/nonexistent/expired-window-test").unwrap_err();
+        assert!(error.contains("work window expired"));
+    }
 }
