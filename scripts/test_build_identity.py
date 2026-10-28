@@ -18,6 +18,8 @@ class BuildIdentityTests(unittest.TestCase):
         self.core = self.root / "crates/ksight-core"
         (self.core / "src").mkdir(parents=True)
         self.env = os.environ.copy()
+        # CI forces ANSI colors; diagnostics below deliberately compare plain text.
+        self.env["CARGO_TERM_COLOR"] = "never"
         for key in ("KERNSIGHT_BUILD_GIT_COMMIT", "KERNSIGHT_BUILD_GIT_DIRTY", "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
             self.env.pop(key, None)
         self.env["CARGO_TARGET_DIR"] = str(Path(self.temp.name) / "target")

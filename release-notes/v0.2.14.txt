@@ -1,0 +1,11 @@
+KernSight 0.2.14
+
+- Capture and initial runtime-copy timing use separate device-side work windows; CLI exposes --runtime-copy-ms.
+- Improve qualified source copy accounting, pending decode handling and bounded UTF-8 report previews.
+- Preserve historical completed/interrupted spool sessions during new capture and rotation. Previously the four-session policy could remove unexported child sessions. The default 512 MiB complete-batch limit now refuses new reservations and asks for explicit export/cleanup. Package dumps are outside this spool budget.
+
+Assets: self-contained ksightd-android-arm64; host ksightctl archives for macOS arm64, Linux x86_64 and Linux arm64; SHA256SUMS. The agent embeds its required assets and expands them at runtime.
+
+Validation scope: workspace tests, formatting/clippy, architecture/build-identity checks, BPF and Android arm64 cross-build. Previous Pixel 6a runs on the preceding build verified initial qualified main-process mappings, not complete application execution, all processes, all DEX/SO or all network traffic. The exact release build is not claimed to repeat those application regressions. Older deleted sessions are unrecoverable.
+
+0.2.13 was not published: release gates caught CI toolchain/color-output issues. This release includes those verification fixes.
